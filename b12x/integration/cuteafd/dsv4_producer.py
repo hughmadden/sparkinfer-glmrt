@@ -31,7 +31,8 @@ ABI (``H`` hidden, ``Q`` q_lora_rank, ``N`` heads; ``rows`` live tokens,
 ``compile_dsv4_index_producer_aot(geometry, max_rows=...)`` equals
 ``dsv4_producer.run_indexer``: block-FP8 GEMM of the index ``wq_b`` over
 ``q_rank``, the BF16 head-weight projection ``hidden @ weights_proj^T``
-(CuTe warp-MMA, FP32 accumulate), partial RoPE, Hadamard, FP4 QAT::
+(FP32 accumulate, BF16 out like ``torch.mm``: skinny GEMV for <= 160 live
+rows, TMA tensor-core GEMM above), partial RoPE, Hadamard, FP4 QAT::
 
     q_rank        bf16 [rows,Q]                in
     hidden        bf16 [rows,H]                in
@@ -65,7 +66,7 @@ from b12x.attention.dsv4_producer._cute import (
     DSV4QueryNormRope,
     DSV4RankNormPackKV,
 )
-from b12x.gemm.bf16_gemv._kernel import Bf16GemmKernel
+from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
 
 from ._common import FLASH, DSV4Geometry, Operand, Scalar, compile_program
 from ._linear import Fp8LinearStage, block_fp8_lowering, stage_scratch_bytes
@@ -141,7 +142,7 @@ class _IndexProducer:
     def __init__(self, geometry: DSV4Geometry, max_rows: int):
         self.h, self.q = geometry.hidden, geometry.q_lora_rank
         self.wq_b = Fp8LinearStage(in_features=self.q, out_features=_INDEX_WIDTH, max_rows=max_rows)
-        self.proj = Bf16GemmKernel(64, self.h, False)
+        self.proj = RoutedBf16Projection(64, self.h)
         self.post = DSV4IndexerQueryPost(heads=64, weight_scale=_INDEX_WEIGHT_SCALE)
 
     @cute.jit
@@ -156,8 +157,7 @@ class _IndexProducer:
         raw_weights = cute.make_ptr(cutlass.BFloat16, weights_off, cute.AddressSpace.gmem, assumed_align=16)
         stage = weights_off + _align_i64(m * Int64(64 * 2))
         self.wq_b(q_rank, w_q, w_q_scale, raw_query, stage, rows, stream)
-        self.proj(hidden, w_proj, hidden, raw_weights, rows, Int64(self.h), Int64(self.h),
-                  Int64(64), Int64(1), Int64(1), Int32(1), stream)
+        self.proj(hidden, w_proj, raw_weights, rows, stream)
         self.post(raw_query, raw_weights, positions, cos_sin, query, head_weights, rows, stream)
 
 
@@ -218,7 +218,7 @@ def compile_dsv4_index_producer_aot(geometry: DSV4Geometry = FLASH, *, max_rows:
     )
     return compile_program(
         launch, name="dsv4_index_producer", operands=operands, scalars=(Scalar("rows"),),
-        key=(h, q, launch.wq_b.key()),
+        key=(h, q, launch.wq_b.key(), launch.proj.key()),
         geometry={"hidden": h, "q_lora_rank": q, "max_rows": max_rows},
         scratch={"scratch": lambda rows: index_producer_scratch_bytes(geometry, rows, max_rows)},
         doc=__doc__,

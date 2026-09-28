@@ -11,8 +11,9 @@ Three compile functions mirror ``b12x.attention.dsv4_compressor``:
 
 Each program computes the joint BF16 projection ``hidden @ joint^T`` (FP32
 accumulate, BF16 out, in place of ``torch.mm``): a bandwidth-bound skinny
-GEMV while the live ``rows`` <= 48 (C4, W=2560) / 128 (C128), else the CuTe
-warp-MMA GEMM; the branch is on the ``rows`` scalar inside the program. It pools/normalizes/RoPEs
+GEMV while the live ``rows`` <= 24 (C4, W=2560) / 64 (C128), else the TMA
+tensor-core GEMM (``Bf16PrefillKernel``, FP32 accumulators); the branch is on
+the ``rows`` scalar inside the program. It pools/normalizes/RoPEs
 each completed group into the FP8 compressed cache (C4 also pools the
 128-dim index key: Hadamard, E2M1 QAT, FP8 + FP32 row scale into the index
 cache) and maintains the FP32 rolling state. Only the fp8 cache format is

@@ -1,4 +1,6 @@
-"""Skinny BF16 GEMV route used by the compressor projection and router scores.
+"""Routed BF16 projection (skinny GEMV for few rows, TMA tensor-core GEMM above)
+used by the compressor projection, the index head-weight projection and (skinny
+only) the router scores.
 
 Accuracy contract: every output is within the rounding of one
 FP32-accumulated dot product of the FP64 reference,
@@ -53,13 +55,14 @@ def _check(out, x, w):
 
 @pytest.mark.parametrize(("n", "k", "dtype"), [
     (2560, 4096, torch.bfloat16), (1024, 4096, torch.bfloat16), (2560, 7168, torch.bfloat16),
-    (1024, 7168, torch.bfloat16), (256, 4096, torch.float32), (384, 7168, torch.float32)])
+    (1024, 7168, torch.bfloat16), (64, 4096, torch.bfloat16), (64, 7168, torch.bfloat16),
+    (256, 4096, torch.float32), (384, 7168, torch.float32)])
 def test_routed_projection_accuracy_across_route_boundary(n, k, dtype):
     device = require_b12x()
     run, threshold = _compile(n, k, dtype)
     gen = torch.Generator().manual_seed(n + k)
     w = (torch.randn((n, k), generator=gen) / 16).bfloat16().to(device)
-    for rows in sorted({1, 2, 7, 8, 9, 16, threshold, threshold + 1, 200}):
+    for rows in sorted({1, 2, 7, 8, 9, 16, threshold, threshold + 1, 200, 1000}):
         x = torch.randn((rows, k), generator=gen).bfloat16().to(device)
         out = torch.full((rows, n), float("nan"), dtype=dtype, device=device)
         run(x, w, out)
