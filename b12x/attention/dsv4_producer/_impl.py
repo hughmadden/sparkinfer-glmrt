@@ -12,11 +12,10 @@ from ..._lib.scratch import ScratchBufferSpec, scratch_buffer_spec, scratch_tens
 from ...gemm._shared.block_fp8 import (
     BlockFP8LinearBinding,
     BlockFP8LinearScratchCaps,
-    BlockFP8LinearScratchPlan,
     BlockFP8LinearWeight,
+    _scratch_plan as _block_fp8_scratch_plan,
     block_fp8_linear_mxfp8,
     pack_block_fp8_linear_weight_mxfp8,
-    plan_block_fp8_linear_scratch,
 )
 
 
@@ -46,6 +45,84 @@ def _check_cuda_tensor(name: str, tensor: torch.Tensor) -> None:
         raise TypeError(f"{name} must be a torch.Tensor")
     if not tensor.is_cuda:
         raise ValueError(f"{name} must be on CUDA")
+
+
+# The checkpoint quantizes every projection input per token over 128-wide K
+# blocks (UE8M0 scale replicated across four hardware K32 slots).
+_ACTIVATION_BLOCK_SIZE = 128
+
+
+@dataclass(frozen=True)
+class _ProducerLinear:
+    """One ``gemm.block_fp8_linear`` declaration owned by a producer plan.
+
+    CUDA declarations are prepared with their default configuration when the
+    producer is planned, so the retained scratch size includes any split-K
+    workspace of the selected configuration. A PreparationSession may prepare
+    ``plan`` first (for example to autotune); the producer then sizes its arena
+    from that prepared selection. CPU declarations only describe the arena and
+    reserve the activation staging (the non-split layout).
+    """
+
+    caps: BlockFP8LinearScratchCaps
+    plan: object
+
+    @property
+    def scratch_nbytes(self) -> int:
+        if self.plan is None:
+            return int(
+                _block_fp8_scratch_plan(self.caps, (0, 0)).scratch_specs()[0].nbytes
+            )
+        return int(self.plan.scratch_specs()[0].nbytes)
+
+    def bind(
+        self,
+        *,
+        scratch: torch.Tensor,
+        source: torch.Tensor,
+        packed_weight: BlockFP8LinearWeight,
+        output: torch.Tensor,
+        expected_m: int | None = None,
+    ) -> BlockFP8LinearBinding:
+        if self.plan is None:
+            raise ValueError("a CPU DSV4 producer declaration cannot be bound")
+        from ...gemm import block_fp8_linear
+
+        return block_fp8_linear.bind(
+            self.plan,
+            scratch=scratch,
+            source=source,
+            packed_weight=packed_weight,
+            output=output,
+            expected_m=expected_m,
+            activation_block_size=_ACTIVATION_BLOCK_SIZE,
+        )
+
+
+def _plan_linear(
+    *, device: torch.device, max_tokens: int, in_features: int, out_features: int,
+    name: str,
+) -> _ProducerLinear:
+    caps = BlockFP8LinearScratchCaps(
+        device=device,
+        max_tokens=max_tokens,
+        in_features=in_features,
+        out_features=out_features,
+        output_dtype=torch.bfloat16,
+        activation_block_size=_ACTIVATION_BLOCK_SIZE,
+    )
+    if caps.device.type != "cuda":
+        return _ProducerLinear(caps=caps, plan=None)
+    from ...gemm import block_fp8_linear
+    from ...preparation import PreparedCall, prepare_default
+
+    plan = block_fp8_linear.plan(caps)
+    if plan.prepared is None:
+        prepare_default(plan.request(
+            name=f"{name}.m{caps.max_tokens}",
+            prepare_call=lambda state: PreparedCall(run=lambda: None),
+        ))
+    return _ProducerLinear(caps=caps, plan=plan)
 
 
 @dataclass(frozen=True)
@@ -278,7 +355,7 @@ class DSV4IndexerProducerBinding:
 class DSV4IndexerProducerPlan:
     caps: DSV4IndexerProducerCaps
     layout: _DSV4IndexerProducerScratchLayout
-    q_linear_plan: BlockFP8LinearScratchPlan
+    q_linear_plan: _ProducerLinear
     _scratch_specs: tuple[ScratchBufferSpec, ...]
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
@@ -336,7 +413,6 @@ class DSV4IndexerProducerPlan:
             packed_weight=weights.q,
             output=q_output,
             expected_m=expected_m,
-            activation_block_size=128,
         )
         return DSV4IndexerProducerBinding(
             q_rank=q_rank,
@@ -356,8 +432,8 @@ class DSV4IndexerProducerPlan:
 class DSV4ProducerPlan:
     caps: DSV4ProducerCaps
     layout: _DSV4ProducerScratchLayout
-    qkv_linear_plan: BlockFP8LinearScratchPlan
-    q_linear_plan: BlockFP8LinearScratchPlan
+    qkv_linear_plan: _ProducerLinear
+    q_linear_plan: _ProducerLinear
     _scratch_specs: tuple[ScratchBufferSpec, ...]
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
@@ -429,7 +505,6 @@ class DSV4ProducerPlan:
             packed_weight=weights.qkv_rank,
             output=qkv_output,
             expected_m=expected_m,
-            activation_block_size=128,
         )
         q_linear = self.q_linear_plan.bind(
             scratch=q_scratch,
@@ -437,7 +512,6 @@ class DSV4ProducerPlan:
             packed_weight=weights.q,
             output=query.view(tokens, self.caps.heads * self.caps.head_dim, 1),
             expected_m=expected_m,
-            activation_block_size=128,
         )
         return DSV4ProducerBinding(
             hidden_states=hidden_states,
@@ -460,7 +534,7 @@ class DSV4ProducerPlan:
 class DSV4KVProducerPlan:
     caps: DSV4ProducerCaps
     layout: _DSV4KVProducerScratchLayout
-    kv_linear_plan: BlockFP8LinearScratchPlan
+    kv_linear_plan: _ProducerLinear
     _scratch_specs: tuple[ScratchBufferSpec, ...]
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
@@ -508,7 +582,6 @@ class DSV4KVProducerPlan:
             packed_weight=weights.kv,
             output=kv_output,
             expected_m=expected_m,
-            activation_block_size=128,
         )
         return DSV4KVProducerBinding(
             hidden_states=hidden_states,
@@ -689,30 +762,26 @@ def pack_dsv4_indexer_producer_weights(
 
 
 def plan_dsv4_producer(caps: DSV4ProducerCaps) -> DSV4ProducerPlan:
-    qkv_linear_plan = plan_block_fp8_linear_scratch(
-        BlockFP8LinearScratchCaps(
-            device=caps.device,
-            max_tokens=caps.max_tokens,
-            in_features=caps.hidden,
-            out_features=caps.q_lora_rank + caps.head_dim,
-            output_dtype=caps.dtype,
-        )
+    qkv_linear_plan = _plan_linear(
+        device=caps.device,
+        max_tokens=caps.max_tokens,
+        in_features=caps.hidden,
+        out_features=caps.q_lora_rank + caps.head_dim,
+        name="dsv4_producer.qkv",
     )
-    q_linear_plan = plan_block_fp8_linear_scratch(
-        BlockFP8LinearScratchCaps(
-            device=caps.device,
-            max_tokens=caps.max_tokens,
-            in_features=caps.q_lora_rank,
-            out_features=caps.heads * caps.head_dim,
-            output_dtype=caps.dtype,
-        )
+    q_linear_plan = _plan_linear(
+        device=caps.device,
+        max_tokens=caps.max_tokens,
+        in_features=caps.q_lora_rank,
+        out_features=caps.heads * caps.head_dim,
+        name="dsv4_producer.q",
     )
     cursor = 0
     qkv_linear_offset = _align_up(cursor)
-    qkv_linear_bytes = qkv_linear_plan.scratch_specs()[0].nbytes
+    qkv_linear_bytes = qkv_linear_plan.scratch_nbytes
     cursor = qkv_linear_offset + qkv_linear_bytes
     q_linear_offset = _align_up(cursor)
-    q_linear_bytes = q_linear_plan.scratch_specs()[0].nbytes
+    q_linear_bytes = q_linear_plan.scratch_nbytes
     cursor = q_linear_offset + q_linear_bytes
     qkv_output_offset = _align_up(cursor)
     cursor = (
@@ -745,18 +814,16 @@ def plan_dsv4_producer(caps: DSV4ProducerCaps) -> DSV4ProducerPlan:
 def plan_dsv4_kv_producer(caps: DSV4ProducerCaps) -> DSV4KVProducerPlan:
     """Plan the dSpark target-main path without unused query scratch."""
 
-    kv_linear_plan = plan_block_fp8_linear_scratch(
-        BlockFP8LinearScratchCaps(
-            device=caps.device,
-            max_tokens=caps.max_tokens,
-            in_features=caps.hidden,
-            out_features=caps.head_dim,
-            output_dtype=caps.dtype,
-        )
+    kv_linear_plan = _plan_linear(
+        device=caps.device,
+        max_tokens=caps.max_tokens,
+        in_features=caps.hidden,
+        out_features=caps.head_dim,
+        name="dsv4_kv_producer.kv",
     )
     cursor = 0
     kv_linear_offset = _align_up(cursor)
-    kv_linear_bytes = kv_linear_plan.scratch_specs()[0].nbytes
+    kv_linear_bytes = kv_linear_plan.scratch_nbytes
     cursor = kv_linear_offset + kv_linear_bytes
     kv_output_offset = _align_up(cursor)
     kv_output_bytes = caps.max_tokens * caps.head_dim * 2
@@ -783,18 +850,16 @@ def plan_dsv4_kv_producer(caps: DSV4ProducerCaps) -> DSV4KVProducerPlan:
 def plan_dsv4_indexer_producer(
     caps: DSV4IndexerProducerCaps,
 ) -> DSV4IndexerProducerPlan:
-    q_linear_plan = plan_block_fp8_linear_scratch(
-        BlockFP8LinearScratchCaps(
-            device=caps.device,
-            max_tokens=caps.max_tokens,
-            in_features=caps.q_lora_rank,
-            out_features=caps.heads * caps.head_dim,
-            output_dtype=caps.dtype,
-        )
+    q_linear_plan = _plan_linear(
+        device=caps.device,
+        max_tokens=caps.max_tokens,
+        in_features=caps.q_lora_rank,
+        out_features=caps.heads * caps.head_dim,
+        name="dsv4_indexer_producer.q",
     )
     cursor = 0
     q_linear_offset = _align_up(cursor)
-    q_linear_bytes = q_linear_plan.scratch_specs()[0].nbytes
+    q_linear_bytes = q_linear_plan.scratch_nbytes
     cursor = q_linear_offset + q_linear_bytes
     q_output_offset = _align_up(cursor)
     q_output_bytes = caps.max_tokens * caps.heads * caps.head_dim * 2

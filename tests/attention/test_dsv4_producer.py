@@ -337,6 +337,7 @@ def test_native_dsv4_nvfp4_writer_matches_432_byte_record_and_replays() -> None:
         caps,
         torch.zeros(layout.nbytes, device="cuda", dtype=torch.uint8),
         layout,
+        None,
     )
     output = torch.empty_like(query)
 
@@ -563,38 +564,37 @@ def test_indexer_query_feeds_physical_slot_topk_without_remap_allocation() -> No
     )
     page_table = torch.stack((first, second)).contiguous()
     seqlens = torch.tensor([700, 641], device=device, dtype=torch.int32)
+    output = torch.empty((rows, topk), device=device, dtype=torch.int32)
+    operands = dict(
+        q_fp8=query,
+        query_weights=head_weights,
+        index_k_cache=index_cache,
+        page_table=page_table,
+        cache_lengths=seqlens,
+        active_width=torch.tensor([pages * 64], device=device, dtype=torch.int32),
+        output_indices=output,
+    )
+    selection_caps = nsa_indexer.Caps(
+        device=device,
+        num_q_heads=heads,
+        max_q_rows=rows,
+        max_page_table_width=pages,
+        topk=topk,
+        mode="decode",
+        output_index_space="physical",
+    )
     selection_plan = nsa_indexer.plan(
-        nsa_indexer.Caps(
-            device=device,
-            source_layout=nsa_indexer.SOURCE_LAYOUT_PAGED,
-            num_q_heads=heads,
-            max_q_rows=rows,
-            max_page_table_width=pages,
-            topk=topk,
-            mode="decode",
-        )
+        selection_caps,
+        invocation=nsa_indexer.invocation_from_tensors(selection_caps, **operands),
     )
     (selection_spec,) = selection_plan.scratch_specs()
     selection_scratch = torch.empty(
         selection_spec.shape, dtype=selection_spec.dtype, device=device
     )
-    selection_binding = selection_plan.bind(
-        scratch=selection_scratch,
-        real_page_table=page_table,
-        cache_seqlens_int32=seqlens,
-        expected_num_q_heads=heads,
-        output_physical_slots=True,
+    selection_binding = nsa_indexer.bind(
+        selection_plan, scratch=selection_scratch, **operands
     )
-    output = torch.empty((rows, topk), device=device, dtype=torch.int32)
-    scores = torch.empty((rows, topk), device=device, dtype=torch.float32)
-    nsa_indexer.index_topk_fp8(
-        q_fp8=query,
-        weights=head_weights,
-        index_k_cache=index_cache,
-        binding=selection_binding,
-        out_indices=output,
-        out_scores=scores,
-    )
+    nsa_indexer.run(selection_binding)
     torch.cuda.synchronize()
 
     logits = paged_decode_logits_reference(
