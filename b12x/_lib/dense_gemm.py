@@ -9491,7 +9491,9 @@ def _lower_dense_gemm(
     )
 
 
-def dense_gemm_launch_from_lowering(payload) -> tuple["_DenseGemmLaunch", int]:
+def dense_gemm_launch_from_lowering(
+    payload, *, atomic_split: str = "reject",
+) -> tuple["_DenseGemmLaunch", int]:
     """Uncompiled launch for a prepared MXFP8/FP8 lowering, for AOT composition.
 
     Returns ``(launch, split_k_slices)``. The launch is exactly the one
@@ -9499,16 +9501,26 @@ def dense_gemm_launch_from_lowering(payload) -> tuple["_DenseGemmLaunch", int]:
     the pointer ABI ``(a, b, sfa, sfb, c, qc_values, qc_scale_rows,
     qc_scale_mma, alpha, m, stream)`` and may be invoked from another
     ``@cute.jit`` program. Split plans write FP32 [slices, m, n] partials that
-    the caller reduces; atomic BF16 split plans are rejected.
+    the caller reduces. Atomic BF16 split plans (``out.zero_()`` then BF16
+    atomics; order-dependent double rounding) are rejected unless
+    ``atomic_split="partials"``, which keeps the tile/K split but writes FP32
+    partial planes instead (the convention of ``compile_dense_gemm_mxfp8_aot``):
+    deterministic, one BF16 rounding.
     """
     p = payload if isinstance(payload, _DenseLowering) else _DenseLowering.from_dict(payload)
     if p.is_mxfp6:
         raise ValueError("MXFP6 lowerings are not exposed for AOT composition")
+    if atomic_split not in ("reject", "partials"):
+        raise ValueError("atomic_split must be 'reject' or 'partials'")
     split = p.policy.split_k_slices > 1
+    c_l = p.kernel_c_l
     if split and p.policy.split_k_atomic_bf16:
-        raise ValueError("atomic BF16 split-K lowerings require a pre-cleared output")
+        if atomic_split == "reject":
+            raise ValueError("atomic BF16 split-K lowerings require a pre-cleared output")
+        p = replace(p, policy=replace(p.policy, split_k_atomic_bf16=False))
+        c_l = p.policy.split_k_slices
     launch = _new_dense_gemm_launch(
-        n=p.n, k=p.k, l=p.l, c_l=p.kernel_c_l, a_major="k", b_major="k", c_major="n",
+        n=p.n, k=p.k, l=p.l, c_l=c_l, a_major="k", b_major="k", c_major="n",
         ab_dtype=get_cutlass_dtype(p.ab_dtype), sf_dtype=get_cutlass_dtype(p.sf_dtype),
         c_dtype=get_cutlass_dtype("float32" if split else p.c_dtype),
         alpha_dtype=get_cutlass_dtype(p.alpha_dtype), sf_vec_size=p.sf_vec_size,
