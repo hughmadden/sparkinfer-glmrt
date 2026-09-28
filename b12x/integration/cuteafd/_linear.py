@@ -8,7 +8,9 @@ quantization) inside a larger ``@cute.jit`` program:
    (``_MXFP8RowsQuantLaunch``, K128 blocks, subgroup/threads by capacity);
 2. the dense MXFP8 GEMM launch of the plan's default lowering for the
    declared capacity (``dense_gemm_launch_from_lowering``);
-3. for non-atomic split-K lowerings, the FP32 partial-plane reduction.
+3. for split-K lowerings, FP32 partial planes and one reduction (BF16-atomic
+   split lowerings are converted to partial planes: deterministic, one BF16
+   rounding instead of the prepared path's order-dependent atomics).
 
 Weights are the packed ``block_fp8_linear.pack_weight`` operands: ``values``
 FP8 E4M3 ``[N, K]`` and ``scale_mma``, the UE8M0 scales in dense-GEMM MMA tile
@@ -21,7 +23,7 @@ computed from the live row count at launch):
     values      rows * K                         FP8 E4M3
     scale_rows  rows * K / 32                     UE8M0 (quantizer byproduct)
     scale_mma   ceil(rows/128) * ceil(K/128)*512  UE8M0 MMA layout
-    alpha       16 bytes                          ignored FP32 operand
+    alpha       16 bytes                          FP32 1.0 (written when K is split)
     split-K     slices * rows * N * 4             FP32 partials (slices > 1)
 
 ``stage_scratch_bytes(K, N, rows, slices)`` is the exact total; it is
@@ -39,7 +41,7 @@ from cutlass import Int32, Int64, const_expr
 from b12x._lib.dense_gemm import _DenseSplitKReduce, dense_gemm_launch_from_lowering
 from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch, _GRID_CTAS_PER_SM
 
-__all__ = ["Fp8LinearStage", "stage_scratch_bytes", "block_fp8_lowering"]
+__all__ = ["Fp8LinearStage", "StoreOne", "stage_scratch_bytes", "block_fp8_lowering"]
 
 _ALIGN = 1024
 
@@ -77,6 +79,24 @@ def block_fp8_lowering(*, max_rows: int, in_features: int, out_features: int, de
     return _dense_lowering(query, config, identity)
 
 
+class StoreOne:
+    """Write FP32 1.0 to a dense GEMM alpha slot.
+
+    The unit-alpha dense GEMM still multiplies its FP32 split-K partial planes
+    by ``alpha[0]``, so the slot must hold 1.0 when a lowering splits K
+    (scratch is otherwise uninitialized).
+    """
+
+    @cute.jit
+    def __call__(self, alpha: cute.Pointer, stream: cuda.CUstream):
+        self.kernel(alpha).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, alpha: cute.Pointer):
+        if cute.arch.thread_idx()[0] == 0:
+            alpha[0] = cutlass.Float32(1.0)
+
+
 @cute.jit
 def _align_i64(value: Int64) -> Int64:
     return (value + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
@@ -93,7 +113,9 @@ class Fp8LinearStage:
         self.max_rows = int(max_rows)
         self.lowering = block_fp8_lowering(max_rows=max_rows, in_features=self.k,
                                            out_features=self.n, device=device)
-        self.gemm, self.slices = dense_gemm_launch_from_lowering(self.lowering)
+        # BF16-atomic split lowerings become FP32 partial planes + one
+        # deterministic reduction (single BF16 rounding).
+        self.gemm, self.slices = dense_gemm_launch_from_lowering(self.lowering, atomic_split="partials")
         self.sm_count = int(self.lowering.sm_count)
         subgroup_width, threads = (8, 128) if self.max_rows <= 8 else (4, 256)
         self.quant = _MXFP8RowsQuantLaunch(
@@ -103,6 +125,7 @@ class Fp8LinearStage:
         self.quant_tasks_per_row = (self.k // 32 + (32 // subgroup_width) - 1) // (32 // subgroup_width)
         self.quant_grid_cap = self.sm_count * _GRID_CTAS_PER_SM
         self.reduce = _DenseSplitKReduce(self.n, self.slices) if self.slices > 1 else None
+        self.store_one = StoreOne()
 
     def scratch_bytes(self, rows: int) -> int:
         return stage_scratch_bytes(self.k, self.n, rows, self.slices)
@@ -141,6 +164,7 @@ class Fp8LinearStage:
         qc_values = cute.make_ptr(cutlass.Float8E4M3FN, scratch + values_off, cute.AddressSpace.gmem, assumed_align=16)
         qc_rows = cute.make_ptr(cutlass.Float8E8M0FNU, scratch + scale_rows_off, cute.AddressSpace.gmem, assumed_align=16)
         if const_expr(self.slices > 1):
+            self.store_one(alpha, stream)
             partials = cute.make_ptr(cutlass.Float32, scratch + split_off, cute.AddressSpace.gmem, assumed_align=16)
             self.gemm(a, b, sfa, sfb, partials, qc_values, qc_rows, sfa, alpha, rows, stream)
             self.reduce(partials, out, rows, stream)

@@ -70,6 +70,7 @@ from b12x._lib.dense_gemm import _DenseSplitKReduce, dense_gemm_launch_from_lowe
 from b12x.gemm.wo_projection._quant_cute import _GRID_CTAS_PER_SM, _THREADS, _WOQuantCuTeLaunch
 
 from ._common import FLASH, DSV4Geometry, Operand, Scalar, compile_program
+from ._linear import StoreOne
 
 __all__ = ["compile_dsv4_wo_projection_aot", "wo_lowerings", "wo_scratch_bytes"]
 
@@ -132,23 +133,6 @@ def _align_i64(value: Int64) -> Int64:
     return (value + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
 
 
-class _StoreOne:
-    """Write FP32 1.0 to the dense GEMM alpha slot.
-
-    The unit-alpha dense GEMM still multiplies its FP32 split-K partial planes
-    by ``alpha[0]``, so the slot must hold 1.0 (scratch is uninitialized).
-    """
-
-    @cute.jit
-    def __call__(self, alpha: cute.Pointer, stream: cuda.CUstream):
-        self.kernel(alpha).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
-
-    @cute.kernel
-    def kernel(self, alpha: cute.Pointer):
-        if cute.arch.thread_idx()[0] == 0:
-            alpha[0] = cutlass.Float32(1.0)
-
-
 class _WoProjection:
     def __init__(self, geometry: DSV4Geometry, max_rows: int):
         self.g, self.w = geometry.o_groups, geometry.o_group_width
@@ -169,7 +153,7 @@ class _WoProjection:
         self.quant_b = _WOQuantCuTeLaunch(
             "group_major", self.g * self.r, self.r, cutlass.BFloat16, False, 0, 0, 0,
             cutlass.Int64, cutlass.BFloat16, _THREADS, False)
-        self.store_one = _StoreOne()
+        self.store_one = StoreOne()
         self.grid_cap = int(low_a.sm_count) * _GRID_CTAS_PER_SM
         self.warps = _THREADS // 32
 
