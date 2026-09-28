@@ -2478,6 +2478,41 @@ def fabs_f32(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def div_full_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """Approximate f32 division (div.full.f32), Triton's lowering of ``/``.
+
+    Use where a CuTe port must reproduce a Triton kernel's fp32 quotient.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "div.full.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def rsqrt_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
+    """rsqrt.approx.ftz.f32, Triton's lowering of ``tl.rsqrt``."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "rsqrt.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def div_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
     """IEEE round-to-nearest f32 division (div.rn.f32).
 

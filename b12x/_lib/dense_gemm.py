@@ -6583,6 +6583,97 @@ def _dense_gemm_target_occupancy(
     )
 
 
+def _new_dense_gemm_launch(
+    *,
+    n: int,
+    k: int,
+    l: int,
+    c_l: int,
+    a_major: str,
+    b_major: str,
+    c_major: str,
+    ab_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    alpha_dtype: Type[cutlass.Numeric],
+    sf_vec_size: int,
+    mma_k: int,
+    tile_k: int,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    policy: _DenseGemmPolicy,
+    sm_count: int,
+    sm_version: str,
+    load_path: str,
+    swap_ab: bool,
+    sfb_k_reuse: bool,
+    b_tile_major: bool,
+    quantize_c: bool = False,
+    alpha_is_one: bool = False,
+    direct_sfa_live16: bool = False,
+    direct_m1_wo_a_inputs: bool = False,
+    plain_fp8: bool = False,
+    block_fp8: bool = False,
+    target_occupancy_override: Optional[int] = None,
+    weight_only: Optional[str] = None,
+    alpha_reciprocal: bool = False,
+    input_k: Optional[int] = None,
+) -> "_DenseGemmLaunch":
+    """Construct (without compiling) the exact launch _get_compiled_dense_gemm compiles."""
+    return _DenseGemmLaunch(
+        n=n,
+        k=k,
+        l=l,
+        c_l=c_l,
+        a_major=a_major,
+        b_major=b_major,
+        c_major=c_major,
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        alpha_dtype=alpha_dtype,
+        sf_vec_size=sf_vec_size,
+        mma_k=mma_k,
+        tile_k=tile_k,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        policy=policy,
+        sm_count=sm_count,
+        sm_version=sm_version,
+        load_path=load_path,
+        swap_ab=swap_ab,
+        sfb_k_reuse=sfb_k_reuse,
+        b_tile_major=b_tile_major,
+        quantize_c=quantize_c,
+        alpha_is_one=alpha_is_one,
+        direct_sfa_live16=direct_sfa_live16,
+        direct_m1_wo_a_inputs=direct_m1_wo_a_inputs,
+        plain_fp8=plain_fp8,
+        block_fp8=block_fp8,
+        weight_only=weight_only,
+        alpha_reciprocal=alpha_reciprocal,
+        input_k=input_k,
+        target_occupancy=(
+            target_occupancy_override
+            if target_occupancy_override is not None
+            else _dense_gemm_target_occupancy(
+                n=n,
+                k=k,
+                l=l,
+                ab_dtype=ab_dtype,
+                c_dtype=c_dtype,
+                tile_k=tile_k,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                sm_count=sm_count,
+                load_path=load_path,
+                swap_ab=swap_ab,
+                b_tile_major=b_tile_major,
+            )
+        ),
+    )
+
+
 @program_cache
 def _get_compiled_dense_gemm(
     n: int,
@@ -6700,57 +6791,17 @@ def _get_compiled_dense_gemm(
             ),
         ]
 
-    launch = _DenseGemmLaunch(
-        n=n,
-        k=k,
-        l=l,
-        c_l=c_l,
-        a_major=a_major,
-        b_major=b_major,
-        c_major=c_major,
-        ab_dtype=ab_dtype,
-        sf_dtype=sf_dtype,
-        c_dtype=c_dtype,
-        alpha_dtype=alpha_dtype,
-        sf_vec_size=sf_vec_size,
-        mma_k=mma_k,
-        tile_k=tile_k,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mn=cluster_shape_mn,
-        policy=policy,
-        sm_count=sm_count,
-        sm_version=sm_version,
-        load_path=load_path,
-        swap_ab=swap_ab,
-        sfb_k_reuse=sfb_k_reuse,
-        b_tile_major=b_tile_major,
-        quantize_c=quantize_c,
-        alpha_is_one=alpha_is_one,
-        direct_sfa_live16=direct_sfa_live16,
-        direct_m1_wo_a_inputs=direct_m1_wo_a_inputs,
-        plain_fp8=plain_fp8,
-        block_fp8=block_fp8,
-        weight_only=weight_only,
-        alpha_reciprocal=alpha_reciprocal,
-        input_k=input_k,
-        target_occupancy=(
-            target_occupancy_override
-            if target_occupancy_override is not None
-            else _dense_gemm_target_occupancy(
-                n=n,
-                k=k,
-                l=l,
-                ab_dtype=ab_dtype,
-                c_dtype=c_dtype,
-                tile_k=tile_k,
-                mma_tiler_mn=mma_tiler_mn,
-                cluster_shape_mn=cluster_shape_mn,
-                sm_count=sm_count,
-                load_path=load_path,
-                swap_ab=swap_ab,
-                b_tile_major=b_tile_major,
-            )
-        ),
+    launch = _new_dense_gemm_launch(
+        n=n, k=k, l=l, c_l=c_l, a_major=a_major, b_major=b_major, c_major=c_major,
+        ab_dtype=ab_dtype, sf_dtype=sf_dtype, c_dtype=c_dtype, alpha_dtype=alpha_dtype,
+        sf_vec_size=sf_vec_size, mma_k=mma_k, tile_k=tile_k, mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn, policy=policy, sm_count=sm_count,
+        sm_version=sm_version, load_path=load_path, swap_ab=swap_ab,
+        sfb_k_reuse=sfb_k_reuse, b_tile_major=b_tile_major, quantize_c=quantize_c,
+        alpha_is_one=alpha_is_one, direct_sfa_live16=direct_sfa_live16,
+        direct_m1_wo_a_inputs=direct_m1_wo_a_inputs, plain_fp8=plain_fp8,
+        block_fp8=block_fp8, target_occupancy_override=target_occupancy_override,
+        weight_only=weight_only, alpha_reciprocal=alpha_reciprocal, input_k=input_k,
     )
     if weight_only is not None and torch.cuda.is_current_stream_capturing():
         raise RuntimeError("A16 dense GEMM must be prewarmed before CUDA graph capture")
@@ -9438,6 +9489,40 @@ def _lower_dense_gemm(
         direct_sfa_live16=_use_direct_sfa_live16(**common, alpha_is_one=alpha_is_one),
         direct_m1_wo_a_inputs=_use_direct_m1_wo_a_inputs(**common),
     )
+
+
+def dense_gemm_launch_from_lowering(payload) -> tuple["_DenseGemmLaunch", int]:
+    """Uncompiled launch for a prepared MXFP8/FP8 lowering, for AOT composition.
+
+    Returns ``(launch, split_k_slices)``. The launch is exactly the one
+    ``_compile_dense_lowering`` compiles; it is a ``@cute.jit`` callable with
+    the pointer ABI ``(a, b, sfa, sfb, c, qc_values, qc_scale_rows,
+    qc_scale_mma, alpha, m, stream)`` and may be invoked from another
+    ``@cute.jit`` program. Split plans write FP32 [slices, m, n] partials that
+    the caller reduces; atomic BF16 split plans are rejected.
+    """
+    p = payload if isinstance(payload, _DenseLowering) else _DenseLowering.from_dict(payload)
+    if p.is_mxfp6:
+        raise ValueError("MXFP6 lowerings are not exposed for AOT composition")
+    split = p.policy.split_k_slices > 1
+    if split and p.policy.split_k_atomic_bf16:
+        raise ValueError("atomic BF16 split-K lowerings require a pre-cleared output")
+    launch = _new_dense_gemm_launch(
+        n=p.n, k=p.k, l=p.l, c_l=p.kernel_c_l, a_major="k", b_major="k", c_major="n",
+        ab_dtype=get_cutlass_dtype(p.ab_dtype), sf_dtype=get_cutlass_dtype(p.sf_dtype),
+        c_dtype=get_cutlass_dtype("float32" if split else p.c_dtype),
+        alpha_dtype=get_cutlass_dtype(p.alpha_dtype), sf_vec_size=p.sf_vec_size,
+        mma_k=p.mma_k, tile_k=p.tile_k, mma_tiler_mn=p.mma_tiler_mn,
+        cluster_shape_mn=p.cluster_shape_mn, policy=p.policy, sm_count=p.sm_count,
+        sm_version="sm_120", alpha_is_one=p.alpha_is_one, load_path=p.load_path,
+        swap_ab=p.swap_ab, sfb_k_reuse=False if p.plain_fp8 else p.sfb_k_reuse,
+        b_tile_major=False if p.plain_fp8 else p.b_tile_major, quantize_c=p.quantize_c,
+        plain_fp8=p.plain_fp8, block_fp8=p.block_fp8,
+        direct_sfa_live16=False if p.plain_fp8 else p.direct_sfa_live16,
+        direct_m1_wo_a_inputs=False if p.plain_fp8 or p.quantize_c else p.direct_m1_wo_a_inputs,
+        target_occupancy_override=p.target_occupancy_override,
+    )
+    return launch, int(p.policy.split_k_slices)
 
 
 def _compile_dense_lowering(payload, device_ordinal):
