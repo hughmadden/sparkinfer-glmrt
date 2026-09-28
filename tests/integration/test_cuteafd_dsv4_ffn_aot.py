@@ -181,7 +181,7 @@ def test_shared_ffn_replays_in_cuda_graph(programs):
     assert_bitwise(out, eager, "graph out")
 
 
-@pytest.mark.parametrize(("name", "rows"), [("flash", 1), ("flash", 13), ("flash", 300), ("pro", 7), ("pro", 129)])
+@pytest.mark.parametrize(("name", "rows"), [("flash", 1), ("flash", 13), ("flash", 32), ("flash", 33), ("flash", 300), ("pro", 7), ("pro", 32), ("pro", 129)])
 def test_router_scores_match_fp32_gate(programs, name, rows):
     """Prototype router: logits = x.float() @ gate.float().t() (FP32)."""
     device = require_b12x()

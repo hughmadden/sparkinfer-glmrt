@@ -22,9 +22,10 @@ moe_inter, 2048 Flash / 3072 Pro)::
     scratch    u8   shared_ffn_scratch_bytes(geometry, rows, max_rows)
     rows       int32 (1 <= rows <= max_rows)
 
-``compile_dsv4_router_scores_aot(geometry)`` wraps
-``compile_v41_router_scores_aot(experts=E, hidden=H)`` (TMA-fed BF16 MMA,
-FP32 accumulate) with the V4.1 header names::
+``compile_dsv4_router_scores_aot(geometry)``: FP32-accumulated BF16 scores.
+Live rows <= 32 run a bandwidth-bound skinny GEMV (FP32 output); more rows run
+the V4.1 TMA-fed warp-MMA kernel (``_V41RouterScores``); the branch is on the
+``live_rows`` scalar inside the program. V4.1 header names::
 
     x          bf16 [rows,H]      in   ffn input (after ffn_norm)
     w          bf16 [E,H]         in   ffn.gate.weight
@@ -172,20 +173,45 @@ def compile_dsv4_shared_ffn_aot(geometry: DSV4Geometry = FLASH, *, max_rows: int
     )
 
 
+ROUTER_SKINNY_MAX_ROWS = 32
+
+
+class _RouterScores:
+    """Skinny GEMV (FP32 out) for live_rows <= 32, else the V4.1 TMA MMA kernel."""
+
+    def __init__(self, experts: int, hidden: int):
+        from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
+        from b12x.moe._shared.v41_router import _V41RouterScores
+
+        self.skinny = SkinnyBf16Gemv(experts, hidden, out_dtype=cutlass.Float32,
+                                     **skinny_config(experts, hidden, cutlass.Float32))
+        self.mma = _V41RouterScores(experts, hidden=hidden)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w: cute.Pointer, logits: cute.Pointer, live_rows: Int32,
+                 stream: cuda.CUstream):
+        if live_rows <= Int32(ROUTER_SKINNY_MAX_ROWS):
+            self.skinny(x, w, logits, live_rows, stream)
+        else:
+            self.mma(x, w, logits, live_rows, stream)
+
+
 def compile_dsv4_router_scores_aot(geometry: DSV4Geometry = FLASH, experts: int | None = None) -> AotProgram:
     """Raw FP32 router scores ``x @ gate^T``; see module docstring."""
-    from b12x.moe._shared.v41_router import compile_v41_router_scores_aot
-
     e = geometry.routed_experts if experts is None else int(experts)
     h = geometry.hidden
-    compiled = compile_v41_router_scores_aot(experts=e, hidden=h)
-    return AotProgram(
-        name="dsv4_router_scores", compiled=compiled,
+    if e not in (256, 384) or h not in (4096, 7168):
+        raise ValueError("DSV4 router scores support 256/384 experts over hidden 4096/7168")
+    launch = _RouterScores(e, h)
+    s = launch.skinny
+    return compile_program(
+        launch, name="dsv4_router_scores",
         operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
                   Operand("w", torch.bfloat16, f"[{e},{h}]", note="ffn.gate.weight"),
                   Operand("logits", torch.float32, f"[rows,{e}]", "out")),
         scalars=(Scalar("live_rows"),),
-        geometry={"hidden": h, "experts": e, "tile_m": 64}, doc=__doc__,
+        key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.cols, s.rows_per_tile, s.threads),
+        geometry={"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS}, doc=__doc__,
     )
 
 

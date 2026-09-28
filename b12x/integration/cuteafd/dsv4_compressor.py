@@ -9,8 +9,10 @@ Three compile functions mirror ``b12x.attention.dsv4_compressor``:
 * ``compile_dsv4_compressor_continuation_aot`` = ``run_continuation``
   (one ordered chunk per sequence continuing its persistent state).
 
-Each program computes the joint BF16 projection ``hidden @ joint^T`` (CuTe
-warp-MMA, FP32 accumulate, in place of ``torch.mm``), pools/normalizes/RoPEs
+Each program computes the joint BF16 projection ``hidden @ joint^T`` (FP32
+accumulate, BF16 out, in place of ``torch.mm``): a bandwidth-bound skinny
+GEMV while the live ``rows`` <= 48 (C4, W=2560) / 128 (C128), else the CuTe
+warp-MMA GEMM; the branch is on the ``rows`` scalar inside the program. It pools/normalizes/RoPEs
 each completed group into the FP8 compressed cache (C4 also pools the
 128-dim index key: Hadamard, E2M1 QAT, FP8 + FP32 row scale into the index
 cache) and maintains the FP32 rolling state. Only the fp8 cache format is
@@ -71,7 +73,7 @@ from b12x.attention.dsv4_compressor._cute import (
     DSV4CompressorPool,
     main_page_bytes,
 )
-from b12x.gemm.bf16_gemv._kernel import Bf16GemmKernel
+from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
 
 from ._common import FLASH, DSV4Geometry, Operand, Scalar, compile_program
 
@@ -101,7 +103,7 @@ class _Base:
         self.mode = mode
         self.h = geometry.hidden
         self.w = joint_width(self.ratio)
-        self.gemm = Bf16GemmKernel(self.w, self.h, False)
+        self.gemm = RoutedBf16Projection(self.w, self.h)
         eps = geometry.norm_eps
         self.main = DSV4CompressorPool(ratio=self.ratio, index=False, mode=mode, eps=eps)
         self.index = (DSV4CompressorPool(ratio=4, index=True, mode=mode, eps=eps)
@@ -114,8 +116,7 @@ class _Base:
     @cute.jit
     def _project(self, hidden: cute.Pointer, joint: cute.Pointer, projection: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.gemm(hidden, joint, hidden, projection, rows, Int64(self.h), Int64(self.h),
-                  Int64(self.w), Int64(1), Int64(1), Int32(1), stream)
+        self.gemm(hidden, joint, projection, rows, stream)
 
 
 def _bf16(pointer: cute.Pointer):
@@ -301,7 +302,7 @@ def _compile(launch, *, geometry, ratio, mode, metadata, scalars):
         launch, name=f"dsv4_compressor_{mode}_c{ratio}",
         operands=(Operand("hidden", torch.bfloat16, f"[rows,{geometry.hidden}]"),) + metadata
         + _weights_and_state(geometry, ratio),
-        scalars=scalars, key=(geometry.hidden, ratio, mode, geometry.norm_eps),
+        scalars=scalars, key=(geometry.hidden, ratio, mode, geometry.norm_eps, launch.gemm.key()),
         geometry={"hidden": geometry.hidden, "ratio": ratio, "mode": mode,
                   "joint_width": joint_width(ratio), "cache_format": "fp8"},
         scratch={"scratch": lambda rows: compressor_scratch_bytes(ratio, rows)},
