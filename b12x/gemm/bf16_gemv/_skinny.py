@@ -21,7 +21,7 @@ from cutlass import Float32, Int32, Int64, Uint32, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-__all__ = ["RoutedBf16Projection", "SkinnyBf16Gemv", "skinny_config", "skinny_max_rows"]
+__all__ = ["RoutedBf16Projection", "SkinnyBf16Gemv", "TmaBf16Projection", "prefill_config", "skinny_config", "skinny_max_rows"]
 
 
 @dsl_user_op
@@ -167,35 +167,70 @@ def skinny_config(n: int, k: int, out_dtype) -> dict:
         return dict(cols=4, rows_per_tile=2, threads=256)
     if (n, k) == (384, 7168):
         return dict(cols=4, rows_per_tile=2, threads=224)
+    if (n, k) == (64, 4096):
+        return dict(cols=1, rows_per_tile=2, threads=256)
+    if (n, k) == (64, 7168):
+        return dict(cols=2, rows_per_tile=2, threads=448)
     return dict(cols=1, rows_per_tile=8, threads=128)
 
 
 def skinny_max_rows(n: int, k: int) -> int:
     """Largest live row count routed to the skinny GEMV (measured crossover
-    against ``Bf16GemmKernel`` on SM120 with L2-cold weights)."""
-    return 48 if n >= 2048 else 128
+    against the TMA tensor-core route on SM120, L2-cold weights)."""
+    if n >= 2048:
+        return 24
+    if n >= 512:
+        return 64
+    return 160
+
+
+def prefill_config(n: int, k: int) -> dict:
+    """Measured SM120 choices for the TMA tensor-core route (uncompensated)."""
+    if n >= 1024:
+        return dict(compute_warps=4, tile_n=128, num_stages=3, compensated=False)
+    return dict(compute_warps=4, tile_n=64, num_stages=4, compensated=False)
+
+
+class TmaBf16Projection:
+    """Pointer ABI over ``Bf16PrefillKernel`` (TMA pipeline, FP32 MMA accumulation)."""
+
+    def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, **config):
+        from ._prefill import Bf16PrefillKernel
+
+        self.n, self.k = int(n), int(k)
+        self.out_dtype = out_dtype
+        self.config = dict(prefill_config(n, k), **config)
+        self.kernel = Bf16PrefillKernel(self.n, self.k, **self.config)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        xt = cute.make_tensor(x, cute.make_layout((rows, self.k), stride=(self.k, 1)))
+        wt = cute.make_tensor(w, cute.make_layout((self.n, self.k), stride=(self.k, 1)))
+        ot = cute.make_tensor(out, cute.make_layout((rows, self.n), stride=(self.n, 1)))
+        self.kernel(xt, wt, ot, rows, stream)
 
 
 class RoutedBf16Projection:
-    """``out = x @ w^T`` choosing the skinny GEMV or the warp-MMA GEMM by live rows.
+    """``out = x @ w^T``: skinny GEMV for few live rows, TMA tensor-core GEMM above.
 
     The branch is on the ``rows`` launch scalar inside the program (no host
     sync), so one compiled program serves decode and prefill and stays
-    CUDA-graph capturable. ``out`` is dense ``[rows, N]`` (BF16 or FP32).
+    CUDA-graph capturable. ``x``/``w``/``out`` are dense and 16-byte aligned;
+    ``out`` is ``[rows, N]`` BF16 or FP32. Both routes accumulate in FP32.
     """
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, max_skinny_rows: int | None = None):
-        from ._kernel import Bf16GemmKernel
-
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
         self.max_skinny_rows = int(skinny_max_rows(n, k) if max_skinny_rows is None else max_skinny_rows)
         self.skinny = SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, **skinny_config(n, k, out_dtype))
-        self.mma = Bf16GemmKernel(self.n, self.k, False)
+        self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype)
 
     def key(self) -> tuple:
         s = self.skinny
-        return (self.n, self.k, str(self.out_dtype), self.max_skinny_rows, s.cols, s.rows_per_tile, s.threads)
+        return (self.n, self.k, str(self.out_dtype), self.max_skinny_rows, s.cols, s.rows_per_tile,
+                s.threads, tuple(sorted(self.large.config.items())))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
@@ -203,5 +238,4 @@ class RoutedBf16Projection:
         if rows <= Int32(self.max_skinny_rows):
             self.skinny(x, w, out, rows, stream)
         else:
-            self.mma(x, w, x, out, rows, Int64(self.k), Int64(self.k), Int64(self.n),
-                     Int64(1), Int64(1), Int32(1), stream)
+            self.large(x, w, out, rows, stream)

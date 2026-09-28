@@ -74,6 +74,19 @@ def _warp_gemm(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, sha
         acc.store(total)
 
 
+@cute.jit
+def _warp_gemm_direct(tiled_mma, acc, fragment_a, fragment_b, shared_a, shared_b, copy_a, copy_b):
+    target_a = copy_a.retile(fragment_a)
+    target_b = copy_b.retile(fragment_b)
+    cute.copy(copy_a, shared_a[None, None, 0], target_a[None, None, 0])
+    cute.copy(copy_b, shared_b[None, None, 0], target_b[None, None, 0])
+    for k in cutlass.range_constexpr(cute.size(shared_a.shape[2])):
+        if k < cute.size(shared_a.shape[2]) - 1:
+            cute.copy(copy_a, shared_a[None, None, k + 1], target_a[None, None, k + 1])
+            cute.copy(copy_b, shared_b[None, None, k + 1], target_b[None, None, k + 1])
+        cute.gemm(tiled_mma, acc, fragment_a[None, None, k], fragment_b[None, None, k], acc)
+
+
 class Bf16PrefillKernel:
     """TMA-fed BF16 matrix product with FP32 accumulators and runtime rows."""
 
@@ -89,7 +102,24 @@ class Bf16PrefillKernel:
     unroll_k = False
     buffer_align_bytes = 1024
 
-    def __init__(self, n: int, k: int):
+    def __init__(self, n: int, k: int, *, compute_warps: int | None = None,
+                 tile_n: int | None = None, num_stages: int | None = None,
+                 compensated: bool = True):
+        """Defaults keep the original 64x64x64, two-stage, compensated kernel.
+
+        ``compensated=False`` accumulates directly in the tensor-core FP32
+        accumulators (cuBLAS-style). ``compute_warps`` sets tile_m = 16 x warps.
+        """
+        if compute_warps is not None:
+            self.num_compute_warps = int(compute_warps)
+            self.producer_warp = self.num_compute_warps
+            self.num_threads = 32 * (self.num_compute_warps + 1)
+            self.tile_m = 16 * self.num_compute_warps
+        if tile_n is not None:
+            self.tile_n = int(tile_n)
+        if num_stages is not None:
+            self.num_stages = int(num_stages)
+        self.compensated = bool(compensated)
         self.n, self.k = int(n), int(k)
         if self.n <= 0 or self.k <= 0 or self.k % self.tile_k:
             raise ValueError("BF16 prefill needs positive N and K divisible by 64")
@@ -310,17 +340,29 @@ class Bf16PrefillKernel:
 
             for _k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
                 load_pipeline.consumer_wait(consumer_state)
-                _warp_gemm(
-                    thr_mma,
-                    acc,
-                    correction,
-                    tCrA,
-                    tCrB,
-                    tSsA[None, None, None, consumer_state.index],
-                    tSsB[None, None, None, consumer_state.index],
-                    smem_thr_copy_A,
-                    smem_thr_copy_B,
-                )
+                if const_expr(self.compensated):
+                    _warp_gemm(
+                        thr_mma,
+                        acc,
+                        correction,
+                        tCrA,
+                        tCrB,
+                        tSsA[None, None, None, consumer_state.index],
+                        tSsB[None, None, None, consumer_state.index],
+                        smem_thr_copy_A,
+                        smem_thr_copy_B,
+                    )
+                else:
+                    _warp_gemm_direct(
+                        thr_mma,
+                        acc,
+                        tCrA,
+                        tCrB,
+                        tSsA[None, None, None, consumer_state.index],
+                        tSsB[None, None, None, consumer_state.index],
+                        smem_thr_copy_A,
+                        smem_thr_copy_B,
+                    )
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 
