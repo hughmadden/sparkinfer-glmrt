@@ -17,6 +17,9 @@ module docstring for the exact pointer list, dtypes, shapes and scratch sizes:
 * ``dsv4_ffn``         ``compile_dsv4_shared_ffn_aot`` (shared expert),
                        ``compile_dsv4_router_scores_aot`` (FP32 gate scores),
                        ``compile_dsv4_expert_input_quant_aot`` (FP8 K32 wire rows)
+* ``weights``          ``WEIGHT_SOURCES`` (checkpoint tensor -> operand table),
+                       ``compile_dsv4_block_fp8_scale_prep_aot`` (UE8M0 block
+                       scales -> scale_mma), ``compile_dsv4_i64_to_i32_aot``
 
 Exporter recipe (per program)::
 
