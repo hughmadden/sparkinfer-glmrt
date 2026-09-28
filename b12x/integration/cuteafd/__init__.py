@@ -14,6 +14,9 @@ module docstring for the exact pointer list, dtypes, shapes and scratch sizes:
 * ``dsv4_indexer``     ``compile_dsv4_index_topk_aot`` (C4 top-k, physical slots)
 * ``dsv4_sparse_mla``  ``compile_dsv4_sparse_mla_aot`` (FP8 584-byte records + sink)
 * ``dsv4_wo``          ``compile_dsv4_wo_projection_aot`` (inverse RoPE, wo_a, wo_b)
+* ``dsv4_ffn``         ``compile_dsv4_shared_ffn_aot`` (shared expert),
+                       ``compile_dsv4_router_scores_aot`` (FP32 gate scores),
+                       ``compile_dsv4_expert_input_quant_aot`` (FP8 K32 wire rows)
 
 Exporter recipe (per program)::
 

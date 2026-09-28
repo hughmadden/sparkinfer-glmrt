@@ -76,6 +76,9 @@ class DSV4Geometry:
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1.0e-6
     norm_eps: float = 1.0e-6
+    moe_inter: int = 2048
+    routed_experts: int = 256
+    swiglu_limit: float = 10.0
 
     def __post_init__(self) -> None:
         if (self.head_dim, self.nope_dim, self.rope_dim) != (512, 448, 64):
@@ -102,7 +105,7 @@ class DSV4Geometry:
 FLASH = DSV4Geometry()
 PRO = DSV4Geometry(
     name="pro", hidden=7168, heads=128, q_lora_rank=1536, o_groups=16,
-    o_lora_rank=1024, index_topk=1024,
+    o_lora_rank=1024, index_topk=1024, moe_inter=3072, routed_experts=384,
 )
 
 
@@ -113,6 +116,7 @@ _TORCH_TO_CUTE = {
     torch.int32: cutlass.Int32,
     torch.int64: cutlass.Int64,
     torch.uint8: cutlass.Uint8,
+    torch.uint32: cutlass.Uint32,
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
 }
 
