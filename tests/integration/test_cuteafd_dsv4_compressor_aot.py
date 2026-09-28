@@ -418,3 +418,46 @@ def test_prefill_replays_in_cuda_graph(programs):
 def test_export_to_c_signature(programs, key, tmp_path):
     info = check_export(programs[key], tmp_path, f"dsv4_compressor_{key[0]}_c{key[1]}")
     assert info["argument_count"] == len(programs[key].operands) + len(programs[key].scalars) + 1
+
+
+def test_decode_completing_first_group_matches_prefill(programs):
+    """A C4 decode step that completes group 0 has no previous group.
+
+    The AOT decode reads the -inf rolling-state rows left by the prefill
+    finalizer (floor modulo), so it must agree bitwise with a prefill of the
+    same four tokens. (The Triton decode's C remainder addresses rows -4..-1,
+    i.e. another sequence's state, for this case.)
+    """
+    device = require_b12x()
+    ratio = 4
+    weights = _weights(ratio, device)
+    cos_sin = _cos_sin(64, device)
+    hidden = _hidden(4, 99, device)
+    i32 = dict(dtype=torch.int32, device=device)
+
+    # Reference: prefill all four tokens into slot 0 (sequence state 1).
+    ref = Pools(ratio, 2, device, high_page=0)
+    meta = _prefill_meta(ratio, [4], device, 0)
+    meta["state_sequence_ids"] = torch.tensor([1], **i32)
+    program = programs[("prefill", ratio)]
+    scratch = torch.empty((program.scratch_bytes(4)["scratch"],), dtype=torch.uint8, device=device)
+    program.launch(hidden, *[meta[k] for k in _PREFILL_KEYS], cos_sin, weights.joint_projection,
+                   *ref.pointers(weights), scratch, scalars=(4, 1, 1))
+
+    # AOT: prefill two tokens (no group), then decode positions 2 and 3.
+    aot = Pools(ratio, 2, device, high_page=0)
+    aot.score.fill_(123.0)  # poison: previous-group rows must come from the finalizer
+    meta = _prefill_meta(ratio, [2], device, 0)
+    meta["state_sequence_ids"] = torch.tensor([1], **i32)
+    program.launch(hidden[:2].contiguous(), *[meta[k] for k in _PREFILL_KEYS], cos_sin,
+                   weights.joint_projection, *aot.pointers(weights), scratch, scalars=(2, 1, 1))
+    decode = programs[("decode", ratio)]
+    for position in (2, 3):
+        decode.launch(hidden[position:position + 1].contiguous(), torch.tensor([position], **i32),
+                      torch.tensor([1], **i32), torch.tensor([0], **i32), cos_sin,
+                      weights.joint_projection, *aot.pointers(weights), scratch, scalars=(1,))
+    torch.cuda.synchronize()
+    main_a, index_a = _written_rows(aot, ratio, [0])
+    main_e, index_e = _written_rows(ref, ratio, [0])
+    assert torch.equal(main_a, main_e)
+    assert torch.equal(index_a, index_e)
