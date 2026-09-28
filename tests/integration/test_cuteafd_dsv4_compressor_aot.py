@@ -25,11 +25,11 @@ C128_PAGE_BYTES = 1_728
 INDEX_PAGE_BYTES = 8_448
 
 
-def _weights(ratio: int, device):
+def _weights(ratio: int, device, hidden: int = 4096):
     from b12x.attention import dsv4_compressor
 
     layer = 2 if ratio == 4 else 3
-    if has_checkpoint():
+    if hidden == 4096 and has_checkpoint():
         g = lambda n: checkpoint_tensor(f"layers.{layer}.attn.{n}", device)  # noqa: E731
         kw = {}
         if ratio == 4:
@@ -45,9 +45,9 @@ def _weights(ratio: int, device):
     rnd = lambda *s, scale=0.02: (torch.randn(s, generator=gen) * scale).to(device)  # noqa: E731
     kw = {}
     if ratio == 4:
-        kw = dict(index_wkv=rnd(256, 4096).bfloat16(), index_wgate=rnd(256, 4096).bfloat16(),
+        kw = dict(index_wkv=rnd(256, hidden).bfloat16(), index_wgate=rnd(256, hidden).bfloat16(),
                   index_ape=rnd(4, 256, scale=0.5), index_norm=(1 + rnd(128, scale=0.1)).bfloat16())
-    return dsv4_compressor.pack_weights(rnd(pw, 4096).bfloat16(), rnd(pw, 4096).bfloat16(),
+    return dsv4_compressor.pack_weights(rnd(pw, hidden).bfloat16(), rnd(pw, hidden).bfloat16(),
                                         rnd(ratio, pw, scale=0.5), (1 + rnd(512, scale=0.1)).bfloat16(), **kw)
 
 
@@ -63,7 +63,7 @@ class Pools:
     def __init__(self, ratio, sequences, device, *, high_page):
         self.ratio = ratio
         page_bytes = C4_PAGE_BYTES if ratio == 4 else C128_PAGE_BYTES
-        self.pages = high_page + 64
+        self.pages = high_page + 256
         self.cache = torch.zeros((self.pages, page_bytes), dtype=torch.uint8, device=device)
         self.index_cache = (torch.zeros((self.pages, INDEX_PAGE_BYTES), dtype=torch.uint8, device=device)
                             if ratio == 4 else None)
@@ -106,7 +106,7 @@ def _prefill_meta(ratio, lengths, device, high_page, *, group_capacity=None):
         for j in range(n // ratio):
             starts.append(offsets[-1] + j * ratio)
             ropes.append(j * ratio)
-            slots.append(_slot(ratio, 10 * s + j, high_page))
+            slots.append(_slot(ratio, 100 * s + j, high_page))
         offsets.append(offsets[-1] + n)
     groups = len(starts)
     cap = max(group_capacity or groups, 1)
@@ -130,7 +130,7 @@ def _continuation_meta(ratio, starts_lengths, device, high_page):
             if p % ratio == ratio - 1:
                 seq_slots.append(s)
                 positions.append(p + 1 - ratio)
-                slots.append(_slot(ratio, 10 * s + p // ratio, high_page))
+                slots.append(_slot(ratio, 100 * s + p // ratio, high_page))
         offsets.append(offsets[-1] + n)
     groups = len(positions)
     cap = max(groups, 1)
@@ -155,11 +155,11 @@ _CONT_KEYS = ("active_groups", "group_sequence_slots", "group_source_positions",
               "state_sequence_ids")
 
 
-def _plan(ratio, max_tokens, device):
+def _plan(ratio, max_tokens, device, hidden=4096):
     from b12x.attention import dsv4_compressor
 
     return dsv4_compressor.plan(dsv4_compressor.Caps(
-        device=device, max_tokens=max_tokens, hidden=4096, compress_ratio=ratio,
+        device=device, max_tokens=max_tokens, hidden=hidden, compress_ratio=ratio,
         with_indexer=ratio == 4, cache_format="fp8"))
 
 
@@ -272,7 +272,7 @@ def _compare_pools(actual, expected, ratio, slots, *, exact):
 @pytest.fixture(scope="module")
 def programs():
     require_b12x()
-    from b12x.integration.cuteafd import FLASH, exportable_compilation
+    from b12x.integration.cuteafd import FLASH, PRO, exportable_compilation
     from b12x.integration.cuteafd import dsv4_compressor as c
 
     with exportable_compilation():
@@ -281,31 +281,32 @@ def programs():
             out[("decode", ratio)] = c.compile_dsv4_compressor_decode_aot(FLASH, ratio=ratio)
             out[("prefill", ratio)] = c.compile_dsv4_compressor_prefill_aot(FLASH, ratio=ratio)
             out[("continuation", ratio)] = c.compile_dsv4_compressor_continuation_aot(FLASH, ratio=ratio)
+            out[("pro_prefill", ratio)] = c.compile_dsv4_compressor_prefill_aot(PRO, ratio=ratio)
         return out
 
 
 HIGH = {4: (2**31) // C4_PAGE_BYTES + 2, 128: (2**31) // C128_PAGE_BYTES + 2}
 
 
-def _hidden(rows, seed, device):
+def _hidden(rows, seed, device, hidden=4096):
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    return torch.randn((rows, 4096), generator=gen).bfloat16().to(device)
+    return torch.randn((rows, hidden), generator=gen).bfloat16().to(device)
 
 
-def _run_prefill_both(programs, ratio, lengths, weights, cos_sin, device, *, pools=None):
+def _run_prefill_both(programs, ratio, lengths, weights, cos_sin, device, *, pools=None, hidden_size=4096):
     """Returns (aot_pools, triton_on_aot_projection_pools, full_prepared_pools, aot_projection)."""
     rows = sum(lengths)
     meta = _prefill_meta(ratio, lengths, device, HIGH[ratio])
     base = pools if pools is not None else Pools(ratio, len(lengths), device, high_page=HIGH[ratio])
-    hidden = _hidden(rows, rows + ratio, device)
-    program = programs[("prefill", ratio)]
+    hidden = _hidden(rows, rows + ratio, device, hidden_size)
+    program = programs[("prefill", ratio) if hidden_size == 4096 else ("pro_prefill", ratio)]
     aot = base.clone()
     scratch = torch.empty((program.scratch_bytes(rows)["scratch"],), dtype=torch.uint8, device=device)
     program.launch(hidden, *[meta[k] for k in _PREFILL_KEYS], cos_sin, weights.joint_projection,
                    *aot.pointers(weights), scratch,
                    scalars=(rows, int(meta["group_source_starts"].shape[0]), len(lengths)))
     projection = _aot_projection(program, scratch, rows)
-    plan = _plan(ratio, rows, device)
+    plan = _plan(ratio, rows, device, hidden_size)
     results = []
     for use_projection in (True, False):
         ref = base.clone()
@@ -327,6 +328,17 @@ def test_prefill_matches_triton(programs, ratio, lengths):
     cos_sin = _cos_sin(4096, device)
     aot, exact_ref, full_ref, projection, slots = _run_prefill_both(programs, ratio, lengths, weights,
                                                                     cos_sin, device)
+    _compare_pools(aot, exact_ref, ratio, slots, exact=True)
+    _compare_pools(aot, full_ref, ratio, slots, exact=False)
+
+
+@pytest.mark.parametrize(("ratio", "lengths"), [(4, [45, 7]), (128, [260])])
+def test_pro_prefill_matches_triton(programs, ratio, lengths):
+    device = require_b12x()
+    weights = _weights(ratio, device, 7168)
+    cos_sin = _cos_sin(4096, device)
+    aot, exact_ref, full_ref, _, slots = _run_prefill_both(programs, ratio, lengths, weights, cos_sin,
+                                                           device, hidden_size=7168)
     _compare_pools(aot, exact_ref, ratio, slots, exact=True)
     _compare_pools(aot, full_ref, ratio, slots, exact=False)
 
@@ -368,7 +380,7 @@ def test_continuation_and_decode_match_triton(programs):
             i32 = dict(dtype=torch.int32, device=device)
             pos = torch.tensor(position, **i32)
             seq = torch.arange(rows, **i32)
-            slots = torch.tensor([_slot(ratio, 10 * s + p // ratio, HIGH[ratio]) for s, p in enumerate(position)], **i32)
+            slots = torch.tensor([_slot(ratio, 100 * s + p // ratio, HIGH[ratio]) for s, p in enumerate(position)], **i32)
             hidden = _hidden(rows, 1000 + step, device)
             scratch = torch.empty((program.scratch_bytes(rows)["scratch"],), dtype=torch.uint8, device=device)
             program.launch(hidden, pos, seq, slots, cos_sin, weights.joint_projection,
