@@ -224,8 +224,9 @@ class V41RoutePlan:
 class V41SliceReduce:
     """Ordered FP32 slice sum into original route order; invalid routes are zero."""
 
-    def __init__(self, width, capacity, topk=6, *, intermediate=576):
+    def __init__(self, width, capacity, topk=6, *, intermediate=576, hidden=5120):
         assert width in (64, 128, 192) and capacity > 0 and topk > 0
+        self.hidden = hidden
         self.capacity = capacity
         assert intermediate > 0 and intermediate % 32 == 0
         self.slices = (intermediate + width - 1) // width
@@ -244,7 +245,7 @@ class V41SliceReduce:
     ):
         launch_rows = self.capacity if rows < 0 else min(rows, self.capacity)
         self.kernel(source, dest, inverse, live_rows).launch(
-            grid=(max(1, (launch_rows * self.topk * 5120 + 255) // 256), 1, 1),
+            grid=(max(1, (launch_rows * self.topk * self.hidden + 255) // 256), 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )
@@ -258,7 +259,7 @@ class V41SliceReduce:
         live_rows: cute.Tensor,
     ):
         index = Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
-        route, col = index // 5120, index % 5120
+        route, col = index // self.hidden, index % self.hidden
         if route < min(live_rows[0] * self.topk, self.routes):
             grouped = inverse[route]
             value = Float32(0)

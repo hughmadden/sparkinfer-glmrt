@@ -11,13 +11,15 @@ from tests.moe.test_v41_expert_numerics import reference
 from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 
 
-@pytest.mark.parametrize("n", [576, 2304])
+# V4.1 TP4 and dSpark widths, plus the DeepSeek V4 Flash TP4 shard (hidden 4096).
+@pytest.mark.parametrize("h,n", [(5120, 576), (5120, 2304), (4096, 512)])
 @pytest.mark.parametrize("width", [64, 128, 192])
-def test_v41_fused_slice(width, n):
+def test_v41_fused_slice(width, h, n):
+    if -(-n // width) * width > (n + 127) // 128 * 128:
+        pytest.skip("slice width does not tile this intermediate within its packed storage")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("Blackwell GPU required")
     torch.manual_seed(4106576)
-    h = 5120
     weights = {}
     scales = {}
     for name, shape in [
@@ -69,7 +71,7 @@ def test_v41_fused_slice(width, n):
     )
     args = [from_dlpack(t, assumed_align=16) for t in [qa, qs, *packed, routing, out]]
     compiled = cute.compile(
-        V41FusedSliceKernel(width, intermediate=n), *args, cutlass.Int32(16), current_cuda_stream()
+        V41FusedSliceKernel(width, intermediate=n, hidden=h), *args, cutlass.Int32(16), current_cuda_stream()
     )
     results = []
     for m in [1, 2, 6, 16, 1]:

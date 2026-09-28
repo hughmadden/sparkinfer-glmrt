@@ -54,17 +54,19 @@ def _metadata(ids):
     return torch.tensor(tasks, dtype=torch.int32), torch.tensor(pairs, dtype=torch.long)
 
 
-@pytest.mark.parametrize("n,topk", [(576, 6), (2304, 3)])
+@pytest.mark.parametrize("h,n,topk", [(5120, 576, 6), (5120, 2304, 3), (4096, 512, 6)])
 @pytest.mark.parametrize("width", [64, 128, 192])
-def test_grouped_slices(width, n, topk):
-    _check_grouped_slices(width, n=n, topk=topk)
+def test_grouped_slices(width, h, n, topk):
+    _check_grouped_slices(width, n=n, topk=topk, h=h)
 
 
-def _check_grouped_slices(width, after_case=None, *, n=576, topk=6):
+def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120):
+    if -(-n // width) * width > (n + 127) // 128 * 128:
+        pytest.skip("slice width does not tile this intermediate within its packed storage")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("Blackwell GPU required")
     torch.manual_seed(4164)
-    experts, h, capacity = (128 if n == 2304 else 32), 5120, 80
+    experts, capacity = (128 if n == 2304 else 32), 80
     weights = {}
     scales = {}
     for name, shape in [
@@ -95,7 +97,7 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6):
     )
     packed = [t.view(torch.uint32).flatten() for t in [w13, s13, w2, s2]]
     x = torch.randn(capacity, h, device="cuda").mul_(0.5).bfloat16()
-    wire = torch.empty((capacity, 5280), device="cuda", dtype=torch.uint8)
+    wire = torch.empty((capacity, h + h // 32), device="cuda", dtype=torch.uint8)
     qa = wire[:, :h].view(torch.uint32)
     qs = wire[:, h:]
     group_capacity = max(64, capacity * topk) if n == 2304 else 64
@@ -105,7 +107,7 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6):
     args = [from_dlpack(t, assumed_align=16) for t in [qa, qs, *packed, routing, out]]
     meta_view = from_dlpack(metadata, assumed_align=16)
     compiled = cute.compile(
-        V41FusedSliceKernel(width, grouped=True, intermediate=n),
+        V41FusedSliceKernel(width, grouped=True, intermediate=n, hidden=h),
         *args,
         cutlass.Int32(capacity),
         current_cuda_stream(),

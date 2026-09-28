@@ -14,8 +14,11 @@ Nonpositive group row counts mark inactive launch slots. Output route indices
 are grouped order. This low-level kernel is not a serving
 binding or a replacement planner policy.
 
+Hidden width is model geometry too (5120 for V4.1, 4096 for V4 Flash); it must
+be a multiple of the 128-wide K/N tile.
+
 With atomic_tokens=True, grouped mode accumulates directly into a zero-initialized
-flat FP32 [token_capacity * 5120] output. Metadata input row IDs also select output
+flat FP32 [token_capacity * hidden] output. Metadata input row IDs also select output
 tokens. This removes route/slice planes but changes FP32 addition order and flushes
 subnormal atomic operands/results; callers must qualify that numerical contract.
 The caller owns output clearing and stream ordering.
@@ -46,8 +49,11 @@ from b12x.moe._shared.kernels.w4a8_staging import (
 
 
 class V41FusedSliceKernel:
-    def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576):
+    def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576, hidden=5120):
         assert width in (64, 128, 192)
+        assert hidden > 0 and hidden % 128 == 0
+        self.hidden = hidden
+        self.hidden_tiles = hidden // 128
         assert not atomic_tokens or grouped
         self.atomic_tokens = atomic_tokens
         self.grouped = grouped
@@ -147,12 +153,12 @@ class V41FusedSliceKernel:
             gate.fill(0)
             up = cute.make_rmem_tensor((self.width // 32, 4), Float32)
             up.fill(0)
-            for kt in range(40):
+            for kt in range(self.hidden_tiles):
                 stage_repacked_b_slice(
                     w13,
                     bb,
-                    expert * Int64(self.kernel_intermediate * 5120 // 4),
-                    Int32(40),
+                    expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                    Int32(self.hidden_tiles),
                     kt,
                     start,
                     tid,
@@ -162,8 +168,8 @@ class V41FusedSliceKernel:
                 stage_repacked_b_slice(
                     w13,
                     bb + self.width * 64,
-                    expert * Int64(self.kernel_intermediate * 5120 // 4),
-                    Int32(40),
+                    expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                    Int32(self.hidden_tiles),
                     kt,
                     start + self.kernel_intermediate,
                     tid,
@@ -173,8 +179,8 @@ class V41FusedSliceKernel:
                 stage_repacked_sfb_slice(
                     s13,
                     sb,
-                    expert * Int64(self.kernel_intermediate * 5120 // 64),
-                    Int32(40),
+                    expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                    Int32(self.hidden_tiles),
                     kt,
                     start,
                     tid,
@@ -184,8 +190,8 @@ class V41FusedSliceKernel:
                 stage_repacked_sfb_slice(
                     s13,
                     sb + self.width * 4,
-                    expert * Int64(self.kernel_intermediate * 5120 // 64),
-                    Int32(40),
+                    expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                    Int32(self.hidden_tiles),
                     kt,
                     start + self.kernel_intermediate,
                     tid,
@@ -287,11 +293,11 @@ class V41FusedSliceKernel:
                     qa[row, block * 8 + j] = payload[j]
                 qs[row, block] = scale
             cute.arch.sync_threads()
-            for ot in range(40):
+            for ot in range(self.hidden_tiles):
                 stage_repacked_b_k_slice(
                     w2,
                     bb,
-                    expert * Int64(self.kernel_intermediate * 5120 // 8),
+                    expert * Int64(self.kernel_intermediate * self.hidden // 8),
                     Int32(self.kernel_intermediate // 128),
                     start,
                     ot * 128,
@@ -302,7 +308,7 @@ class V41FusedSliceKernel:
                 stage_repacked_sfb_k_slice(
                     s2,
                     sf,
-                    expert * Int64(self.kernel_intermediate * 5120 // 128),
+                    expert * Int64(self.kernel_intermediate * self.hidden // 128),
                     Int32(self.kernel_intermediate // 128),
                     start,
                     ot * 128,
@@ -355,7 +361,7 @@ class V41FusedSliceKernel:
                                 if cutlass.const_expr(self.atomic_tokens):
                                     token = Int64(metadata[group, 3 + row])
                                     red_add_global_f32(
-                                        get_ptr_as_int64(out, token * Int64(5120) + Int64(col)),
+                                        get_ptr_as_int64(out, token * Int64(self.hidden) + Int64(col)),
                                         acc[nf, elem],
                                     )
                                 else:

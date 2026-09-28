@@ -14,14 +14,17 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 
 
 class V41SlicePipeline:
-    def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576):
+    def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576,
+                 hidden=5120):
         self.capacity = capacity
+        self.hidden = hidden
         self.atomic_tokens = atomic_tokens
         self.experts = experts
         self.topk = topk
         self.plan = V41RoutePlan(capacity, experts, topk)
-        self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=atomic_tokens, intermediate=intermediate)
-        self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate)
+        self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=atomic_tokens,
+                                           intermediate=intermediate, hidden=hidden)
+        self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate, hidden=hidden)
 
     @cute.jit
     def __call__(
@@ -61,7 +64,7 @@ class V41SlicePipeline:
         )
         if cutlass.const_expr(self.atomic_tokens):
             self.clear_output(output, rows).launch(
-                grid=(max(1, (rows * 5120 + 255) // 256), 1, 1),
+                grid=(max(1, (rows * self.hidden + 255) // 256), 1, 1),
                 block=(256, 1, 1), stream=stream,
             )
         if cutlass.const_expr(self.atomic_tokens):
@@ -93,7 +96,7 @@ class V41SlicePipeline:
     @cute.kernel
     def clear_output(self, output: cute.Tensor, rows: Int32):
         i = Int64(cute.arch.block_idx()[0]) * 256 + Int64(cute.arch.thread_idx()[0])
-        if i < Int64(rows) * 5120:
+        if i < Int64(rows) * self.hidden:
             output[i] = Float32(0)
 
 

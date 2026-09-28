@@ -8,7 +8,7 @@ from b12x._lib.utils import current_cuda_stream
 from b12x.moe._shared.kernels.v41_route_plan import V41RoutePlan
 
 
-@pytest.mark.parametrize("experts,topk", [(384, 6), (128, 3)])
+@pytest.mark.parametrize("experts,topk", [(384, 6), (128, 3), (256, 6)])
 @pytest.mark.parametrize("capacity", [1, 16, 80, 4096])
 def test_route_plan(capacity, experts, topk):
     if not torch.cuda.is_available():
@@ -91,9 +91,9 @@ def test_route_plan(capacity, experts, topk):
         assert [t.data_ptr() for t in tensors] == pointers
 
 
-@pytest.mark.parametrize("n,topk", [(576, 6), (2304, 3)])
+@pytest.mark.parametrize("h,n,topk", [(5120, 576, 6), (5120, 2304, 3), (4096, 512, 6)])
 @pytest.mark.parametrize("width", [64, 128, 192])
-def test_inverse_reduce(width, n, topk):
+def test_inverse_reduce(width, h, n, topk):
     from b12x.moe._shared.kernels.v41_route_plan import V41SliceReduce
 
     if not torch.cuda.is_available():
@@ -101,12 +101,12 @@ def test_inverse_reduce(width, n, topk):
     capacity = 16
     routes = capacity * topk
     planes = (n + width - 1) // width
-    source = torch.randn(planes, routes, 5120, device="cuda")
-    dest = torch.empty(routes, 5120, device="cuda")
+    source = torch.randn(planes, routes, h, device="cuda")
+    dest = torch.empty(routes, h, device="cuda")
     inverse = torch.empty(routes, dtype=torch.int32, device="cuda")
     live = torch.empty(1, dtype=torch.int32, device="cuda")
     args = [from_dlpack(t) for t in [source, dest, inverse, live]]
-    fn = cute.compile(V41SliceReduce(width, capacity, topk, intermediate=n), *args, current_cuda_stream())
+    fn = cute.compile(V41SliceReduce(width, capacity, topk, intermediate=n, hidden=h), *args, current_cuda_stream())
     live.zero_()
     fn(*args, current_cuda_stream())
     graph = torch.cuda.CUDAGraph()
@@ -119,7 +119,7 @@ def test_inverse_reduce(width, n, topk):
         inverse.copy_(mapping)
         source.mul_(-0.75)
         dest.fill_(12345)
-        expected = torch.zeros(rows * topk, 5120, device="cuda")
+        expected = torch.zeros(rows * topk, h, device="cuda")
         valid = mapping[: rows * topk] >= 0
         for plane in range(planes):
             expected[valid] += source[plane, mapping[: rows * topk][valid].long()]

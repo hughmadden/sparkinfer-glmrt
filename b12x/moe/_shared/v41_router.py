@@ -92,9 +92,10 @@ def _warp_mma_gemm(
 class _V41RouterScores:
     """TMA-fed BF16 gate projection, with runtime rows and FP32 output."""
 
-    def __init__(self, experts: int, tile_m: int = 64):
+    def __init__(self, experts: int, tile_m: int = 64, hidden: int = 5120):
+        assert hidden % _TILE_K == 0 and experts % _TILE_N == 0
         self.output_columns = experts
-        self.reduction_width = 5120
+        self.reduction_width = hidden
         self.tile_m = tile_m
         self.reduction_tiles = self.reduction_width // _TILE_K
         self.compute_warps = self.tile_m // 16
@@ -383,17 +384,18 @@ def v41_router_gemm_min_rows(*, experts: int) -> int:
     return 16 if experts == 384 else 26
 
 
-def compile_v41_router_scores_aot(*, experts: int):
-    """Compile BF16 [rows,5120] @ gate.T -> FP32 [rows,experts].
+def compile_v41_router_scores_aot(*, experts: int, hidden: int = 5120):
+    """Compile BF16 [rows,hidden] @ gate.T -> FP32 [rows,experts].
 
-    Supports the official 384-expert backbone and 128-expert dSpark gates.
+    Supports the V4.1 384-expert backbone and 128-expert dSpark gates (hidden
+    5120) and the DeepSeek V4 gates (Flash: 256 x 4096, Pro: 384 x 7168).
     Caller owns all buffers; no scratch, packing, allocation, or live-row cache
     keys. Score transform, bias and top-k selection are separate operations.
     """
-    if experts not in (128, 384):
-        raise ValueError("V4.1 router experts must be 128 or 384")
-    kernel = _V41RouterScores(experts)
-    key = (experts, 5120, 64, torch.cuda.current_device())
+    if experts not in (128, 256, 384) or hidden not in (4096, 5120, 7168):
+        raise ValueError("router scores support 128/256/384 experts over hidden 4096/5120/7168")
+    kernel = _V41RouterScores(experts, hidden=hidden)
+    key = (experts, hidden, 64, torch.cuda.current_device())
     raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
     return b12x_compile(
         kernel,
