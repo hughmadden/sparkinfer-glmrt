@@ -25,7 +25,15 @@ from cutlass.base_dsl.compiler import OptLevel
 from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
+from b12x._lib.intrinsics import (
+    bfloat2_to_float2_scaled,
+    get_ptr_as_int64,
+    half2_to_float2_scaled,
+    ld_global_nc_v2_u32,
+    pack_f32x2_to_f16x2,
+    shared_ptr_to_u32,
+    st_global_v2_u32,
+)
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.moe._shared.trellis_codebooks import (
@@ -55,6 +63,13 @@ from .kernel import (
 _TIER_DESCRIPTOR_BITS = 9
 _TIER_DESCRIPTOR_MASK = (1 << _TIER_DESCRIPTOR_BITS) - 1
 _MAX_TIER_EXPERTS = 1 << _TIER_DESCRIPTOR_BITS
+
+
+# Below this many rows a (route, block) unit per warp keeps the grid busy;
+# above it, each token's input block is read once for all of its routes.
+_TOKEN_MAJOR_ROTATION_MIN_ROWS = 64
+# H128 blocks one warp rotates per token-major unit (expert ids load once).
+_ROTATION_BLOCKS_PER_UNIT = 8
 
 
 @dataclass(frozen=True)
@@ -219,7 +234,8 @@ class W4A16MixedTrellisKernel:
 
     # Persistent compile keys do not include launch source text. Change this
     # version whenever the compiled argument or tensor-layout contract changes.
-    ABI_VERSION = 18
+    ABI_VERSION = 19
+    _token_major_rotation = False
 
     def __init__(
         self,
@@ -228,6 +244,7 @@ class W4A16MixedTrellisKernel:
         tier0: W4A16FusedMoeKernel,
         tier1: W4A16FusedMoeKernel,
         paired_boundary: str | None = None,
+        token_major_rotation: bool = False,
     ):
         for name, moe in (("driver", driver), ("tier0", tier0), ("tier1", tier1)):
             if not moe.full_rotation or not moe.intermediate_rotation:
@@ -296,6 +313,7 @@ class W4A16MixedTrellisKernel:
                 if 128 % moe.fc1.tile_n or 128 % moe.fc2.tile_k:
                     raise ValueError("paired boundary must align to FC1 N and FC2 K tiles")
         self.paired_boundary = paired_boundary
+        self._token_major_rotation = bool(token_major_rotation)
         self.driver = driver
         self.tier0 = tier0
         self.tier1 = tier1
@@ -333,6 +351,7 @@ class W4A16MixedTrellisKernel:
             self.blocks_per_sm,
             self.shared_words,
             self.paired_boundary,
+            self.token_major_rotation,
         )
 
     @cute.jit
@@ -843,6 +862,99 @@ class W4A16MixedTrellisKernel:
             stream=stream,
         )
 
+    @property
+    def token_major_rotation(self) -> bool:
+        """Packed-route layers rotate each token's input once for all of its
+        routes instead of re-reading the token row per packed route."""
+        return bool(
+            self._token_major_rotation
+            and not self.driver.direct_topk_routes
+            and self.paired_boundary is None
+            and not self.driver.broadcast_suh
+            and not self.driver.coupled_hadamard
+            and self.driver.rotation_input_dtype == "bf16"
+        )
+
+    @cute.jit
+    def _run_input_rotation_token_major(
+        self,
+        x_input: cute.Tensor,
+        a_gate: cute.Tensor,
+        a_up: cute.Tensor,
+        gate_suh: cute.Tensor,
+        up_suh: cute.Tensor,
+        raw_topk_ids: cute.Tensor,
+        global_to_combined: cute.Tensor,
+        route_num_experts: Int32,
+        total_experts: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: Int32,
+    ):
+        # One warp owns eight H128 blocks of one token: each BF16 block is read
+        # once and rotated for every route of the token. Lane t owns
+        # elements 4t..4t+3 of a block; rounding matches the per-route path
+        # (x and x*suh to fp16, fp32 butterfly, fp16 store).
+        lane = tid & Int32(31)
+        warps_per_cta = Int32(self.cta_threads // 32)
+        hidden = Int32(self.hidden_size)
+        nblk = Int32(self.hidden_size // 128)
+        groups = (nblk + Int32(_ROTATION_BLOCKS_PER_UNIT - 1)) // Int32(_ROTATION_BLOCKS_PER_UNIT)
+        unit = cta * warps_per_cta + (tid >> Int32(5))
+        unit_stride = grid_x * warps_per_cta
+        while unit < active_m * groups:
+            token = unit // groups
+            first_blk = (unit - token * groups) * Int32(_ROTATION_BLOCKS_PER_UNIT)
+            last_blk = first_blk + Int32(_ROTATION_BLOCKS_PER_UNIT)
+            if last_blk > nblk:
+                last_blk = nblk
+            experts = []
+            for j in cutlass.range_constexpr(self.top_k):
+                global_expert = raw_topk_ids[token * Int32(self.top_k) + Int32(j)].to(Int32)
+                route_expert = Int32(-1)
+                if global_expert >= Int32(0) and global_expert < route_num_experts:
+                    route_expert = global_to_combined[global_expert].to(Int32)
+                if route_expert >= total_experts:
+                    route_expert = Int32(-1)
+                experts.append(route_expert)
+            blk = first_blk
+            while blk < last_blk:
+                col = blk * Int32(128) + lane * Int32(4)
+                xw0, xw1 = ld_global_nc_v2_u32(get_ptr_as_int64(x_input, token * hidden + col))
+                x0, x1 = bfloat2_to_float2_scaled(xw0, cutlass.Float32(1.0))
+                x2, x3 = bfloat2_to_float2_scaled(xw1, cutlass.Float32(1.0))
+                x0, x1 = half2_to_float2_scaled(pack_f32x2_to_f16x2(x0, x1), cutlass.Float32(1.0))
+                x2, x3 = half2_to_float2_scaled(pack_f32x2_to_f16x2(x2, x3), cutlass.Float32(1.0))
+                for j in cutlass.range_constexpr(self.top_k):
+                    expert_j = experts[j]
+                    if expert_j >= Int32(0):
+                        s_off = expert_j * hidden + col
+                        out_off = (token * Int32(self.top_k) + Int32(j)) * hidden + col
+                        for proj in cutlass.range_constexpr(2):
+                            suh = gate_suh
+                            out = a_gate
+                            if cutlass.const_expr(proj == 1):
+                                suh = up_suh
+                                out = a_up
+                            sw0, sw1 = ld_global_nc_v2_u32(get_ptr_as_int64(suh, s_off))
+                            s0, s1 = half2_to_float2_scaled(sw0, cutlass.Float32(1.0))
+                            s2, s3 = half2_to_float2_scaled(sw1, cutlass.Float32(1.0))
+                            v0, v1 = half2_to_float2_scaled(
+                                pack_f32x2_to_f16x2(x0 * s0, x1 * s1), cutlass.Float32(1.0)
+                            )
+                            v2, v3 = half2_to_float2_scaled(
+                                pack_f32x2_to_f16x2(x2 * s2, x3 * s3), cutlass.Float32(1.0)
+                            )
+                            h0, h1, h2, h3 = self.driver._had128_quad(v0, v1, v2, v3, lane)
+                            st_global_v2_u32(
+                                get_ptr_as_int64(out, out_off),
+                                pack_f32x2_to_f16x2(h0, h1),
+                                pack_f32x2_to_f16x2(h2, h3),
+                            )
+                blk += Int32(1)
+            unit += unit_stride
+
     @cute.kernel
     def kernel(
         self,
@@ -998,6 +1110,43 @@ class W4A16MixedTrellisKernel:
             tier1_up_experts,
         )
         total_experts = tier0_num_experts + tier1_num_experts
+        if cutlass.const_expr(self.token_major_rotation):
+            if active_m >= Int32(_TOKEN_MAJOR_ROTATION_MIN_ROWS):
+                self._run_input_rotation_token_major(
+                    rotation_input,
+                    rotation_gate,
+                    rotation_up,
+                    gate_suh,
+                    up_suh,
+                    raw_topk_ids,
+                    global_to_combined,
+                    route_num_experts,
+                    total_experts,
+                    tid,
+                    cta,
+                    grid_x,
+                    active_m,
+                )
+            else:
+                # Few rows: spread (route, block) units over the whole grid.
+                self.driver._run_input_rotation(
+                    rotation_input,
+                    rotation_gate,
+                    rotation_up,
+                    gate_suh,
+                    up_suh,
+                    packed_route_indices,
+                    block_expert_ids,
+                    packed_route_count,
+                    descriptor_map,
+                    total_experts,
+                    total_experts,
+                    tid,
+                    cta,
+                    grid_x,
+                    active_m,
+                )
+            self.driver._grid_barrier(workspace, tid, grid_x)
         self.driver._moe_body(
             rotation_gate,
             rotation_up,
@@ -1035,6 +1184,7 @@ class W4A16MixedTrellisKernel:
             active_m,
             fc1_emit,
             fc2_emit,
+            input_rotated=self.token_major_rotation,
         )
 
 
@@ -1752,6 +1902,7 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
             active_m,
             fc1_emit,
             fc2_emit,
+            input_rotated=False,
         )
 
 
@@ -1906,6 +2057,7 @@ def compile_mixed_trellis(
     route_num_experts: int | None = None,
     force_blocks_per_sm: int | None = None,
     paired_boundary: str | None = None,
+    token_major_rotation: bool = False,
 ) -> MixedTrellisCompileResult:
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
@@ -1980,6 +2132,7 @@ def compile_mixed_trellis(
             tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
             tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
             paired_boundary=paired_boundary,
+            token_major_rotation=token_major_rotation,
         )
 
     kernel = _select_mixed_fc2_kernel(

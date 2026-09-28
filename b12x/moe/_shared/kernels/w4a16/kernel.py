@@ -1202,6 +1202,17 @@ class W4A16GemmKernel:
             raise ValueError("fused_sum_topk must be >= 1")
         self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
         self.uses_m_block_8 = moe_block_size == 8
+        # Wide packed-route Trellis blocks (large prefill) specialize the K loop
+        # on the block's occupied M16 fragments, so an expert's partial last
+        # block issues no MMA or A-fragment work for its padding rows. Its
+        # weight tiles are still decoded once for all of the block's rows.
+        self.skip_empty_m_blocks = bool(
+            self.cta_m_blocks == 4
+            and weight_layout == "trellis_t256"
+            and not direct_topk_routes
+        )
+        # Trace-time count of M16 fragments the K loop being traced issues.
+        self._traced_m_blocks = self.cta_m_blocks
         self.max_m_blocks = int(max_m_blocks)
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -1357,6 +1368,7 @@ class W4A16GemmKernel:
             self.schedule_route_block_factor,
             self.sqg_xor_cheb_t12_smem,
             self.small_m_splitk,
+            self.skip_empty_m_blocks,
         )
 
     @cute.jit
@@ -2770,42 +2782,90 @@ class W4A16GemmKernel:
             Int32(0),
             False,
         )
-        self._run_mma_pipeline(
-            a_bf16_flat,
-            a_alt_bf16_flat,
-            b_i32_flat,
-            scales_i32_flat,
-            trellis_lut_addr,
-            smem_base,
-            tid,
-            acc0,
-            acc1,
-            acc2,
-            acc3,
-            b_scale_cur,
-            b_scale_next,
-            a_regs,
-            a_regs_next,
-            b_sh_rd,
-            s_sh_rd,
-            a_sh_rd,
-            k_tiles,
-            reduce_k_tile,
-            block_valid_rows,
-            a_gl_stride,
-            b_gl_stride,
-            s_gl_stride,
-            scales_expert_off,
-            b_gl_rd_base,
-            a_gl_rd_row,
-            a_gl_rd_col0,
-            a_sh_wr,
-            a_rows_per_iter,
-            output_n_tile,
-            expert_idx,
-            dynamic_pair_override,
-            False,
-        )
+        if cutlass.const_expr(self.skip_empty_m_blocks):
+            # One K-loop specialization per occupied-fragment count; the
+            # smallest also takes an empty block so its prefetch groups drain.
+            occupied = (block_valid_rows + Int32(15)) // Int32(16)
+            if occupied < Int32(1):
+                occupied = Int32(1)
+            if occupied > Int32(self.cta_m_blocks):
+                occupied = Int32(self.cta_m_blocks)
+            for active in cutlass.range_constexpr(1, self.cta_m_blocks + 1):
+                if occupied == Int32(active):
+                    self._run_mma_pipeline_occupied(
+                        active,
+                        a_bf16_flat,
+                        a_alt_bf16_flat,
+                        b_i32_flat,
+                        scales_i32_flat,
+                        trellis_lut_addr,
+                        smem_base,
+                        tid,
+                        acc0,
+                        acc1,
+                        acc2,
+                        acc3,
+                        b_scale_cur,
+                        b_scale_next,
+                        a_regs,
+                        a_regs_next,
+                        b_sh_rd,
+                        s_sh_rd,
+                        a_sh_rd,
+                        k_tiles,
+                        reduce_k_tile,
+                        block_valid_rows,
+                        a_gl_stride,
+                        b_gl_stride,
+                        s_gl_stride,
+                        scales_expert_off,
+                        b_gl_rd_base,
+                        a_gl_rd_row,
+                        a_gl_rd_col0,
+                        a_sh_wr,
+                        a_rows_per_iter,
+                        output_n_tile,
+                        expert_idx,
+                        dynamic_pair_override,
+                        False,
+                    )
+        else:
+            self._run_mma_pipeline(
+                a_bf16_flat,
+                a_alt_bf16_flat,
+                b_i32_flat,
+                scales_i32_flat,
+                trellis_lut_addr,
+                smem_base,
+                tid,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                b_scale_cur,
+                b_scale_next,
+                a_regs,
+                a_regs_next,
+                b_sh_rd,
+                s_sh_rd,
+                a_sh_rd,
+                k_tiles,
+                reduce_k_tile,
+                block_valid_rows,
+                a_gl_stride,
+                b_gl_stride,
+                s_gl_stride,
+                scales_expert_off,
+                b_gl_rd_base,
+                a_gl_rd_row,
+                a_gl_rd_col0,
+                a_sh_wr,
+                a_rows_per_iter,
+                output_n_tile,
+                expert_idx,
+                dynamic_pair_override,
+                False,
+            )
 
         self._finish_tile(
             acc0,
@@ -2825,6 +2885,15 @@ class W4A16GemmKernel:
             lock_slot,
             False,
         )
+
+    def _run_mma_pipeline_occupied(self, active: int, *args):
+        """Trace the K loop issuing only `active` M16 fragments (trace-time
+        Python, called from inside the kernel's occupied-count branch)."""
+        self._traced_m_blocks = int(active)
+        try:
+            self._run_mma_pipeline(*args)
+        finally:
+            self._traced_m_blocks = self.cta_m_blocks
 
     @cute.jit
     def _run_mma_pipeline(
@@ -3280,7 +3349,7 @@ class W4A16GemmKernel:
             if cutlass.const_expr(uses_m_block_8):
                 self._mma_accumulate_m8(acc0, jj, a_regs_cur, b_frag)
             else:
-                for mb in cutlass.range_constexpr(self.cta_m_blocks):
+                for mb in cutlass.range_constexpr(self._traced_m_blocks):
                     if cutlass.const_expr(mb == 0):
                         self._mma_accumulate_large_m(
                             acc0, a_regs_cur, mb, jj, b_frag
@@ -3674,7 +3743,7 @@ class W4A16GemmKernel:
         pipe: Int32,
         kk: Int32,
     ):
-        for mb in cutlass.range_constexpr(self.cta_m_blocks):
+        for mb in cutlass.range_constexpr(self._traced_m_blocks):
             a0, a1, a2, a3 = self._load_a_registers_large_m(
                 smem_base,
                 a_sh_rd,
@@ -3702,7 +3771,7 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _clear_a_register_bundle_large_m(self, regs: cute.Tensor):
-        for mb in cutlass.range_constexpr(self.cta_m_blocks):
+        for mb in cutlass.range_constexpr(self._traced_m_blocks):
             for reg in cutlass.range_constexpr(4):
                 regs[mb, reg] = Uint32(0)
 
@@ -3713,7 +3782,7 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _copy_a_register_bundle_large_m(self, dst: cute.Tensor, src: cute.Tensor):
-        for mb in cutlass.range_constexpr(self.cta_m_blocks):
+        for mb in cutlass.range_constexpr(self._traced_m_blocks):
             for reg in cutlass.range_constexpr(4):
                 dst[mb, reg] = src[mb, reg]
 
@@ -7044,6 +7113,7 @@ class W4A16FusedMoeKernel:
         active_m: cutlass.Int32,
         fc1_emit_tile: cutlass.Constexpr = None,
         fc2_emit_tile: cutlass.Constexpr = None,
+        input_rotated: cutlass.Constexpr = False,
     ):
         # Phase assembly shared by the single-tier fused kernel and the hybrid
         # multi-tier entry: zero prologue, FC1, grid barrier, activation, grid
@@ -7060,7 +7130,7 @@ class W4A16FusedMoeKernel:
             )
             fc1_phase_lut = table_addr
             fc2_phase_lut = table_addr
-        if cutlass.const_expr(self.full_rotation):
+        if cutlass.const_expr(self.full_rotation and not input_rotated):
             if cutlass.const_expr(self.coupled_hadamard):
                 self._run_input_rotation_coupled(
                     rotation_input_flat,
