@@ -208,13 +208,36 @@ def _triton_continuation(binding, projection=None):
                                            projected_width=256)
 
 
+def _seed_decode_rows(binding):
+    """Write each decode row into the rolling state before the Triton kernel.
+
+    ``_update_pool_pack_*_kernel`` stores the current row and reloads it with
+    a different thread mapping and no barrier, so its result races (40
+    identical runs gave 15 distinct outputs). Pre-seeding the identical
+    values makes the Triton reference deterministic with the intended
+    semantics (the CuTe port has each thread reload only its own writes).
+    """
+    ratio = binding.compress_ratio
+    heads = [(binding.main_kv_state, binding.main_score_state, binding.weights.main_ape, 0)]
+    if ratio == 4:
+        heads.append((binding.index_kv_state, binding.index_score_state, binding.weights.index_ape, 2048))
+    for kv, score, ape, offset in heads:
+        width = int(kv.shape[2])
+        rows = (binding.positions.long() % int(kv.shape[1]))
+        seqs = binding.sequence_ids.long()
+        proj = binding.projection.float()
+        kv[seqs, rows] = proj[:, offset:offset + width]
+        score[seqs, rows] = proj[:, offset + width:offset + 2 * width] + ape[binding.positions.long() % ratio]
+
+
 def _triton_decode(binding, projection=None):
     from b12x.attention.dsv4_compressor import _impl
 
     if projection is None:
-        _impl.run_dsv4_compressor_decode(binding=binding)
-        return
-    binding = replace(binding, projection=projection)
+        torch.mm(binding.hidden_states, binding.weights.joint_projection_t, out=binding.projection)
+    else:
+        binding = replace(binding, projection=projection)
+    _seed_decode_rows(binding)
     _impl._run_main(binding)
     if binding.compress_ratio == 4:
         _impl._run_index(binding)
@@ -473,3 +496,28 @@ def test_decode_completing_first_group_matches_prefill(programs):
     main_e, index_e = _written_rows(ref, ratio, [0])
     assert torch.equal(main_a, main_e)
     assert torch.equal(index_a, index_e)
+
+
+def test_decode_is_deterministic(programs):
+    """Repeated identical decode launches give identical caches and states."""
+    device = require_b12x()
+    ratio = 4
+    weights = _weights(ratio, device)
+    cos_sin = _cos_sin(4096, device)
+    aot, _, _, _, _ = _run_prefill_both(programs, ratio, [23, 11], weights, cos_sin, device)
+    i32 = dict(dtype=torch.int32, device=device)
+    pos, seq = torch.tensor([23, 11], **i32), torch.tensor([0, 1], **i32)
+    slots = torch.tensor([5, 6], **i32)
+    hidden = _hidden(2, 5, device)
+    program = programs[("decode", ratio)]
+    scratch = torch.empty((program.scratch_bytes(2)["scratch"],), dtype=torch.uint8, device=device)
+    results = []
+    for _ in range(20):
+        pools = aot.clone()
+        program.launch(hidden, pos, seq, slots, cos_sin, weights.joint_projection,
+                       *pools.pointers(weights), scratch, scalars=(2,))
+        results.append(pools)
+    torch.cuda.synchronize()
+    for other in results[1:]:
+        for name in ("cache", "index_cache", "kv", "score", "ikv", "iscore"):
+            assert torch.equal(getattr(other, name), getattr(results[0], name)), name
