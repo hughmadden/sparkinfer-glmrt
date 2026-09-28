@@ -385,7 +385,7 @@ class DSV4IndexerQueryPost:
             magnitude = fmin_f32(div_full_f32(fabs_f32(v[e]), fp4_scale), Float32(6.0))
             q = _fp4_magnitude(magnitude)
             if v[e] < Float32(0.0):
-                q = -q
+                q = Float32(0.0) - q  # Triton lowers unary minus to 0 - x (+0 for +0)
             out[e] = Float32((q * fp4_scale).to(BFloat16))
         packed = cvt_f32x4_to_e4m3x4(out[0], out[1], out[2], out[3])
         words = cute.make_ptr(
