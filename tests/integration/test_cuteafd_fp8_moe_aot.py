@@ -3,9 +3,10 @@
 Random E4M3 expert weights with FP32 128x128 block scales at the MiMo V2
 Flash (H 4096) and GLM 5.3 (H 6144) geometries, full width (TP1, the RTX
 local/MTP layers) and the TP4 Spark slice (I 512); FP8 K32 wire or BF16
-input rows; decode (grouped GEMV), prefill (grouped TMA GEMM) and auto
-routes. The reference is the checkpoint semantics: ``F.linear`` of BF16
-activations with ``bf16(w * s)`` weights, BF16 gate/up, ``bf16(silu(g)) *
+input rows; decode (grouped GEMV), prefill (grouped TMA GEMM), stream
+(expert-stationary streaming GEMMs, FP8 wire input) and auto routes. The
+reference is the checkpoint semantics: ``F.linear`` of BF16 activations
+with ``bf16(w * s)`` weights, BF16 gate/up, ``bf16(silu(g)) *
 u``, BF16 down output, FP32 weighted route sum.
 """
 
@@ -80,12 +81,15 @@ def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, limit=0.0):
     return out.bfloat16()
 
 
-def _run(g, route, capacity, rows, wire=True, seed=1):
+def _run(g, route, capacity, rows, wire=True, seed=1, hot=0):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     w = _weights(g)
     x = torch.randn(rows, g.hidden, device="cuda", generator=gen).bfloat16()
     source, x_exact = wire_rows(x) if wire else (x, x)
-    ids = torch.rand(rows, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int().contiguous()
+    scores = torch.rand(rows, g.experts, device="cuda", generator=gen)
+    if hot:
+        scores[:, :hot] += 2.0  # every row routes to the first `hot` experts (multi-chunk groups)
+    ids = scores.topk(g.top_k, -1).indices.int().contiguous()
     weights = torch.rand(rows, g.top_k, device="cuda", generator=gen).contiguous()
     from b12x.integration.cuteafd.fp8_moe import fp8_moe_scratch_bytes
 
@@ -115,6 +119,8 @@ CASES = [
     ("mimo", 1, "auto", 1024, 1024), ("mimo", 1, "auto", 4096, 4096),
     ("glm", 1, "decode", 1, 1), ("glm", 1, "auto", 80, 80), ("glm", 1, "auto", 4096, 4096),
     ("glm", 4, "auto", 256, 256),
+    ("mimo", 4, "stream", 16, 5), ("mimo", 4, "stream", 256, 200), ("mimo", 4, "stream", 4096, 4096),
+    ("mimo", 2, "stream", 1024, 1024), ("glm", 4, "stream", 4096, 3000), ("glm", 2, "stream", 256, 256),
 ]
 
 
@@ -139,4 +145,20 @@ def test_fp8_moe_clamp():
     g = Fp8MoeGeometry("clamped", hidden=4096, experts=256, top_k=8, intermediate=2048, tp=4, swiglu_limit=0.5)
     c, worst = _run(g, "auto", 16, 16)
     print(f"fp8_moe clamp 0.5 rows=16: cosine {c:.7f} worst row {worst:.6f}")
+    assert c >= COS
+
+
+def test_fp8_moe_stream_hot_experts():
+    g = _geometry("mimo", 4)
+    c, worst = _run(g, "stream", 1024, 1000, hot=6)
+    print(f"fp8_moe mimo tp4 stream hot experts rows=1000: cosine {c:.7f} worst row {worst:.6f}")
+    assert c >= COS and worst >= 0.999
+
+
+def test_fp8_moe_stream_clamp():
+    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry
+
+    g = Fp8MoeGeometry("clamped", hidden=4096, experts=256, top_k=8, intermediate=2048, tp=4, swiglu_limit=0.5)
+    c, worst = _run(g, "stream", 256, 256)
+    print(f"fp8_moe clamp 0.5 stream rows=256: cosine {c:.7f} worst row {worst:.6f}")
     assert c >= COS
