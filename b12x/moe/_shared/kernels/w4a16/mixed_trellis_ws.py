@@ -47,7 +47,7 @@ import os
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import Int32, Int64, Uint32, dsl_user_op
+from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from b12x._lib.intrinsics import (
@@ -192,12 +192,86 @@ def _cp_async_mbar_arrive_noinc(addr: Int32, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _mapa(addr: Int32, rank: Int32, *, loc=None, ip=None) -> Int32:
+    """The shared::cluster address of this CTA's shared address ``addr`` in
+    cluster peer ``rank``."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip), Int32(rank).ir_value(loc=loc, ip=ip)],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_cluster_v4(addr: Int32, v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+            Uint32(v2).ir_value(loc=loc, ip=ip),
+            Uint32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared::cluster.v4.u32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbar_arrive_cluster(addr: Int32, *, loc=None, ip=None):
+    """Arrive (release, cluster scope) on a peer's mbarrier (shared::cluster address)."""
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [$0];",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbar_wait_cluster(addr: Int32, parity: Int32, *, loc=None, ip=None):
+    """Wait with cluster-scope acquire (peers arrive with cluster release)."""
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(parity).ir_value(loc=loc, ip=ip)],
+        "{ .reg .pred p; WS_WAITC: "
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$0], $1; "
+        "@!p bra WS_WAITC; }",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     """Warp-specialized two-tier mixed Trellis for packed-route prefill."""
 
     WS_ABI_VERSION = 2
 
-    def __init__(self, *, driver, tier0, tier1, max_shared_mem: int):
+    def __init__(self, *, driver, tier0, tier1, max_shared_mem: int, cluster: bool = False):
         super().__init__(driver=driver, tier0=tier0, tier1=tier1)
         d = driver
         if d.direct_topk_routes:
@@ -288,6 +362,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         self.ws_act_ctas_per_sm = 8
         # Timing probes only (wrong numerics): nodecode, nomma, norot.
         self.ws_exp = frozenset(filter(None, os.environ.get("B12X_WS_EXP", "").split(",")))
+        # FC1 clusters: the N tiles of one projection half share each block's
+        # rotated input rows (each CTA rotates 1/C of them into every peer).
+        half_tiles = inter // tile_n
+        self.ws_cluster = 1
+        if cluster and half_tiles in (2, 3, 4, 6) and block // 2 >= half_tiles:
+            self.ws_cluster = half_tiles
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -298,6 +378,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             self.ws_a_stages,
             self.ws_bc_stages,
             self.ws_threads,
+            self.ws_cluster,
             tuple(sorted(self.ws_exp)),
         )
 
@@ -414,8 +495,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             tier1_up_experts,
             active_m,
         ).launch(
-            grid=(grid_x, 1, 1),
+            grid=((grid_x // Int32(self.ws_cluster)) * Int32(self.ws_cluster), 1, 1),
             block=[self.ws_threads, 1, 1],
+            cluster=[self.ws_cluster, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
         )
@@ -637,13 +719,21 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         storage = smem.allocate(Storage)
         base = shared_ptr_to_u32(storage.words.data_ptr())
 
+        # FC1 cluster peers arrive on each other's A barriers.
+        cl = 1
+        if cutlass.const_expr(is_fc1):
+            cl = self.ws_cluster
         if tid == Int32(0):
             for s in cutlass.range_constexpr(self.ws_a_stages):
                 _mbar_init(base + Int32(self.ws_bar_a_raw + 8 * s), Int32(_PRODUCER_THREADS))
-                _mbar_init(base + Int32(self.ws_bar_a_full + 8 * s), Int32(_PRODUCER_THREADS))
-                _mbar_init(
-                    base + Int32(self.ws_bar_a_empty + 8 * s), Int32(self.ws_consumer_threads)
-                )
+                # Cluster peers arrive once per warp (after a warp sync).
+                full_count = _PRODUCER_THREADS
+                empty_count = self.ws_consumer_threads
+                if cutlass.const_expr(cl > 1):
+                    full_count = cl * _PRODUCER_WARPS
+                    empty_count = cl * self.ws_consumer_warps
+                _mbar_init(base + Int32(self.ws_bar_a_full + 8 * s), Int32(full_count))
+                _mbar_init(base + Int32(self.ws_bar_a_empty + 8 * s), Int32(empty_count))
             for s in cutlass.range_constexpr(self.ws_bc_stages):
                 _mbar_init(base + Int32(self.ws_bar_bc_full + 8 * s), Int32(1))
                 _mbar_init(
@@ -655,7 +745,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     base + Int32(self.ws_bar_t_empty + 8 * s), Int32(self.ws_consumer_threads)
                 )
             _fence_mbar_init()
-        cute.arch.sync_threads()
+        if cutlass.const_expr(cl > 1):
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.sync_threads()
 
         if cutlass.const_expr(is_fc1):
             k_size = self.hidden_size
@@ -698,6 +792,10 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             if cutlass.const_expr(self.ws_setmaxnreg):
                 cute.arch.warpgroup_reg_alloc(_CONSUMER_REGS)
             self._ws_consumer(is_fc1, k_size, n_total, base, lut_addr, tid, c_out)
+        if cutlass.const_expr(cl > 1):
+            # Peers may still arrive on this CTA's barriers or write its A slots.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
 
     # ------------------------------------------------------------------
     # Tile schedule (producer side)
@@ -755,6 +853,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         t: Int32,
         grid: Int32,
         total_tiles: Int32,
+        rank: Int32,
         n_tiles: Int32,
         block_expert_ids: cute.Tensor,
         descriptor_map: cute.Tensor,
@@ -765,7 +864,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tier0_hi_experts: Int32,
         tier1_hi_experts: Int32,
     ):
-        """First tile >= t (stride grid) that has weights; total_tiles if none."""
+        """First tile >= t (stride grid) that has weights; total_tiles if none.
+        FC1 clusters walk (route block, projection half) pairs; cluster rank r
+        takes the half's r-th N tile."""
         found = Int32(0)
         rb = Int32(0)
         nt = Int32(0)
@@ -773,9 +874,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tier = Int32(-1)
         local = Int32(0)
         while t < total_tiles and found == Int32(0):
+            tile = t
+            if cutlass.const_expr(is_fc1 and self.ws_cluster > 1):
+                tile = (t >> Int32(1)) * n_tiles + (t & Int32(1)) * Int32(self.ws_cluster) + rank
             rb, nt, combined, tier, local = self._ws_tile_meta(
                 is_fc1,
-                t,
+                tile,
                 n_tiles,
                 block_expert_ids,
                 descriptor_map,
@@ -941,6 +1045,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         kblock: Int32,
         ptid: Int32,
         bar: Int32,
+        rank: Int32,
+        shared_rows: cutlass.Constexpr = False,
     ):
         """cp.async one 128-wide K block of the tile's rows into an A slot
         (row r at r * 256 bytes; 16-byte chunk c at (c & 8) | ((c ^ r) & 7)),
@@ -957,21 +1063,36 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 + Int64(kblock) * Int64(128)
                 + Int64(c) * Int64(8)
             )
-            if row_id < Int32(0):
+            load = row_id >= Int32(0)
+            if cutlass.const_expr(shared_rows):
+                # FC1 cluster: this CTA rotates (so loads) row pairs r, r + C, ...
+                load = load and ((r >> Int32(1)) % Int32(self.ws_cluster)) == rank
+            if not load:
                 src_elem = Int64(0)
             cp_async4_shared_global_pred(
                 dst,
                 get_ptr_as_int64(a_src, src_elem),
-                (row_id >= Int32(0)).to(Int32),
+                load.to(Int32),
             )
         _cp_async_mbar_arrive_noinc(bar)
 
     @cute.jit
-    def _ws_rotate_block(self, base: Int32, slot: Int32, valid: Int32, suh_w, ptid: Int32):
+    def _ws_rotate_block(
+        self,
+        base: Int32,
+        slot: Int32,
+        valid: Int32,
+        suh_w,
+        ptid: Int32,
+        rank: Int32,
+        shared_rows: cutlass.Constexpr = False,
+    ):
         """fp16(had128(fp16(fp16(x) * suh))) in place with the cooperative
         kernel's _rotate_a_pair arithmetic: a half-warp per row, lane l holding
         the row's elements 8l..8l+7 (one 16-byte chunk); three butterfly
-        stages in registers, four across the half-warp."""
+        stages in registers, four across the half-warp. With ``shared_rows``
+        (FC1 clusters) this CTA rotates row pairs rank, rank + C, ... and
+        stores each rotated chunk into every cluster peer's slot."""
         lane = ptid & Int32(31)
         l16 = lane & Int32(15)
         half = lane >> Int32(4)
@@ -979,15 +1100,32 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         pos_hi = l16 & Int32(8)
         pos_lo = l16 & Int32(7)
         a_slot = base + Int32(self.ws_a_off) + slot * Int32(self.ws_a_slot)
-        iters = self.ws_m // (2 * _PRODUCER_WARPS)
+        pairs = self.ws_m // 2
+        cl = 1
+        if cutlass.const_expr(shared_rows):
+            cl = self.ws_cluster
+        # Pair index q of this CTA's pairs (pair = rank + cl * q); warps take
+        # q = warp, warp + 4, ...
+        owned = (pairs + cl - 1) // cl
+        iters = (owned + _PRODUCER_WARPS - 1) // _PRODUCER_WARPS
         group = min(iters, 2)
-        for g in cutlass.range_constexpr(iters // group):
-            first_row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * g * group))
-            if first_row < valid:
+        for g in cutlass.range_constexpr((iters + group - 1) // group):
+            q0 = warp + Int32(_PRODUCER_WARPS * g * group)
+            pair0 = q0 * Int32(cl)
+            if cutlass.const_expr(shared_rows):
+                pair0 = pair0 + rank
+            if pair0 < Int32(pairs) and Int32(2) * pair0 < valid:
                 addrs = []
                 loads = []
                 for j in cutlass.range_constexpr(group):
-                    row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
+                    pair = (q0 + Int32(_PRODUCER_WARPS * j)) * Int32(cl)
+                    if cutlass.const_expr(shared_rows):
+                        pair = pair + rank
+                    # A group's second pair past the block rotates stale rows of
+                    # the last pair's slot neighbour; keep it inside the slot.
+                    if pair >= Int32(pairs):
+                        pair = pair0
+                    row = Int32(2) * pair + half
                     addr = (
                         a_slot
                         + row * Int32(256)
@@ -1019,13 +1157,17 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             p = cute.arch.shuffle_sync_bfly(v[e], offset=st)
                             v[e] = p + sign * v[e]
                     rs = cutlass.Float32(0.088388347648)
-                    st_shared_v4_u32(
-                        addrs[j],
-                        pack_f32x2_to_f16x2(v[0] * rs, v[1] * rs),
-                        pack_f32x2_to_f16x2(v[2] * rs, v[3] * rs),
-                        pack_f32x2_to_f16x2(v[4] * rs, v[5] * rs),
-                        pack_f32x2_to_f16x2(v[6] * rs, v[7] * rs),
-                    )
+                    w0 = pack_f32x2_to_f16x2(v[0] * rs, v[1] * rs)
+                    w1 = pack_f32x2_to_f16x2(v[2] * rs, v[3] * rs)
+                    w2 = pack_f32x2_to_f16x2(v[4] * rs, v[5] * rs)
+                    w3 = pack_f32x2_to_f16x2(v[6] * rs, v[7] * rs)
+                    st_shared_v4_u32(addrs[j], w0, w1, w2, w3)
+                    if cutlass.const_expr(shared_rows):
+                        for d in cutlass.range_constexpr(1, cl):
+                            peer = rank + Int32(d)
+                            if peer >= Int32(cl):
+                                peer = peer - Int32(cl)
+                            _st_cluster_v4(_mapa(addrs[j], peer), w0, w1, w2, w3)
 
     @cute.jit
     def _ws_publish_tile(
@@ -1105,11 +1247,24 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(self.ws_m)
         total_tiles = route_blocks * n_tiles
         live = active_m * Int32(self.top_k)
+        # FC1 clusters iterate (route block, half) pairs per cluster; the
+        # cursors below then count in those units.
+        shared = False
+        cl = 1
+        if cutlass.const_expr(is_fc1 and self.ws_cluster > 1):
+            shared = True
+            cl = self.ws_cluster
+        rank = cta % Int32(cl)
+        cta = cta // Int32(cl)
+        grid = grid // Int32(cl)
+        if cutlass.const_expr(shared):
+            total_tiles = route_blocks * Int32(2)
         units_per_tile = Int32(k_size // 64)
         blocks_per_tile = Int32(k_size // 128)
         na = self.ws_a_stages
         nc = self.ws_bc_stages
         meta = (
+            rank,
             n_tiles,
             block_expert_ids,
             descriptor_map,
@@ -1168,7 +1323,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             if at < total_tiles:
                 self._ws_issue_a(
                     k_size, a_src, rows, base, Int32(i), ab, ptid,
-                    base + a_bar_base + Int32(i * _BARRIER_BYTES),
+                    base + a_bar_base + Int32(i * _BARRIER_BYTES), rank, shared,
                 )
                 a_issued += Int32(1)
                 ab += Int32(1)
@@ -1229,20 +1384,32 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         (blk // Int32(na)) & Int32(1),
                     )
                     if cutlass.const_expr("norot" not in self.ws_exp):
-                        self._ws_rotate_block(base, a_slot, dvalid, suh_w, ptid)
-                    _mbar_arrive(base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES))
+                        self._ws_rotate_block(base, a_slot, dvalid, suh_w, ptid, rank, shared)
+                    a_full = base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES)
+                    if cutlass.const_expr(shared):
+                        cute.arch.sync_warp()
+                        if lane < Int32(cl):
+                            _mbar_arrive_cluster(_mapa(a_full, lane))
+                    else:
+                        _mbar_arrive(a_full)
                 if blk >= Int32(1):
                     # Consumers finished block blk - 1: its A slot and its two
                     # weight units are free.
                     if at < total_tiles:
                         fill = a_issued % Int32(na)
-                        _mbar_wait(
-                            base + Int32(self.ws_bar_a_empty) + fill * Int32(_BARRIER_BYTES),
-                            ((a_issued // Int32(na)) & Int32(1)) ^ Int32(1),
-                        )
+                        if cutlass.const_expr(shared):
+                            _mbar_wait_cluster(
+                                base + Int32(self.ws_bar_a_empty) + fill * Int32(_BARRIER_BYTES),
+                                ((a_issued // Int32(na)) & Int32(1)) ^ Int32(1),
+                            )
+                        else:
+                            _mbar_wait(
+                                base + Int32(self.ws_bar_a_empty) + fill * Int32(_BARRIER_BYTES),
+                                ((a_issued // Int32(na)) & Int32(1)) ^ Int32(1),
+                            )
                         self._ws_issue_a(
                             k_size, a_src, rows, base, fill, ab, ptid,
-                            base + a_bar_base + fill * Int32(_BARRIER_BYTES),
+                            base + a_bar_base + fill * Int32(_BARRIER_BYTES), rank, shared,
                         )
                         a_issued += Int32(1)
                         ab += Int32(1)
@@ -1376,10 +1543,16 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 base + Int32(self.ws_bar_bc_full) + slot1 * Int32(_BARRIER_BYTES),
                 ((unit0 + Int32(1)) // Int32(nc)) & Int32(1),
             )
-            _mbar_wait(
-                base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES),
-                (blk // Int32(na)) & Int32(1),
-            )
+            if cutlass.const_expr(is_fc1 and self.ws_cluster > 1):
+                _mbar_wait_cluster(
+                    base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES),
+                    (blk // Int32(na)) & Int32(1),
+                )
+            else:
+                _mbar_wait(
+                    base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES),
+                    (blk // Int32(na)) & Int32(1),
+                )
             a_base = base + Int32(self.ws_a_off) + a_slot * Int32(self.ws_a_slot)
             bc0 = base + Int32(self.ws_bc_off) + slot0 * Int32(self.ws_bc_slot)
             bc1 = base + Int32(self.ws_bc_off) + slot1 * Int32(self.ws_bc_slot)
@@ -1435,7 +1608,15 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             acc[o + 3][0] = d3
             _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
             _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
-            _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
+            a_empty = base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES)
+            if cutlass.const_expr(is_fc1 and self.ws_cluster > 1):
+                # Every peer's producer writes rotated rows into this slot.
+                cute.arch.sync_warp()
+                lane_c = tid & Int32(31)
+                if lane_c < Int32(self.ws_cluster):
+                    _mbar_arrive_cluster(_mapa(a_empty, lane_c))
+            else:
+                _mbar_arrive(a_empty)
             step += Int32(8)
             blk += Int32(1)
             b += Int32(1)
