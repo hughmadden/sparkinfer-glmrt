@@ -80,6 +80,7 @@ from ._glmf_kernels import (
     GlmfKdaCommit,
     GlmfKdaConv,
     GlmfKdaConvCommit,
+    GlmfKdaConvRows,
     GlmfKdaConvState,
     GlmfKdaGatedNorm,
     GlmfKdaRecurrent,
@@ -131,23 +132,51 @@ def mhc_geometry(g: GLMFGeometry = GLM53_FLASH):
 
 
 class _Fp8Switch:
-    """A projection whose decode rows may read FP8: ``MmaFp8Gemv`` when
-    ``rows <= fp8_rows`` (a launch scalar, 0 turns FP8 off; at most
+    """A projection whose rows may read FP8. Decode programs: ``MmaFp8Gemv``
+    when ``rows <= fp8_rows`` (a launch scalar, 0 turns FP8 off; at most
     ``FP8_ROWS``), else the BF16 projection. ``row_scales``: FP32 scales
     ``[N, K/128]`` (per-row quantization of a BF16 weight) instead of the
-    checkpoint's 128x128 block grid."""
+    checkpoint's 128x128 block grid.
 
-    def __init__(self, n: int, k: int, *, fp8: bool, row_scales: bool = False):
+    Prefill programs (``prefill_rows``): rows past the skinny BF16 GEMV run
+    the block-FP8 GEMM (``BlockFp8Projection``: E4M3 activations per row and
+    128-K block, FP32 scales) when ``fp8_rows`` is nonzero; per-row weight
+    scales are then stored K-block major, ``[K/128, N]``. ``qscratch`` holds
+    the quantized rows (``quant_scratch_bytes``); ``prefill_mask`` selects the
+    ``fp8_rows`` bits that turn this projection's FP8 route on."""
+
+    def __init__(self, n: int, k: int, *, fp8: bool, row_scales: bool = False, prefill_rows: int | None = None,
+                 prefill_mask: int = 0xFF):
         from ._fp8_weights import MmaFp8Gemv, gemv_warps
+        from ._glmf_fp8 import BlockFp8Projection
 
         self.n, self.k = int(n), int(k)
-        self.bf16 = glm_projection(self.n, self.k)
-        warps, groups = FP8_GEMV_CONFIG.get((self.n, self.k), (gemv_warps(self.k), 4))
-        self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_ROWS, warps=warps, groups=groups, row_scales=row_scales) \
-            if fp8 else None
+        self.bf16 = glm_projection(self.n, self.k, wide=prefill_rows is not None)
+        self.prefill = None
+        self.fp8 = None
+        self.prefill_mask = int(prefill_mask)
+        if fp8 and prefill_rows is not None:
+            self.prefill = BlockFp8Projection(self.n, self.k, int(prefill_rows), row_scales=row_scales)
+        elif fp8:
+            warps, groups = FP8_GEMV_CONFIG.get((self.n, self.k), (gemv_warps(self.k), 4))
+            self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_ROWS, warps=warps, groups=groups,
+                                  row_scales=row_scales)
 
     def key(self) -> tuple:
-        return (self.bf16.key(), None if self.fp8 is None else self.fp8.key())
+        return (self.bf16.key(), None if self.fp8 is None else self.fp8.key(),
+                None if self.prefill is None else (self.prefill.key(), self.prefill_mask))
+
+    @cute.jit
+    def run(self, x: cute.Pointer, w: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+            rows: Int32, fp8_rows: Int32, qscratch: Int64, stream: cuda.CUstream):
+        """``__call__`` with the prefill route's quantization scratch."""
+        if cutlass.const_expr(self.prefill is not None):
+            if (fp8_rows & Int32(self.prefill_mask)) != Int32(0) and rows > Int32(self.bf16.max_skinny_rows):
+                self.prefill(x, w_fp8, scale, out, qscratch, rows, stream)
+            else:
+                self.bf16(x, w, out, rows, stream)
+        else:
+            self(x, w, w_fp8, scale, out, rows, fp8_rows, stream)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
@@ -183,12 +212,39 @@ FP8_GEMV_CONFIG = {
 }
 
 
-def fp8_ops(name: str, n: int, k: int, row_scales: bool) -> tuple:
-    """``{name}_fp8`` E4M3 [n, k] and ``{name}_scale`` FP32 (``[n, k/128]`` row scales or the 128x128 grid)."""
+def fp8_ops(name: str, n: int, k: int, row_scales: bool, prefill: bool = False) -> tuple:
+    """``{name}_fp8`` E4M3 [n, k] and ``{name}_scale`` FP32 (``[n, k/128]`` row scales or the 128x128
+    grid); prefill programs take per-row scales K-block major as ``{name}_kscale`` ``[k/128, n]``."""
+    kb = -(-int(k) // 128)
+    if prefill and row_scales:
+        return (Operand(f"{name}_fp8", torch.float8_e4m3fn, f"[{n},{k}]"),
+                Operand(f"{name}_kscale", torch.float32, f"[{kb},{n}]", note="per-row x 128-K scales, K-block major"))
     rows = int(n) if row_scales else -(-int(n) // 128)
     return (Operand(f"{name}_fp8", torch.float8_e4m3fn, f"[{n},{k}]"),
-            Operand(f"{name}_scale", torch.float32, f"[{rows},{-(-int(k) // 128)}]", align=4,
+            Operand(f"{name}_scale", torch.float32, f"[{rows},{kb}]", align=16 if prefill else 4,
                     note="per-row x 128-K scales" if row_scales else "checkpoint 128x128 block scales"))
+
+
+def _fp8_mode(fp8) -> tuple[bool, bool]:
+    """``fp8`` of the compile functions: False, True (decode FP8 GEMVs) or "prefill"
+    (block-FP8 GEMMs); returns (fp8, prefill)."""
+    if fp8 not in (False, True, "prefill"):
+        raise ValueError(f"fp8 must be False, True or 'prefill', got {fp8!r}")
+    return bool(fp8), fp8 == "prefill"
+
+
+def _fp8_scalars(fp8, prefill: bool) -> tuple:
+    if prefill:
+        return (Scalar("rows"), Scalar("fp8_rows", note="prefill: nonzero runs rows past the skinny GEMV "
+                                                        "through the block-FP8 GEMMs"))
+    return (Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),)
+
+
+def _batched_warps(max_rows: int) -> int:
+    """MMA warps (16 rows each) of the per-head batched BF16 GEMMs: 128-row
+    tiles at prefill capacities (4096 rows: fg 125 -> 96 us, absorb 373 -> 308,
+    uv 300 -> 276 on SM120), 64 below."""
+    return 8 if int(max_rows) > CHUNKED_MIN_ROWS else 4
 
 
 def _ptr(dtype, address: Int64, align: int = 16):
@@ -309,31 +365,41 @@ class _KdaChunked:
                                 Int32(w), stream)
 
 
-def kda_scratch_bytes(g: GLMFGeometry, rows: int, chunked: int = 0) -> int:
+def kda_scratch_bytes(g: GLMFGeometry, rows: int, chunked: int = 0, prefill_fp8: bool = False) -> int:
     """proj [rows,P], f|gate [rows,2,D], conv q|k|v [rows,3D], o [rows,D], y [rows,D] (BF16), then
-    the chunked recurrence's workspace (``chunked`` bytes, prefill capacities)."""
+    the chunked recurrence's workspace (``chunked`` bytes, prefill capacities), then the quantized
+    rows of the block-FP8 prefill projections (``prefill_fp8``)."""
+    from ._glmf_fp8 import quant_scratch_bytes
+
     rows = max(int(rows), 1)
     d = g.kda_width
+    quant = quant_scratch_bytes(max(g.hidden, d), rows) if prefill_fp8 else 0
     return (_align(rows * g.kda_in_width * 2) + _align(rows * 2 * d * 2) + _align(rows * 3 * d * 2)
-            + 2 * _align(rows * d * 2) + _align(chunked))
+            + 2 * _align(rows * d * 2) + _align(chunked) + quant)
 
 
 class _Kda:
-    def __init__(self, g: GLMFGeometry, max_rows: int = 64, fp8: bool = False):
+    def __init__(self, g: GLMFGeometry, max_rows: int = 64, fp8=False):
         self.g = g
+        fp8, prefill = _fp8_mode(fp8)
         self.chunked = _KdaChunked(g, max_rows) if int(max_rows) > CHUNKED_MIN_ROWS else None
         d, p = g.kda_width, g.kda_in_width
         self.d, self.p = d, p
-        self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True)
+        prefill_rows = int(max_rows) if prefill else None
+        self.chunked_bytes = 0 if self.chunked is None else self.chunked.nbytes
+        # Prefill: fp8_rows bit 0 turns the in-projection's FP8 GEMM on, bit 1 o_proj's.
+        self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=1)
         # f_b(f_a) and g_b(g_a): two 128 -> D products off the in-projection row.
         self.fg = BatchedBf16Gemm(n=d, k=g.kda_head_dim, batch=2, a_row=p, a_batch=g.kda_head_dim,
-                                  o_row=2 * d, o_batch=d)
-        self.conv = GlmfKdaConv(channels=3 * d, proj_width=p)
-        self.conv_state = GlmfKdaConvState(channels=3 * d, proj_width=p)
+                                  o_row=2 * d, o_batch=d, compute_warps=_batched_warps(max_rows))
+        # Prefill capacities: the row-blocked conv and the scanning conv-state update.
+        wide = int(max_rows) > CHUNKED_MIN_ROWS
+        self.conv = (GlmfKdaConvRows if wide else GlmfKdaConv)(channels=3 * d, proj_width=p)
+        self.conv_state = GlmfKdaConvState(channels=3 * d, proj_width=p, row_block=64 if wide else 0)
         self.recurrent = GlmfKdaRecurrent(heads=g.kda_heads, lower_bound=g.gate_lower_bound, qkv_width=3 * d,
                                           g_stride=2 * d, b_stride=p)
         self.norm = GlmfKdaGatedNorm(heads=g.kda_heads, eps=g.norm_eps, gate_stride=2 * d)
-        self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True)
+        self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=2)
 
     def key(self) -> tuple:
         return (self.in_proj.key(), self.fg.key(), self.o_proj.key(), self.g,
@@ -361,9 +427,11 @@ class _Kda:
         qkv_off = fg_off + _align_i64(m * Int64(4 * d))
         o_off = qkv_off + _align_i64(m * Int64(6 * d))
         y_off = o_off + _align_i64(m * Int64(2 * d))
+        # Quantized prefill rows follow the chunked recurrence's workspace.
+        qscratch = y_off + _align_i64(m * Int64(2 * d)) + Int64(_align(self.chunked_bytes))
         bf16 = cutlass.BFloat16
         proj = _ptr(bf16, base)
-        self.in_proj(x, w_in, w_in_fp8, w_in_scale, proj, rows, fp8_rows, stream)
+        self.in_proj.run(x, w_in, w_in_fp8, w_in_scale, proj, rows, fp8_rows, qscratch, stream)
         self.fg(_ptr(bf16, base + Int64(3 * d * 2)), w_fg, _ptr(bf16, fg_off), rows, stream)
         self.conv(proj, conv_w, conv_state, slots, seq_first, _ptr(bf16, qkv_off), rows, stream)
         _, proj_off, _ = kda_replay_layout(self.g.kda_heads, 3 * d)
@@ -381,7 +449,7 @@ class _Kda:
                 self.recurrent(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
                                _ptr(bf16, o_off), replay, spec, rows, stream)
         self.norm(_ptr(bf16, o_off), _ptr(bf16, fg_off + Int64(d * 2)), o_norm, _ptr(bf16, y_off), rows, stream)
-        self.o_proj(_ptr(bf16, y_off), w_o, w_o_fp8, w_o_scale, out, rows, fp8_rows, stream)
+        self.o_proj.run(_ptr(bf16, y_off), w_o, w_o_fp8, w_o_scale, out, rows, fp8_rows, qscratch, stream)
 
 
 class _KdaFp8(_Kda):
@@ -396,42 +464,57 @@ class _KdaFp8(_Kda):
                   conv_state, state, slots, seq_first, out, replay, scratch, rows, fp8_rows, spec, stream)
 
 
-def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8: bool = False) -> AotProgram:
+class _KdaFp8Prefill(_Kda):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_kscale: cute.Pointer,
+                 w_fg: cute.Pointer, conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer,
+                 o_norm: cute.Pointer, w_o: cute.Pointer, w_o_fp8: cute.Pointer, w_o_kscale: cute.Pointer,
+                 conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_in, w_in_fp8, w_in_kscale, w_fg, conv_w, a_log, dt_bias, o_norm, w_o, w_o_fp8, w_o_kscale,
+                  conv_state, state, slots, seq_first, out, state, scratch, rows, fp8_rows, Int32(0), stream)
+
+
+def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False) -> AotProgram:
     """One KDA layer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds ``w_in``/``w_o`` E4M3 copies with per-row scales and the ``fp8_rows``
-    scalar (decode steps up to that many rows read them)."""
+    scalar (decode steps up to that many rows read them); ``fp8="prefill"``
+    adds them with K-block-major scales (``w_in_kscale``/``w_o_kscale``) and
+    the ``fp8_rows`` scalar as an on/off switch (block-FP8 GEMMs, no replay record)."""
     max_rows = _check_rows(max_rows)
-    launch = (_KdaFp8 if fp8 else _Kda)(g, max_rows, fp8)
+    fp8_on, prefill = _fp8_mode(fp8)
+    launch = (_KdaFp8Prefill if prefill else _KdaFp8 if fp8_on else _Kda)(g, max_rows, fp8)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, d, p, heads = g.hidden, g.kda_width, g.kda_in_width, g.kda_heads
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         Operand("w_in", torch.bfloat16, f"[{p},{h}]"),
-        *(fp8_ops("w_in", p, h, True) if fp8 else ()),
+        *(fp8_ops("w_in", p, h, True, prefill) if fp8_on else ()),
         Operand("w_fg", torch.bfloat16, f"[2,{d},{g.kda_head_dim}]"),
         Operand("conv_w", torch.float32, f"[{3 * d},4]", align=4),
         Operand("a_log", torch.float32, f"[{heads}]", align=4),
         Operand("dt_bias", torch.float32, f"[{d}]", align=4),
         Operand("o_norm", torch.bfloat16, f"[{g.kda_head_dim}]"),
         Operand("w_o", torch.bfloat16, f"[{h},{d}]"),
-        *(fp8_ops("w_o", h, d, True) if fp8 else ()),
+        *(fp8_ops("w_o", h, d, True, prefill) if fp8_on else ()),
         Operand("conv_state", torch.bfloat16, f"[slots,3,{3 * d}]", "inout", align=2),
         Operand("state", torch.float32, f"[slots,{heads},128,128]", "inout"),
         Operand("slots", torch.int32, "[rows]", align=4),
         Operand("seq_first", torch.int32, "[rows]", align=4),
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
         *((Operand("replay", torch.float32, f"[{kda_replay_layout(heads, 3 * d)[2] // 4}]", "inout"),)
-          if fp8 else ()),
+          if fp8_on and not prefill else ()),
         Operand("scratch", torch.uint8, "[kda_scratch_bytes]", "scratch"),
     )
+    scalars = (_fp8_scalars(fp8, True) if prefill else
+               (Scalar("rows"), Scalar("fp8_rows"), Scalar("spec")) if fp8_on else (Scalar("rows"),))
     return compile_program(
-        launch, name="glmf_kda", operands=operands,
-        scalars=(Scalar("rows"), Scalar("fp8_rows"), Scalar("spec")) if fp8 else (Scalar("rows"),),
+        launch, name="glmf_kda", operands=operands, scalars=scalars,
         key=(max_rows, fp8, launch.key()),
         geometry={"hidden": h, "heads": heads, "head_dim": g.kda_head_dim, "max_rows": max_rows,
                   "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None},
-        scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked)},
+        scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill)},
         doc=__doc__,
     )
 
@@ -483,22 +566,29 @@ def compile_glmf_kda_commit_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
 # ---------------------------------------------------------------------------
 
 
-def mla_producer_scratch_bytes(g: GLMFGeometry, rows: int) -> int:
-    """qkv_a BF16 [rows, Q+512] then q_b BF16 [rows, N*256]."""
+def mla_producer_scratch_bytes(g: GLMFGeometry, rows: int, prefill_fp8: bool = False) -> int:
+    """qkv_a BF16 [rows, Q+512] then q_b BF16 [rows, N*256], then the quantized rows of the
+    block-FP8 prefill projections (``prefill_fp8``)."""
+    from ._glmf_fp8 import quant_scratch_bytes
+
     rows = max(int(rows), 1)
-    return _align(rows * g.qkv_a_width * 2) + _align(rows * g.heads * g.qk_head_dim * 2)
+    quant = quant_scratch_bytes(max(g.hidden, g.q_lora_rank), rows) if prefill_fp8 else 0
+    return _align(rows * g.qkv_a_width * 2) + _align(rows * g.heads * g.qk_head_dim * 2) + quant
 
 
 class _MlaProducer:
-    def __init__(self, g: GLMFGeometry, fp8: bool = False):
+    def __init__(self, g: GLMFGeometry, fp8=False, max_rows: int = 64):
         self.g = g
         n, q = g.heads, g.q_lora_rank
-        self.qkv_a = _Fp8Switch(g.qkv_a_width, g.hidden, fp8=fp8)
-        self.q_b = _Fp8Switch(n * g.qk_head_dim, q, fp8=fp8)
+        fp8, prefill = _fp8_mode(fp8)
+        prefill_rows = int(max_rows) if prefill else None
+        self.qkv_a = _Fp8Switch(g.qkv_a_width, g.hidden, fp8=fp8, prefill_rows=prefill_rows)
+        self.q_b = _Fp8Switch(n * g.qk_head_dim, q, fp8=fp8, prefill_rows=prefill_rows)
         self.pack = GlmRankNormPackKV(q_rank=q, eps=g.norm_eps, page_rows=g.page_rows,
                                       record_bytes=g.record_bytes, rope=0)
         self.absorb = BatchedBf16Gemm(n=g.kv_lora_rank, k=g.qk_nope_dim, batch=n, a_row=n * g.qk_head_dim,
-                                      a_batch=g.qk_head_dim, o_row=n * g.latent_dim, o_batch=g.latent_dim)
+                                      a_batch=g.qk_head_dim, o_row=n * g.latent_dim, o_batch=g.latent_dim,
+                                      compute_warps=_batched_warps(max_rows))
 
     def key(self) -> tuple:
         return (self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
@@ -520,12 +610,14 @@ class _MlaProducer:
         g = self.g
         base = Int64(scratch.toint())
         qkv = _ptr(cutlass.BFloat16, base)
-        q = _ptr(cutlass.BFloat16, base + _align_i64(Int64(rows) * Int64(g.qkv_a_width * 2)))
-        self.qkv_a(x, w_qkv_a, w_qkv_a_fp8, w_qkv_a_scale, qkv, rows, fp8_rows, stream)
+        q_at = base + _align_i64(Int64(rows) * Int64(g.qkv_a_width * 2))
+        q = _ptr(cutlass.BFloat16, q_at)
+        qscratch = q_at + _align_i64(Int64(rows) * Int64(g.heads * g.qk_head_dim * 2))
+        self.qkv_a.run(x, w_qkv_a, w_qkv_a_fp8, w_qkv_a_scale, qkv, rows, fp8_rows, qscratch, stream)
         # No RoPE: the pack kernel never reads positions or cos_sin.
         self.pack(qkv, q_a_norm, kv_a_norm, kv_slots, kv_slots, _ptr(cutlass.Float32, Int64(kv_slots.toint()), 4),
                   q_resid, kv_cache, rows, stream)
-        self.q_b(q_resid, w_q_b, w_q_b_fp8, w_q_b_scale, q, rows, fp8_rows, stream)
+        self.q_b.run(q_resid, w_q_b, w_q_b_fp8, w_q_b_scale, q, rows, fp8_rows, qscratch, stream)
         self.absorb(q, w_uk, query, rows, stream)
 
 
@@ -540,21 +632,23 @@ class _MlaProducerFp8(_MlaProducer):
                   w_q_b_scale, w_uk, kv_cache, query, q_resid, scratch, rows, fp8_rows, stream)
 
 
-def compile_glmf_mla_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8: bool = False) -> AotProgram:
+def compile_glmf_mla_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False) -> AotProgram:
     """MLA producer for ``rows <= max_rows``; see the module docstring. ``fp8``
-    adds the checkpoint's E4M3 ``w_qkv_a``/``w_q_b`` with 128x128 scales and ``fp8_rows``."""
+    adds the checkpoint's E4M3 ``w_qkv_a``/``w_q_b`` with 128x128 scales and ``fp8_rows``
+    (``fp8="prefill"``: ``fp8_rows`` switches block-FP8 GEMMs)."""
     max_rows = _check_rows(max_rows)
-    launch = (_MlaProducerFp8 if fp8 else _MlaProducer)(g, fp8)
+    fp8_on, prefill = _fp8_mode(fp8)
+    launch = (_MlaProducerFp8 if fp8_on else _MlaProducer)(g, fp8, max_rows)
     h, q, n = g.hidden, g.q_lora_rank, g.heads
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         Operand("kv_slots", torch.int64, "[rows]", align=8),
         Operand("w_qkv_a", torch.bfloat16, f"[{g.qkv_a_width},{h}]"),
-        *(fp8_ops("w_qkv_a", g.qkv_a_width, h, False) if fp8 else ()),
+        *(fp8_ops("w_qkv_a", g.qkv_a_width, h, False, prefill) if fp8_on else ()),
         Operand("q_a_norm", torch.bfloat16, f"[{q}]"),
         Operand("kv_a_norm", torch.bfloat16, f"[{g.kv_lora_rank}]"),
         Operand("w_q_b", torch.bfloat16, f"[{n * g.qk_head_dim},{q}]"),
-        *(fp8_ops("w_q_b", n * g.qk_head_dim, q, False) if fp8 else ()),
+        *(fp8_ops("w_q_b", n * g.qk_head_dim, q, False, prefill) if fp8_on else ()),
         Operand("w_uk", torch.bfloat16, f"[{n},{g.kv_lora_rank},{g.qk_nope_dim}]"),
         Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]", "inout"),
         Operand("query", torch.bfloat16, f"[rows,{n},{g.latent_dim}]", "out"),
@@ -562,12 +656,11 @@ def compile_glmf_mla_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: in
         Operand("scratch", torch.uint8, "[mla_producer_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name="glmf_mla_producer", operands=operands,
-        scalars=(Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),),
+        launch, name="glmf_mla_producer", operands=operands, scalars=_fp8_scalars(fp8_on, prefill),
         key=(max_rows, fp8, launch.key()),
         geometry={"hidden": h, "q_lora_rank": q, "heads": n, "max_rows": max_rows,
                   "record_bytes": g.record_bytes, "page_rows": g.page_rows, "eps": g.norm_eps},
-        scratch={"scratch": lambda rows: mla_producer_scratch_bytes(g, rows)},
+        scratch={"scratch": lambda rows: mla_producer_scratch_bytes(g, rows, prefill)},
         doc=__doc__,
     )
 
@@ -578,10 +671,12 @@ def compile_glmf_mla_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: in
 
 
 class _GlmfFfn:
-    def __init__(self, g: GLMFGeometry, inter: int, fp8: bool):
+    def __init__(self, g: GLMFGeometry, inter: int, fp8, max_rows: int = 64):
         self.h, self.i = g.hidden, int(inter)
-        self.gate_up = _Fp8Switch(2 * self.i, self.h, fp8=fp8)
-        self.down = _Fp8Switch(self.h, self.i, fp8=fp8)
+        fp8, prefill = _fp8_mode(fp8)
+        prefill_rows = int(max_rows) if prefill else None
+        self.gate_up = _Fp8Switch(2 * self.i, self.h, fp8=fp8, prefill_rows=prefill_rows)
+        self.down = _Fp8Switch(self.h, self.i, fp8=fp8, prefill_rows=prefill_rows)
         self.swiglu = GlmSwiGLU(self.i, limit=g.swiglu_limit)
 
     def key(self) -> tuple:
@@ -599,10 +694,12 @@ class _GlmfFfn:
              stream: cuda.CUstream):
         base = Int64(scratch.toint())
         gate_up = _ptr(cutlass.BFloat16, base)
-        hidden = _ptr(cutlass.BFloat16, base + _align_i64(Int64(rows) * Int64(4 * self.i)))
-        self.gate_up(x, w_gate_up, w_gate_up_fp8, w_gate_up_scale, gate_up, rows, fp8_rows, stream)
+        hidden_at = base + _align_i64(Int64(rows) * Int64(4 * self.i))
+        hidden = _ptr(cutlass.BFloat16, hidden_at)
+        qscratch = hidden_at + _align_i64(Int64(rows) * Int64(2 * self.i))
+        self.gate_up.run(x, w_gate_up, w_gate_up_fp8, w_gate_up_scale, gate_up, rows, fp8_rows, qscratch, stream)
         self.swiglu(gate_up, hidden, rows, stream)
-        self.down(hidden, w_down, w_down_fp8, w_down_scale, out, rows, fp8_rows, stream)
+        self.down.run(hidden, w_down, w_down_fp8, w_down_scale, out, rows, fp8_rows, qscratch, stream)
 
 
 class _GlmfFfnFp8(_GlmfFfn):
@@ -615,30 +712,33 @@ class _GlmfFfnFp8(_GlmfFfn):
                   rows, fp8_rows, stream)
 
 
-def compile_glmf_ffn_aot(g: GLMFGeometry = GLM53_FLASH, *, inter: int, max_rows: int, fp8: bool = False) -> AotProgram:
+def compile_glmf_ffn_aot(g: GLMFGeometry = GLM53_FLASH, *, inter: int, max_rows: int, fp8=False) -> AotProgram:
     """Clamped SwiGLU MLP: the ``glm_ffn`` ABI (x, w_gate_up, w_down, out, scratch; rows); ``fp8`` adds
-    the checkpoint's E4M3 weights with 128x128 scales and ``fp8_rows``."""
+    the checkpoint's E4M3 weights with 128x128 scales and ``fp8_rows`` (``fp8="prefill"``:
+    ``fp8_rows`` switches block-FP8 GEMMs)."""
+    from ._glmf_fp8 import quant_scratch_bytes
     from .glm_ffn import ffn_scratch_bytes
 
     max_rows = _check_rows(max_rows)
     i = int(inter)
-    launch = (_GlmfFfnFp8 if fp8 else _GlmfFfn)(g, i, fp8)
+    fp8_on, prefill = _fp8_mode(fp8)
+    launch = (_GlmfFfnFp8 if fp8_on else _GlmfFfn)(g, i, fp8, max_rows)
     h = g.hidden
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         Operand("w_gate_up", torch.bfloat16, f"[{2 * i},{h}]"),
-        *(fp8_ops("w_gate_up", 2 * i, h, False) if fp8 else ()),
+        *(fp8_ops("w_gate_up", 2 * i, h, False, prefill) if fp8_on else ()),
         Operand("w_down", torch.bfloat16, f"[{h},{i}]"),
-        *(fp8_ops("w_down", h, i, False) if fp8 else ()),
+        *(fp8_ops("w_down", h, i, False, prefill) if fp8_on else ()),
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
         Operand("scratch", torch.uint8, "[ffn_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name="glmf_ffn", operands=operands,
-        scalars=(Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),),
+        launch, name="glmf_ffn", operands=operands, scalars=_fp8_scalars(fp8_on, prefill),
         key=(max_rows, fp8, launch.key()),
         geometry={"hidden": h, "inter": i, "max_rows": max_rows, "swiglu_limit": g.swiglu_limit},
-        scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows)},
+        scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows)
+                 + (quant_scratch_bytes(max(h, i), rows) if prefill else 0)},
         doc=__doc__,
     )
 
@@ -725,10 +825,10 @@ def index_producer_scratch_bytes(g: GLMFGeometry, rows: int) -> int:
 
 
 class _IndexProducer:
-    def __init__(self, g: GLMFGeometry):
+    def __init__(self, g: GLMFGeometry, max_rows: int = 64):
         self.g = g
         i = g.index_heads
-        self.wq = glm_projection(i * 128, g.q_lora_rank)
+        self.wq = glm_projection(i * 128, g.q_lora_rank, wide=int(max_rows) > CHUNKED_MIN_ROWS)
         self.wk = glm_projection(256 + i, g.hidden)
         self.post = GlmfIndexPost(heads=i, eps=g.index_norm_eps, weight_scale=float(i) ** -0.5 * 128.0 ** -0.5)
         self.pool = GlmfPoolKeys(kpool=g.index_kpool, page_rows=g.page_rows)
@@ -765,7 +865,7 @@ def compile_glmf_index_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: 
     inout, ``q_fp8`` fp8 [rows,I,128] out, ``head_weights`` f32 [rows,I] out.
     """
     max_rows = _check_rows(max_rows)
-    launch = _IndexProducer(g)
+    launch = _IndexProducer(g, max_rows)
     h, q, i = g.hidden, g.q_lora_rank, g.index_heads
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
@@ -847,11 +947,14 @@ def compile_glmf_index_expand_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
 
 
 class _GlmfOutput:
-    def __init__(self, g: GLMFGeometry, fp8: bool):
+    def __init__(self, g: GLMFGeometry, fp8, max_rows: int = 64):
         n, v = g.heads, g.v_head_dim
+        self.width = n * v
+        fp8, prefill = _fp8_mode(fp8)
         self.uv = BatchedBf16Gemm(n=v, k=g.kv_lora_rank, batch=n, a_row=n * g.kv_lora_rank,
-                                  a_batch=g.kv_lora_rank, o_row=n * v, o_batch=v)
-        self.o = _Fp8Switch(g.hidden, n * v, fp8=fp8)
+                                  a_batch=g.kv_lora_rank, o_row=n * v, o_batch=v,
+                                  compute_warps=_batched_warps(max_rows))
+        self.o = _Fp8Switch(g.hidden, n * v, fp8=fp8, prefill_rows=int(max_rows) if prefill else None)
 
     def key(self) -> tuple:
         return (self.uv.key(), self.o.key())
@@ -866,8 +969,9 @@ class _GlmfOutput:
              w_o_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
              stream: cuda.CUstream):
         values = _ptr(cutlass.BFloat16, Int64(scratch.toint()))
+        qscratch = Int64(scratch.toint()) + _align_i64(Int64(rows) * Int64(self.width * 2))
         self.uv(attn, w_uv, values, rows, stream)
-        self.o(values, w_o, w_o_fp8, w_o_scale, out, rows, fp8_rows, stream)
+        self.o.run(values, w_o, w_o_fp8, w_o_scale, out, rows, fp8_rows, qscratch, stream)
 
 
 class _GlmfOutputFp8(_GlmfOutput):
@@ -878,27 +982,30 @@ class _GlmfOutputFp8(_GlmfOutput):
         self.body(attn, w_uv, w_o, w_o_fp8, w_o_scale, out, scratch, rows, fp8_rows, stream)
 
 
-def compile_glmf_o_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8: bool = False) -> AotProgram:
-    """``glm_o`` (attn, w_uv, w_o, out, scratch; rows) with the FP8 o_proj switch when ``fp8``."""
+def compile_glmf_o_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False) -> AotProgram:
+    """``glm_o`` (attn, w_uv, w_o, out, scratch; rows) with the FP8 o_proj switch when ``fp8``
+    (``fp8="prefill"``: ``fp8_rows`` switches the block-FP8 GEMM)."""
+    from ._glmf_fp8 import quant_scratch_bytes
     from .glm_attention import o_scratch_bytes
 
     max_rows = _check_rows(max_rows)
-    launch = (_GlmfOutputFp8 if fp8 else _GlmfOutput)(g, fp8)
+    fp8_on, prefill = _fp8_mode(fp8)
+    launch = (_GlmfOutputFp8 if fp8_on else _GlmfOutput)(g, fp8, max_rows)
     h, n, v = g.hidden, g.heads, g.v_head_dim
     operands = (
         Operand("attn", torch.bfloat16, f"[rows,{n},{g.kv_lora_rank}]"),
         Operand("w_uv", torch.bfloat16, f"[{n},{v},{g.kv_lora_rank}]"),
         Operand("w_o", torch.bfloat16, f"[{h},{n * v}]"),
-        *(fp8_ops("w_o", h, n * v, False) if fp8 else ()),
+        *(fp8_ops("w_o", h, n * v, False, prefill) if fp8_on else ()),
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
         Operand("scratch", torch.uint8, "[o_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name="glmf_o", operands=operands,
-        scalars=(Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),),
+        launch, name="glmf_o", operands=operands, scalars=_fp8_scalars(fp8_on, prefill),
         key=(max_rows, fp8, launch.key()),
         geometry={"hidden": h, "heads": n, "v_head_dim": v, "max_rows": max_rows, "fp8_weights": fp8},
-        scratch={"scratch": lambda rows: o_scratch_bytes(g, rows)},
+        scratch={"scratch": lambda rows: o_scratch_bytes(g, rows)
+                 + (quant_scratch_bytes(n * v, rows) if prefill else 0)},
         doc=compile_glmf_o_aot.__doc__,
     )
 

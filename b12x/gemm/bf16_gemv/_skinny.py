@@ -190,6 +190,14 @@ def skinny_max_rows(n: int, k: int) -> int:
     return 160
 
 
+# 2 x 2 MMA warps on 128 x 128 tiles, two stages: the same per-element K
+# order as prefill_config's, 17-21% faster from 512 rows on SM120 (4096 rows:
+# 4096x8192 0.83 -> 0.69 ms, 16384x1536 0.69 -> 0.55, 24576x4096 2.55 -> 2.05),
+# slower on narrow outputs below that (4096x8192 at 100 rows 0.056 -> 0.101 ms).
+WIDE_PREFILL_CONFIG = dict(warp_layout=(2, 2), tile_m=128, tile_n=128, num_stages=2, compensated=False)
+WIDE_PREFILL_MIN_ROWS = 512
+
+
 def prefill_config(n: int, k: int) -> dict:
     """Measured SM120 choices for the TMA tensor-core route (uncompensated)."""
     if n >= 1024:
@@ -226,17 +234,22 @@ class RoutedBf16Projection:
     ``out`` is ``[rows, N]`` BF16 or FP32. Both routes accumulate in FP32.
     """
 
-    def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, max_skinny_rows: int | None = None):
+    def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, max_skinny_rows: int | None = None,
+                 wide: bool = False):
+        """``wide`` adds the ``WIDE_PREFILL_CONFIG`` TMA route from
+        ``WIDE_PREFILL_MIN_ROWS`` live rows (prefill capacities)."""
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
         self.max_skinny_rows = int(skinny_max_rows(n, k) if max_skinny_rows is None else max_skinny_rows)
         self.skinny = SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, **skinny_config(n, k, out_dtype))
         self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype)
+        self.wide = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, **WIDE_PREFILL_CONFIG) \
+            if wide and self.n % 2 == 0 else None
 
     def key(self) -> tuple:
         s = self.skinny
         return (self.n, self.k, str(self.out_dtype), self.max_skinny_rows, s.cols, s.rows_per_tile,
-                s.threads, tuple(sorted(self.large.config.items())))
+                s.threads, tuple(sorted(self.large.config.items())), self.wide is not None)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
@@ -244,4 +257,10 @@ class RoutedBf16Projection:
         if rows <= Int32(self.max_skinny_rows):
             self.skinny(x, w, out, rows, stream)
         else:
-            self.large(x, w, out, rows, stream)
+            if cutlass.const_expr(self.wide is not None):
+                if rows >= Int32(WIDE_PREFILL_MIN_ROWS):
+                    self.wide(x, w, out, rows, stream)
+                else:
+                    self.large(x, w, out, rows, stream)
+            else:
+                self.large(x, w, out, rows, stream)

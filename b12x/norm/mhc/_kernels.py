@@ -1800,7 +1800,12 @@ class MHCPostPrePrefillBlockMPartialKernel:
         block_m: int = _PREFILL_BLOCK_M,
         tile_n: int = _PREFILL_BLOCK_TILE_N,
         compute_gram: bool = True,
+        n_fastest: bool = False,
     ):
+        """``n_fastest`` launches the mix tiles of one token block next to each
+        other (grid ``(n_tiles, m_tiles)``), so the tiles re-reading a block's
+        rows find them in L2; the arithmetic is unchanged."""
+        self.n_fastest = bool(n_fastest)
         self.hidden_size = int(hidden_size)
         self.total_k = _MHC_MULT * self.hidden_size
         self.split_k = (
@@ -1850,10 +1855,11 @@ class MHCPostPrePrefillBlockMPartialKernel:
         if const_expr(out.element_type != cutlass.BFloat16):
             raise TypeError("out must be BFloat16")
         m_tiles = (num_tokens + Int32(self.block_m - 1)) // Int32(self.block_m)
+        grid = (self.n_tiles, m_tiles, 1) if const_expr(self.n_fastest) else (m_tiles, self.n_tiles, 1)
         self.kernel(
             x, residual, prev_post, prev_comb, fn, partials, out, num_tokens
         ).launch(
-            grid=(m_tiles, self.n_tiles, 1),
+            grid=grid,
             block=[self.num_threads, 1, 1],
             stream=stream,
         )
@@ -1871,6 +1877,8 @@ class MHCPostPrePrefillBlockMPartialKernel:
         num_tokens: Int32,
     ):
         m_tile, n_tile, _ = cute.arch.block_idx()
+        if const_expr(self.n_fastest):
+            n_tile, m_tile, _ = cute.arch.block_idx()
         tidx = Int32(cute.arch.thread_idx()[0])
         lane = tidx % Int32(32)
         warp = tidx // Int32(32)

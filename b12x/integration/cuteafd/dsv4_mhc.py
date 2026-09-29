@@ -59,6 +59,8 @@ from b12x.norm.mhc._kernels import (
     MHCFinalizeGramKernel,
     MHCPostPrePartialKernel,
     MHCPostPrePrefillBlockMPartialKernel,
+    MHCPostPrePrefillGramKernel,
+    MHCPrefillTf32ProjectTmaKernel,
     _PREFILL_BLOCK_M,
     _PREFILL_BLOCK_TILE_N,
 )
@@ -89,13 +91,23 @@ def mhc_post_pre_route(max_rows: int) -> str:
     return "decode" if int(max_rows) < _PREFILL_MIN_ROWS else "block_m"
 
 
-def _finalize(geometry: DSV4Geometry, *, compact: bool) -> MHCFinalizeGramKernel:
+def _finalize(geometry: DSV4Geometry, *, compact: bool, projection_splits: int = 1) -> MHCFinalizeGramKernel:
     return MHCFinalizeGramKernel(
         hidden_size=geometry.hidden, split_k=geometry.mhc_split_k,
         rms_eps=geometry.norm_eps, hc_eps=geometry.hc_eps,
         sinkhorn_iters=geometry.hc_sinkhorn_iters, norm_eps=geometry.norm_eps,
-        fuse_norm=True, compact_partials=compact,
+        fuse_norm=True, compact_partials=compact, compact_projection_splits=projection_splits,
     )
+
+
+# The "tf32" post_pre route (prefill capacities): the post and Gram rows on
+# CUDA cores, the 24 fn mixes on TF32 tensor cores with fn split into two
+# TF32 terms (the BF16 stream values are exact in TF32), K split 8 ways.
+# Tiles of the torch route's 4096-hidden, >= 3584-token configuration. Below
+# _TF32_MIN_ROWS live rows the program runs the block_m route instead.
+_TF32_PROJECTION = dict(tile_m=192, tile_n=24, tile_k=64, num_stages=2, num_m_warps=12, num_n_warps=1,
+                        k_splits=8)
+_TF32_MIN_ROWS = 384
 
 
 class _MhcPre:
@@ -133,7 +145,8 @@ class _MhcPre:
 
 
 class _MhcPostPre:
-    def __init__(self, geometry: DSV4Geometry, route: str, partials_per_cta: int):
+    def __init__(self, geometry: DSV4Geometry, route: str, partials_per_cta: int, block_m: int | None = None,
+                 tile_n: int | None = None):
         self.h, self.s = geometry.hidden, geometry.mhc_split_k
         self.route = route
         if route == "decode":
@@ -141,10 +154,21 @@ class _MhcPostPre:
                 hidden_size=self.h, split_k=self.s, compute_gram=True,
                 partials_per_cta=partials_per_cta,
             )
-        elif route == "block_m":
+        elif route == "tf32":
+            self.gram = MHCPostPrePrefillGramKernel(hidden_size=self.h, split_k=self.s)
+            self.project = MHCPrefillTf32ProjectTmaKernel(hidden_size=self.h, split_k=self.s, split_fp32_fn=True,
+                                                          **_TF32_PROJECTION)
+            self.tf32_finalize = _finalize(geometry, compact=True, projection_splits=_TF32_PROJECTION["k_splits"])
             self.partial = MHCPostPrePrefillBlockMPartialKernel(
                 hidden_size=self.h, split_k=self.s, block_m=_PREFILL_BLOCK_M,
                 tile_n=12 if self.h == 7168 else _PREFILL_BLOCK_TILE_N, compute_gram=True,
+            )
+        elif route == "block_m":
+            tuned = block_m is not None or tile_n is not None
+            self.partial = MHCPostPrePrefillBlockMPartialKernel(
+                hidden_size=self.h, split_k=self.s, block_m=_PREFILL_BLOCK_M if block_m is None else block_m,
+                tile_n=tile_n if tile_n is not None else 12 if self.h == 7168 else _PREFILL_BLOCK_TILE_N,
+                compute_gram=True, n_fastest=tuned,
             )
         else:
             raise ValueError(f"unknown mHC post_pre route {route!r}")
@@ -170,8 +194,32 @@ class _MhcPostPre:
         bs = cute.make_tensor(base, cute.make_layout((_MIXES,)))
         if const_expr(self.route == "decode"):
             self.partial(xt, r, pp, pc, w, p, out, pp, out, rows, stream)
+        elif const_expr(self.route == "tf32"):
+            if rows >= Int32(_TF32_MIN_ROWS):
+                self.gram(xt, r, pp, pc, p, out, rows, stream)
+                self.project(cute.make_tensor(residual_out, cute.make_layout((m, 4 * h), stride=(4 * h, 1))), w, p,
+                             rows, stream)
+                self.tf32_finalize(
+                    out, p, sc, bs, out_y,
+                    cute.make_tensor(post, cute.make_layout((m, 4), stride=(4, 1))),
+                    cute.make_tensor(comb, cute.make_layout((m, 4, 4), stride=(16, 4, 1))),
+                    cute.make_tensor(norm, cute.make_layout((h,))),
+                    sc, bs, rows, stream,
+                )
+            else:
+                self.partial(xt, r, pp, pc, w, p, out, rows, stream)
         else:
             self.partial(xt, r, pp, pc, w, p, out, rows, stream)
+        if const_expr(self.route == "tf32"):
+            if rows < Int32(_TF32_MIN_ROWS):
+                self.finalize(
+                    out, p, sc, bs, out_y,
+                    cute.make_tensor(post, cute.make_layout((m, 4), stride=(4, 1))),
+                    cute.make_tensor(comb, cute.make_layout((m, 4, 4), stride=(16, 4, 1))),
+                    cute.make_tensor(norm, cute.make_layout((h,))),
+                    sc, bs, rows, stream,
+                )
+            return
         self.finalize(
             out, p, sc, bs, out_y,
             cute.make_tensor(post, cute.make_layout((m, 4), stride=(4, 1))),
@@ -241,8 +289,12 @@ def compile_dsv4_mhc_pre_aot(geometry: DSV4Geometry = FLASH, *, partials_per_cta
 
 
 def compile_dsv4_mhc_post_pre_aot(geometry: DSV4Geometry = FLASH, *, max_rows: int = 1,
-                                  route: str | None = None, partials_per_cta: int = 4):
-    """Fused mHC post + next pre; ``max_rows`` selects the prepared route."""
+                                  route: str | None = None, partials_per_cta: int = 4,
+                                  block_m: int | None = None, tile_n: int | None = None):
+    """Fused mHC post + next pre; ``max_rows`` selects the prepared route (``route="tf32"``:
+    TF32 tensor-core mixes with split FP32 fn from 384 live rows, the block_m route below). ``block_m`` /
+    ``tile_n`` retile the block_m route (tokens and mixes per CTA; the mix tiles of a
+    token block then launch adjacently) without changing its arithmetic."""
     route = mhc_post_pre_route(max_rows) if route is None else route
     ops = _stream_ops(geometry)
     h = geometry.hidden
@@ -256,9 +308,10 @@ def compile_dsv4_mhc_post_pre_aot(geometry: DSV4Geometry = FLASH, *, max_rows: i
         ops["post"], ops["comb"], ops["y"], ops["scratch"],
     )
     return compile_program(
-        _MhcPostPre(geometry, route, partials_per_cta), name=f"dsv4_mhc_post_pre_{route}",
+        _MhcPostPre(geometry, route, partials_per_cta, block_m, tile_n), name=f"dsv4_mhc_post_pre_{route}",
         operands=operands, scalars=(Scalar("rows"),),
-        key=_geometry_key(geometry) + (route, partials_per_cta),
+        key=_geometry_key(geometry) + (route, partials_per_cta)
+        + (() if block_m is None and tile_n is None else (block_m, tile_n)),
         geometry={"hidden": h, "split_k": geometry.mhc_split_k, "route": route,
                   "eps": geometry.norm_eps},
         scratch={"scratch": lambda rows: mhc_scratch_bytes(geometry, rows)},

@@ -36,6 +36,7 @@ from b12x._lib.intrinsics import (
     fmin_f32,
     ld_global_v4_u32,
     pack_f32x2_to_bfloat2,
+    st_global_u32,
     st_global_v4_u32,
 )
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo, _ld_cached
@@ -50,11 +51,12 @@ ROPE_PAIRS = 32
 WIDE_SKINNY_MAX_ROWS = 8
 
 
-def glm_projection(n: int, k: int):
-    """``RoutedBf16Projection`` with the GLM crossover (narrow outputs keep the default)."""
+def glm_projection(n: int, k: int, wide: bool = False):
+    """``RoutedBf16Projection`` with the GLM crossover (narrow outputs keep the default);
+    ``wide`` adds its 128 x 128-tile route for prefill capacities."""
     from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
 
-    return RoutedBf16Projection(n, k, max_skinny_rows=WIDE_SKINNY_MAX_ROWS if n >= 2048 else None)
+    return RoutedBf16Projection(n, k, max_skinny_rows=WIDE_SKINNY_MAX_ROWS if n >= 2048 else None, wide=wide)
 
 
 @cute.jit
@@ -704,12 +706,16 @@ class BatchedBf16Gemm:
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
             coordinates = thr_mma.partition_C(cute.make_identity_tensor((self.tile_m, self.tile_n)))
-            for index in cutlass.range_constexpr(cute.size(acc)):
-                coord = coordinates[index]
+            # Accumulator pairs (2i, 2i + 1) are adjacent columns of one row: one
+            # packed BF16x2 store each (the same round-to-nearest conversion).
+            base = Int64(output.iterator.toint())
+            for pair in cutlass.range_constexpr(cute.size(acc) // 2):
+                coord = coordinates[2 * pair]
                 token = m_tile * Int32(self.tile_m) + coord[0]
                 column = n_tile * Int32(self.tile_n) + coord[1]
                 if token < num_tokens:
-                    output[Int64(token), Int64(column), Int64(batch)] = acc[index].to(output.element_type)
+                    at = (Int64(token) * Int64(self.o_row) + Int64(batch) * Int64(self.o_batch) + Int64(column)) * Int64(2)
+                    st_global_u32(base + at, pack_f32x2_to_bfloat2(acc[2 * pair], acc[2 * pair + 1]))
         elif warp_idx == Int32(self.producer_warp):
             producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_stages)
             for k_tile in cutlass.range(self.k_tiles, unroll_full=False):

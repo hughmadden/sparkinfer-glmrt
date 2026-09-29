@@ -22,6 +22,7 @@ from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
 from b12x._lib.compiler import DimKey, KernelCompileSpec, compile as b12x_compile, launch, run_compiled, tensor_key
 from b12x._lib.utils import current_cuda_stream
+from b12x._lib.intrinsics import pack_f32x2_to_bfloat2, st_global_u32
 
 def _to_kernel_tensor(tensor, dtype, *, dynamic_layout=False):
     if hasattr(tensor, "fake_mode"):
@@ -104,17 +105,28 @@ class Bf16PrefillKernel:
 
     def __init__(self, n: int, k: int, *, compute_warps: int | None = None,
                  tile_n: int | None = None, num_stages: int | None = None,
-                 compensated: bool = True):
+                 compensated: bool = True, warp_layout: tuple[int, int] | None = None,
+                 tile_m: int | None = None):
         """Defaults keep the original 64x64x64, two-stage, compensated kernel.
 
         ``compensated=False`` accumulates directly in the tensor-core FP32
         accumulators (cuBLAS-style). ``compute_warps`` sets tile_m = 16 x warps.
+        ``warp_layout`` ``(wm, wn)`` with ``tile_m`` arranges the MMA warps in
+        a grid (each owns a ``tile_m / wm`` x ``tile_n / wn`` block): the same
+        per-element K order, fewer shared-memory fragment reads per MMA.
         """
+        self.warp_layout = None
         if compute_warps is not None:
             self.num_compute_warps = int(compute_warps)
             self.producer_warp = self.num_compute_warps
             self.num_threads = 32 * (self.num_compute_warps + 1)
             self.tile_m = 16 * self.num_compute_warps
+        if warp_layout is not None:
+            self.warp_layout = (int(warp_layout[0]), int(warp_layout[1]))
+            self.num_compute_warps = self.warp_layout[0] * self.warp_layout[1]
+            self.producer_warp = self.num_compute_warps
+            self.num_threads = 32 * (self.num_compute_warps + 1)
+            self.tile_m = int(tile_m)
         if tile_n is not None:
             self.tile_n = int(tile_n)
         if num_stages is not None:
@@ -127,6 +139,12 @@ class Bf16PrefillKernel:
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
 
     def _get_tiled_mma(self) -> cute.TiledMma:
+        if self.warp_layout is not None:
+            return cute.make_tiled_mma(
+                warp.MmaF16BF16Op(cutlass.BFloat16, Float32, (16, 8, 16)),
+                (self.warp_layout[0], self.warp_layout[1], 1),
+                permutation_mnk=(self.tile_m, self.tile_n, 16),
+            )
         return cute.make_tiled_mma(
             warp.MmaF16BF16Op(cutlass.BFloat16, Float32, (16, 8, 16)),
             (self.num_compute_warps, 1, 1),
@@ -369,13 +387,25 @@ class Bf16PrefillKernel:
             coordinates = thr_mma.partition_C(
                 cute.make_identity_tensor((self.tile_m, self.tile_n))
             )
-            for index in cutlass.range_constexpr(cute.size(acc)):
-                coord = coordinates[index]
-                token = m_tile * Int32(self.tile_m) + coord[0]
-                column = n_tile * Int32(self.tile_n) + coord[1]
-                if token < num_tokens and column < Int32(self.n):
-                    output[Int64(token), Int64(column)] = acc[index].to(
-                        output.element_type)
+            if const_expr(output.element_type == cutlass.BFloat16 and self.n % 2 == 0):
+                # Accumulator pairs (2i, 2i + 1) are adjacent columns of one
+                # row: one packed BF16x2 store each (the same RN conversion).
+                base = Int64(output.iterator.toint())
+                for pair in cutlass.range_constexpr(cute.size(acc) // 2):
+                    coord = coordinates[2 * pair]
+                    token = m_tile * Int32(self.tile_m) + coord[0]
+                    column = n_tile * Int32(self.tile_n) + coord[1]
+                    if token < num_tokens and column < Int32(self.n):
+                        at = Int64(cute.crd2idx((Int64(token), Int64(column)), output.layout)) * Int64(2)
+                        st_global_u32(base + at, pack_f32x2_to_bfloat2(acc[2 * pair], acc[2 * pair + 1]))
+            else:
+                for index in cutlass.range_constexpr(cute.size(acc)):
+                    coord = coordinates[index]
+                    token = m_tile * Int32(self.tile_m) + coord[0]
+                    column = n_tile * Int32(self.tile_n) + coord[1]
+                    if token < num_tokens and column < Int32(self.n):
+                        output[Int64(token), Int64(column)] = acc[index].to(
+                            output.element_type)
 
         elif warp_idx == Int32(self.producer_warp):
             producer_state = pipeline.make_pipeline_state(
