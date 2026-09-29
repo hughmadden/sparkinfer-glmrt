@@ -88,6 +88,7 @@ __all__ = [
     "compile_glmf_expert_input_quant_aot",
     "compile_glmf_ffn_aot",
     "compile_glmf_head_aot",
+    "compile_glmf_head_fp8_aot",
     "compile_glmf_index_expand_aot",
     "compile_glmf_index_producer_aot",
     "compile_glmf_index_topk_aot",
@@ -165,11 +166,11 @@ FP8_ROWS = 16
 # KDA o 4096x8192 23.5 -> 22.5, MLA o 4096x16384 44.6 -> 44.0, q_b 16384x1536 18.6 -> 16.9,
 # qkv_a 2048x4096 12.4 -> 12.0, shared gate_up 4096x4096 13.7 -> 13.0, shared down
 # 4096x2048 12.4 -> 12.0, dense gate_up 24576x4096 69.9 -> 64.5, dense down 4096x12288
-# 38.4 -> 34.5.
+# 38.4 -> 34.5, FP32 LM head 154880x4096 387 -> 385 (BF16 cuBLAS head: 801).
 FP8_GEMV_CONFIG = {
     (24896, 4096): (8, 2), (4096, 8192): (8, 2), (4096, 16384): (4, 2), (16384, 1536): (2, 2),
     (2048, 4096): (8, 4), (4096, 4096): (8, 2), (4096, 2048): (2, 2), (24576, 4096): (8, 4),
-    (4096, 12288): (8, 2),
+    (4096, 12288): (8, 2), (154880, 4096): (8, 2),
 }
 
 
@@ -842,4 +843,44 @@ def compile_glmf_o_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8: boo
         geometry={"hidden": h, "heads": n, "v_head_dim": v, "max_rows": max_rows, "fp8_weights": fp8},
         scratch={"scratch": lambda rows: o_scratch_bytes(g, rows)},
         doc=compile_glmf_o_aot.__doc__,
+    )
+
+
+# ---------------------------------------------------------------------------
+# LM head for decode rows over an FP8 copy
+# ---------------------------------------------------------------------------
+
+
+class _HeadFp8:
+    def __init__(self, vocab: int, hidden: int):
+        from ._fp8_weights import MmaFp8Gemv
+
+        warps, groups = FP8_GEMV_CONFIG.get((vocab, hidden), (4, 4))
+        self.gemv = MmaFp8Gemv(vocab, hidden, max_rows=FP8_ROWS, warps=warps, groups=groups,
+                               out_dtype=cutlass.Float32, row_scales=True)
+
+    def key(self) -> tuple:
+        return self.gemv.key()
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, logits: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        self.gemv(x, w_fp8, scale, logits, rows, stream)
+
+
+def compile_glmf_head_fp8_aot(g: GLMFGeometry = GLM53_FLASH, *, vocab: int = 154880) -> AotProgram:
+    """FP32 logits of up to 16 decode rows over an E4M3 LM head with per-row
+    x 128-K scales: x bf16 [rows,H] (the head norm's output), w_fp8 [V,H],
+    scale f32 [V,H/128], logits f32 [rows,V]."""
+    h = g.hidden
+    launch = _HeadFp8(int(vocab), h)
+    return compile_program(
+        launch, name="glmf_head_fp8",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("w_fp8", torch.float8_e4m3fn, f"[{vocab},{h}]"),
+                  Operand("scale", torch.float32, f"[{vocab},{h // 128}]", align=4),
+                  Operand("logits", torch.float32, f"[rows,{vocab}]", "out")),
+        scalars=(Scalar("rows"),), key=(int(vocab), launch.key()),
+        geometry={"hidden": h, "vocab": int(vocab), "max_rows": FP8_ROWS},
+        doc=compile_glmf_head_fp8_aot.__doc__,
     )
