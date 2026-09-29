@@ -2663,9 +2663,14 @@ def _make_mixed_trellis_buffers(
     rotation_gate = torch.empty(
         (capacity_rows, launch.hidden_size), dtype=torch.float16, device=device
     )
-    # A fused FC1 input rotation never writes or reads the per-route up copy.
+    # A fused FC1 input rotation (and the warp-specialized kernels, which
+    # rotate FC1 inputs in shared memory) never write or read the per-route
+    # up copy; the gate buffer then only backs the FC2 output.
     rotation_up = rotation_gate
-    if not getattr(launch, "fused_input_rotation", False):
+    if not (
+        getattr(launch, "fused_input_rotation", False)
+        or getattr(launch, "warp_specialized", False)
+    ):
         rotation_up = torch.empty(
             (capacity_rows, launch.hidden_size), dtype=torch.float16, device=device
         )
