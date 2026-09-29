@@ -70,7 +70,8 @@ def _descriptor(shape, dtype, strides=None):
     return {"shape": tuple(shape), "strides": tuple(strides), "dtype": dtype, "alignment": 16}
 
 
-def _prepared_layout(geometry: DSV4Geometry, max_rows: int, max_pages: int, mode: str):
+def _prepared_layout(geometry: DSV4Geometry, max_rows: int, max_pages: int, mode: str,
+                     heads: int = _HEADS):
     """The scratch layout (and route) of the prepared plan for this capacity."""
     from b12x.attention import dsa_indexer
     from b12x.attention.dsa_indexer import _preparation as prep
@@ -80,12 +81,12 @@ def _prepared_layout(geometry: DSV4Geometry, max_rows: int, max_pages: int, mode
 
     device = torch.device("cuda", torch.cuda.current_device())
     rows, pages, topk = int(max_rows), int(max_pages), int(geometry.index_topk)
-    caps = dsa_indexer.Caps(device=device, num_q_heads=_HEADS, max_q_rows=rows,
+    caps = dsa_indexer.Caps(device=device, num_q_heads=heads, max_q_rows=rows,
                             max_page_table_width=pages, topk=topk, mode=mode,
                             output_index_space="physical")
     operands = dict(
-        q_fp8=_descriptor((rows, _HEADS, _HEAD_DIM), "float8_e4m3fn"),
-        query_weights=_descriptor((rows, _HEADS), "float32"),
+        q_fp8=_descriptor((rows, heads, _HEAD_DIM), "float8_e4m3fn"),
+        query_weights=_descriptor((rows, heads), "float32"),
         index_k_cache=_descriptor((pages, _PAGE_BYTES), "uint8"),
         page_table=_descriptor((rows, pages), "int32", (0, 1) if mode == "prefill" else None),
         cache_lengths=_descriptor((rows,), "int32"),
@@ -121,13 +122,17 @@ def index_topk_scratch_bytes(geometry: DSV4Geometry, *, max_rows: int, max_pages
 
 
 class _TopK:
-    def __init__(self, geometry: DSV4Geometry, max_rows: int, max_pages: int, mode: str):
+    """``heads`` index heads (64 for DeepSeek V4, 32 for GLM 5.x)."""
+
+    def __init__(self, geometry: DSV4Geometry, max_rows: int, max_pages: int, mode: str,
+                 heads: int = _HEADS):
         from b12x.attention.dsa_indexer.tiled_topk import (
             _build_tiled_topk_kernel,
             _resolve_smem_candidate_capacity,
         )
 
-        layout = _prepared_layout(geometry, max_rows, max_pages, mode)
+        self.heads = int(heads)
+        layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads)
         self.layout = layout
         self.route = layout.route
         self.mode = mode
@@ -141,11 +146,11 @@ class _TopK:
             from b12x.attention.dsa_indexer.fused_indexer import KV_LAYOUT_PAGED, _build_fused_indexer_kernel
 
             self.fused = _build_fused_indexer_kernel(
-                KV_LAYOUT_PAGED, _HEADS, self.topk, True, int(layout.fused_ctas_per_group),
+                KV_LAYOUT_PAGED, self.heads, self.topk, True, int(layout.fused_ctas_per_group),
                 num_sms=self.num_sms, merge_threshold=int(layout.fused_merge_threshold),
                 k_quant_page_stride=_PAGE_BYTES, k_scales_row_stride=_PAGE_BYTES // 4,
                 max_seq_capacity=self.max_pages * _PAGE, vectorized_q_load=True,
-                q_row_stride_bytes=_HEADS * _HEAD_DIM,
+                q_row_stride_bytes=self.heads * _HEAD_DIM,
             )
             return
         if self.route == "packed_contiguous":
@@ -158,7 +163,7 @@ class _TopK:
             self.block_k = int(layout.prefill_block_k)
             self.prefill512 = self.block_k == _PREFILL512_BLOCK_K
             self.scorer = (
-                _build_dsa_contiguous_prefill512_kernel(tiled_output=True, num_heads=_HEADS)
+                _build_dsa_contiguous_prefill512_kernel(tiled_output=True, num_heads=self.heads)
                 if self.prefill512 else _build_dsa_contiguous_prefill_kernel(tiled_output=True)
             )
             self.gather = SharedSupertileGather(supertile_tokens=self.supertile)
@@ -169,7 +174,7 @@ class _TopK:
                 raise NotImplementedError("the non-streaming paged scorer is not exported")
             self.block_k = _PAGED_TILE_BLOCK_K
             self.scorer = _build_dsa_paged_stream_supertile_kernel(
-                int(layout.stream_scorer_ctas), _HEADS, _TILE_BLOCK_Q, _PAGED_TILE_BLOCK_K,
+                int(layout.stream_scorer_ctas), self.heads, _TILE_BLOCK_Q, _PAGED_TILE_BLOCK_K,
                 _PAGE_BYTES, _PAGE_BYTES // 4)
             self.active_width = WriteActiveWidth()
         else:
@@ -185,9 +190,10 @@ class _TopK:
 
     def key(self) -> tuple:
         L = self.layout
-        return (self.route, self.topk, self.max_rows, self.max_pages, self.supertile,
-                L.prefill_block_k, L.fused_ctas_per_group, L.fused_merge_threshold,
-                L.stream_scorer_ctas, L.max_chunks, L.nbytes, self.num_sms)
+        key = (self.route, self.topk, self.max_rows, self.max_pages, self.supertile,
+               L.prefill_block_k, L.fused_ctas_per_group, L.fused_merge_threshold,
+               L.stream_scorer_ctas, L.max_chunks, L.nbytes, self.num_sms)
+        return key if self.heads == _HEADS else key + (self.heads,)
 
     # -- helpers ------------------------------------------------------------
     @cute.jit
@@ -209,8 +215,8 @@ class _TopK:
         m = rows
         q_bytes = cute.make_tensor(
             cute.make_ptr(cutlass.Uint8, Int64(q_fp8.toint()), cute.AddressSpace.gmem, assumed_align=16),
-            cute.make_layout((m, _HEADS, _HEAD_DIM), stride=(_HEADS * _HEAD_DIM, _HEAD_DIM, 1)))
-        w = cute.make_tensor(weights, cute.make_layout((m, _HEADS), stride=(_HEADS, 1)))
+            cute.make_layout((m, self.heads, _HEAD_DIM), stride=(self.heads * _HEAD_DIM, _HEAD_DIM, 1)))
+        w = cute.make_tensor(weights, cute.make_layout((m, self.heads), stride=(self.heads, 1)))
         lengths = cute.make_tensor(cache_lengths, cute.make_layout((m,)))
         topk = self.topk
         out = cute.make_tensor(output_indices, cute.make_layout((m, topk), stride=(topk, 1)))
@@ -324,7 +330,7 @@ class _TopK:
                 rows, table_width, page_begin, stream)
             q_u32 = cute.make_tensor(
                 cute.make_ptr(cutlass.Uint32, Int64(q_fp8.toint()), cute.AddressSpace.gmem, assumed_align=16),
-                cute.make_layout((m, _HEADS, _HEAD_DIM // 4), stride=(_HEADS * _HEAD_DIM // 4, _HEAD_DIM // 4, 1)))
+                cute.make_layout((m, self.heads, _HEAD_DIM // 4), stride=(self.heads * _HEAD_DIM // 4, _HEAD_DIM // 4, 1)))
             k_quant = cute.make_tensor(self._ptr(cutlass.Uint8, base, L.gather_k_quant_offset_bytes),
                                        cute.make_layout((s, _HEAD_DIM), stride=(_HEAD_DIM, 1)))
             k_scale = self._flat(cutlass.Float32, base, L.gather_k_scale_offset_bytes, s)

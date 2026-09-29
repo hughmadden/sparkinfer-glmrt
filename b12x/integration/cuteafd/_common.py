@@ -43,6 +43,8 @@ __all__ = [
     "AotProgram",
     "DSV4Geometry",
     "FLASH",
+    "GLM53",
+    "GLMGeometry",
     "Operand",
     "PRO",
     "Scalar",
@@ -107,6 +109,76 @@ PRO = DSV4Geometry(
     name="pro", hidden=7168, heads=128, q_lora_rank=1536, o_groups=16,
     o_lora_rank=1024, index_topk=1024, moe_inter=3072, routed_experts=384,
 )
+
+
+@dataclass(frozen=True)
+class GLMGeometry:
+    """Static GLM 5.x (``glm_moe_dsa``) geometry baked into the ``glm_*`` programs.
+
+    MLA with a 512-wide latent (q_lora 2048, nope 192, rope 64, v 256), the
+    DSA indexer (32 heads x 128, top-2048, LayerNorm k), SwiGLU dense layers
+    and a top-8 sigmoid router over 256 experts plus one shared expert.
+    """
+
+    name: str = "glm53"
+    hidden: int = 6144
+    heads: int = 64
+    q_lora_rank: int = 2048
+    kv_lora_rank: int = 512
+    qk_nope_dim: int = 192
+    qk_rope_dim: int = 64
+    v_head_dim: int = 256
+    index_heads: int = 32
+    index_head_dim: int = 128
+    index_topk: int = 2048
+    dense_inter: int = 12288
+    moe_inter: int = 2048
+    routed_experts: int = 256
+    norm_eps: float = 1.0e-5
+    index_norm_eps: float = 1.0e-6
+    page_rows: int = 64
+
+    def __post_init__(self) -> None:
+        if (self.kv_lora_rank, self.qk_rope_dim) != (512, 64):
+            raise ValueError("GLM programs require the 512 latent + 64 RoPE record")
+        if (self.index_head_dim, self.page_rows) != (128, 64):
+            raise ValueError("GLM index cache requires 128-dim keys on 64-row pages")
+        if self.qk_nope_dim % 64 or self.v_head_dim % 64 or self.hidden % 1024:
+            raise ValueError("GLM projection widths must be multiples of 64 (hidden of 1024)")
+
+    @property
+    def qkv_a_width(self) -> int:
+        """Joint ``[q_a_proj; kv_a_proj_with_mqa]`` output width."""
+        return self.q_lora_rank + self.kv_lora_rank + self.qk_rope_dim
+
+    @property
+    def qk_head_dim(self) -> int:
+        return self.qk_nope_dim + self.qk_rope_dim
+
+    @property
+    def latent_dim(self) -> int:
+        """Absorbed query / cache record width (latent + RoPE)."""
+        return self.kv_lora_rank + self.qk_rope_dim
+
+    @property
+    def softmax_scale(self) -> float:
+        return self.qk_head_dim ** -0.5
+
+    @property
+    def record_bytes(self) -> int:
+        """FP8 latent record: 512 E4M3, 4 FP32 group scales, 64 BF16 RoPE."""
+        return self.kv_lora_rank + 4 * (self.kv_lora_rank // 128) + 2 * self.qk_rope_dim
+
+    @property
+    def kv_page_bytes(self) -> int:
+        return self.page_rows * self.record_bytes
+
+    @property
+    def index_page_bytes(self) -> int:
+        return self.page_rows * (self.index_head_dim + 4)
+
+
+GLM53 = GLMGeometry()
 
 
 _TORCH_TO_CUTE = {
