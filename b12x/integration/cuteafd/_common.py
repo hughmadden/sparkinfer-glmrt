@@ -44,6 +44,8 @@ __all__ = [
     "DSV4Geometry",
     "FLASH",
     "GLM53",
+    "GLM53_FLASH",
+    "GLMFGeometry",
     "GLMGeometry",
     "MIMO_V2_FLASH",
     "MiMoGeometry",
@@ -249,6 +251,114 @@ class MiMoGeometry:
 
 
 MIMO_V2_FLASH = MiMoGeometry()
+
+
+@dataclass(frozen=True)
+class GLMFGeometry:
+    """Static GLM 5.3 Flash (``glm5_next``) geometry baked into the ``glmf_*`` programs.
+
+    Hybrid attention: Kimi Delta Attention layers (``kda_heads`` x 128,
+    short convolution ``conv_kernel`` over q/k/v, per-key decay gate bounded
+    below by ``gate_lower_bound``, FP32 recurrent state) and MLA layers
+    without RoPE (``mla_use_nope``: q_lora 1536, a 512 latent, qk/v heads of
+    256; the absorbed query is 512 wide and the FP8 latent record is 528
+    bytes: 512 E4M3 then 4 FP32 group scales) with a DSA indexer over 4-token
+    key pools. Four mHC streams (``hc_mult``) around every sublayer, an
+    unweighted stream mean before the final norm; SwiGLU clamped at
+    ``swiglu_limit`` in dense, shared and routed experts; a top-8 sigmoid
+    router over 288 experts plus one shared expert.
+    """
+
+    name: str = "glm53_flash"
+    hidden: int = 4096
+    heads: int = 64
+    q_lora_rank: int = 1536
+    kv_lora_rank: int = 512
+    qk_nope_dim: int = 256
+    v_head_dim: int = 256
+    index_heads: int = 32
+    index_head_dim: int = 128
+    index_topk: int = 2048
+    index_kpool: int = 4
+    kda_heads: int = 64
+    kda_head_dim: int = 128
+    conv_kernel: int = 4
+    gate_lower_bound: float = -5.0
+    dense_inter: int = 12288
+    moe_inter: int = 2048
+    routed_experts: int = 288
+    top_k: int = 8
+    swiglu_limit: float = 10.0
+    hc_mult: int = 4
+    hc_sinkhorn_iters: int = 20
+    hc_eps: float = 1.0e-6
+    norm_eps: float = 1.0e-5
+    index_norm_eps: float = 1.0e-6
+    page_rows: int = 64
+
+    def __post_init__(self) -> None:
+        if (self.kv_lora_rank, self.kda_head_dim, self.conv_kernel) != (512, 128, 4):
+            raise ValueError("GLM Flash programs require the 512 latent, 128-wide KDA heads and a 4-tap conv")
+        if self.hc_mult != 4 or self.hidden % 2048:
+            raise ValueError("GLM Flash programs require 4 mHC streams and hidden % 2048 == 0")
+
+    # MLA (the GLMGeometry names the shared GLM programs read).
+    qk_rope_dim: int = 0
+
+    @property
+    def qkv_a_width(self) -> int:
+        """Joint ``[q_a_proj; kv_a_proj_with_mqa]`` output width (no RoPE key)."""
+        return self.q_lora_rank + self.kv_lora_rank
+
+    @property
+    def qk_head_dim(self) -> int:
+        return self.qk_nope_dim
+
+    @property
+    def latent_dim(self) -> int:
+        return self.kv_lora_rank
+
+    @property
+    def softmax_scale(self) -> float:
+        return self.qk_head_dim ** -0.5
+
+    @property
+    def record_bytes(self) -> int:
+        """FP8 latent record: 512 E4M3 then 4 FP32 group scales."""
+        return self.kv_lora_rank + 4 * (self.kv_lora_rank // 128)
+
+    @property
+    def kv_page_bytes(self) -> int:
+        return self.page_rows * self.record_bytes
+
+    @property
+    def sparse_topk(self) -> int:
+        """Selected slots per row: ``index_topk`` plus the open tail pool, padded to 64."""
+        return -(-(self.index_topk + self.index_kpool - 1) // 64) * 64
+
+    # KDA
+    @property
+    def kda_width(self) -> int:
+        """Per-projection KDA width (q, k, v, decay gate, output gate)."""
+        return self.kda_heads * self.kda_head_dim
+
+    @property
+    def kda_in_width(self) -> int:
+        """``[q; k; v; f_a; g_a; b]`` in-projection rows."""
+        return 3 * self.kda_width + 2 * self.kda_head_dim + self.kda_heads
+
+    @property
+    def kda_state_bytes(self) -> int:
+        """FP32 recurrent state of one sequence in one layer, ``[heads, v, k]``."""
+        return self.kda_heads * self.kda_head_dim * self.kda_head_dim * 4
+
+    @property
+    def conv_state_bytes(self) -> int:
+        """BF16 short-conv state of one sequence in one layer: the last 3 q/k/v inputs."""
+        return (self.conv_kernel - 1) * 3 * self.kda_width * 2
+
+
+GLM53_FLASH = GLMFGeometry()
 
 
 _TORCH_TO_CUTE = {

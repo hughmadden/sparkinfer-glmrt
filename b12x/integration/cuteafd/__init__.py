@@ -54,6 +54,8 @@ Import the submodule you need; this package does not import them eagerly.
 from ._common import (  # noqa: F401
     FLASH,
     GLM53,
+    GLM53_FLASH,
+    GLMFGeometry,
     PRO,
     AotProgram,
     DSV4Geometry,

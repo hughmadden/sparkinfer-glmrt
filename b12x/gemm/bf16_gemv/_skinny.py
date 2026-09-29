@@ -171,6 +171,12 @@ def skinny_config(n: int, k: int, out_dtype) -> dict:
         return dict(cols=1, rows_per_tile=2, threads=256)
     if (n, k) == (64, 7168):
         return dict(cols=2, rows_per_tile=2, threads=448)
+    vectors = int(k) // 8
+    if vectors % 128:
+        # K/8 must split evenly over the CTA (GLM 5.3 Flash q_lora 1536: 192).
+        for threads in (192, 96, 64, 32):
+            if vectors % threads == 0:
+                return dict(cols=1, rows_per_tile=8, threads=threads)
     return dict(cols=1, rows_per_tile=8, threads=128)
 
 
