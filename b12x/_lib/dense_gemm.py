@@ -760,6 +760,7 @@ class DenseGemmKernel:
         block_fp8: bool = False,
         weight_only: Optional[str] = None,
         alpha_reciprocal: bool = False,
+        block_fp8_row_b: bool = False,
     ):
         if weight_only not in (None, "nvfp4", "mxfp8"):
             raise ValueError("weight_only must be nvfp4 or mxfp8")
@@ -789,6 +790,9 @@ class DenseGemmKernel:
         self.mxfp6_fmt_a = mxfp6_fmt_a
         self.mxfp6_fmt_b = mxfp6_fmt_b
         self.block_fp8 = bool(block_fp8)
+        # Per-row FP32 weight scales ``[N, K/128]`` instead of 128x128 blocks.
+        self.block_fp8_row_b = bool(block_fp8_row_b)
+        assert not self.block_fp8_row_b or self.block_fp8
         self.plain_fp8 = bool(plain_fp8 or block_fp8)
         if self.plain_fp8:
             assert mxfp6_fmt_a is None
@@ -1500,20 +1504,40 @@ class DenseGemmKernel:
     ) -> None:
         accum_mn = _reshape_acc_to_mn(accumulators)
         stage_accum_mn = _reshape_acc_to_mn(stage_accumulators)
-        scale_n = (tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])) // Int32(128)
-        scale_b = cutlass.Float32(sfb[(scale_n, k_tile_global, tile_coord_mnl[2])])
-        for acc_m in cutlass.range_constexpr(cute.size(accum_mn.shape[0])):
-            coord = coord_mn[acc_m, 0]
-            m_coord = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + coord[0]
-            scale_a = cutlass.Float32(0.0)
-            if m_coord < Int32(sfa.shape[0]):
-                scale_a = cutlass.Float32(
-                    sfa[(m_coord, k_tile_global, tile_coord_mnl[2])]
-                )
-            scale_ab = scale_a * scale_b
-            for acc_n in cutlass.range_constexpr(cute.size(accum_mn.shape[1])):
-                accum_mn[acc_m, acc_n] += stage_accum_mn[acc_m, acc_n] * scale_ab
-                stage_accum_mn[acc_m, acc_n] = 0.0
+        if cutlass.const_expr(self.block_fp8_row_b):
+            # Per-row weight scales: one per accumulator column (zero past N).
+            n0 = tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
+            columns = cute.size(accum_mn.shape[1])
+            scale_cols = cute.make_rmem_tensor(cute.make_layout((columns,), stride=(1,)), cutlass.Float32)
+            for acc_n in cutlass.range_constexpr(columns):
+                n_coord = n0 + coord_mn[0, acc_n][1]
+                scale_cols[acc_n] = cutlass.Float32(0.0)
+                if n_coord < Int32(sfb.shape[0]):
+                    scale_cols[acc_n] = cutlass.Float32(sfb[(n_coord, k_tile_global, tile_coord_mnl[2])])
+            for acc_m in cutlass.range_constexpr(cute.size(accum_mn.shape[0])):
+                coord = coord_mn[acc_m, 0]
+                m_coord = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + coord[0]
+                scale_a = cutlass.Float32(0.0)
+                if m_coord < Int32(sfa.shape[0]):
+                    scale_a = cutlass.Float32(sfa[(m_coord, k_tile_global, tile_coord_mnl[2])])
+                for acc_n in cutlass.range_constexpr(columns):
+                    accum_mn[acc_m, acc_n] += stage_accum_mn[acc_m, acc_n] * (scale_a * scale_cols[acc_n])
+                    stage_accum_mn[acc_m, acc_n] = 0.0
+        else:
+            scale_n = (tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])) // Int32(128)
+            scale_b = cutlass.Float32(sfb[(scale_n, k_tile_global, tile_coord_mnl[2])])
+            for acc_m in cutlass.range_constexpr(cute.size(accum_mn.shape[0])):
+                coord = coord_mn[acc_m, 0]
+                m_coord = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + coord[0]
+                scale_a = cutlass.Float32(0.0)
+                if m_coord < Int32(sfa.shape[0]):
+                    scale_a = cutlass.Float32(
+                        sfa[(m_coord, k_tile_global, tile_coord_mnl[2])]
+                    )
+                scale_ab = scale_a * scale_b
+                for acc_n in cutlass.range_constexpr(cute.size(accum_mn.shape[1])):
+                    accum_mn[acc_m, acc_n] += stage_accum_mn[acc_m, acc_n] * scale_ab
+                    stage_accum_mn[acc_m, acc_n] = 0.0
 
     @cute.jit
     def _make_cpasync_tiled_copy(
@@ -4742,6 +4766,7 @@ class DenseGemmKernel:
         swap_ab: bool = False,
         block_fp8: bool = False,
         weight_only: Optional[str] = None,
+        block_fp8_row_b: bool = False,
     ) -> bool:
         if weight_only is not None:
             return (
@@ -4768,7 +4793,7 @@ class DenseGemmKernel:
             or load_path != "tma"
             or swap_ab
             or l != 1
-            or n % 128 != 0
+            or n % (8 if block_fp8_row_b else 128) != 0
         ):
             return False
         if swap_ab:
@@ -4879,7 +4904,9 @@ class _DenseGemmLaunch:
         weight_only: Optional[str] = None,
         alpha_reciprocal: bool = False,
         input_k: Optional[int] = None,
+        block_fp8_row_b: bool = False,
     ):
+        self._block_fp8_row_b = bool(block_fp8_row_b)
         self._weight_only = weight_only
         self._alpha_reciprocal = alpha_reciprocal
         self._input_k = k if input_k is None else input_k
@@ -4947,6 +4974,7 @@ class _DenseGemmLaunch:
             swap_ab=swap_ab,
             block_fp8=block_fp8,
             weight_only=weight_only,
+            block_fp8_row_b=self._block_fp8_row_b,
         ):
             raise TypeError(
                 "dense_gemm launch is unsupported with "
@@ -5011,6 +5039,8 @@ class _DenseGemmLaunch:
             self._target_occupancy,
             self._plain_fp8,
         )
+        if self._block_fp8_row_b:
+            key = key + ("block_fp8_row_b",)
 
         return key if self._weight_only is None else key + (
             self._weight_only, self._alpha_reciprocal, self._input_k,
@@ -5104,11 +5134,13 @@ class _DenseGemmLaunch:
                     (m, self._k // 128, self._l), order=(1, 0, 2)
                 ),
             )
+            # Per-row weight scales are stored K-block major (``[K/128, N]``):
+            # a K block's column scales are contiguous for the promotion loads.
             sfb_tensor = cute.make_tensor(
                 sfb_ptr,
                 layout=cute.make_ordered_layout(
-                    (self._n // 128, self._k // 128, self._l),
-                    order=(1, 0, 2),
+                    (self._n if self._block_fp8_row_b else self._n // 128, self._k // 128, self._l),
+                    order=(0, 1, 2) if self._block_fp8_row_b else (1, 0, 2),
                 ),
             )
         else:
@@ -5146,6 +5178,7 @@ class _DenseGemmLaunch:
             block_fp8=self._block_fp8,
             weight_only=self._weight_only,
             alpha_reciprocal=self._alpha_reciprocal,
+            block_fp8_row_b=self._block_fp8_row_b,
         )(
             a_tensor,
             a_tensor,
@@ -6618,6 +6651,7 @@ def _new_dense_gemm_launch(
     weight_only: Optional[str] = None,
     alpha_reciprocal: bool = False,
     input_k: Optional[int] = None,
+    block_fp8_row_b: bool = False,
 ) -> "_DenseGemmLaunch":
     """Construct (without compiling) the exact launch _get_compiled_dense_gemm compiles."""
     return _DenseGemmLaunch(
@@ -6653,6 +6687,7 @@ def _new_dense_gemm_launch(
         weight_only=weight_only,
         alpha_reciprocal=alpha_reciprocal,
         input_k=input_k,
+        block_fp8_row_b=block_fp8_row_b,
         target_occupancy=(
             target_occupancy_override
             if target_occupancy_override is not None
