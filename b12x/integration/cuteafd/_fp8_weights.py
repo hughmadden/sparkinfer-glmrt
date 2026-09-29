@@ -408,10 +408,15 @@ class MmaFp8Gemv:
     program's dequantized weight; one scale per 128-wide K block since a
     CTA's columns share a 128-row block), FP32 accumulation; warps reduce
     through shared memory; output BF16 or FP32 ``[rows, N]``.
+
+    ``row_scales``: the scale grid is ``[N, K/128]`` FP32, one scale per
+    output row and 128-wide K block (per-channel or row-block quantization of
+    a BF16 weight); each lane scales its own row's weights.
     """
 
     def __init__(self, n: int, k: int, *, max_rows: int = 64, warps: int = 4, groups: int = 4,
-                 out_dtype=cutlass.BFloat16):
+                 out_dtype=cutlass.BFloat16, row_scales: bool = False):
+        self.row_scales = bool(row_scales)
         self.n, self.k = int(n), int(k)
         self.warps, self.groups = int(warps), int(groups)
         self.cols = 8 * self.groups
@@ -426,7 +431,7 @@ class MmaFp8Gemv:
         self.frags = self.m_tiles * self.groups * 4
 
     def key(self) -> tuple:
-        return (self.n, self.k, self.warps, self.groups, self.m_tiles, str(self.out_dtype))
+        return (self.n, self.k, self.warps, self.groups, self.m_tiles, str(self.out_dtype), self.row_scales)
 
     def _storage(self):
         class Storage:
@@ -468,26 +473,35 @@ class MmaFp8Gemv:
         k_begin = Int64(warp_id) * Int64(self.k_per_warp)
         w_row = Int64(w.toint()) + (n0 + Int64(g)) * Int64(self.k) + k_begin + Int64(16) * Int64(j)
         x_base = Int64(x.toint()) + (k_begin + Int64(16) * Int64(j)) * Int64(2)
-        s_row = Int64(scale.toint()) + (n0 // Int64(128)) * Int64(self.k_blocks * 4) \
-            + (k_begin // Int64(128)) * Int64(4)
+        # Scale of (row group gi, K block): one per CTA column block, or per lane row.
+        s_rows = self.groups if self.row_scales else 1
+        s_first = (n0 + Int64(g)) if self.row_scales else (n0 // Int64(128))
+        s_row = Int64(scale.toint()) + s_first * Int64(self.k_blocks * 4) + (k_begin // Int64(128)) * Int64(4)
+        s_gi = Int64(8 * self.k_blocks * 4)
         live_tiles = (rows + Int32(15)) // Int32(16)
         per_block = 2 * self.groups * 4
-        # Register double buffer: block b+1's weights and scale load while b computes.
+        # Register double buffer: block b+1's weights and scales load while b computes.
         cur = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
         nxt = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
+        s_cur = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
+        s_nxt = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
         self._load_block(cur, w_row, Int64(0))
-        s_cur = _ld_f32(s_row)
+        for si in cutlass.range_constexpr(s_rows):
+            s_cur[si] = _ld_f32(s_row + Int64(si) * s_gi)
         for block in cutlass.range(self.blocks, unroll=1):
-            s_nxt = s_cur
+            for si in cutlass.range_constexpr(s_rows):
+                s_nxt[si] = s_cur[si]
             if block + 1 < self.blocks:
                 self._load_block(nxt, w_row, Int64(block + 1) * Int64(128))
-                s_nxt = _ld_f32(s_row + Int64(block + 1) * Int64(4))
+                for si in cutlass.range_constexpr(s_rows):
+                    s_nxt[si] = _ld_f32(s_row + Int64(si) * s_gi + Int64(block + 1) * Int64(4))
             for chunk in cutlass.range_constexpr(2):
                 k_off = Int64(block) * Int64(128) + Int64(chunk * 64)
                 bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
                 for gi in cutlass.range_constexpr(self.groups):
                     for t in cutlass.range_constexpr(4):
-                        b0, b1 = _e4m3x4_scaled_bf16x2x2(cur[(chunk * self.groups + gi) * 4 + t], s_cur)
+                        b0, b1 = _e4m3x4_scaled_bf16x2x2(cur[(chunk * self.groups + gi) * 4 + t],
+                                                          s_cur[gi if self.row_scales else 0])
                         bw[8 * gi + 2 * t] = b0
                         bw[8 * gi + 2 * t + 1] = b1
                 for mt in cutlass.range_constexpr(self.m_tiles):
@@ -524,7 +538,8 @@ class MmaFp8Gemv:
                                 acc[f + 3] = d3
             for i in cutlass.range_constexpr(per_block):
                 cur[i] = nxt[i]
-            s_cur = s_nxt
+            for si in cutlass.range_constexpr(s_rows):
+                s_cur[si] = s_nxt[si]
         for i in cutlass.range_constexpr(self.frags):
             partial[(warp_id * Int32(self.frags) + Int32(i)) * Int32(32) + lane] = acc[i]
         cute.arch.sync_threads()
