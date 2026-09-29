@@ -61,7 +61,7 @@ gate weight; the sigmoid top-8 stays native), ``glmf_expert_input_quant``
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -73,6 +73,9 @@ from ._common import FLASH, GLM53_FLASH, AotProgram, GLMFGeometry, Operand, Scal
 from ._glm_kernels import BatchedBf16Gemm, GlmRankNormPackKV, GlmSwiGLU, glm_projection
 from ._glmf_kernels import (
     GlmfAdd,
+    GlmfIndexExpand,
+    GlmfIndexPost,
+    GlmfPoolKeys,
     GlmfKdaConv,
     GlmfKdaConvState,
     GlmfKdaGatedNorm,
@@ -85,6 +88,9 @@ __all__ = [
     "compile_glmf_expert_input_quant_aot",
     "compile_glmf_ffn_aot",
     "compile_glmf_head_aot",
+    "compile_glmf_index_expand_aot",
+    "compile_glmf_index_producer_aot",
+    "compile_glmf_index_topk_aot",
     "compile_glmf_kda_aot",
     "compile_glmf_mla_producer_aot",
     "compile_glmf_router_scores_aot",
@@ -375,4 +381,132 @@ def compile_glmf_head_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
                   Operand("out", torch.bfloat16, f"[rows,{h}]", "out")),
         scalars=(Scalar("rows"),), key=(h, g.norm_eps, g.hc_mult), geometry={"hidden": h, "eps": g.norm_eps},
         doc=__doc__,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DSA indexer over 4-token key pools
+# ---------------------------------------------------------------------------
+
+
+def index_producer_scratch_bytes(g: GLMFGeometry, rows: int) -> int:
+    """Index query BF16 [rows, I*128] then [wk | weights_proj | gate] BF16 [rows, 256+I]."""
+    rows = max(int(rows), 1)
+    return _align(rows * g.index_heads * 128 * 2) + _align(rows * (256 + g.index_heads) * 2)
+
+
+class _IndexProducer:
+    def __init__(self, g: GLMFGeometry):
+        self.g = g
+        i = g.index_heads
+        self.wq = glm_projection(i * 128, g.q_lora_rank)
+        self.wk = glm_projection(256 + i, g.hidden)
+        self.post = GlmfIndexPost(heads=i, eps=g.index_norm_eps, weight_scale=float(i) ** -0.5 * 128.0 ** -0.5)
+        self.pool = GlmfPoolKeys(kpool=g.index_kpool, page_rows=g.page_rows)
+
+    def key(self) -> tuple:
+        return (self.wq.key(), self.wk.key(), self.g)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, q_resid: cute.Pointer, slots: cute.Pointer, pool_slots: cute.Pointer,
+                 w_iq: cute.Pointer, w_ik: cute.Pointer, k_norm_w: cute.Pointer, k_norm_b: cute.Pointer,
+                 ape: cute.Pointer, token_keys: cute.Pointer, index_cache: cute.Pointer, q_fp8: cute.Pointer,
+                 head_weights: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        g = self.g
+        base = Int64(scratch.toint())
+        iq = _ptr(cutlass.BFloat16, base)
+        kw = _ptr(cutlass.BFloat16, base + _align_i64(Int64(rows) * Int64(g.index_heads * 128 * 2)))
+        self.wq(q_resid, w_iq, iq, rows, stream)
+        self.wk(x, w_ik, kw, rows, stream)
+        self.post(iq, kw, slots, k_norm_w, k_norm_b, q_fp8, head_weights, token_keys, rows, stream)
+        self.pool(slots, pool_slots, ape, token_keys, index_cache, rows, stream)
+
+
+def compile_glmf_index_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int) -> AotProgram:
+    """DSA index query, per-token keys and completed pool keys.
+
+    ``x`` bf16 [rows,H], ``q_resid`` bf16 [rows,Q] (mla producer), ``slots``
+    i64 [rows] (the rows' MLA record slots, also their token-key rows),
+    ``pool_slots`` i64 [rows] (index-cache slot of the pool a row completes,
+    else -1), ``w_iq`` bf16 [I*128,Q] (indexer.wq_b), ``w_ik`` bf16
+    [256+I,H] (cat(indexer.wk, indexer.weights_proj,
+    indexer.index_kpool_compress_gate)), ``k_norm_w``/``k_norm_b`` bf16
+    [128], ``ape`` bf16 [4,128] (index_kpool_compress_ape), ``token_keys``
+    bf16 [record slots,256] inout, ``index_cache`` u8 [pool_pages,8448]
+    inout, ``q_fp8`` fp8 [rows,I,128] out, ``head_weights`` f32 [rows,I] out.
+    """
+    max_rows = _check_rows(max_rows)
+    launch = _IndexProducer(g)
+    h, q, i = g.hidden, g.q_lora_rank, g.index_heads
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{h}]"),
+        Operand("q_resid", torch.bfloat16, f"[rows,{q}]"),
+        Operand("slots", torch.int64, "[rows]", align=8),
+        Operand("pool_slots", torch.int64, "[rows]", align=8),
+        Operand("w_iq", torch.bfloat16, f"[{i * 128},{q}]"),
+        Operand("w_ik", torch.bfloat16, f"[{256 + i},{h}]"),
+        Operand("k_norm_w", torch.bfloat16, "[128]"),
+        Operand("k_norm_b", torch.bfloat16, "[128]"),
+        Operand("ape", torch.bfloat16, f"[{g.index_kpool},128]"),
+        Operand("token_keys", torch.bfloat16, "[record_slots,256]", "inout"),
+        Operand("index_cache", torch.uint8, "[pool_pages,8448]", "inout"),
+        Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{i},128]", "out"),
+        Operand("head_weights", torch.float32, f"[rows,{i}]", "out"),
+        Operand("scratch", torch.uint8, "[index_producer_scratch_bytes]", "scratch"),
+    )
+    return compile_program(
+        launch, name="glmf_index_producer", operands=operands, scalars=(Scalar("rows"),),
+        key=(max_rows, launch.key()),
+        geometry={"hidden": h, "index_heads": i, "max_rows": max_rows, "kpool": g.index_kpool,
+                  "eps": g.index_norm_eps},
+        scratch={"scratch": lambda rows: index_producer_scratch_bytes(g, rows)},
+        doc=compile_glmf_index_producer_aot.__doc__,
+    )
+
+
+@dataclass(frozen=True)
+class _PoolTopK:
+    """The DSA top-k over pools: ``index_topk / kpool`` of them."""
+
+    index_topk: int
+    index_heads: int
+    index_page_bytes: int = 64 * (128 + 4)
+
+
+def compile_glmf_index_topk_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, max_pages: int,
+                                mode: str = "prefill") -> AotProgram:
+    """Top ``index_topk / kpool`` (512) pools per row: the GLM index top-k
+    (``glm_index_topk``) over the pool index cache; ``cache_lengths`` are the
+    complete pools each row sees (``(position + 1) // 4``)."""
+    from .glm_indexer import compile_glm_index_topk_aot as topk
+
+    pools = _PoolTopK(index_topk=g.index_topk // g.index_kpool, index_heads=g.index_heads)
+    return topk(pools, max_rows=max_rows, max_pages=max_pages, mode=mode)
+
+
+def compile_glmf_index_expand_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
+    """Top-k pools (or every earlier token up to ``index_topk + kpool - 1``)
+    to MLA record slots plus the open tail pool.
+
+    ``positions`` i64 [rows], ``pools`` i32 [rows, index_topk/kpool]
+    (glmf_index_topk output), ``pool_logical`` i32 [pool_pages] (logical
+    page of each pool-cache page in its sequence), ``page_table`` i32 (MLA
+    record pages; per row ``stride`` entries, 0 = one shared table),
+    ``indices`` i32 [rows, sparse_topk] out, ``lengths`` i32 [rows] out;
+    scalars ``rows``, ``stride``.
+    """
+    pools = g.index_topk // g.index_kpool
+    launch = GlmfIndexExpand(pools=pools, width=g.sparse_topk, dense_limit=g.index_topk + g.index_kpool - 1,
+                             kpool=g.index_kpool)
+    return compile_program(
+        launch, name="glmf_index_expand",
+        operands=(Operand("positions", torch.int64, "[rows]", align=8),
+                  Operand("pools", torch.int32, f"[rows,{pools}]", align=4),
+                  Operand("pool_logical", torch.int32, "[pool_pages]", align=4),
+                  Operand("page_table", torch.int32, "[rows,stride]", align=4),
+                  Operand("indices", torch.int32, f"[rows,{g.sparse_topk}]", "out", align=4),
+                  Operand("lengths", torch.int32, "[rows]", "out", align=4)),
+        scalars=(Scalar("rows"), Scalar("stride")), key=(pools, g.sparse_topk, g.index_kpool),
+        geometry={"pools": pools, "width": g.sparse_topk, "dense_limit": g.index_topk + g.index_kpool - 1},
+        doc=compile_glmf_index_expand_aot.__doc__,
     )

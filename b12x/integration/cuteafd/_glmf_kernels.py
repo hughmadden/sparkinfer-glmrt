@@ -26,12 +26,20 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import div_rn_f32, ld_global_v4_u32, pack_f32x2_to_bfloat2, st_global_v4_u32
+from b12x._lib.intrinsics import (
+    cvt_f32x4_to_e4m3x4,
+    div_rn_f32,
+    fabs_f32,
+    fmax_f32,
+    ld_global_v4_u32,
+    pack_f32x2_to_bfloat2,
+    st_global_v4_u32,
+)
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 
-from ._glm_kernels import _bf16, _block_sum, _reduction_storage, _rsqrt, _warp_sum
+from ._glm_kernels import _bf16, _block_sum, _fp8_scale, _reduction_storage, _rsqrt, _warp_max, _warp_sum
 
 KDA_HEAD = 128
 CONV_TAPS = 4
@@ -426,8 +434,247 @@ class GlmfKdaRecurrent:
                     old[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
 
 
+class GlmfIndexPost:
+    """DSA indexer epilogue without RoPE (GLM 5.3 Flash).
+
+    ``iq`` BF16 ``[rows, H*128]`` = ``wq_b(q_resid)``; ``kw`` BF16 ``[rows,
+    128 + H + 128]`` = ``[wk(x) | weights_proj(x) | kpool_compress_gate(x)]``.
+    Per (row, head): E4M3 query with scale ``amax/448`` into ``q_fp8 [rows,
+    H, 128]`` and ``head_weights = bf16(proj) * H^-0.5 * 128^-0.5 * q_scale``.
+    Key: ``bf16(LayerNorm(wk(x)))`` and the raw gate, stored BF16 as ``[k |
+    g]`` (256 values) at ``token_keys[slots[row]]`` (negative slots skip).
+    One warp per (row, head) plus one for the key; lane ``l`` owns 4l..4l+3.
+    """
+
+    def __init__(self, *, heads: int, eps: float, weight_scale: float):
+        self.heads, self.eps, self.weight_scale = int(heads), float(eps), float(weight_scale)
+        self.width = 128 + self.heads + 128
+
+    @cute.jit
+    def __call__(self, iq: cute.Pointer, kw: cute.Pointer, slots: cute.Pointer, k_weight: cute.Pointer,
+                 k_bias: cute.Pointer, q_fp8: cute.Pointer, head_weights: cute.Pointer, token_keys: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        m = Int64(rows)
+        h = self.heads
+        self.kernel(
+            cute.make_tensor(iq, cute.make_layout((m, h, 128), stride=(h * 128, 128, 1))),
+            cute.make_tensor(kw, cute.make_layout((m, self.width), stride=(self.width, 1))),
+            cute.make_tensor(slots, cute.make_layout((m,))),
+            cute.make_tensor(k_weight, cute.make_layout((128,))),
+            cute.make_tensor(k_bias, cute.make_layout((128,))),
+            q_fp8,
+            cute.make_tensor(head_weights, cute.make_layout((m, h), stride=(h, 1))),
+            token_keys,
+        ).launch(grid=(rows, h + 1, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, iq: cute.Tensor, kw: cute.Tensor, slots: cute.Tensor, k_weight: cute.Tensor,
+               k_bias: cute.Tensor, q_fp8: cute.Pointer, head_weights: cute.Tensor, token_keys: cute.Pointer):
+        token = Int64(cute.arch.block_idx()[0])
+        head = Int32(cute.arch.block_idx()[1])
+        lane = Int32(cute.arch.thread_idx()[0])
+        out = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+        if head < Int32(self.heads):
+            h64 = Int64(head)
+            for e in cutlass.range_constexpr(4):
+                out[e] = Float32(iq[token, h64, Int64(4) * Int64(lane) + Int64(e)])
+            local = fmax_f32(fmax_f32(fabs_f32(out[0]), fabs_f32(out[1])),
+                             fmax_f32(fabs_f32(out[2]), fabs_f32(out[3])))
+            scale = _fp8_scale(_warp_max(local))
+            packed = cvt_f32x4_to_e4m3x4(div_rn_f32(out[0], scale), div_rn_f32(out[1], scale),
+                                         div_rn_f32(out[2], scale), div_rn_f32(out[3], scale))
+            words = cute.make_ptr(
+                Uint32, Int64(q_fp8.toint()) + (token * Int64(self.heads) + h64) * Int64(128)
+                + Int64(4) * Int64(lane), cute.AddressSpace.gmem, assumed_align=4)
+            words[0] = packed
+            if lane == Int32(0):
+                raw = Float32(kw[token, Int64(128) + h64])
+                head_weights[token, h64] = raw * Float32(self.weight_scale) * scale
+        else:
+            total = Float32(0.0)
+            for e in cutlass.range_constexpr(4):
+                out[e] = Float32(kw[token, Int64(4) * Int64(lane) + Int64(e)])
+                total = total + out[e]
+            mean = _warp_sum(total) / Float32(128.0)
+            var = Float32(0.0)
+            for e in cutlass.range_constexpr(4):
+                diff = out[e] - mean
+                var = var + diff * diff
+            rstd = _rsqrt(_warp_sum(var) / Float32(128.0) + Float32(self.eps))
+            slot = Int64(slots[token])
+            if slot >= Int64(0):
+                row = cute.make_tensor(
+                    cute.make_ptr(BFloat16, Int64(token_keys.toint()) + slot * Int64(512), cute.AddressSpace.gmem,
+                                  assumed_align=16), cute.make_layout((256,)))
+                for e in cutlass.range_constexpr(4):
+                    d = Int32(4) * lane + Int32(e)
+                    row[d] = ((out[e] - mean) * rstd * Float32(k_weight[d]) + Float32(k_bias[d])).to(BFloat16)
+                    row[Int32(128) + d] = kw[token, Int64(128 + self.heads) + Int64(d)]
+
+
+class GlmfPoolKeys:
+    """Compressed key of every pool a row completes (``pool_slots[row] >= 0``).
+
+    The pool is the row's own token and the three before it (record slots
+    ``slots[row] - 3 .. slots[row]``: a pool never crosses a 64-row page).
+    Per channel ``c``: ``p_t = bf16(softmax_t(g[t, c] + ape[t, c]))`` and
+    ``key[c] = bf16(sum_t bf16(p_t * k[t, c]))``, as the reference's
+    ``get_pooled_states``; then E4M3 with a per-pool scale ``amax/448`` into
+    the index cache (64 pools x 128 E4M3 then 64 FP32 scales per page) at
+    ``pool_slots[row]``. One CTA of 128 threads (one per channel) per row.
+    """
+
+    threads = 128
+
+    def __init__(self, *, kpool: int = 4, page_rows: int = 64):
+        if kpool != 4:
+            raise ValueError("pool keys are built for 4-token pools")
+        self.kpool, self.page_rows = int(kpool), int(page_rows)
+        self.page_bytes = self.page_rows * (128 + 4)
+        self.warps = self.threads // 32
+
+    @cute.jit
+    def __call__(self, slots: cute.Pointer, pool_slots: cute.Pointer, ape: cute.Pointer, token_keys: cute.Pointer,
+                 cache: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        m = Int64(rows)
+        self.kernel(
+            cute.make_tensor(slots, cute.make_layout((m,))),
+            cute.make_tensor(pool_slots, cute.make_layout((m,))),
+            cute.make_tensor(ape, cute.make_layout((self.kpool, 128), stride=(128, 1))),
+            token_keys, cache,
+        ).launch(grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, slots: cute.Tensor, pool_slots: cute.Tensor, ape: cute.Tensor, token_keys: cute.Pointer,
+               cache: cute.Pointer):
+        token = Int64(cute.arch.block_idx()[0])
+        c = Int32(cute.arch.thread_idx()[0])
+        lane = c % Int32(32)
+        warp_id = c // Int32(32)
+        pool = Int64(pool_slots[token])
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(_reduction_storage(1, self.warps))
+        maxes = storage.sums.get_tensor(cute.make_layout((1, self.warps), stride=(self.warps, 1)))
+        if pool >= Int64(0):
+            first = Int64(slots[token]) - Int64(self.kpool - 1)
+            keys = cute.make_tensor(
+                cute.make_ptr(BFloat16, Int64(token_keys.toint()) + first * Int64(512), cute.AddressSpace.gmem,
+                              assumed_align=16), cute.make_layout((self.kpool, 256), stride=(256, 1)))
+            logit = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+            top = Float32(-3.0e38)
+            for t in cutlass.range_constexpr(4):
+                logit[t] = Float32(keys[t, Int32(128) + c]) + Float32(ape[t, c])
+                top = fmax_f32(top, logit[t])
+            total = Float32(0.0)
+            for t in cutlass.range_constexpr(4):
+                logit[t] = cute.math.exp(logit[t] - top, fastmath=False)
+                total = total + logit[t]
+            key = Float32(0.0)
+            for t in cutlass.range_constexpr(4):
+                key = key + _bf16(_bf16(div_rn_f32(logit[t], total)) * Float32(keys[t, c]))
+            key = _bf16(key)
+            local = _warp_max(fabs_f32(key))
+            if lane == Int32(0):
+                maxes[0, warp_id] = local
+            cute.arch.sync_threads()
+            amax = Float32(0.0)
+            for w in cutlass.range_constexpr(self.warps):
+                amax = fmax_f32(amax, maxes[0, w])
+            scale = _fp8_scale(amax)
+            page = pool // Int64(self.page_rows)
+            row = pool - page * Int64(self.page_rows)
+            page_base = Int64(cache.toint()) + page * Int64(self.page_bytes)
+            value = cute.make_tensor(cute.make_ptr(cutlass.Float8E4M3FN, page_base + row * Int64(128),
+                                                   cute.AddressSpace.gmem, assumed_align=1), cute.make_layout((128,)))
+            value[c] = div_rn_f32(key, scale).to(cutlass.Float8E4M3FN)
+            if c == Int32(0):
+                scale_ptr = cute.make_ptr(Float32, page_base + Int64(self.page_rows * 128) + row * Int64(4),
+                                          cute.AddressSpace.gmem, assumed_align=4)
+                scale_ptr[0] = scale
+
+
+class GlmfIndexExpand:
+    """Selected MLA record slots per row (``SPARSE`` wide) and their count.
+
+    Rows whose context ``p + 1 <= dense_limit`` select every earlier token
+    (the reference's selection there); longer rows expand the top-k pools
+    (index-cache physical slots) to their 4 tokens, then append the open tail
+    pool. Record slot of position ``q``: ``table[row * stride + q / 64] * 64
+    + q % 64``; the pool of index slot ``s`` is ``pool_logical[s / 64] * 64 +
+    s % 64``. One CTA of 256 threads per row.
+    """
+
+    threads = 256
+
+    def __init__(self, *, pools: int, width: int, dense_limit: int, kpool: int = 4):
+        self.pools, self.width, self.dense_limit, self.kpool = int(pools), int(width), int(dense_limit), int(kpool)
+
+    @cute.jit
+    def __call__(self, positions: cute.Pointer, pools: cute.Pointer, pool_logical: cute.Pointer,
+                 page_table: cute.Pointer, indices: cute.Pointer, lengths: cute.Pointer, rows: Int32, stride: Int32,
+                 stream: cuda.CUstream):
+        m = Int64(rows)
+        self.kernel(
+            cute.make_tensor(positions, cute.make_layout((m,))),
+            cute.make_tensor(pools, cute.make_layout((m, self.pools), stride=(self.pools, 1))),
+            pool_logical, page_table,
+            cute.make_tensor(indices, cute.make_layout((m, self.width), stride=(self.width, 1))),
+            cute.make_tensor(lengths, cute.make_layout((m,))),
+            stride,
+        ).launch(grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.jit
+    def _slot(self, table: cute.Pointer, base: Int64, position: Int64) -> Int32:
+        entry = cute.make_ptr(Int32, Int64(table.toint()) + (base + position // Int64(64)) * Int64(4),
+                              cute.AddressSpace.gmem, assumed_align=4)
+        return Int32(Int64(entry[0]) * Int64(64) + position % Int64(64))
+
+    @cute.kernel
+    def kernel(self, positions: cute.Tensor, pools: cute.Tensor, pool_logical: cute.Pointer,
+               page_table: cute.Pointer, indices: cute.Tensor, lengths: cute.Tensor, stride: Int32):
+        row = Int64(cute.arch.block_idx()[0])
+        tidx = Int64(cute.arch.thread_idx()[0])
+        p = Int64(positions[row])
+        base = row * Int64(stride)
+        count = p + Int64(1)
+        if count <= Int64(self.dense_limit):
+            for it in cutlass.range_constexpr((self.width + self.threads - 1) // self.threads):
+                i = Int64(it * self.threads) + tidx
+                if i < Int64(self.width):
+                    value = Int32(-1)
+                    if i < count:
+                        value = self._slot(page_table, base, i)
+                    indices[row, i] = value
+            if tidx == Int64(0):
+                lengths[row] = Int32(count)
+        else:
+            for it in cutlass.range_constexpr((self.pools + self.threads - 1) // self.threads):
+                j = Int64(it * self.threads) + tidx
+                if j < Int64(self.pools):
+                    s = Int64(pools[row, j])
+                    entry = cute.make_ptr(Int32, Int64(pool_logical.toint()) + s // Int64(64) * Int64(4),
+                                          cute.AddressSpace.gmem, assumed_align=4)
+                    pool = Int64(entry[0]) * Int64(64) + s % Int64(64)
+                    for e in cutlass.range_constexpr(4):
+                        indices[row, j * Int64(4) + Int64(e)] = self._slot(page_table, base,
+                                                                            pool * Int64(4) + Int64(e))
+            tail_start = count // Int64(self.kpool) * Int64(self.kpool)
+            tail = count - tail_start
+            filled = Int64(self.pools * self.kpool)
+            if tidx < Int64(self.width) - filled:
+                value = Int32(-1)
+                if tidx < tail:
+                    value = self._slot(page_table, base, tail_start + tidx)
+                indices[row, filled + tidx] = value
+            if tidx == Int64(0):
+                lengths[row] = Int32(filled + tail)
+
+
 __all__ = [
     "GlmfAdd",
+    "GlmfIndexExpand",
+    "GlmfIndexPost",
+    "GlmfPoolKeys",
     "GlmfKdaConv",
     "GlmfKdaConvState",
     "GlmfKdaGatedNorm",
