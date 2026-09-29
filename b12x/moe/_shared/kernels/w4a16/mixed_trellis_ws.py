@@ -52,6 +52,8 @@ from cutlass._mlir.dialects import llvm
 from b12x._lib.intrinsics import (
     cp_async4_shared_global_pred,
     cp_async_bulk_g2s_mbar,
+    cp_async_bulk_g2s_mbar_l2hint,
+    create_l2_evict_first_policy,
     cvt_bf16x2_to_f16x2,
     f16_mma_m16n8k16_f32,
     f16x2_to_f32x2,
@@ -866,19 +868,44 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         wrow0: Int64,
         wstride: Int64,
         row_bytes: Int32,
+        last_reader: Int32,
     ):
-        """One thread: four K16 rows (one 64-wide K unit) of a tile's weights."""
+        """One thread: four K16 rows (one 64-wide K unit) of a tile's weights.
+        The last route block of an expert streams them L2 evict-first: no
+        later block rereads them, and the gathered input rows stay cached."""
         bar = base + Int32(self.ws_bar_bc_full) + slot * Int32(_BARRIER_BYTES)
         dst = base + Int32(self.ws_bc_off) + slot * Int32(self.ws_bc_slot)
         _mbar_arrive_expect_tx(bar, row_bytes * Int32(4))
-        for q in cutlass.range_constexpr(4):
-            k16 = unit * Int32(4) + Int32(q)
-            cp_async_bulk_g2s_mbar(
-                dst + Int32(q) * row_bytes,
-                wrow0 + Int64(k16) * wstride,
-                row_bytes,
-                bar,
-            )
+        if last_reader != Int32(0):
+            policy = create_l2_evict_first_policy()
+            for q in cutlass.range_constexpr(4):
+                k16 = unit * Int32(4) + Int32(q)
+                cp_async_bulk_g2s_mbar_l2hint(
+                    dst + Int32(q) * row_bytes,
+                    wrow0 + Int64(k16) * wstride,
+                    row_bytes,
+                    bar,
+                    policy,
+                )
+        else:
+            for q in cutlass.range_constexpr(4):
+                k16 = unit * Int32(4) + Int32(q)
+                cp_async_bulk_g2s_mbar(
+                    dst + Int32(q) * row_bytes,
+                    wrow0 + Int64(k16) * wstride,
+                    row_bytes,
+                    bar,
+                )
+
+    @cute.jit
+    def _ws_last_block(self, block_expert_ids: cute.Tensor, rb: Int32, route_blocks: Int32):
+        """1 when route block rb is its expert's last (no later block rereads
+        the expert's weights)."""
+        last = Int32(1)
+        if rb + Int32(1) < route_blocks:
+            if block_expert_ids[rb + Int32(1)].to(Int32) == block_expert_ids[rb].to(Int32):
+                last = Int32(0)
+        return last
 
     @cute.jit
     def _ws_load_rows(
@@ -1105,11 +1132,14 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
             tier0_lo_experts, tier1_lo_experts,
         )
+        clast = Int32(0)
+        if ct < total_tiles:
+            clast = self._ws_last_block(block_expert_ids, _crb, route_blocks)
         bc_issued = Int32(0)
         for i in cutlass.range_constexpr(nc):
             if ct < total_tiles:
                 if ptid == Int32(0):
-                    self._ws_issue_bc(base, Int32(i), cu, crow0, cstride, crow_bytes)
+                    self._ws_issue_bc(base, Int32(i), cu, crow0, cstride, crow_bytes, clast)
                 bc_issued += Int32(1)
                 cu += Int32(1)
                 if cu == units_per_tile:
@@ -1122,6 +1152,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
                             tier0_lo_experts, tier1_lo_experts,
                         )
+                        clast = self._ws_last_block(block_expert_ids, _crb, route_blocks)
 
         # Input-row cursor and prologue.
         rows = cute.make_rmem_tensor((self.ws_m // 8,), Int32)
@@ -1231,7 +1262,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                     base + Int32(self.ws_bar_bc_empty) + fill * Int32(_BARRIER_BYTES),
                                     ((bc_issued // Int32(nc)) & Int32(1)) ^ Int32(1),
                                 )
-                                self._ws_issue_bc(base, fill, cu, crow0, cstride, crow_bytes)
+                                self._ws_issue_bc(base, fill, cu, crow0, cstride, crow_bytes, clast)
                             bc_issued += Int32(1)
                             cu += Int32(1)
                             if cu == units_per_tile:
@@ -1243,6 +1274,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                     crow0, cstride, crow_bytes = self._ws_weight_row(
                                         is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier,
                                         t0_w, t1_w, tier0_lo_experts, tier1_lo_experts,
+                                    )
+                                    clast = self._ws_last_block(
+                                        block_expert_ids, _crb, route_blocks
                                     )
                 blk += Int32(1)
                 b += Int32(1)
