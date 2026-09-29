@@ -76,11 +76,15 @@ from ._glmf_kernels import (
     GlmfIndexExpand,
     GlmfIndexPost,
     GlmfPoolKeys,
+    REPLAY_ROWS,
+    GlmfKdaCommit,
     GlmfKdaConv,
+    GlmfKdaConvCommit,
     GlmfKdaConvState,
     GlmfKdaGatedNorm,
     GlmfKdaRecurrent,
     GlmfMeanNorm,
+    kda_replay_layout,
 )
 
 __all__ = [
@@ -89,6 +93,7 @@ __all__ = [
     "compile_glmf_ffn_aot",
     "compile_glmf_head_aot",
     "compile_glmf_head_fp8_aot",
+    "compile_glmf_kda_commit_aot",
     "compile_glmf_index_expand_aot",
     "compile_glmf_index_producer_aot",
     "compile_glmf_index_topk_aot",
@@ -336,14 +341,15 @@ class _Kda:
                  conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
                  out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         self.body(x, w_in, w_in, w_in, w_fg, conv_w, a_log, dt_bias, o_norm, w_o, w_o, w_o, conv_state, state, slots,
-                  seq_first, out, scratch, rows, Int32(0), stream)
+                  seq_first, out, state, scratch, rows, Int32(0), Int32(0), stream)
 
     @cute.jit
     def body(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
              w_fg: cute.Pointer, conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer,
              o_norm: cute.Pointer, w_o: cute.Pointer, w_o_fp8: cute.Pointer, w_o_scale: cute.Pointer,
              conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
-             out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+             out: cute.Pointer, replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
+             spec: Int32, stream: cuda.CUstream):
         d, p = self.d, self.p
         m = Int64(rows)
         base = Int64(scratch.toint())
@@ -356,18 +362,20 @@ class _Kda:
         self.in_proj(x, w_in, w_in_fp8, w_in_scale, proj, rows, fp8_rows, stream)
         self.fg(_ptr(bf16, base + Int64(3 * d * 2)), w_fg, _ptr(bf16, fg_off), rows, stream)
         self.conv(proj, conv_w, conv_state, slots, seq_first, _ptr(bf16, qkv_off), rows, stream)
-        self.conv_state(proj, conv_state, slots, seq_first, rows, stream)
+        _, proj_off, _ = kda_replay_layout(self.g.kda_heads, 3 * d)
+        self.conv_state(proj, conv_state, slots, seq_first, _ptr(bf16, Int64(replay.toint()) + Int64(proj_off)), spec,
+                        rows, stream)
         b_raw = _ptr(bf16, base + Int64((3 * d + 256) * 2), 2)
         if cutlass.const_expr(self.chunked is None):
             self.recurrent(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
-                           _ptr(bf16, o_off), rows, stream)
+                           _ptr(bf16, o_off), replay, spec, rows, stream)
         else:
             if rows > Int32(CHUNKED_MIN_ROWS):
                 self.chunked(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
                              _ptr(bf16, o_off), y_off + _align_i64(m * Int64(2 * d)), 3 * d, 2 * d, p, rows, stream)
             else:
                 self.recurrent(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
-                               _ptr(bf16, o_off), rows, stream)
+                               _ptr(bf16, o_off), replay, spec, rows, stream)
         self.norm(_ptr(bf16, o_off), _ptr(bf16, fg_off + Int64(d * 2)), o_norm, _ptr(bf16, y_off), rows, stream)
         self.o_proj(_ptr(bf16, y_off), w_o, w_o_fp8, w_o_scale, out, rows, fp8_rows, stream)
 
@@ -378,9 +386,10 @@ class _KdaFp8(_Kda):
                  w_fg: cute.Pointer, conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer,
                  o_norm: cute.Pointer, w_o: cute.Pointer, w_o_fp8: cute.Pointer, w_o_scale: cute.Pointer,
                  conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
-                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+                 out: cute.Pointer, replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
+                 spec: Int32, stream: cuda.CUstream):
         self.body(x, w_in, w_in_fp8, w_in_scale, w_fg, conv_w, a_log, dt_bias, o_norm, w_o, w_o_fp8, w_o_scale,
-                  conv_state, state, slots, seq_first, out, scratch, rows, fp8_rows, stream)
+                  conv_state, state, slots, seq_first, out, replay, scratch, rows, fp8_rows, spec, stream)
 
 
 def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8: bool = False) -> AotProgram:
@@ -407,17 +416,61 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8: b
         Operand("slots", torch.int32, "[rows]", align=4),
         Operand("seq_first", torch.int32, "[rows]", align=4),
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+        *((Operand("replay", torch.float32, f"[{kda_replay_layout(heads, 3 * d)[2] // 4}]", "inout"),)
+          if fp8 else ()),
         Operand("scratch", torch.uint8, "[kda_scratch_bytes]", "scratch"),
     )
     return compile_program(
         launch, name="glmf_kda", operands=operands,
-        scalars=(Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),),
+        scalars=(Scalar("rows"), Scalar("fp8_rows"), Scalar("spec")) if fp8 else (Scalar("rows"),),
         key=(max_rows, fp8, launch.key()),
         geometry={"hidden": h, "heads": heads, "head_dim": g.kda_head_dim, "max_rows": max_rows,
                   "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked)},
         doc=__doc__,
+    )
+
+
+class _KdaCommit:
+    def __init__(self, g: GLMFGeometry):
+        self.g = g
+        self.recurrent = GlmfKdaCommit(heads=g.kda_heads, channels=3 * g.kda_width)
+        self.conv = GlmfKdaConvCommit(heads=g.kda_heads, channels=3 * g.kda_width)
+
+    @cute.jit
+    def __call__(self, state: cute.Pointer, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer,
+                 sequences: Int32, layers: Int32, slots: Int32, stream: cuda.CUstream):
+        self.recurrent(state, replay, tables, sequences, layers, slots, stream)
+        self.conv(conv_state, replay, tables, sequences, layers, slots, stream)
+
+
+def compile_glmf_kda_commit_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
+    """Verify-by-replay for KDA: after a speculative decode step (``glmf_kda``
+    with ``spec`` = 1, which records each row's replay inputs and leaves the
+    state alone), apply each sequence's accepted rows to its recurrent and
+    conv state in every KDA layer.
+
+    ``state`` FP32 ``[layers, slots, H, 128, 128]`` and ``conv_state`` BF16
+    ``[layers, slots, 3, 3D]`` (the layers' pools back to back), ``replay``
+    the layers' records back to back (``replay_bytes`` each), ``tables`` i32
+    ``[3, sequences]``: state slot (negative: skip), first step row and
+    accepted rows per sequence. The recurrent update repeats ``glmf_kda``'s
+    arithmetic, so the state is bit-identical to serial steps over those rows.
+    """
+    launch = _KdaCommit(g)
+    heads, d = g.kda_heads, g.kda_width
+    record = kda_replay_layout(heads, 3 * d)[2]
+    return compile_program(
+        launch, name="glmf_kda_commit",
+        operands=(Operand("state", torch.float32, f"[layers,slots,{heads},128,128]", "inout"),
+                  Operand("conv_state", torch.bfloat16, f"[layers,slots,3,{3 * d}]", "inout", align=2),
+                  Operand("replay", torch.float32, f"[layers,{record // 4}]"),
+                  Operand("tables", torch.int32, "[3,sequences]", align=4)),
+        scalars=(Scalar("sequences"), Scalar("layers"), Scalar("slots")),
+        key=(heads, d, REPLAY_ROWS),
+        geometry={"heads": heads, "channels": 3 * d, "replay_rows": REPLAY_ROWS, "replay_bytes": record},
+        doc=compile_glmf_kda_commit_aot.__doc__,
     )
 
 

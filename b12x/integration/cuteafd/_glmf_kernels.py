@@ -18,6 +18,13 @@ the step row where its sequence starts):
   per key; ``beta = bf16(sigmoid(b))``; ``S *= exp(g)`` per key column,
   ``d = (v - S k) * beta``, ``S += d k^T``, ``o = S q``;
 * output: per head ``w * rmsnorm(o) * sigmoid(gate)`` (eps 1e-5), BF16.
+
+Speculative verify steps (``spec`` != 0) leave the conv and recurrent state
+untouched and record each row's replay inputs instead (``kda_replay_bytes``
+per layer: the normalized key, decay and value per head in FP32, beta, and
+the q/k/v in-projection row); ``GlmfKdaCommit`` / ``GlmfKdaConvCommit`` then
+apply a sequence's accepted rows with the recurrent step's own arithmetic, so
+the state equals that of serial steps over those rows.
 """
 
 from __future__ import annotations
@@ -43,6 +50,17 @@ from ._glm_kernels import _bf16, _block_sum, _fp8_scale, _reduction_storage, _rs
 
 KDA_HEAD = 128
 CONV_TAPS = 4
+#: Rows one speculative step records per layer (the decode programs' rows).
+REPLAY_ROWS = 64
+
+
+def kda_replay_layout(heads: int, channels: int) -> tuple[int, int, int]:
+    """Byte offsets of a layer's replay record: k | decay | v FP32 ``[REPLAY_ROWS, heads, 3, 128]``
+    at 0, beta FP32 ``[REPLAY_ROWS, heads]``, the in-projection q|k|v BF16 ``[REPLAY_ROWS, channels]``;
+    returns (beta offset, projection offset, total bytes)."""
+    beta = REPLAY_ROWS * heads * 3 * KDA_HEAD * 4
+    proj = beta + REPLAY_ROWS * heads * 4
+    return beta, proj, proj + REPLAY_ROWS * channels * 2
 
 
 @cute.jit
@@ -225,19 +243,22 @@ class GlmfKdaConvState:
 
     @cute.jit
     def __call__(self, proj: cute.Pointer, conv_state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
-                 rows: Int32, stream: cuda.CUstream):
+                 replay: cute.Pointer, spec: Int32, rows: Int32, stream: cuda.CUstream):
+        """With ``spec`` != 0 every row's q/k/v in-projection goes to ``replay``
+        (``[REPLAY_ROWS, channels]`` BF16) and the state stays as it was."""
         m = Int64(rows)
         self.kernel(
             cute.make_tensor(proj, cute.make_layout((m, self.proj_width), stride=(self.proj_width, 1))),
             conv_state,
             cute.make_tensor(slots, cute.make_layout((m,))),
             cute.make_tensor(seq_first, cute.make_layout((m,))),
-            rows,
+            cute.make_tensor(replay, cute.make_layout((m, self.channels), stride=(self.channels, 1))),
+            spec, rows,
         ).launch(grid=(rows, self.channels // self.threads, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, proj: cute.Tensor, conv_state: cute.Pointer, slots: cute.Tensor, seq_first: cute.Tensor,
-               rows: Int32):
+               replay: cute.Tensor, spec: Int32, rows: Int32):
         row = Int64(cute.arch.block_idx()[0])
         ch = Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
         first = Int64(seq_first[row])
@@ -245,18 +266,27 @@ class GlmfKdaConvState:
         if not last:
             last = Int64(seq_first[row + Int64(1)]) != first
         slot = Int64(slots[row])
-        if last and slot >= Int64(0):
-            state = _conv_state(conv_state, slot, self.channels)
-            n = row - first + Int64(1)
-            kept = cute.make_rmem_tensor(cute.make_layout((CONV_TAPS - 1,), stride=(1,)), BFloat16)
-            for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                s = n - Int64(CONV_TAPS - 1 - i)
-                if s >= Int64(0):
-                    kept[i] = proj[first + s, ch]
-                else:
-                    kept[i] = state[Int64(CONV_TAPS - 1) + s, ch]
-            for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                state[i, ch] = kept[i]
+        if spec != Int32(0):
+            replay[row, ch] = proj[row, ch]
+        else:
+            if last and slot >= Int64(0):
+                _shift_conv_state(_conv_state(conv_state, slot, self.channels), proj, first, row - first + Int64(1),
+                                  ch)
+
+
+@cute.jit
+def _shift_conv_state(state: cute.Tensor, proj: cute.Tensor, first: Int64, n: Int64, ch: Int64):
+    """``state`` (a slot's ``[3, C]``) becomes the last three of its rows followed by
+    ``proj`` rows ``first .. first + n`` (column ``ch``)."""
+    kept = cute.make_rmem_tensor(cute.make_layout((CONV_TAPS - 1,), stride=(1,)), BFloat16)
+    for i in cutlass.range_constexpr(CONV_TAPS - 1):
+        s = n - Int64(CONV_TAPS - 1 - i)
+        if s >= Int64(0):
+            kept[i] = proj[first + s, ch]
+        else:
+            kept[i] = state[Int64(CONV_TAPS - 1) + s, ch]
+    for i in cutlass.range_constexpr(CONV_TAPS - 1):
+        state[i, ch] = kept[i]
 
 
 class GlmfKdaGatedNorm:
@@ -335,8 +365,11 @@ class GlmfKdaRecurrent:
 
     @cute.jit
     def __call__(self, qkv: cute.Pointer, g_raw: cute.Pointer, b_raw: cute.Pointer, a_log: cute.Pointer,
-                 dt_bias: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, out: cute.Pointer, rows: Int32,
-                 stream: cuda.CUstream):
+                 dt_bias: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, out: cute.Pointer,
+                 replay: cute.Pointer, spec: Int32, rows: Int32, stream: cuda.CUstream):
+        """With ``spec`` != 0 the state is read but not stored; each row's
+        normalized key, decay, value and beta go to ``replay`` (see
+        ``kda_replay_layout``) for ``GlmfKdaCommit``."""
         m = Int64(rows)
         d = self.width
         self.kernel(
@@ -348,7 +381,7 @@ class GlmfKdaRecurrent:
             state,
             cute.make_tensor(slots, cute.make_layout((m,))),
             cute.make_tensor(out, cute.make_layout((m, d), stride=(d, 1))),
-            rows,
+            replay, spec, rows,
         ).launch(grid=(self.heads, KDA_HEAD // self.v_block, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.jit
@@ -359,9 +392,15 @@ class GlmfKdaRecurrent:
 
     @cute.kernel
     def kernel(self, qkv: cute.Tensor, g_raw: cute.Tensor, b_raw: cute.Tensor, a_log: cute.Tensor,
-               dt_bias: cute.Tensor, state: cute.Pointer, slots: cute.Tensor, out: cute.Tensor, rows: Int32):
+               dt_bias: cute.Tensor, state: cute.Pointer, slots: cute.Tensor, out: cute.Tensor,
+               replay_ptr: cute.Pointer, spec: Int32, rows: Int32):
         head = Int64(cute.arch.block_idx()[0])
         tidx = Int32(cute.arch.thread_idx()[0])
+        beta_off, _, _ = kda_replay_layout(self.heads, 3 * self.width)
+        replay = _replay_rows(Int64(replay_ptr.toint()), self.heads)
+        replay_beta = _replay_beta(Int64(replay_ptr.toint()) + Int64(beta_off), self.heads)
+        # Warp 0 of the head's first CTA records the row's key, decay and beta.
+        recorder = Int32(cute.arch.block_idx()[1]) * Int32(self.threads) + tidx < Int32(32)
         lane = tidx % Int32(32)
         v0 = Int64(cute.arch.block_idx()[1]) * Int64(self.v_block) + Int64(tidx // Int32(32)) * Int64(4)
         k0 = Int64(lane) * Int64(4)
@@ -383,10 +422,11 @@ class GlmfKdaRecurrent:
             slot = Int64(slots[row])
             if slot != current:
                 if current >= Int64(0):
-                    old = self._state_tensor(state, current, head)
-                    for j in cutlass.range_constexpr(4):
-                        for i in cutlass.range_constexpr(4):
-                            old[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+                    if spec == Int32(0):
+                        old = self._state_tensor(state, current, head)
+                        for j in cutlass.range_constexpr(4):
+                            for i in cutlass.range_constexpr(4):
+                                old[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
                 if slot >= Int64(0):
                     new = self._state_tensor(state, slot, head)
                     for j in cutlass.range_constexpr(4):
@@ -413,8 +453,18 @@ class GlmfKdaRecurrent:
                 q[i] = div_rn_f32(q[i], q_norm) * Float32(self.scale)
                 k[i] = div_rn_f32(k[i], k_norm)
             beta = _bf16(_sigmoid(Float32(b_raw[row, head])))
+            if spec != Int32(0):
+                if recorder:
+                    for i in cutlass.range_constexpr(4):
+                        replay[row, head, 0, k0 + Int64(i)] = k[i]
+                        replay[row, head, 1, k0 + Int64(i)] = decay[i]
+                    if tidx == Int32(0):
+                        replay_beta[row, head] = beta
             for j in cutlass.range_constexpr(4):
                 v = Float32(qkv[row, d + d + col + v0 + Int64(j)])
+                if spec != Int32(0):
+                    if lane == Int32(j):
+                        replay[row, head, 2, v0 + Int64(j)] = v
                 memory = Float32(0.0)
                 for i in cutlass.range_constexpr(4):
                     s[j, i] = s[j, i] * decay[i]
@@ -428,10 +478,140 @@ class GlmfKdaRecurrent:
                 if lane == Int32(j):
                     out[row, col + v0 + Int64(j)] = o.to(BFloat16)
         if current >= Int64(0):
-            old = self._state_tensor(state, current, head)
+            if spec == Int32(0):
+                old = self._state_tensor(state, current, head)
+                for j in cutlass.range_constexpr(4):
+                    for i in cutlass.range_constexpr(4):
+                        old[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+
+
+@cute.jit
+def _replay_rows(address: Int64, heads: cutlass.Constexpr) -> cute.Tensor:
+    """A layer's recorded k | decay | v at ``address``, FP32 ``[REPLAY_ROWS, heads, 3, 128]``."""
+    return cute.make_tensor(cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=16),
+                            cute.make_layout((REPLAY_ROWS, heads, 3, KDA_HEAD),
+                                             stride=(heads * 3 * KDA_HEAD, 3 * KDA_HEAD, KDA_HEAD, 1)))
+
+
+@cute.jit
+def _replay_beta(address: Int64, heads: cutlass.Constexpr) -> cute.Tensor:
+    """A layer's recorded beta at ``address``, FP32 ``[REPLAY_ROWS, heads]``."""
+    return cute.make_tensor(cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=16),
+                            cute.make_layout((REPLAY_ROWS, heads), stride=(heads, 1)))
+
+
+class GlmfKdaCommit:
+    """Applies each sequence's accepted rows of a speculative step to its
+    recurrent state, in every KDA layer at once.
+
+    ``state`` FP32 ``[layers, slots, H, 128, 128]``, ``replay`` the layers'
+    records (``replay_bytes`` apart, see ``kda_replay_layout``), ``tables``
+    i32 ``[3, sequences]``: state slot, first step row and accepted rows of
+    each sequence. Grid ``(H, 128 / 32, sequences * layers)`` with the
+    recurrent kernel's thread mapping and update arithmetic (decay, memory,
+    delta, rank-1 update per row), so the result is what serial steps store.
+    """
+
+    threads = 256
+    v_block = 32
+
+    def __init__(self, *, heads: int, channels: int):
+        self.heads = int(heads)
+        self.beta_off, _, self.replay_bytes = kda_replay_layout(self.heads, int(channels))
+
+    @cute.jit
+    def __call__(self, state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,
+                 layers: Int32, slots: Int32, stream: cuda.CUstream):
+        self.kernel(state, replay, cute.make_tensor(tables, cute.make_layout((3, sequences), stride=(sequences, 1))),
+                    sequences, slots).launch(
+            grid=(self.heads, KDA_HEAD // self.v_block, sequences * layers), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, state: cute.Pointer, replay: cute.Pointer, tables: cute.Tensor, sequences: Int32, slots: Int32):
+        head = Int64(cute.arch.block_idx()[0])
+        z = Int32(cute.arch.block_idx()[2])
+        seq = z % sequences
+        layer = Int64(z // sequences)
+        tidx = Int32(cute.arch.thread_idx()[0])
+        lane = tidx % Int32(32)
+        v0 = Int64(cute.arch.block_idx()[1]) * Int64(self.v_block) + Int64(tidx // Int32(32)) * Int64(4)
+        k0 = Int64(lane) * Int64(4)
+        slot = Int64(tables[0, seq])
+        first = Int64(tables[1, seq])
+        keep = Int32(tables[2, seq])
+        if slot >= Int64(0):
+            base = Int64(state.toint()) + (((layer * Int64(slots) + slot) * Int64(self.heads) + head)
+                                           * Int64(KDA_HEAD * KDA_HEAD)) * Int64(4)
+            st = cute.make_tensor(cute.make_ptr(Float32, base, cute.AddressSpace.gmem, assumed_align=16),
+                                  cute.make_layout((KDA_HEAD, KDA_HEAD), stride=(KDA_HEAD, 1)))
+            record = Int64(replay.toint()) + layer * Int64(self.replay_bytes)
+            rows = _replay_rows(record, self.heads)
+            betas = _replay_beta(record + Int64(self.beta_off), self.heads)
+            s = cute.make_rmem_tensor(cute.make_layout((4, 4), stride=(4, 1)), Float32)
+            k = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+            decay = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
             for j in cutlass.range_constexpr(4):
                 for i in cutlass.range_constexpr(4):
-                    old[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+                    s[j, i] = st[v0 + Int64(j), k0 + Int64(i)]
+            for t in cutlass.range(keep, unroll=1):
+                row = first + Int64(t)
+                for i in cutlass.range_constexpr(4):
+                    k[i] = rows[row, head, 0, k0 + Int64(i)]
+                    decay[i] = rows[row, head, 1, k0 + Int64(i)]
+                beta = betas[row, head]
+                for j in cutlass.range_constexpr(4):
+                    v = rows[row, head, 2, v0 + Int64(j)]
+                    memory = Float32(0.0)
+                    for i in cutlass.range_constexpr(4):
+                        s[j, i] = s[j, i] * decay[i]
+                        memory = memory + s[j, i] * k[i]
+                    delta = (v - _warp_sum(memory)) * beta
+                    for i in cutlass.range_constexpr(4):
+                        s[j, i] = s[j, i] + k[i] * delta
+            for j in cutlass.range_constexpr(4):
+                for i in cutlass.range_constexpr(4):
+                    st[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+
+
+class GlmfKdaConvCommit:
+    """Shifts each sequence's accepted in-projection rows of a speculative step
+    into its conv state, in every KDA layer at once: ``conv_state`` BF16
+    ``[layers, slots, 3, C]``, ``replay`` as ``GlmfKdaCommit``. Grid
+    ``(sequences * layers, C / 256)``."""
+
+    threads = 256
+
+    def __init__(self, *, heads: int, channels: int):
+        self.channels = int(channels)
+        _, self.proj_off, self.replay_bytes = kda_replay_layout(int(heads), self.channels)
+
+    @cute.jit
+    def __call__(self, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,
+                 layers: Int32, slots: Int32, stream: cuda.CUstream):
+        self.kernel(conv_state, replay, cute.make_tensor(tables, cute.make_layout((3, sequences), stride=(sequences, 1))),
+                    sequences, slots).launch(
+            grid=(sequences * layers, self.channels // self.threads, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Tensor, sequences: Int32,
+               slots: Int32):
+        z = Int32(cute.arch.block_idx()[0])
+        seq = z % sequences
+        layer = Int64(z // sequences)
+        ch = Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
+        slot = Int64(tables[0, seq])
+        first = Int64(tables[1, seq])
+        keep = Int64(tables[2, seq])
+        if slot >= Int64(0):
+            if keep > Int64(0):
+                c = self.channels
+                base = Int64(conv_state.toint()) + (layer * Int64(slots) + slot) * Int64((CONV_TAPS - 1) * c * 2)
+                state = cute.make_tensor(cute.make_ptr(BFloat16, base, cute.AddressSpace.gmem, assumed_align=2),
+                                         cute.make_layout((CONV_TAPS - 1, c), stride=(c, 1)))
+                record = Int64(replay.toint()) + layer * Int64(self.replay_bytes) + Int64(self.proj_off)
+                proj = cute.make_tensor(cute.make_ptr(BFloat16, record, cute.AddressSpace.gmem, assumed_align=16),
+                                        cute.make_layout((REPLAY_ROWS, c), stride=(c, 1)))
+                _shift_conv_state(state, proj, first, keep, ch)
 
 
 class GlmfIndexPost:
