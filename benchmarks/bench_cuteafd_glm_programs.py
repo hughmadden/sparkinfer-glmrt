@@ -7,6 +7,9 @@ weights of the real shapes. Attention: 2048 selected slots per row; the
 decode index top-k scores ``--decode-context`` cached rows per query row,
 the prefill top-k is a 4096-row first chunk (causal lengths 1..4096).
 
+Decode programs also run with FP8 weight operands (``*_m64 fp8``): E4M3
+weights and FP32 block scales next to the BF16 copy.
+
   python benchmarks/bench_cuteafd_glm_programs.py [--iters 30] [--decode-context 8192]
 """
 
@@ -62,6 +65,16 @@ def main() -> None:
         norm=bf16(h, scale=1.0), router=bf16(256, h),
         ffn2048=(bf16(4096, h), bf16(h, 2048)), ffn12288=(bf16(24576, h), bf16(h, 12288)),
     )
+
+    def fp8(w):
+        rows, cols = w.shape
+        scale = torch.rand(((rows + 127) // 128, cols // 128), generator=gen, device=dev) * 1e-3 + 1e-4
+        return (w.float() / scale.repeat_interleave(128, 0)[:rows].repeat_interleave(128, 1)).to(
+            torch.float8_e4m3fn), scale
+
+    F = {name: fp8(W[name]) for name in ("w_qkv_a", "w_q_b", "w_iq", "w_o")}
+    F["ffn2048"] = (fp8(W["ffn2048"][0]), fp8(W["ffn2048"][1]))
+    F["ffn12288"] = (fp8(W["ffn12288"][0]), fp8(W["ffn12288"][1]))
     max_ctx = max(args.decode_context, 4096) + 64
     pages = max_ctx // 64 + 2
     kv_cache = torch.randint(0, 120, (pages, 64 * 656), dtype=torch.uint8, device=dev, generator=gen)
@@ -141,6 +154,29 @@ def main() -> None:
                     x, wire, wire[:, h:], wire, scalars=(rows, expert_input_quant_grid(h, rows, sms)))),
             ]
             # Producers first so the q8/query operands of later cases are real.
+            if cap == 64:
+                q8p = prog("prod64f", lambda: attn.compile_glm_producer_aot(g, max_rows=64, fp8=True))
+                i8p = prog("iprod64f", lambda: attn.compile_glm_index_producer_aot(g, max_rows=64, fp8=True))
+                o8p = prog("o64f", lambda: attn.compile_glm_o_aot(g, max_rows=64, fp8=True))
+                f2p = prog("f264f", lambda: ffn.compile_glm_ffn_aot(g, inter=2048, max_rows=64, fp8=True))
+                f12p = prog("f1264f", lambda: ffn.compile_glm_ffn_aot(g, inter=12288, max_rows=64, fp8=True))
+                (gu2, gu2s), (d2, d2s) = F["ffn2048"]
+                (gu12, gu12s), (d12, d12s) = F["ffn12288"]
+                cases += [
+                    ("glm_producer_m64 fp8", lambda: q8p.launch(
+                        x, pos, slots, cs, W["w_qkv_a"], *F["w_qkv_a"], W["q_a_norm"], W["kv_a_norm"], W["w_q_b"],
+                        *F["w_q_b"], W["w_uk"], kv_cache, query, q_resid, s_prod, scalars=(rows,))),
+                    ("glm_index_producer_m64 fp8", lambda: i8p.launch(
+                        x, q_resid, pos, slots, cs, W["w_iq"], *F["w_iq"], W["w_ik"], W["k_norm_w"],
+                        W["k_norm_b"], index_cache, q8, hw, s_iprod, scalars=(rows,))),
+                    ("glm_o_m64 fp8", lambda: o8p.launch(latent, W["w_uv"], W["w_o"], *F["w_o"], out, s_o,
+                                                        scalars=(rows,))),
+                    ("glm_ffn_i2048_m64 fp8", lambda: f2p.launch(x, W["ffn2048"][0], gu2, gu2s, W["ffn2048"][1],
+                                                                d2, d2s, out, s_f2, scalars=(rows,))),
+                    ("glm_ffn_i12288_m64 fp8", lambda: f12p.launch(
+                        x, W["ffn12288"][0], gu12, gu12s, W["ffn12288"][1], d12, d12s, out, s_f12,
+                        scalars=(rows,))),
+                ]
             for name, fn in cases:
                 results.append((name, rows, time_us(fn, args.iters, flush)))
     names = list(dict.fromkeys(name.replace("_m4096", "").replace("_m64", "").replace("_decode", "")

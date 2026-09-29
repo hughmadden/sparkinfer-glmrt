@@ -144,3 +144,15 @@ def unpack_latent_records(cache: torch.Tensor, slots: torch.Tensor) -> torch.Ten
 
     records = cache.view(-1, 656)[slots.long()]
     return unpack_mla_kv_cache_reference(records.unsqueeze(1)).squeeze(1)
+
+
+def fp8_rows(names: list[str], device="cuda") -> tuple[torch.Tensor, torch.Tensor]:
+    """Row-concatenated checkpoint E4M3 weights and their FP32 block-scale grids."""
+    weights, scales = [], []
+    for name in names:
+        weights.append(raw_tensor(name).to(device))
+        scales.append(raw_tensor(name.removesuffix("weight") + "weight_scale_inv").to(device).float())
+        assert weights[-1].dtype == torch.float8_e4m3fn
+    for w in weights[:-1]:
+        assert w.shape[0] % 128 == 0, "only the last concatenated weight may end mid-block"
+    return torch.cat(weights).contiguous(), torch.cat(scales).contiguous()
