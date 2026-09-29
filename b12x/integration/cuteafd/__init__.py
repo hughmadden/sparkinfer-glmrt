@@ -61,6 +61,7 @@ from ._common import (  # noqa: F401
     DSV4Geometry,
     GLMGeometry,
     MIMO_V2_FLASH,
+    MIMO_V26_PRO,
     MiMoGeometry,
     QWEN38_FLASH_NEXT,
     Qwen4Geometry,

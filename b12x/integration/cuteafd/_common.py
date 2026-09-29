@@ -48,6 +48,7 @@ __all__ = [
     "GLMFGeometry",
     "GLMGeometry",
     "MIMO_V2_FLASH",
+    "MIMO_V26_PRO",
     "MiMoGeometry",
     "Operand",
     "PRO",
@@ -222,6 +223,9 @@ class MiMoGeometry:
     routed_experts: int = 256
     top_k: int = 8
     norm_eps: float = 1.0e-5
+    # The router weight is stored FP32 (Flash: split into BF16 hi + lo) or
+    # BF16 (V2.6 Pro: one BF16 product, FP32 accumulation).
+    router_fp32: bool = True
 
     def __post_init__(self) -> None:
         if (self.qk_head_dim, self.v_head_dim, self.rope_dim) != (192, 128, 64):
@@ -251,6 +255,12 @@ class MiMoGeometry:
 
 
 MIMO_V2_FLASH = MiMoGeometry()
+# MiMo V2.6 Pro (``mimo_v2``, MiMoV2ForCausalLM): 128 query / 8 KV heads on
+# both layer kinds, hidden 6144, 384 experts, BF16 router weight.
+MIMO_V26_PRO = MiMoGeometry(
+    name="mimo_v2_pro", hidden=6144, heads=128, full_kv_heads=8, swa_kv_heads=8, v_scale=0.612,
+    full_rope_theta=1.0e7, swa_rope_theta=1.0e4, dense_inter=16384, routed_experts=384, router_fp32=False,
+)
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,4 @@
-"""Native AOT MiMo V2 norm and FFN-side programs (``H`` = 4096).
+"""Native AOT MiMo V2 norm and FFN-side programs (``H`` = 4096 Flash, 6144 V2.6 Pro).
 
 ``compile_mimo_norm_aot(g)``: residual add + RMSNorm (eps 1e-5), the
 ``glm_norm`` kernel and ABI at the MiMo width::
@@ -133,17 +133,40 @@ class _RouterHiLo:
         self.add(hilo, logits, rows, stream)
 
 
+class _RouterBf16:
+    """BF16 router weight (V2.6 Pro): one BF16 product, FP32 accumulation."""
+
+    def __init__(self, g: MiMoGeometry):
+        from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
+
+        self.proj = RoutedBf16Projection(g.routed_experts, g.hidden, out_dtype=cutlass.Float32)
+
+    def key(self) -> tuple:
+        return ("bf16", self.proj.key())
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_router: cute.Pointer, logits: cute.Pointer, scratch: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        self.proj(x, w_router, logits, rows, stream)
+
+
 def compile_mimo_router_scores_aot(g: MiMoGeometry = MIMO_V2_FLASH) -> AotProgram:
-    launch = _RouterHiLo(g)
+    """FP32 router weight: ``w_hilo`` (BF16 hi + lo); BF16 router weight
+    (``g.router_fp32`` False): ``w_router`` BF16 ``[E, H]`` as stored."""
     e, h = g.routed_experts, g.hidden
+    if g.router_fp32:
+        launch = _RouterHiLo(g)
+        weight = Operand("w_hilo", torch.bfloat16, f"[{2 * e},{h}]", note="split mlp.gate.weight (FP32)")
+    else:
+        launch = _RouterBf16(g)
+        weight = Operand("w_router", torch.bfloat16, f"[{e},{h}]", note="mlp.gate.weight (BF16)")
     return compile_program(
         launch, name="mimo_router_scores",
-        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
-                  Operand("w_hilo", torch.bfloat16, f"[{2 * e},{h}]", note="split mlp.gate.weight (FP32)"),
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"), weight,
                   Operand("logits", torch.float32, f"[rows,{e}]", "out"),
                   Operand("scratch", torch.uint8, "[router_scratch_bytes]", "scratch")),
         scalars=(Scalar("rows"),), key=(launch.key(),),
-        geometry={"hidden": h, "experts": e, "top_k": g.top_k},
+        geometry={"hidden": h, "experts": e, "top_k": g.top_k, "router_fp32": g.router_fp32},
         scratch={"scratch": lambda rows: router_scratch_bytes(g, rows)}, doc=__doc__,
     )
 
