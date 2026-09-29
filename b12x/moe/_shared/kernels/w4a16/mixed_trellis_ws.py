@@ -1,42 +1,52 @@
 """Warp-specialized mixed-Trellis prefill (SM12x, packed routes).
 
-The cooperative mixed-Trellis kernel decodes each Trellis weight fragment in
-the registers of the warp that multiplies it, so every warp alternates between
-integer decode, shared-memory staging and MMA behind CTA-wide barriers. On
-GB10 (one 256-thread CTA per SM at ~250 registers) that leaves the SM stalled
-on memory latency with the tensor pipe mostly idle.
+The cooperative mixed-Trellis kernel runs every stage of a tile in the same
+eight warps: cp.async staging, the FC1 input rotation, Trellis decode and the
+MMAs, separated by CTA-wide barriers. On GB10 (one 256-thread CTA per SM at
+~250 registers) that leaves the SM waiting on memory with the tensor pipe
+mostly idle.
 
-This variant splits each CTA into roles:
+This variant splits each CTA into roles (one CTA per SM, persistent):
 
-``consumer`` warps (``tile_n / 32``, two warpgroups for 256-wide tiles)
-    hold the FP32 accumulators of a ``route_block x tile_n`` output tile and
-    only issue ``ldmatrix`` (activations), 16-byte shared loads (decoded
-    weights) and ``mma.m16n8k16``.
-``producer`` warpgroup (4 warps)
-    streams the compressed Trellis weights with bulk copies into a deep ring,
-    gathers the tile's input rows with ``cp.async``, rotates FC1 inputs in
-    shared memory (``x * suh``, H128) and decodes weights into FP16 MMA
-    fragments in a second ring, one K16 row at a time.
+``consumer`` warps (``tile_n / 32``: two warpgroups for 256-wide tiles)
+    own a 32-column slice of the ``route_block x tile_n`` output tile. Per
+    128-wide K block they wait once for the block's input rows and the two
+    compressed 64-wide weight units, then run eight straight-line K16 steps:
+    window loads, t256 decode of their two N16 fragments, ``ldmatrix`` of the
+    rows, ``mma.m16n8k16``. They hold the tile's FP32 accumulators and store
+    the FP16 result directly.
+``producer`` warpgroup (4 warps, 88 registers)
+    streams the compressed weights with bulk copies (thread 0) into an up to
+    8-deep ring, gathers each block's input rows with ``cp.async``, applies
+    the FC1 input rotation (``x * suh``, H128) one block ahead of the
+    consumers, and publishes each tile's metadata (valid rows, route ids,
+    tier, global scale) through a small shared ring so consumers never wait
+    on dependent global loads between tiles.
 
-Rings are synchronized with mbarriers, so decode of step ``s + ring`` overlaps
-the MMAs of step ``s`` and weight loads run several 64-wide K steps ahead,
-across tile boundaries. FC1, the SwiGLU/intermediate-rotation pass and FC2
-are separate launches of one compiled entry point (the prefill capacities
-are milliseconds per layer; the cooperative grid barriers buy nothing there).
+Rings are mbarrier-synchronized and cross tile boundaries. FC1, the
+SwiGLU/intermediate-rotation pass and FC2 are three launches of one compiled
+entry point with the cooperative kernel's ABI; the prefill capacities spend
+milliseconds per layer, so its grid barriers buy nothing here.
+
+Decoding in dedicated producer warps (weights decoded to FP16 MMA fragments in
+a shared ring) was measured first and lost on GB10: one decode warp per SMSP
+is latency bound, and even two leave the consumers idle while the decode
+instructions still issue on the same schedulers.
 
 Arithmetic is bit-identical to the cooperative kernel with (64, 256, 64, 256)
-tiles: the decoded fragments, rotated activations and MMA instructions are the
-same, and each output element accumulates its K16 steps in the same two
-chains (K16 index mod 4 in {0, 1} and {2, 3}, the cooperative kernel's two
-K-split warp rows) that are summed once before the global scale and FP16
-store.
+tiles: the same decoded fragments, rotated rows and MMA instructions, and each
+output element accumulates its K16 steps in the same two chains (K16 index
+mod 4 in {0, 1} and {2, 3}: the cooperative kernel's K-split warp rows),
+summed once before the global scale and FP16 rounding.
 """
 
 from __future__ import annotations
 
+import os
+
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
+from cutlass.cutlass_dsl import Int32, Int64, Uint32, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from b12x._lib.intrinsics import (
@@ -48,12 +58,16 @@ from b12x._lib.intrinsics import (
     get_ptr_as_int64,
     half2_mul,
     ld_global_nc_v4_u32,
+    ld_shared_f32,
+    ld_shared_i32_relaxed,
     ld_shared_u32,
     ld_shared_v4_u32,
     ldmatrix_m8n8x4_b16,
     pack_f32x2_to_f16x2,
     shared_ptr_to_u32,
     st_global_u32,
+    st_shared_f32,
+    st_shared_i32,
     st_shared_v4_u32,
     trellis_align_stream_u32x2,
 )
@@ -66,20 +80,20 @@ from .mixed_trellis import (
     _TIER_DESCRIPTOR_MASK,
 )
 
-# Decoded-fragment ring depth (K16 rows). Producers run at most this far ahead
-# of the consumers; four rows cover one rotation burst at 64-row blocks.
-_BD_STAGES = 4
-_MAX_BC_STAGES = 4
-_MAX_A_STAGES = 4
-# setmaxnreg budgets per (producer warps): one producer warpgroup gives two
-# consumer warpgroups 208 registers (128*88 + 256*208 = 64512); two producer
-# warpgroups leave them 168 (256*88 + 256*168 = 65536).
-_REGS = {4: (88, 208), 8: (88, 168)}
+_PRODUCER_WARPS = 4
+_PRODUCER_THREADS = 32 * _PRODUCER_WARPS
+# setmaxnreg split for the 384-thread layout (two consumer warpgroups):
+# 128 * 88 + 256 * 208 = 64512 <= 65536 registers.
+_PRODUCER_REGS = 88
+_CONSUMER_REGS = 208
+_MAX_BC_STAGES = 8
+_TILE_STAGES = 4
+_TILE_HEADER_WORDS = 8
 _BARRIER_BYTES = 8
 
 
 # --------------------------------------------------------------------------
-# mbarrier / named-barrier primitives on 32-bit shared addresses
+# mbarrier primitives on 32-bit shared addresses
 # --------------------------------------------------------------------------
 
 
@@ -175,46 +189,13 @@ def _cp_async_mbar_arrive_noinc(addr: Int32, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def _named_barrier(barrier_id: int, threads: int, *, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [],
-        f"bar.sync {int(barrier_id)}, {int(threads)};",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
 class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     """Warp-specialized two-tier mixed Trellis for packed-route prefill."""
 
-    WS_ABI_VERSION = 1
+    WS_ABI_VERSION = 2
 
-    def __init__(
-        self,
-        *,
-        driver,
-        tier0,
-        tier1,
-        max_shared_mem: int,
-        producer_warps: int = 4,
-        decode_role: str = "consumer",
-    ):
+    def __init__(self, *, driver, tier0, tier1, max_shared_mem: int):
         super().__init__(driver=driver, tier0=tier0, tier1=tier1)
-        if decode_role not in ("consumer", "producer"):
-            raise ValueError("Trellis decode runs in the consumer or producer warps")
-        self.ws_decode = decode_role
-        if decode_role == "consumer" and producer_warps != 4:
-            raise ValueError("consumer-decode layout uses one producer warpgroup")
-        if producer_warps not in _REGS:
-            raise ValueError("warp-specialized producers are one or two warpgroups")
-        self.ws_pw = int(producer_warps)
-        self.ws_pt = 32 * self.ws_pw
         d = driver
         if d.direct_topk_routes:
             raise ValueError("warp-specialized mixed Trellis requires packed routes")
@@ -251,35 +232,31 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         self.ws_m = block
         self.ws_mb = block // 16
         self.ws_n = tile_n
+        self.ws_n16 = tile_n // 16
         self.ws_consumer_warps = tile_n // 32
         self.ws_consumer_threads = tile_n
-        self.ws_threads = tile_n + self.ws_pt
+        self.ws_threads = tile_n + _PRODUCER_THREADS
         self.ws_setmaxnreg = self.ws_threads > 256
-        self.ws_producer_regs, self.ws_consumer_regs = _REGS[self.ws_pw]
-        self.ws_n16 = tile_n // 16
-        if self.ws_n16 % self.ws_pw or (self.ws_pt // 16) > block:
-            raise ValueError("producer warps must split the N16 tiles and A rows evenly")
-        self.ws_tiles_per_producer = self.ws_n16 // self.ws_pw
         self.ws_bits = (int(tier0.trellis_bits), int(tier1.trellis_bits))
         self.ws_max_bits = max(self.ws_bits)
-        # Shared layout (bytes): A ring (block rows x 128 K, FP16/BF16),
-        # decoded-fragment ring (one K16 row x N, FP16 MMA fragments),
-        # compressed ring (four K16 rows x N at the widest tier), barriers.
+        # Shared layout (bytes): A ring (block rows x 128 K, rows at 256-byte
+        # stride), compressed-weight ring (four K16 rows x N at the widest
+        # tier), tile-metadata ring, mbarriers.
         self.ws_a_slot = block * 256
-        self.ws_bd_slot = tile_n * 32
-        self.ws_bc_row_max = self.ws_n16 * 32 * self.ws_max_bits
-        self.ws_bc_slot = 4 * self.ws_bc_row_max
-        budget = int(max_shared_mem) - 1024
-        self.ws_bd_stages = _BD_STAGES if decode_role == "producer" else 0
-        bd_bytes = self.ws_bd_stages * self.ws_bd_slot
-        max_bc = _MAX_BC_STAGES if decode_role == "producer" else 8
+        self.ws_bc_slot = 4 * self.ws_n16 * 32 * self.ws_max_bits
+        self.ws_tile_slot = 4 * (_TILE_HEADER_WORDS + block)
+        fixed = _TILE_STAGES * (self.ws_tile_slot + 2 * _BARRIER_BYTES)
+        budget = int(max_shared_mem) - 1024 - fixed
         a_stages = 2
         bc_stages = 0
-        a_choices = range(_MAX_A_STAGES, 1, -1) if decode_role == "producer" else (3, 2)
-        for candidate_a in a_choices:
-            rest = budget - candidate_a * self.ws_a_slot - bd_bytes
-            candidate_bc = min(max_bc, rest // self.ws_bc_slot) if rest > 0 else 0
-            if candidate_bc >= 3 or (candidate_a == 2 and candidate_bc >= 2):
+        for candidate_a in (3, 2):
+            rest = budget - candidate_a * (self.ws_a_slot + 3 * _BARRIER_BYTES)
+            candidate_bc = (
+                min(_MAX_BC_STAGES, rest // (self.ws_bc_slot + 2 * _BARRIER_BYTES))
+                if rest > 0
+                else 0
+            )
+            if candidate_bc >= 4 or (candidate_a == 2 and candidate_bc >= 2):
                 a_stages, bc_stages = candidate_a, candidate_bc
                 break
         if bc_stages < 2:
@@ -290,26 +267,24 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         self.ws_a_stages = a_stages
         self.ws_bc_stages = bc_stages
         self.ws_a_off = 0
-        self.ws_bd_off = self.ws_a_off + a_stages * self.ws_a_slot
-        self.ws_bc_off = self.ws_bd_off + bd_bytes
-        self.ws_bar_off = self.ws_bc_off + bc_stages * self.ws_bc_slot
-        # a_raw, a_full, a_empty (A stages each), bd_full, bd_empty, bc_full.
-        self.ws_bar_a_raw = self.ws_bar_off
+        self.ws_bc_off = self.ws_a_off + a_stages * self.ws_a_slot
+        self.ws_tile_off = self.ws_bc_off + bc_stages * self.ws_bc_slot
+        bar = self.ws_tile_off + _TILE_STAGES * self.ws_tile_slot
+        self.ws_bar_a_raw = bar
         self.ws_bar_a_full = self.ws_bar_a_raw + a_stages * _BARRIER_BYTES
         self.ws_bar_a_empty = self.ws_bar_a_full + a_stages * _BARRIER_BYTES
-        self.ws_bar_bd_full = self.ws_bar_a_empty + a_stages * _BARRIER_BYTES
-        self.ws_bar_bd_empty = self.ws_bar_bd_full + self.ws_bd_stages * _BARRIER_BYTES
-        self.ws_bar_bc_full = self.ws_bar_bd_empty + self.ws_bd_stages * _BARRIER_BYTES
+        self.ws_bar_bc_full = self.ws_bar_a_empty + a_stages * _BARRIER_BYTES
         self.ws_bar_bc_empty = self.ws_bar_bc_full + bc_stages * _BARRIER_BYTES
-        self.ws_smem_bytes = self.ws_bar_bc_empty + bc_stages * _BARRIER_BYTES
+        self.ws_bar_t_full = self.ws_bar_bc_empty + bc_stages * _BARRIER_BYTES
+        self.ws_bar_t_empty = self.ws_bar_t_full + _TILE_STAGES * _BARRIER_BYTES
+        self.ws_smem_bytes = self.ws_bar_t_empty + _TILE_STAGES * _BARRIER_BYTES
         if self.ws_smem_bytes > int(max_shared_mem):
             raise ValueError("warp-specialized mixed Trellis shared layout exceeds the device limit")
         self.blocks_per_sm = 1
         self.shared_words = (self.ws_smem_bytes + 3) // 4
-        # Timing probes (wrong numerics): nodecode, nomma, norot.
-        import os as _os
-        self.ws_exp = frozenset(filter(None, _os.environ.get("B12X_WS_EXP", "").split(",")))
         self.ws_act_ctas_per_sm = 8
+        # Timing probes only (wrong numerics): nodecode, nomma, norot.
+        self.ws_exp = frozenset(filter(None, os.environ.get("B12X_WS_EXP", "").split(",")))
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -318,11 +293,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             self.WS_ABI_VERSION,
             super().__cache_key__,
             self.ws_a_stages,
-            self.ws_bd_stages,
             self.ws_bc_stages,
             self.ws_threads,
-            self.ws_pw,
-            self.ws_decode,
             tuple(sorted(self.ws_exp)),
         )
 
@@ -394,6 +366,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         def flat(ptr, n):
             return cute.make_tensor(ptr, layout=cute.make_layout((n,), stride=(1,)))
 
+        # Weight extents match the cooperative kernel's views: the W13 plane
+        # is sized by the gate count so the up plane starts at its end.
         t0_w13 = flat(t0_w13_ptr, tier0_gate * h16 * fc1_n16 * b0)
         t1_w13 = flat(t1_w13_ptr, tier1_gate * h16 * fc1_n16 * b1)
         t0_w2 = flat(t0_w2_ptr, tier0_fc2 * i16 * h16 * b0)
@@ -504,6 +478,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
         total = tier0_num_experts + tier1_num_experts
+        # The cooperative kernel's activation phase, unchanged (it strides by
+        # the driver's 256-thread CTA).
         self.driver._run_activation_compact(
             fc1,
             activated,
@@ -646,8 +622,6 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
         tid = Int32(tidx)
-        cta = Int32(bidx)
-        grid = Int32(gdim)
 
         smem = cutlass.utils.SmemAllocator()
 
@@ -662,17 +636,20 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
 
         if tid == Int32(0):
             for s in cutlass.range_constexpr(self.ws_a_stages):
-                _mbar_init(base + Int32(self.ws_bar_a_raw + 8 * s), Int32(self.ws_pt))
-                _mbar_init(base + Int32(self.ws_bar_a_full + 8 * s), Int32(self.ws_pt))
-                _mbar_init(base + Int32(self.ws_bar_a_empty + 8 * s), Int32(self.ws_consumer_threads))
-            for s in cutlass.range_constexpr(self.ws_bd_stages):
-                _mbar_init(base + Int32(self.ws_bar_bd_full + 8 * s), Int32(self.ws_pt))
-                _mbar_init(base + Int32(self.ws_bar_bd_empty + 8 * s), Int32(self.ws_consumer_threads))
+                _mbar_init(base + Int32(self.ws_bar_a_raw + 8 * s), Int32(_PRODUCER_THREADS))
+                _mbar_init(base + Int32(self.ws_bar_a_full + 8 * s), Int32(_PRODUCER_THREADS))
+                _mbar_init(
+                    base + Int32(self.ws_bar_a_empty + 8 * s), Int32(self.ws_consumer_threads)
+                )
             for s in cutlass.range_constexpr(self.ws_bc_stages):
                 _mbar_init(base + Int32(self.ws_bar_bc_full + 8 * s), Int32(1))
                 _mbar_init(
-                    base + Int32(self.ws_bar_bc_empty + 8 * s),
-                    Int32(self.ws_pt if self.ws_decode == "producer" else self.ws_consumer_threads),
+                    base + Int32(self.ws_bar_bc_empty + 8 * s), Int32(self.ws_consumer_threads)
+                )
+            for s in cutlass.range_constexpr(_TILE_STAGES):
+                _mbar_init(base + Int32(self.ws_bar_t_full + 8 * s), Int32(_PRODUCER_THREADS))
+                _mbar_init(
+                    base + Int32(self.ws_bar_t_empty + 8 * s), Int32(self.ws_consumer_threads)
                 )
             _fence_mbar_init()
         cute.arch.sync_threads()
@@ -683,38 +660,30 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         else:
             k_size = self.intermediate_size
             n_total = self.hidden_size
-        n_tiles = Int32(n_total // self.ws_n)
-        route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(self.ws_m)
-        total_tiles = route_blocks * n_tiles
-        live = active_m * Int32(self.top_k)
-        warp = tid >> Int32(5)
         lut_addr = get_ptr_as_int64(trellis_lut, Int32(0))
-        if warp >= Int32(self.ws_consumer_warps):
+        if tid >= Int32(self.ws_consumer_threads):
             if cutlass.const_expr(self.ws_setmaxnreg):
-                cute.arch.warpgroup_reg_dealloc(self.ws_producer_regs)
-            producer = self._ws_producer
-            if cutlass.const_expr(self.ws_decode == "consumer"):
-                producer = self._ws_loader
-            producer(
+                cute.arch.warpgroup_reg_dealloc(_PRODUCER_REGS)
+            self._ws_producer(
                 is_fc1,
                 k_size,
                 n_total,
                 base,
                 tid - Int32(self.ws_consumer_threads),
-                cta,
-                grid,
-                n_tiles,
-                total_tiles,
-                live,
+                Int32(bidx),
+                Int32(gdim),
+                active_m,
                 a_src,
                 t0_w,
                 t1_w,
+                t0_global,
+                t1_global,
                 packed_route_indices,
                 block_expert_ids,
+                packed_route_count,
                 descriptor_map,
                 gate_suh,
                 up_suh,
-                lut_addr,
                 tier0_num_experts,
                 tier1_num_experts,
                 tier0_lo_experts,
@@ -724,35 +693,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             )
         else:
             if cutlass.const_expr(self.ws_setmaxnreg):
-                cute.arch.warpgroup_reg_alloc(self.ws_consumer_regs)
-            self._ws_consumer(
-                is_fc1,
-                k_size,
-                n_total,
-                base,
-                lut_addr,
-                tid,
-                cta,
-                grid,
-                n_tiles,
-                total_tiles,
-                live,
-                t0_global,
-                t1_global,
-                c_out,
-                packed_route_indices,
-                block_expert_ids,
-                descriptor_map,
-                tier0_num_experts,
-                tier1_num_experts,
-                tier0_lo_experts,
-                tier1_lo_experts,
-                tier0_hi_experts,
-                tier1_hi_experts,
-            )
+                cute.arch.warpgroup_reg_alloc(_CONSUMER_REGS)
+            self._ws_consumer(is_fc1, k_size, n_total, base, lut_addr, tid, c_out)
 
     # ------------------------------------------------------------------
-    # Tile metadata (identical in both roles)
+    # Tile schedule (producer side)
     # ------------------------------------------------------------------
 
     @cute.jit
@@ -770,7 +715,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tier0_hi_experts: Int32,
         tier1_hi_experts: Int32,
     ):
-        """(route block, N tile, combined expert, tier or -1, tier-local expert)."""
+        """(route block, N tile, combined expert, tier or -1, tier-local expert):
+        the cooperative kernel's _emit_tier_tile resolution."""
         rb = t // n_tiles
         nt = t - rb * n_tiles
         combined = block_expert_ids[rb].to(Int32)
@@ -875,8 +821,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tier0_lo_experts: Int32,
         tier1_lo_experts: Int32,
     ):
-        """(byte address of the tile's first K16 row, K16 row stride bytes,
-        bytes of one tile row) for one tile's compressed weights."""
+        """(byte address of the tile's first K16 weight row, K16 row stride in
+        bytes, bytes of one tile row). The tile's N16 records of one K16 row
+        are contiguous in both Trellis layouts."""
         bits = Int32(self.ws_bits[0])
         wbase = get_ptr_as_int64(t0_w, Int32(0))
         gate_count = tier0_lo_experts
@@ -887,6 +834,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tile_u32 = Int64(8) * bits.to(Int64)
         row_bytes = Int32(self.ws_n16 * 32) * bits
         if cutlass.const_expr(is_fc1):
+            # Projection-major W13: [gate plane | up plane], each [E, K16, N16/2].
             half_n16 = Int64(n_total // 32)
             proj = Int64(0)
             if nt >= n_tiles // Int32(2):
@@ -919,7 +867,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         wstride: Int64,
         row_bytes: Int32,
     ):
-        """One thread: four K16 rows (one 64-wide K step) of a tile's weights."""
+        """One thread: four K16 rows (one 64-wide K unit) of a tile's weights."""
         bar = base + Int32(self.ws_bar_bc_full) + slot * Int32(_BARRIER_BYTES)
         dst = base + Int32(self.ws_bc_off) + slot * Int32(self.ws_bc_slot)
         _mbar_arrive_expect_tx(bar, row_bytes * Int32(4))
@@ -942,11 +890,10 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         ptid: Int32,
         live: Int32,
     ):
-        """Row ids of the rows this producer thread copies (rows ptid/16 + 8i);
-        -1 for padding rows."""
-        rows_per_pass = self.ws_pt // 16
-        for i in cutlass.range_constexpr(self.ws_m // rows_per_pass):
-            r = (ptid >> Int32(4)) + Int32(rows_per_pass * i)
+        """Source row ids of the rows this producer thread copies (rows
+        ptid/16 + 8i): tokens for FC1, routes for FC2, -1 for padding."""
+        for i in cutlass.range_constexpr(self.ws_m // 8):
+            r = (ptid >> Int32(4)) + Int32(8 * i)
             idx = packed_route_indices[rb * Int32(self.ws_m) + r].to(Int32)
             row_id = Int32(-1)
             if idx < live:
@@ -968,13 +915,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         bar: Int32,
     ):
         """cp.async one 128-wide K block of the tile's rows into an A slot
-        (row r at r * 256 bytes, 16-byte chunks XOR-swizzled within each
-        64-wide half), then arrive on ``bar`` when this thread's copies land."""
+        (row r at r * 256 bytes; 16-byte chunk c at (c & 8) | ((c ^ r) & 7)),
+        then arrive on ``bar`` when this thread's copies land."""
         c = ptid & Int32(15)
         a_slot = base + Int32(self.ws_a_off) + slot * Int32(self.ws_a_slot)
-        rows_per_pass = self.ws_pt // 16
-        for i in cutlass.range_constexpr(self.ws_m // rows_per_pass):
-            r = (ptid >> Int32(4)) + Int32(rows_per_pass * i)
+        for i in cutlass.range_constexpr(self.ws_m // 8):
+            r = (ptid >> Int32(4)) + Int32(8 * i)
             row_id = rows[i]
             pos = (c & Int32(8)) | ((c & Int32(7)) ^ (r & Int32(7)))
             dst = a_slot + r * Int32(256) + pos * Int32(16)
@@ -993,17 +939,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         _cp_async_mbar_arrive_noinc(bar)
 
     @cute.jit
-    def _ws_rotate_block(
-        self,
-        base: Int32,
-        slot: Int32,
-        valid: Int32,
-        suh_w,
-        ptid: Int32,
-    ):
-        """fp16(had128(fp16(fp16(x) * suh))) in place, the cooperative kernel's
-        _rotate_a_pair arithmetic: half-warp per row, lane l holds the row's
-        elements 8l..8l+7 (one 16-byte chunk)."""
+    def _ws_rotate_block(self, base: Int32, slot: Int32, valid: Int32, suh_w, ptid: Int32):
+        """fp16(had128(fp16(fp16(x) * suh))) in place with the cooperative
+        kernel's _rotate_a_pair arithmetic: a half-warp per row, lane l holding
+        the row's elements 8l..8l+7 (one 16-byte chunk); three butterfly
+        stages in registers, four across the half-warp."""
         lane = ptid & Int32(31)
         l16 = lane & Int32(15)
         half = lane >> Int32(4)
@@ -1011,17 +951,20 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         pos_hi = l16 & Int32(8)
         pos_lo = l16 & Int32(7)
         a_slot = base + Int32(self.ws_a_off) + slot * Int32(self.ws_a_slot)
-        rows_per_iter = 2 * self.ws_pw
-        iters = self.ws_m // rows_per_iter
+        iters = self.ws_m // (2 * _PRODUCER_WARPS)
         group = min(iters, 2)
         for g in cutlass.range_constexpr(iters // group):
-            first_row = Int32(2) * (warp + Int32(self.ws_pw * g * group))
+            first_row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * g * group))
             if first_row < valid:
                 addrs = []
                 loads = []
                 for j in cutlass.range_constexpr(group):
-                    row = Int32(2) * (warp + Int32(self.ws_pw * (g * group + j))) + half
-                    addr = a_slot + row * Int32(256) + (pos_hi | (pos_lo ^ (row & Int32(7)))) * Int32(16)
+                    row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
+                    addr = (
+                        a_slot
+                        + row * Int32(256)
+                        + (pos_hi | (pos_lo ^ (row & Int32(7)))) * Int32(16)
+                    )
                     addrs.append(addr)
                     loads.append(ld_shared_v4_u32(addr))
                 for j in cutlass.range_constexpr(group):
@@ -1057,8 +1000,269 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     )
 
     @cute.jit
+    def _ws_publish_tile(
+        self,
+        base: Int32,
+        ti: Int32,
+        valid: Int32,
+        rb: Int32,
+        nt: Int32,
+        tier: Int32,
+        scale: cutlass.Float32,
+        packed_route_indices: cute.Tensor,
+        live: Int32,
+        ptid: Int32,
+    ):
+        """Write tile ``ti``'s header (valid rows or -1 for the end, route
+        block, N tile, tier, global scale) and route ids into the tile ring."""
+        slot = ti % Int32(_TILE_STAGES)
+        _mbar_wait(
+            base + Int32(self.ws_bar_t_empty) + slot * Int32(_BARRIER_BYTES),
+            ((ti // Int32(_TILE_STAGES)) & Int32(1)) ^ Int32(1),
+        )
+        hdr = base + Int32(self.ws_tile_off) + slot * Int32(self.ws_tile_slot)
+        if ptid == Int32(0):
+            st_shared_i32(hdr, valid)
+            st_shared_i32(hdr + Int32(4), rb)
+            st_shared_i32(hdr + Int32(8), nt)
+            st_shared_i32(hdr + Int32(12), tier)
+            st_shared_f32(hdr + Int32(16), scale)
+        if valid >= Int32(0) and ptid < Int32(self.ws_m):
+            idx = packed_route_indices[rb * Int32(self.ws_m) + ptid].to(Int32)
+            if idx >= live:
+                idx = Int32(-1)
+            st_shared_i32(hdr + Int32(4 * _TILE_HEADER_WORDS) + ptid * Int32(4), idx)
+        _mbar_arrive(base + Int32(self.ws_bar_t_full) + slot * Int32(_BARRIER_BYTES))
+
+    @cute.jit
+    def _ws_producer(
+        self,
+        is_fc1: cutlass.Constexpr,
+        k_size: cutlass.Constexpr,
+        n_total: cutlass.Constexpr,
+        base: Int32,
+        ptid: Int32,
+        cta: Int32,
+        grid: Int32,
+        active_m: Int32,
+        a_src: cute.Tensor,
+        t0_w: cute.Tensor,
+        t1_w: cute.Tensor,
+        t0_global: cute.Tensor,
+        t1_global: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        gate_suh: cute.Tensor,
+        up_suh: cute.Tensor,
+        tier0_num_experts: Int32,
+        tier1_num_experts: Int32,
+        tier0_lo_experts: Int32,
+        tier1_lo_experts: Int32,
+        tier0_hi_experts: Int32,
+        tier1_hi_experts: Int32,
+    ):
+        """Loads and FC1 rotation. Three cursors walk the CTA's tiles (tile
+        cta + i * grid, whole K per tile, the cooperative whole-tile order):
+        compressed weights (units of 64 K), input rows (blocks of 128 K) and
+        the block cursor. Block-cursor iteration j publishes the tile header
+        at a tile's first block, rotates block j, then refills the A slot and
+        the two weight units the consumers released when they finished block
+        j - 1, so loads run up to (A stages - 1) blocks and (weight stages)
+        units ahead of the consumers."""
+        lane = ptid & Int32(31)
+        l16 = lane & Int32(15)
+        n_tiles = Int32(n_total // self.ws_n)
+        route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(self.ws_m)
+        total_tiles = route_blocks * n_tiles
+        live = active_m * Int32(self.top_k)
+        units_per_tile = Int32(k_size // 64)
+        blocks_per_tile = Int32(k_size // 128)
+        na = self.ws_a_stages
+        nc = self.ws_bc_stages
+        meta = (
+            n_tiles,
+            block_expert_ids,
+            descriptor_map,
+            tier0_num_experts,
+            tier1_num_experts,
+            tier0_lo_experts,
+            tier1_lo_experts,
+            tier0_hi_experts,
+            tier1_hi_experts,
+        )
+        a_bar_base = Int32(self.ws_bar_a_full)
+        if cutlass.const_expr(is_fc1):
+            a_bar_base = Int32(self.ws_bar_a_raw)
+
+        # Weight cursor and prologue.
+        ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_tile(
+            is_fc1, cta, grid, total_tiles, *meta
+        )
+        cu = Int32(0)
+        crow0, cstride, crow_bytes = self._ws_weight_row(
+            is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
+            tier0_lo_experts, tier1_lo_experts,
+        )
+        bc_issued = Int32(0)
+        for i in cutlass.range_constexpr(nc):
+            if ct < total_tiles:
+                if ptid == Int32(0):
+                    self._ws_issue_bc(base, Int32(i), cu, crow0, cstride, crow_bytes)
+                bc_issued += Int32(1)
+                cu += Int32(1)
+                if cu == units_per_tile:
+                    cu = Int32(0)
+                    ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_tile(
+                        is_fc1, ct + grid, grid, total_tiles, *meta
+                    )
+                    if ct < total_tiles:
+                        crow0, cstride, crow_bytes = self._ws_weight_row(
+                            is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
+                            tier0_lo_experts, tier1_lo_experts,
+                        )
+
+        # Input-row cursor and prologue.
+        rows = cute.make_rmem_tensor((self.ws_m // 8,), Int32)
+        at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_tile(
+            is_fc1, cta, grid, total_tiles, *meta
+        )
+        ab = Int32(0)
+        if at < total_tiles:
+            self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
+        a_issued = Int32(0)
+        for i in cutlass.range_constexpr(na):
+            if at < total_tiles:
+                self._ws_issue_a(
+                    k_size, a_src, rows, base, Int32(i), ab, ptid,
+                    base + a_bar_base + Int32(i * _BARRIER_BYTES),
+                )
+                a_issued += Int32(1)
+                ab += Int32(1)
+                if ab == blocks_per_tile:
+                    ab = Int32(0)
+                    at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_tile(
+                        is_fc1, at + grid, grid, total_tiles, *meta
+                    )
+                    if at < total_tiles:
+                        self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
+
+        # Block cursor.
+        dt, drb, dnt, dcomb, dtier, dlocal = self._ws_next_tile(
+            is_fc1, cta, grid, total_tiles, *meta
+        )
+        blk = Int32(0)
+        ti = Int32(0)
+        suh_next = cute.make_rmem_tensor((4,), Uint32)
+        while dt < total_tiles:
+            dvalid = self._ws_valid_rows(packed_route_indices, drb, live, lane)
+            scale = cutlass.Float32(0.0)
+            if dtier == Int32(1):
+                scale = t1_global[dlocal].to(cutlass.Float32)
+            else:
+                scale = t0_global[dlocal].to(cutlass.Float32)
+            self._ws_publish_tile(
+                base, ti, dvalid, drb, dnt, dtier, scale, packed_route_indices, live, ptid
+            )
+            ti += Int32(1)
+            suh_addr = Int64(0)
+            if cutlass.const_expr(is_fc1):
+                suh_off = dcomb * Int32(k_size) + l16 * Int32(8)
+                suh_addr = get_ptr_as_int64(gate_suh, suh_off)
+                if dnt >= n_tiles // Int32(2):
+                    suh_addr = get_ptr_as_int64(up_suh, suh_off)
+                w0, w1, w2, w3 = ld_global_nc_v4_u32(suh_addr)
+                suh_next[0] = w0
+                suh_next[1] = w1
+                suh_next[2] = w2
+                suh_next[3] = w3
+            b = Int32(0)
+            while b < blocks_per_tile:
+                if cutlass.const_expr(is_fc1):
+                    suh_w = (suh_next[0], suh_next[1], suh_next[2], suh_next[3])
+                    if b + Int32(1) < blocks_per_tile:
+                        # The next block's SUH words load under this block's
+                        # wait and rotation.
+                        w0, w1, w2, w3 = ld_global_nc_v4_u32(
+                            suh_addr + Int64(b + Int32(1)) * Int64(256)
+                        )
+                        suh_next[0] = w0
+                        suh_next[1] = w1
+                        suh_next[2] = w2
+                        suh_next[3] = w3
+                    a_slot = blk % Int32(na)
+                    _mbar_wait(
+                        base + Int32(self.ws_bar_a_raw) + a_slot * Int32(_BARRIER_BYTES),
+                        (blk // Int32(na)) & Int32(1),
+                    )
+                    if cutlass.const_expr("norot" not in self.ws_exp):
+                        self._ws_rotate_block(base, a_slot, dvalid, suh_w, ptid)
+                    _mbar_arrive(base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES))
+                if blk >= Int32(1):
+                    # Consumers finished block blk - 1: its A slot and its two
+                    # weight units are free.
+                    if at < total_tiles:
+                        fill = a_issued % Int32(na)
+                        _mbar_wait(
+                            base + Int32(self.ws_bar_a_empty) + fill * Int32(_BARRIER_BYTES),
+                            ((a_issued // Int32(na)) & Int32(1)) ^ Int32(1),
+                        )
+                        self._ws_issue_a(
+                            k_size, a_src, rows, base, fill, ab, ptid,
+                            base + a_bar_base + fill * Int32(_BARRIER_BYTES),
+                        )
+                        a_issued += Int32(1)
+                        ab += Int32(1)
+                        if ab == blocks_per_tile:
+                            ab = Int32(0)
+                            at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_tile(
+                                is_fc1, at + grid, grid, total_tiles, *meta
+                            )
+                            if at < total_tiles:
+                                self._ws_load_rows(
+                                    is_fc1, rows, packed_route_indices, arb, ptid, live
+                                )
+                    for _u in cutlass.range_constexpr(2):
+                        if ct < total_tiles:
+                            fill = bc_issued % Int32(nc)
+                            if ptid == Int32(0):
+                                _mbar_wait(
+                                    base + Int32(self.ws_bar_bc_empty) + fill * Int32(_BARRIER_BYTES),
+                                    ((bc_issued // Int32(nc)) & Int32(1)) ^ Int32(1),
+                                )
+                                self._ws_issue_bc(base, fill, cu, crow0, cstride, crow_bytes)
+                            bc_issued += Int32(1)
+                            cu += Int32(1)
+                            if cu == units_per_tile:
+                                cu = Int32(0)
+                                ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_tile(
+                                    is_fc1, ct + grid, grid, total_tiles, *meta
+                                )
+                                if ct < total_tiles:
+                                    crow0, cstride, crow_bytes = self._ws_weight_row(
+                                        is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier,
+                                        t0_w, t1_w, tier0_lo_experts, tier1_lo_experts,
+                                    )
+                blk += Int32(1)
+                b += Int32(1)
+            dt, drb, dnt, dcomb, dtier, dlocal = self._ws_next_tile(
+                is_fc1, dt + grid, grid, total_tiles, *meta
+            )
+        # End of the CTA's tiles.
+        self._ws_publish_tile(
+            base, ti, Int32(-1), Int32(0), Int32(0), Int32(0), cutlass.Float32(0.0),
+            packed_route_indices, live, ptid,
+        )
+
+    # ------------------------------------------------------------------
+    # Consumer
+    # ------------------------------------------------------------------
+
+    @cute.jit
     def _ws_windows(self, gemm, row_addr: Int32, n16: Int32, lane: Int32, bits: cutlass.Constexpr):
-        """The cooperative kernel's per-lane t256 funnel windows of one tile."""
+        """The cooperative kernel's per-lane t256 funnel windows of one N16
+        record (_load_b_registers_trellis256 for a single tile)."""
         tile_u32 = 8 * bits
         tbase = n16 * Int32(tile_u32)
         wa = Uint32(0)
@@ -1095,368 +1299,10 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         return wa, wb
 
     @cute.jit
-    def _ws_decode_row(
-        self,
-        gemm,
-        bits: cutlass.Constexpr,
-        row_addr: Int32,
-        bd_addr: Int32,
-        pwarp: Int32,
-        lane: Int32,
-        lut_addr: Int64,
-    ):
-        """Decode this producer warp's N16 tiles of one K16 row into FP16 MMA
-        B fragments (lane l's 16 bytes at tile * 512 + l * 16)."""
-        was = []
-        wbs = []
-        for i in cutlass.range_constexpr(self.ws_tiles_per_producer):
-            n16 = pwarp * Int32(self.ws_tiles_per_producer) + Int32(i)
-            wa, wb = self._ws_windows(gemm, row_addr, n16, lane, bits)
-            was.append(wa)
-            wbs.append(wb)
-        for i in cutlass.range_constexpr(self.ws_tiles_per_producer):
-            n16 = pwarp * Int32(self.ws_tiles_per_producer) + Int32(i)
-            frag = cute.make_rmem_tensor((2, 2), Uint32)
-            gemm._scaled_dequant_b_fragment_trellis256_bits(frag, was[i], wbs[i], lut_addr, bits)
-            st_shared_v4_u32(
-                bd_addr + n16 * Int32(512) + lane * Int32(16),
-                frag[0, 0],
-                frag[0, 1],
-                frag[1, 0],
-                frag[1, 1],
-            )
-
-    @cute.jit
-    def _ws_producer(
-        self,
-        is_fc1: cutlass.Constexpr,
-        k_size: cutlass.Constexpr,
-        n_total: cutlass.Constexpr,
-        base: Int32,
-        ptid: Int32,
-        cta: Int32,
-        grid: Int32,
-        n_tiles: Int32,
-        total_tiles: Int32,
-        live: Int32,
-        a_src: cute.Tensor,
-        t0_w: cute.Tensor,
-        t1_w: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        block_expert_ids: cute.Tensor,
-        descriptor_map: cute.Tensor,
-        gate_suh: cute.Tensor,
-        up_suh: cute.Tensor,
-        lut_addr: Int64,
-        tier0_num_experts: Int32,
-        tier1_num_experts: Int32,
-        tier0_lo_experts: Int32,
-        tier1_lo_experts: Int32,
-        tier0_hi_experts: Int32,
-        tier1_hi_experts: Int32,
-    ):
-        lane = ptid & Int32(31)
-        pwarp = ptid >> Int32(5)
-        units_per_tile = Int32(k_size // 64)
-        blocks_per_tile = Int32(k_size // 128)
-        na = self.ws_a_stages
-        nb = self.ws_bd_stages
-        nc = self.ws_bc_stages
-        meta = (
-            n_tiles,
-            block_expert_ids,
-            descriptor_map,
-            tier0_num_experts,
-            tier1_num_experts,
-            tier0_lo_experts,
-            tier1_lo_experts,
-            tier0_hi_experts,
-            tier1_hi_experts,
-        )
-
-        # Weight (Bc) load cursor.
-        ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_tile(
-            is_fc1, cta, grid, total_tiles, *meta
-        )
-        cu = Int32(0)
-        crow0, cstride, crow_bytes = self._ws_weight_row(
-            is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
-            tier0_lo_experts, tier1_lo_experts,
-        )
-        for i in cutlass.range_constexpr(nc):
-            if ct < total_tiles:
-                if ptid == Int32(0):
-                    self._ws_issue_bc(base, Int32(i), cu, crow0, cstride, crow_bytes)
-                cu += Int32(1)
-                if cu == units_per_tile:
-                    cu = Int32(0)
-                    ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_tile(
-                        is_fc1, ct + grid, grid, total_tiles, *meta
-                    )
-                    if ct < total_tiles:
-                        crow0, cstride, crow_bytes = self._ws_weight_row(
-                            is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
-                            tier0_lo_experts, tier1_lo_experts,
-                        )
-
-        # Activation (A) load cursor.
-        rows = cute.make_rmem_tensor((self.ws_m // (self.ws_pt // 16),), Int32)
-        at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_tile(
-            is_fc1, cta, grid, total_tiles, *meta
-        )
-        ab = Int32(0)
-        if at < total_tiles:
-            self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
-        a_issued = Int32(0)
-        for i in cutlass.range_constexpr(na):
-            if at < total_tiles:
-                a_bar = Int32(self.ws_bar_a_full)
-                if cutlass.const_expr(is_fc1):
-                    a_bar = Int32(self.ws_bar_a_raw)
-                self._ws_issue_a(
-                    k_size, a_src, rows, base, Int32(i), ab, ptid,
-                    base + a_bar + Int32(i * _BARRIER_BYTES),
-                )
-                a_issued += Int32(1)
-                ab += Int32(1)
-                if ab == blocks_per_tile:
-                    ab = Int32(0)
-                    at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_tile(
-                        is_fc1, at + grid, grid, total_tiles, *meta
-                    )
-                    if at < total_tiles:
-                        self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
-
-        # Decode cursor.
-        dt, drb, dnt, dcomb, dtier, _dlocal = self._ws_next_tile(
-            is_fc1, cta, grid, total_tiles, *meta
-        )
-        step = Int32(0)
-        blk = Int32(0)
-        l16 = lane & Int32(15)
-        while dt < total_tiles:
-            dvalid = self._ws_valid_rows(packed_route_indices, drb, live, lane)
-            suh_addr = Int64(0)
-            suh_next = cute.make_rmem_tensor((4,), Uint32)
-            if cutlass.const_expr(is_fc1):
-                suh_off = dcomb * Int32(k_size) + l16 * Int32(8)
-                suh_addr = get_ptr_as_int64(gate_suh, suh_off)
-                if dnt >= n_tiles // Int32(2):
-                    suh_addr = get_ptr_as_int64(up_suh, suh_off)
-                w0, w1, w2, w3 = ld_global_nc_v4_u32(suh_addr)
-                suh_next[0] = w0
-                suh_next[1] = w1
-                suh_next[2] = w2
-                suh_next[3] = w3
-            b = Int32(0)
-            while b < blocks_per_tile:
-                a_slot = blk % Int32(na)
-                a_phase = (blk // Int32(na)) & Int32(1)
-                if cutlass.const_expr(is_fc1):
-                    suh_w = (suh_next[0], suh_next[1], suh_next[2], suh_next[3])
-                    _mbar_wait(base + Int32(self.ws_bar_a_raw) + a_slot * Int32(8), a_phase)
-                    if cutlass.const_expr("norot" not in self.ws_exp):
-                        self._ws_rotate_block(base, a_slot, dvalid, suh_w, ptid)
-                    _mbar_arrive(base + Int32(self.ws_bar_a_full) + a_slot * Int32(8))
-                    if b + Int32(1) < blocks_per_tile:
-                        w0, w1, w2, w3 = ld_global_nc_v4_u32(
-                            suh_addr + Int64(b + Int32(1)) * Int64(256)
-                        )
-                        suh_next[0] = w0
-                        suh_next[1] = w1
-                        suh_next[2] = w2
-                        suh_next[3] = w3
-                for q in cutlass.range_constexpr(8):
-                    if cutlass.const_expr(q == nb - 1):
-                        # Consumers have released block blk - 1: refill its slot.
-                        if a_issued < blk + Int32(na) and at < total_tiles:
-                            fill = a_issued % Int32(na)
-                            _mbar_wait(
-                                base + Int32(self.ws_bar_a_empty) + fill * Int32(8),
-                                ((a_issued // Int32(na)) & Int32(1)) ^ Int32(1),
-                            )
-                            a_bar = Int32(self.ws_bar_a_full)
-                            if cutlass.const_expr(is_fc1):
-                                a_bar = Int32(self.ws_bar_a_raw)
-                            self._ws_issue_a(
-                                k_size, a_src, rows, base, fill, ab, ptid,
-                                base + a_bar + fill * Int32(_BARRIER_BYTES),
-                            )
-                            a_issued += Int32(1)
-                            ab += Int32(1)
-                            if ab == blocks_per_tile:
-                                ab = Int32(0)
-                                at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_tile(
-                                    is_fc1, at + grid, grid, total_tiles, *meta
-                                )
-                                if at < total_tiles:
-                                    self._ws_load_rows(
-                                        is_fc1, rows, packed_route_indices, arb, ptid, live
-                                    )
-                    unit = step >> Int32(2)
-                    row4 = Int32(q % 4)
-                    bc_slot = unit % Int32(nc)
-                    if cutlass.const_expr(q % 4 == 0):
-                        _mbar_wait(
-                            base + Int32(self.ws_bar_bc_full) + bc_slot * Int32(8),
-                            (unit // Int32(nc)) & Int32(1),
-                        )
-                    bd_slot = step % Int32(nb)
-                    _mbar_wait(
-                        base + Int32(self.ws_bar_bd_empty) + bd_slot * Int32(8),
-                        ((step // Int32(nb)) & Int32(1)) ^ Int32(1),
-                    )
-                    bd_addr = base + Int32(self.ws_bd_off) + bd_slot * Int32(self.ws_bd_slot)
-                    bc_addr = base + Int32(self.ws_bc_off) + bc_slot * Int32(self.ws_bc_slot)
-                    if cutlass.const_expr("nodecode" in self.ws_exp):
-                        pass
-                    elif dtier == Int32(0):
-                        gemm0 = self.tier0.fc2
-                        if cutlass.const_expr(is_fc1):
-                            gemm0 = self.tier0.fc1
-                        self._ws_decode_row(
-                            gemm0,
-                            self.ws_bits[0],
-                            bc_addr + row4 * Int32(self.ws_n16 * 32 * self.ws_bits[0]),
-                            bd_addr,
-                            pwarp,
-                            lane,
-                            lut_addr,
-                        )
-                    else:
-                        gemm1 = self.tier1.fc2
-                        if cutlass.const_expr(is_fc1):
-                            gemm1 = self.tier1.fc1
-                        self._ws_decode_row(
-                            gemm1,
-                            self.ws_bits[1],
-                            bc_addr + row4 * Int32(self.ws_n16 * 32 * self.ws_bits[1]),
-                            bd_addr,
-                            pwarp,
-                            lane,
-                            lut_addr,
-                        )
-                    _mbar_arrive(base + Int32(self.ws_bar_bd_full) + bd_slot * Int32(8))
-                    if cutlass.const_expr(q % 4 == 3):
-                        # This thread finished reading the compressed slot.
-                        _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + bc_slot * Int32(8))
-                    if cutlass.const_expr(q % 4 == 1):
-                        # Refill the previous unit's slot, two decode steps after
-                        # its last reader (usually no wait).
-                        if unit >= Int32(1) and ct < total_tiles:
-                            prev = unit - Int32(1)
-                            prev_slot = prev % Int32(nc)
-                            if ptid == Int32(0):
-                                _mbar_wait(
-                                    base + Int32(self.ws_bar_bc_empty) + prev_slot * Int32(8),
-                                    (prev // Int32(nc)) & Int32(1),
-                                )
-                                self._ws_issue_bc(base, prev_slot, cu, crow0, cstride, crow_bytes)
-                            cu += Int32(1)
-                            if cu == units_per_tile:
-                                cu = Int32(0)
-                                ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_tile(
-                                    is_fc1, ct + grid, grid, total_tiles, *meta
-                                )
-                                if ct < total_tiles:
-                                    crow0, cstride, crow_bytes = self._ws_weight_row(
-                                        is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier,
-                                        t0_w, t1_w, tier0_lo_experts, tier1_lo_experts,
-                                    )
-                    step += Int32(1)
-                blk += Int32(1)
-                b += Int32(1)
-            dt, drb, dnt, dcomb, dtier, _dlocal = self._ws_next_tile(
-                is_fc1, dt + grid, grid, total_tiles, *meta
-            )
-
-    # ------------------------------------------------------------------
-    # Consumer
-    # ------------------------------------------------------------------
-
-    @cute.jit
     def _ws_kloop(
-        self,
-        active: cutlass.Constexpr,
-        k_size: cutlass.Constexpr,
-        acc,
-        base: Int32,
-        tid: Int32,
-        step: Int32,
-        blk: Int32,
-    ):
-        lane = tid & Int32(31)
-        cw = tid >> Int32(5)
-        na = self.ws_a_stages
-        nb = self.ws_bd_stages
-        mb_count = self.ws_mb
-        blocks = Int32(k_size // 128)
-        # ldmatrix lane geometry: lanes 0-15 rows 0-15 of the first K8 chunk,
-        # lanes 16-31 the same rows of the second.
-        lrow = lane & Int32(15)
-        lchunk = lane >> Int32(4)
-        b = Int32(0)
-        while b < blocks:
-            a_slot = blk % Int32(na)
-            _mbar_wait(
-                base + Int32(self.ws_bar_a_full) + a_slot * Int32(8),
-                (blk // Int32(na)) & Int32(1),
-            )
-            a_base = base + Int32(self.ws_a_off) + a_slot * Int32(self.ws_a_slot)
-            for q in cutlass.range_constexpr(8):
-                chain = (q % 4) // 2
-                bd_slot = step % Int32(nb)
-                _mbar_wait(
-                    base + Int32(self.ws_bar_bd_full) + bd_slot * Int32(8),
-                    (step // Int32(nb)) & Int32(1),
-                )
-                a_regs = []
-                for mb in cutlass.range_constexpr(active):
-                    row = Int32(16 * mb) + lrow
-                    c = Int32(2 * q) + lchunk
-                    pos = (c & Int32(8)) | ((c & Int32(7)) ^ (row & Int32(7)))
-                    a_regs.append(ldmatrix_m8n8x4_b16(a_base + row * Int32(256) + pos * Int32(16)))
-                bd_addr = base + Int32(self.ws_bd_off) + bd_slot * Int32(self.ws_bd_slot)
-                b_regs = []
-                for jj in cutlass.range_constexpr(2):
-                    b_regs.append(
-                        ld_shared_v4_u32(
-                            bd_addr + (cw * Int32(2) + Int32(jj)) * Int32(512) + lane * Int32(16)
-                        )
-                    )
-                _mbar_arrive(base + Int32(self.ws_bar_bd_empty) + bd_slot * Int32(8))
-                for jj in cutlass.range_constexpr(0 if "nomma" in self.ws_exp else 2):
-                    for mb in cutlass.range_constexpr(active):
-                        for h in cutlass.range_constexpr(2):
-                            o = (((chain * mb_count + mb) * 2 + jj) * 2 + h) * 4
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                acc[o][0],
-                                acc[o + 1][0],
-                                acc[o + 2][0],
-                                acc[o + 3][0],
-                                a_regs[mb][0],
-                                a_regs[mb][1],
-                                a_regs[mb][2],
-                                a_regs[mb][3],
-                                b_regs[jj][2 * h],
-                                b_regs[jj][2 * h + 1],
-                            )
-                            acc[o][0] = d0
-                            acc[o + 1][0] = d1
-                            acc[o + 2][0] = d2
-                            acc[o + 3][0] = d3
-                step += Int32(1)
-            _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(8))
-            blk += Int32(1)
-            b += Int32(1)
-        return step, blk
-
-    @cute.jit
-    def _ws_kloop_dec(
         self,
         is_fc1: cutlass.Constexpr,
         tier_idx: cutlass.Constexpr,
-        bits: cutlass.Constexpr,
         active: cutlass.Constexpr,
         k_size: cutlass.Constexpr,
         acc,
@@ -1466,10 +1312,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         step: Int32,
         blk: Int32,
     ):
-        """Consumer-decode K loop: each 128-wide block waits once for its A
-        slot and both compressed units, then runs eight straight-line K16
-        steps (window loads, t256 decode of this warp's two N16 tiles,
-        ldmatrix, MMAs) and releases the slots."""
+        """One tile's K loop. Each 128-wide block waits once for its A slot
+        and both compressed units, then runs eight straight-line K16 steps
+        (window loads, t256 decode of this warp's two N16 records, ldmatrix of
+        the ``active`` occupied M16 fragments, MMAs into the step's chain) and
+        releases the slots."""
+        bits = self.ws_bits[tier_idx]
         lane = tid & Int32(31)
         cw = tid >> Int32(5)
         na = self.ws_a_stages
@@ -1486,15 +1334,15 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             slot0 = unit0 % Int32(nc)
             slot1 = (unit0 + Int32(1)) % Int32(nc)
             _mbar_wait(
-                base + Int32(self.ws_bar_bc_full) + slot0 * Int32(8),
+                base + Int32(self.ws_bar_bc_full) + slot0 * Int32(_BARRIER_BYTES),
                 (unit0 // Int32(nc)) & Int32(1),
             )
             _mbar_wait(
-                base + Int32(self.ws_bar_bc_full) + slot1 * Int32(8),
+                base + Int32(self.ws_bar_bc_full) + slot1 * Int32(_BARRIER_BYTES),
                 ((unit0 + Int32(1)) // Int32(nc)) & Int32(1),
             )
             _mbar_wait(
-                base + Int32(self.ws_bar_a_full) + a_slot * Int32(8),
+                base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES),
                 (blk // Int32(na)) & Int32(1),
             )
             a_base = base + Int32(self.ws_a_off) + a_slot * Int32(self.ws_a_slot)
@@ -1550,196 +1398,13 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             acc[o + 1][0] = d1
                             acc[o + 2][0] = d2
                             acc[o + 3][0] = d3
-            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(8))
-            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(8))
-            _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(8))
+            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
+            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
+            _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
             step += Int32(8)
             blk += Int32(1)
             b += Int32(1)
         return step, blk
-
-    @cute.jit
-    def _ws_loader(
-        self,
-        is_fc1: cutlass.Constexpr,
-        k_size: cutlass.Constexpr,
-        n_total: cutlass.Constexpr,
-        base: Int32,
-        ptid: Int32,
-        cta: Int32,
-        grid: Int32,
-        n_tiles: Int32,
-        total_tiles: Int32,
-        live: Int32,
-        a_src: cute.Tensor,
-        t0_w: cute.Tensor,
-        t1_w: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        block_expert_ids: cute.Tensor,
-        descriptor_map: cute.Tensor,
-        gate_suh: cute.Tensor,
-        up_suh: cute.Tensor,
-        lut_addr: Int64,
-        tier0_num_experts: Int32,
-        tier1_num_experts: Int32,
-        tier0_lo_experts: Int32,
-        tier1_lo_experts: Int32,
-        tier0_hi_experts: Int32,
-        tier1_hi_experts: Int32,
-    ):
-        """Producer of the consumer-decode layout: compressed weights by bulk
-        copy (thread 0), input rows by cp.async, FC1 rotation one block ahead
-        of the consumers. Iteration j rotates block j, then refills the slots
-        the consumers released when they finished block j - 1."""
-        lane = ptid & Int32(31)
-        l16 = lane & Int32(15)
-        units_per_tile = Int32(k_size // 64)
-        blocks_per_tile = Int32(k_size // 128)
-        na = self.ws_a_stages
-        nc = self.ws_bc_stages
-        meta = (
-            n_tiles,
-            block_expert_ids,
-            descriptor_map,
-            tier0_num_experts,
-            tier1_num_experts,
-            tier0_lo_experts,
-            tier1_lo_experts,
-            tier0_hi_experts,
-            tier1_hi_experts,
-        )
-        a_bar_base = Int32(self.ws_bar_a_full)
-        if cutlass.const_expr(is_fc1):
-            a_bar_base = Int32(self.ws_bar_a_raw)
-
-        # Weight (Bc) cursor and prologue.
-        ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_tile(
-            is_fc1, cta, grid, total_tiles, *meta
-        )
-        cu = Int32(0)
-        crow0, cstride, crow_bytes = self._ws_weight_row(
-            is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
-            tier0_lo_experts, tier1_lo_experts,
-        )
-        bc_issued = Int32(0)
-        for i in cutlass.range_constexpr(nc):
-            if ct < total_tiles:
-                if ptid == Int32(0):
-                    self._ws_issue_bc(base, Int32(i), cu, crow0, cstride, crow_bytes)
-                bc_issued += Int32(1)
-                cu += Int32(1)
-                if cu == units_per_tile:
-                    cu = Int32(0)
-                    ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_tile(
-                        is_fc1, ct + grid, grid, total_tiles, *meta
-                    )
-                    if ct < total_tiles:
-                        crow0, cstride, crow_bytes = self._ws_weight_row(
-                            is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
-                            tier0_lo_experts, tier1_lo_experts,
-                        )
-
-        # Input-row (A) cursor and prologue.
-        rows = cute.make_rmem_tensor((self.ws_m // (self.ws_pt // 16),), Int32)
-        at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_tile(
-            is_fc1, cta, grid, total_tiles, *meta
-        )
-        ab = Int32(0)
-        if at < total_tiles:
-            self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
-        a_issued = Int32(0)
-        for i in cutlass.range_constexpr(na):
-            if at < total_tiles:
-                self._ws_issue_a(
-                    k_size, a_src, rows, base, Int32(i), ab, ptid,
-                    base + a_bar_base + Int32(i * _BARRIER_BYTES),
-                )
-                a_issued += Int32(1)
-                ab += Int32(1)
-                if ab == blocks_per_tile:
-                    ab = Int32(0)
-                    at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_tile(
-                        is_fc1, at + grid, grid, total_tiles, *meta
-                    )
-                    if at < total_tiles:
-                        self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
-
-        # Block cursor (rotation for FC1, refills for both).
-        dt, drb, dnt, dcomb, _dtier, _dlocal = self._ws_next_tile(
-            is_fc1, cta, grid, total_tiles, *meta
-        )
-        blk = Int32(0)
-        while dt < total_tiles:
-            dvalid = Int32(0)
-            suh_addr = Int64(0)
-            if cutlass.const_expr(is_fc1):
-                dvalid = self._ws_valid_rows(packed_route_indices, drb, live, lane)
-                suh_off = dcomb * Int32(k_size) + l16 * Int32(8)
-                suh_addr = get_ptr_as_int64(gate_suh, suh_off)
-                if dnt >= n_tiles // Int32(2):
-                    suh_addr = get_ptr_as_int64(up_suh, suh_off)
-            b = Int32(0)
-            while b < blocks_per_tile:
-                if cutlass.const_expr(is_fc1):
-                    suh_w = ld_global_nc_v4_u32(suh_addr + Int64(b) * Int64(256))
-                    a_slot = blk % Int32(na)
-                    _mbar_wait(
-                        base + Int32(self.ws_bar_a_raw) + a_slot * Int32(8),
-                        (blk // Int32(na)) & Int32(1),
-                    )
-                    if cutlass.const_expr("norot" not in self.ws_exp):
-                        self._ws_rotate_block(base, a_slot, dvalid, suh_w, ptid)
-                    _mbar_arrive(base + Int32(self.ws_bar_a_full) + a_slot * Int32(8))
-                if blk >= Int32(1):
-                    # Consumers finished block blk - 1: its A slot and its two
-                    # compressed units are free.
-                    if at < total_tiles:
-                        fill = a_issued % Int32(na)
-                        _mbar_wait(
-                            base + Int32(self.ws_bar_a_empty) + fill * Int32(8),
-                            ((a_issued // Int32(na)) & Int32(1)) ^ Int32(1),
-                        )
-                        self._ws_issue_a(
-                            k_size, a_src, rows, base, fill, ab, ptid,
-                            base + a_bar_base + fill * Int32(_BARRIER_BYTES),
-                        )
-                        a_issued += Int32(1)
-                        ab += Int32(1)
-                        if ab == blocks_per_tile:
-                            ab = Int32(0)
-                            at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_tile(
-                                is_fc1, at + grid, grid, total_tiles, *meta
-                            )
-                            if at < total_tiles:
-                                self._ws_load_rows(
-                                    is_fc1, rows, packed_route_indices, arb, ptid, live
-                                )
-                    for _u in cutlass.range_constexpr(2):
-                        if ct < total_tiles:
-                            fill = bc_issued % Int32(nc)
-                            if ptid == Int32(0):
-                                _mbar_wait(
-                                    base + Int32(self.ws_bar_bc_empty) + fill * Int32(8),
-                                    ((bc_issued // Int32(nc)) & Int32(1)) ^ Int32(1),
-                                )
-                                self._ws_issue_bc(base, fill, cu, crow0, cstride, crow_bytes)
-                            bc_issued += Int32(1)
-                            cu += Int32(1)
-                            if cu == units_per_tile:
-                                cu = Int32(0)
-                                ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_tile(
-                                    is_fc1, ct + grid, grid, total_tiles, *meta
-                                )
-                                if ct < total_tiles:
-                                    crow0, cstride, crow_bytes = self._ws_weight_row(
-                                        is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier,
-                                        t0_w, t1_w, tier0_lo_experts, tier1_lo_experts,
-                                    )
-                blk += Int32(1)
-                b += Int32(1)
-            dt, drb, dnt, dcomb, _dtier, _dlocal = self._ws_next_tile(
-                is_fc1, dt + grid, grid, total_tiles, *meta
-            )
 
     @cute.jit
     def _ws_store(
@@ -1748,13 +1413,15 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         n_total: cutlass.Constexpr,
         acc,
         tid: Int32,
+        hdr: Int32,
         nt: Int32,
-        rb: Int32,
         valid: Int32,
         scale: cutlass.Float32,
         c_out: cute.Tensor,
-        packed_route_indices: cute.Tensor,
     ):
+        """fp16((chain0 + chain1) * scale) for the warp's 32 columns of every
+        occupied row (the cooperative kernel's fold and _write_bf16x2_shared
+        rounding), stored straight to the route's output row."""
         lane = tid & Int32(31)
         cw = tid >> Int32(5)
         mb_count = self.ws_mb
@@ -1763,7 +1430,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             for rh in cutlass.range_constexpr(2):
                 row = Int32(16 * mb + 8 * rh) + (lane >> Int32(2))
                 if row < valid:
-                    route = packed_route_indices[rb * Int32(self.ws_m) + row].to(Int32)
+                    route = ld_shared_i32_relaxed(
+                        hdr + Int32(4 * _TILE_HEADER_WORDS) + row * Int32(4)
+                    )
                     row_base = Int64(route) * Int64(n_total)
                     for jj in cutlass.range_constexpr(2):
                         for h in cutlass.range_constexpr(2):
@@ -1786,76 +1455,47 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         base: Int32,
         lut_addr: Int64,
         tid: Int32,
-        cta: Int32,
-        grid: Int32,
-        n_tiles: Int32,
-        total_tiles: Int32,
-        live: Int32,
-        t0_global: cute.Tensor,
-        t1_global: cute.Tensor,
         c_out: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        block_expert_ids: cute.Tensor,
-        descriptor_map: cute.Tensor,
-        tier0_num_experts: Int32,
-        tier1_num_experts: Int32,
-        tier0_lo_experts: Int32,
-        tier1_lo_experts: Int32,
-        tier0_hi_experts: Int32,
-        tier1_hi_experts: Int32,
     ):
-        lane = tid & Int32(31)
-        meta = (
-            n_tiles,
-            block_expert_ids,
-            descriptor_map,
-            tier0_num_experts,
-            tier1_num_experts,
-            tier0_lo_experts,
-            tier1_lo_experts,
-            tier0_hi_experts,
-            tier1_hi_experts,
-        )
         n_acc = 2 * self.ws_mb * 2 * 2 * 4
         acc = [cute.make_rmem_tensor((1,), cutlass.Float32) for _ in range(n_acc)]
         step = Int32(0)
         blk = Int32(0)
-        t, rb, nt, _comb, tier, local = self._ws_next_tile(
-            is_fc1, cta, grid, total_tiles, *meta
-        )
-        while t < total_tiles:
-            valid = self._ws_valid_rows(packed_route_indices, rb, live, lane)
-            scale = cutlass.Float32(0.0)
-            if tier == Int32(1):
-                scale = t1_global[local].to(cutlass.Float32)
+        ti = Int32(0)
+        done = Int32(0)
+        while done == Int32(0):
+            slot = ti % Int32(_TILE_STAGES)
+            _mbar_wait(
+                base + Int32(self.ws_bar_t_full) + slot * Int32(_BARRIER_BYTES),
+                (ti // Int32(_TILE_STAGES)) & Int32(1),
+            )
+            hdr = base + Int32(self.ws_tile_off) + slot * Int32(self.ws_tile_slot)
+            valid = ld_shared_i32_relaxed(hdr)
+            if valid < Int32(0):
+                done = Int32(1)
             else:
-                scale = t0_global[local].to(cutlass.Float32)
-            for i in cutlass.range_constexpr(n_acc):
-                acc[i][0] = cutlass.Float32(0.0)
-            occupied = (valid + Int32(15)) // Int32(16)
-            if occupied < Int32(1):
-                occupied = Int32(1)
-            if occupied > Int32(self.ws_mb):
-                occupied = Int32(self.ws_mb)
-            for active in cutlass.range_constexpr(1, self.ws_mb + 1):
-                if occupied == Int32(active):
-                    if cutlass.const_expr(self.ws_decode == "producer"):
-                        step, blk = self._ws_kloop(active, k_size, acc, base, tid, step, blk)
-                    else:
+                nt = ld_shared_i32_relaxed(hdr + Int32(8))
+                tier = ld_shared_i32_relaxed(hdr + Int32(12))
+                scale = ld_shared_f32(hdr + Int32(16))
+                for i in cutlass.range_constexpr(n_acc):
+                    acc[i][0] = cutlass.Float32(0.0)
+                occupied = (valid + Int32(15)) // Int32(16)
+                if occupied < Int32(1):
+                    occupied = Int32(1)
+                if occupied > Int32(self.ws_mb):
+                    occupied = Int32(self.ws_mb)
+                for active in cutlass.range_constexpr(1, self.ws_mb + 1):
+                    if occupied == Int32(active):
                         if tier == Int32(0):
-                            step, blk = self._ws_kloop_dec(
-                                is_fc1, 0, self.ws_bits[0], active, k_size, acc, base, lut_addr,
-                                tid, step, blk,
+                            step, blk = self._ws_kloop(
+                                is_fc1, 0, active, k_size, acc, base, lut_addr, tid, step, blk
                             )
                         else:
-                            step, blk = self._ws_kloop_dec(
-                                is_fc1, 1, self.ws_bits[1], active, k_size, acc, base, lut_addr,
-                                tid, step, blk,
+                            step, blk = self._ws_kloop(
+                                is_fc1, 1, active, k_size, acc, base, lut_addr, tid, step, blk
                             )
-                    self._ws_store(
-                        active, n_total, acc, tid, nt, rb, valid, scale, c_out,
-                        packed_route_indices,
-                    )
-            t, rb, nt, _comb, tier, local = self._ws_next_tile(
-                is_fc1, t + grid, grid, total_tiles, *meta
-            )
+                        self._ws_store(
+                            active, n_total, acc, tid, hdr, nt, valid, scale, c_out
+                        )
+                _mbar_arrive(base + Int32(self.ws_bar_t_empty) + slot * Int32(_BARRIER_BYTES))
+                ti += Int32(1)

@@ -2087,8 +2087,6 @@ def compile_mixed_trellis(
     token_major_rotation: bool = False,
     fused_input_rotation: bool = False,
     warp_specialized: bool = False,
-    ws_producer_warps: int = 4,
-    ws_decode_role: str = "consumer",
 ) -> MixedTrellisCompileResult:
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
@@ -2172,8 +2170,6 @@ def compile_mixed_trellis(
                 tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
                 tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
                 max_shared_mem=int(max_shared_mem),
-                producer_warps=int(ws_producer_warps),
-                decode_role=str(ws_decode_role),
             )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
