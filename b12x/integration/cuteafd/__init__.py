@@ -58,6 +58,8 @@ from ._common import (  # noqa: F401
     AotProgram,
     DSV4Geometry,
     GLMGeometry,
+    MIMO_V2_FLASH,
+    MiMoGeometry,
     Operand,
     Scalar,
     exportable_compilation,

@@ -45,6 +45,8 @@ __all__ = [
     "FLASH",
     "GLM53",
     "GLMGeometry",
+    "MIMO_V2_FLASH",
+    "MiMoGeometry",
     "Operand",
     "PRO",
     "Scalar",
@@ -179,6 +181,74 @@ class GLMGeometry:
 
 
 GLM53 = GLMGeometry()
+
+
+@dataclass(frozen=True)
+class MiMoGeometry:
+    """Static MiMo V2 (``mimo_v2_flash``) geometry baked into the ``mimo_*`` programs.
+
+    Hybrid GQA: ``full`` layers (64 query / 4 KV heads, no sink, RoPE theta
+    5e6) and 128-token sliding-window ``swa`` layers (64 / 8 heads, learned
+    per-head sink, theta 1e4); QK head 192 with RoPE on its first 64 dims
+    (NeoX halves), V head 128 scaled by ``v_scale``; SwiGLU dense layer 0 and
+    a top-8 sigmoid router over 256 experts, no shared expert.
+
+    KV records are BF16, one per token: every KV head's 192-wide key, then
+    every head's 128-wide value (``record_elems``). Full layers keep records
+    in a paged cache (``page_rows`` per page); SWA layers keep a per-sequence
+    ring of ``ring_rows`` records (``ring_rows >= window + max verify rows -
+    1`` so a rejected speculative suffix never overwrites a key the next step
+    still needs).
+    """
+
+    name: str = "mimo_v2_flash"
+    hidden: int = 4096
+    heads: int = 64
+    full_kv_heads: int = 4
+    swa_kv_heads: int = 8
+    qk_head_dim: int = 192
+    v_head_dim: int = 128
+    rope_dim: int = 64
+    window: int = 128
+    ring_rows: int = 256
+    page_rows: int = 64
+    v_scale: float = 0.707
+    full_rope_theta: float = 5.0e6
+    swa_rope_theta: float = 1.0e4
+    dense_inter: int = 16384
+    moe_inter: int = 2048
+    routed_experts: int = 256
+    top_k: int = 8
+    norm_eps: float = 1.0e-5
+
+    def __post_init__(self) -> None:
+        if (self.qk_head_dim, self.v_head_dim, self.rope_dim) != (192, 128, 64):
+            raise ValueError("MiMo programs require QK/V/RoPE head dims 192/128/64")
+        if self.heads % self.full_kv_heads or self.heads % self.swa_kv_heads:
+            raise ValueError("query heads must divide into KV groups")
+        if self.ring_rows < self.window or self.ring_rows & (self.ring_rows - 1):
+            raise ValueError("ring_rows must be a power of two covering the window")
+
+    def kv_heads(self, kind: str) -> int:
+        return {"full": self.full_kv_heads, "swa": self.swa_kv_heads}[kind]
+
+    def record_elems(self, kind: str) -> int:
+        """BF16 elements of one token's KV record: K heads then V heads."""
+        return self.kv_heads(kind) * (self.qk_head_dim + self.v_head_dim)
+
+    def qkv_width(self, kind: str) -> int:
+        """Joint ``[q_proj; k_proj; v_proj]`` output width."""
+        return self.heads * self.qk_head_dim + self.record_elems(kind)
+
+    @property
+    def softmax_scale(self) -> float:
+        return self.qk_head_dim ** -0.5
+
+    def rope_theta(self, kind: str) -> float:
+        return {"full": self.full_rope_theta, "swa": self.swa_rope_theta}[kind]
+
+
+MIMO_V2_FLASH = MiMoGeometry()
 
 
 _TORCH_TO_CUTE = {
