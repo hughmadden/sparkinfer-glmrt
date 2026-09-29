@@ -33,6 +33,7 @@ from b12x._lib.intrinsics import (
     div_rn_f32,
     fabs_f32,
     fmax_f32,
+    fmin_f32,
     ld_global_v4_u32,
     pack_f32x2_to_bfloat2,
     st_global_v4_u32,
@@ -218,7 +219,11 @@ class GlmRankNormPackKV:
 
     threads = 256
 
-    def __init__(self, *, q_rank: int, eps: float, page_rows: int = 64, record_bytes: int = 656):
+    def __init__(self, *, q_rank: int, eps: float, page_rows: int = 64, record_bytes: int = 656,
+                 rope: int = 2 * ROPE_PAIRS):
+        self.rope = int(rope)
+        if self.rope not in (0, 2 * ROPE_PAIRS):
+            raise ValueError("the latent record carries 64 RoPE dims or none (GLM 5.3 Flash)")
         self.q_rank = int(q_rank)
         if self.q_rank % self.threads:
             raise ValueError("q_lora_rank must divide by the CTA width")
@@ -232,7 +237,7 @@ class GlmRankNormPackKV:
     def __call__(self, qkv: cute.Pointer, q_norm: cute.Pointer, kv_norm: cute.Pointer,
                  positions: cute.Pointer, slots: cute.Pointer, cos_sin: cute.Pointer,
                  q_resid: cute.Pointer, cache: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        width = self.q_rank + 576
+        width = self.q_rank + 512 + self.rope
         m = Int64(rows)
         self.kernel(
             cute.make_tensor(qkv, cute.make_layout((m, width), stride=(width, 1))),
@@ -303,7 +308,7 @@ class GlmRankNormPackKV:
                     scale_ptr = cute.make_ptr(Float32, record + Int64(512) + Int64(4) * Int64(tidx // Int32(32)),
                                               cute.AddressSpace.gmem, assumed_align=4)
                     scale_ptr[0] = scale
-            elif tidx < Int32(128 + ROPE_PAIRS):
+            elif cutlass.const_expr(self.rope > 0) and tidx < Int32(128 + ROPE_PAIRS):
                 pair = tidx - Int32(128)
                 position = Int64(positions[token])
                 cs = cute.make_ptr(Float32, Int64(cos_sin.toint()) + position * Int64(64 * 4),
@@ -506,12 +511,17 @@ class GlmIndexPost:
 
 
 class GlmSwiGLU:
-    """``hidden = bf16(bf16(silu(gate)) * up)`` from ``gate_up [rows, 2I]`` (gate first)."""
+    """``hidden = bf16(bf16(silu(gate)) * up)`` from ``gate_up [rows, 2I]`` (gate first).
+
+    With ``limit`` (GLM 5.3 Flash's ``swiglu_limit``) the BF16 gate is clamped
+    to ``<= limit`` and up to ``[-limit, limit]`` first, as the reference.
+    """
 
     threads = 256
 
-    def __init__(self, inter: int):
+    def __init__(self, inter: int, limit: float | None = None):
         self.inter = int(inter)
+        self.limit = None if limit is None else float(limit)
 
     @cute.jit
     def __call__(self, gate_up: cute.Pointer, hidden: cute.Pointer, rows: Int32, stream: cuda.CUstream):
@@ -528,6 +538,9 @@ class GlmSwiGLU:
         if col < Int64(self.inter):
             gate = Float32(gate_up[row, col])
             up = Float32(gate_up[row, Int64(self.inter) + col])
+            if cutlass.const_expr(self.limit is not None):
+                gate = fmin_f32(gate, Float32(self.limit))
+                up = fmax_f32(fmin_f32(up, Float32(self.limit)), Float32(-self.limit))
             silu = _bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
             hidden[row, col] = (silu * up).to(BFloat16)
 

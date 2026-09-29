@@ -94,6 +94,8 @@ class Fp8MoeGeometry:
 GEOMETRIES = {
     "mimo": Fp8MoeGeometry("mimo", hidden=4096, experts=256, top_k=8, intermediate=2048),
     "glm": Fp8MoeGeometry("glm", hidden=6144, experts=256, top_k=8, intermediate=2048),
+    # GLM 5.3 Flash: 288 experts, SwiGLU clamped at 10 as its config says.
+    "glmf": Fp8MoeGeometry("glmf", hidden=4096, experts=288, top_k=8, intermediate=2048, swiglu_limit=10.0),
 }
 
 

@@ -48,7 +48,6 @@ from ._common import GLM53, GLMGeometry, Operand, Scalar, compile_program
 
 __all__ = ["compile_glm_sparse_mla_aot", "decode_buckets"]
 
-_QK = 576
 _DV = 512
 _CAND = 64
 _ALIGN = 1024
@@ -58,10 +57,25 @@ def _align(value: int) -> int:
     return (int(value) + _ALIGN - 1) // _ALIGN * _ALIGN
 
 
-def _traits():
-    from b12x.attention._shared.mla.traits import resolve_unplanned_traits
+def _qk(g) -> int:
+    """Absorbed query / record width: 576 (GLM 5.x, RoPE) or 512 (GLM 5.3 Flash, no RoPE)."""
+    return int(g.latent_dim)
 
+
+def _topk(g) -> int:
+    """Selected slots per row (GLM 5.3 Flash pads index_topk + its open tail pool to 2112)."""
+    return int(getattr(g, "sparse_topk", g.index_topk))
+
+
+def _traits(g=GLM53):
+    from b12x.attention._shared.mla.traits import ModelType, resolve_unplanned_traits
+
+    if _qk(g) == 512:
+        return resolve_unplanned_traits(512, torch.uint8, g.record_bytes, model_type=ModelType.GLM_NEXT)
     return resolve_unplanned_traits(_QK, torch.uint8, 656)
+
+
+_QK = 576
 
 
 def decode_buckets(g: GLMGeometry, max_rows: int) -> tuple[tuple[int, int, int], ...]:
@@ -70,12 +84,12 @@ def decode_buckets(g: GLMGeometry, max_rows: int) -> tuple[tuple[int, int, int],
 
     sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     h_blocks = g.heads // 16
-    max_chunks = -(-g.index_topk // _CAND)
+    max_chunks = -(-_topk(g) // _CAND)
     caps = sorted({c for c in (1, 8, int(max_rows)) if c <= int(max_rows)})
     out = []
     for cap in caps:
         _, splits, per_split = plan_unified_decode_splits(
-            topk=g.index_topk, max_chunks=max_chunks, num_tokens=cap, h_blocks=h_blocks, sm_count=sms)
+            topk=_topk(g), max_chunks=max_chunks, num_tokens=cap, h_blocks=h_blocks, sm_count=sms)
         out.append((cap, int(splits), int(per_split)))
     return tuple(out)
 
@@ -98,8 +112,8 @@ class _Prefill:
         from b12x.attention._shared.mla.traits import ComputeMode
 
         self.g = g
-        self.heads, self.topk = g.heads, g.index_topk
-        traits = replace(_traits(), compute_mode=ComputeMode.FP8)
+        self.heads, self.topk, self.qk = g.heads, _topk(g), _qk(g)
+        traits = replace(_traits(g), compute_mode=ComputeMode.FP8)
         tiles = -(-self.topk // _CAND)
         self.kernels = []
         for mg_n_hg, active, offset in _mg_head_partitions(self.heads, int(traits.hpb)):
@@ -111,7 +125,7 @@ class _Prefill:
                 valid_hpb, replicate = active, 1
             self.kernels.append(UnifiedPrefillMGKernel(
                 traits, layout, g.page_rows, tiles, replicate_h=replicate, num_heads=self.heads,
-                q_stride=(self.heads * _QK, _QK, 1), indices_stride0=self.topk,
+                q_stride=(self.heads * self.qk, self.qk, 1), indices_stride0=self.topk,
                 output_stride=(self.heads * _DV, _DV, 1), out_lse_stride=(self.heads, 1),
                 has_sink=False, topk=self.topk, has_extra=False, pbs_extra=1, num_main_tiles=0,
                 extra_topk=0, extra_indices_stride0=self.topk, row_xor=False, head_offset=offset,
@@ -125,7 +139,7 @@ class _Prefill:
                  stream: cuda.CUstream):
         m = Int64(rows)
         n = self.heads
-        qt = cute.make_tensor(q, cute.make_layout((m, n, _QK), stride=(n * _QK, _QK, 1)))
+        qt = cute.make_tensor(q, cute.make_layout((m, n, self.qk), stride=(n * self.qk, self.qk, 1)))
         kv = cute.make_tensor(kv_cache, cute.make_layout((1,)))
         idx = cute.make_tensor(indices, cute.make_layout((m, self.topk), stride=(self.topk, 1)))
         lens = cute.make_tensor(lengths, cute.make_layout((m,)))
@@ -149,8 +163,8 @@ class _Decode:
         from b12x.attention._shared.mla.smem import make_smem_layout
 
         self.g = g
-        self.heads, self.topk = g.heads, g.index_topk
-        traits = _traits()
+        self.heads, self.topk, self.qk = g.heads, _topk(g), _qk(g)
+        traits = _traits(g)
         layout = make_smem_layout(traits)
         hpb = int(traits.hpb)
         if self.heads % hpb:
@@ -161,8 +175,8 @@ class _Decode:
         for _, splits, per_split in self.buckets:
             self.kernels.append(UnifiedDecodeKernel(
                 traits, layout, g.page_rows, per_split, h_blocks=n // hpb, num_splits=splits,
-                num_heads=n, q_head_dim=_QK, topk=self.topk, extra_topk=0,
-                q_stride=(n * _QK, _QK, 1), swa_indices_stride0=self.topk,
+                num_heads=n, q_head_dim=self.qk, topk=self.topk, extra_topk=0,
+                q_stride=(n * self.qk, self.qk, 1), swa_indices_stride0=self.topk,
                 extra_indices_stride0=self.topk,
                 mid_out_stride=(n * splits * _DV, splits * _DV, _DV, 1),
                 mid_lse_stride=(n * splits, splits, 1), has_extra=False, pbs_extra=1,
@@ -186,7 +200,7 @@ class _Decode:
         partial_lse = cute.make_tensor(
             cute.make_ptr(Float32, base + lse_off, cute.AddressSpace.gmem, assumed_align=16),
             cute.make_layout((m, n, s), stride=(n * s, s, 1)))
-        qt = cute.make_tensor(q, cute.make_layout((m, n, _QK), stride=(n * _QK, _QK, 1)))
+        qt = cute.make_tensor(q, cute.make_layout((m, n, self.qk), stride=(n * self.qk, self.qk, 1)))
         kv = cute.make_tensor(kv_cache, cute.make_layout((1,)))
         idx = cute.make_tensor(indices, cute.make_layout((m, self.topk), stride=(self.topk, 1)))
         lens = cute.make_tensor(lengths, cute.make_layout((m,)))
@@ -219,8 +233,11 @@ class _Decode:
                 self._run(2, q, kv_cache, indices, lengths, out, base, rows, stream)
 
 
-def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill", max_rows: int = 1):
-    """GLM latent sparse MLA; see the module docstring for the ABI."""
+def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill", max_rows: int = 1,
+                               name: str = "glm_sparse_mla"):
+    """GLM latent sparse MLA; see the module docstring for the ABI. A GLM 5.3
+    Flash geometry (``GLMFGeometry``) selects the 512-wide query, 528-byte
+    records (``ModelType.GLM_NEXT``) and its 2112-slot index rows."""
     if route == "prefill":
         launch = _Prefill(g)
         buckets = ()
@@ -229,9 +246,9 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         buckets = launch.buckets
     else:
         raise ValueError("route must be 'prefill' or 'decode'")
-    n, k = g.heads, g.index_topk
+    n, k = g.heads, _topk(g)
     operands = (
-        Operand("q", torch.bfloat16, f"[rows,{n},{_QK}]"),
+        Operand("q", torch.bfloat16, f"[rows,{n},{_qk(g)}]"),
         Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]"),
         Operand("indices", torch.int32, f"[rows,{k}]", align=4),
         Operand("lengths", torch.int32, "[rows]", align=4),
@@ -239,7 +256,7 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         Operand("scratch", torch.uint8, "[sparse_mla_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name=f"glm_sparse_mla_{route}", operands=operands, scalars=(Scalar("rows"),),
+        launch, name=f"{name}_{route}", operands=operands, scalars=(Scalar("rows"),),
         key=(n, k, int(max_rows), launch.key),
         geometry={"heads": n, "route": route, "max_rows": int(max_rows), "topk": k,
                   "softmax_scale": g.softmax_scale, "decode_buckets": [list(b) for b in buckets]},
