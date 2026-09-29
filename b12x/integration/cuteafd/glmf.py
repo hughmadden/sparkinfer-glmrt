@@ -308,12 +308,24 @@ def compile_glmf_ffn_aot(g: GLMFGeometry = GLM53_FLASH, *, inter: int, max_rows:
     )
 
 
+class _RouterScores:
+    def __init__(self, e: int, h: int):
+        from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
+
+        self.proj = RoutedBf16Projection(e, h, out_dtype=cutlass.Float32)
+
+    def key(self) -> tuple:
+        return self.proj.key()
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w: cute.Pointer, logits: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.proj(x, w, logits, rows, stream)
+
+
 def compile_glmf_router_scores_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
     """FP32 router logits ``x @ gate^T`` (BF16 operands, FP32 accumulation)."""
-    from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
-
     e, h = g.routed_experts, g.hidden
-    launch = RoutedBf16Projection(e, h, out_dtype=cutlass.Float32)
+    launch = _RouterScores(e, h)
     return compile_program(
         launch, name="glmf_router_scores",
         operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
