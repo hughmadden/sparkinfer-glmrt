@@ -78,8 +78,17 @@ AUTO_PREFILL_ROWS = 2048
 AUTO_STREAM_ROWS = 1024
 # MXFP4 (MiMo V2.6 Pro) live rows above which ``auto`` streams (wire input);
 # RTX PRO 6000 (us, GEMV / stream): TP6 1024 rows 1662 / 1729, 2048 2598 / 1907;
-# TP1 512 8965 / 7952, 1024 13654 / 10653. GB10 to be measured.
+# TP1 512 8965 / 7952, 1024 13654 / 10653.
 AUTO_MXFP4_STREAM_ROWS = 1024
+# GB10 (SM121), TP6 slice, us, GEMV / stream (block-scaled gate/up): 512 rows
+# 7458 / 8537, 768 8771 / 8454, 1024 10057 / 8946.
+AUTO_MXFP4_STREAM_ROWS_SM121 = 640
+# The MXFP4 stream gate/up multiplies the E4M3 wire rows by the packed E2M1
+# weights with block-scaled MMAs (UE8M0 per 32 on both operands: the same
+# products, FP32 accumulation) instead of widening both to BF16. GB10 TP6
+# (us, widen / block-scaled): 4096 rows 7175 / 5833, 1024 5012 / 4794; the
+# layer outputs match the widening kernel's in all but ~1e-4 of BF16 values.
+MXFP4_STREAM_QMMA = True
 # Column groups (8 columns each) per CTA of the decode gate/up GEMV: one for
 # single-row programs (GB10, us, interleaved x3, 4 groups -> 1: MiMo TP4
 # 236 -> 230, GLM TP4 347 -> 341, MiMo TP2 450 -> 445; bitwise equal; the
@@ -103,7 +112,8 @@ def _streams(wire: bool, weights: str = "fp8") -> bool:
 def auto_large_rows(wire: bool, weights: str = "fp8") -> int:
     """Live-row threshold of ``auto``'s large route (``stream`` or ``prefill``)."""
     if weights == "mxfp4":
-        return AUTO_MXFP4_STREAM_ROWS
+        gb10 = tuple(torch.cuda.get_device_capability()) == (12, 1)
+        return AUTO_MXFP4_STREAM_ROWS_SM121 if gb10 else AUTO_MXFP4_STREAM_ROWS
     return AUTO_STREAM_ROWS if _streams(wire) else AUTO_PREFILL_ROWS
 
 
@@ -316,7 +326,8 @@ class _StreamRoute:
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
                             chunked=True)
         if g.weights == "mxfp4":
-            self.gate_up = StreamMxfp4GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
+            self.gate_up = StreamMxfp4GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+                                             qmma=MXFP4_STREAM_QMMA)
             self.down = StreamMxfp4Down(hidden=h, inter=i, experts=e)
         else:
             self.gate_up = StreamFp8GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)

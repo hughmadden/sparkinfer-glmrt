@@ -37,9 +37,11 @@ from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32,
     cp_async4_shared_global,
     cp_async_u32_shared_global,
+    e2m1x8_to_qmma_e2m1x8,
     ld_shared_u32,
     ld_shared_v4_u32,
     ldmatrix_m8n8x4_b16,
+    mxfp8_mma_m16n8k32_f32_e2m1,
     pack_f32x2_to_bfloat2,
     shared_ptr_to_u32,
     st_global_u32,
@@ -92,8 +94,11 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     w_ring = 3
     w_k = 256
 
-    def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0):
+    def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False):
         super().__init__(inter=inter, hidden=hidden, experts=experts, limit=limit)
+        # qmma: block-scaled E4M3 x E2M1 MMAs (m16n8k32, UE8M0 per 32 on both
+        # operands) read the wire rows and the packed weights as they are.
+        self.qmma = bool(qmma)
         if self.hidden % 512:
             raise ValueError("MXFP4 stream gate/up needs H % 512 == 0 (16-byte scale rows)")
         self.w_blocks = self.hidden // self.w_k
@@ -105,7 +110,7 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
 
     def key(self) -> tuple:
         return ("stream_gate_up_mxfp4", 1, self.inter, self.hidden, self.experts, self.limit, self.a_ring,
-                self.w_ring)
+                self.w_ring, self.qmma)
 
     def _storage(self, w_layout):
         class Storage:
@@ -234,73 +239,128 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                     # block + w_ring - 1.
                     if (step % Int32(2) == Int32(0)) & (block + Int32(self.w_ring - 1) < Int32(self.w_blocks)):
                         self._load_w(block + Int32(self.w_ring - 1), tma_g, tma_u, t_wg, t_wu, t_ws, mbar, w_tile)
-                if active:
-                    stage = step % Int32(self.a_ring)
-                    a_base = sa + stage * Int32(self.a_bytes)
-                    w_base = sw + slot * Int32(2 * self.half_bytes)
-                    s_base = ss + stage * Int32(self.s_bytes)
-                    half = step % Int32(2)
-                    rsc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Uint32)
-                    for mt in cutlass.range_constexpr(2):
-                        for hi in cutlass.range_constexpr(2):
-                            srow = warp_m * Int32(32) + Int32(16 * mt + 8 * hi) + g
-                            rsc[2 * mt + hi] = ld_shared_u32(s_base + srow * Int32(4))
-                    # This step's four UE8M0 weight scales of each column tile nt.
-                    wsc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Uint32)
-                    for nt in cutlass.range_constexpr(4):
-                        col = Int32((nt // 2) * self.cols + (nt % 2) * 8) + warp_n * Int32(16) + g
-                        wsc[nt] = ld_shared_u32(sc + col * Int32(self.sc_stride) + step * Int32(4))
-                    for ks in cutlass.range_constexpr(4):
-                        a = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+                if cutlass.const_expr(self.qmma):
+                    if active:
+                        stage = step % Int32(self.a_ring)
+                        a_base = sa + stage * Int32(self.a_bytes)
+                        w_base = sw + slot * Int32(2 * self.half_bytes)
+                        s_base = ss + stage * Int32(self.s_bytes)
+                        half = step % Int32(2)
+                        # A scales: row g (lanes with even j) or g + 8 (odd j) of each m16 tile,
+                        # this step's four UE8M0 bytes (one per 32-K block, byte ks).
+                        asc = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Uint32)
                         for mt in cutlass.range_constexpr(2):
-                            row = warp_m * Int32(32) + Int32(16 * mt) + (lane % Int32(16))
-                            chunk = Int32(2 * ks) + lane // Int32(16)
-                            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
-                                a_base + row * Int32(self.k_step) + ((chunk ^ (row % Int32(8))) * Int32(16)))
-                            a[4 * mt] = a0
-                            a[4 * mt + 1] = a1
-                            a[4 * mt + 2] = a2
-                            a[4 * mt + 3] = a3
-                        # B of the A permutation: MMA half q of this 32-K chunk takes
-                        # physical K 16q + 4j .. +3 of column g, E2M1 bytes 8q + 2j, +1
-                        # of the chunk's 16-byte unit (half * 4 + ks of the 128-byte row).
-                        wb = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
+                            srow = warp_m * Int32(32) + Int32(16 * mt) + g + (lane & Int32(1)) * Int32(8)
+                            asc[mt] = ld_shared_u32(s_base + srow * Int32(4))
+                        wsc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Uint32)
                         for nt in cutlass.range_constexpr(4):
-                            nrow = warp_n * Int32(16) + Int32((nt % 2) * 8) + g
-                            unit = half * Int32(4) + Int32(ks)
-                            v0, v1, v2, v3 = ld_shared_v4_u32(
-                                w_base + Int32((nt // 2) * self.half_bytes) + nrow * Int32(self.k_step)
-                                + ((unit ^ (nrow % Int32(8))) * Int32(16)))
-                            lo_word = v0
-                            hi_word = v2
-                            if j >= Int32(2):
-                                lo_word = v1
-                                hi_word = v3
-                            factor = ue8m0_bf16x2((wsc[nt] >> Uint32(8 * ks)) & Uint32(0xFF))
-                            b0, b1 = e2m1x4_scaled_bf16((lo_word >> shift) & Uint32(0xFFFF), factor)
-                            b2, b3 = e2m1x4_scaled_bf16((hi_word >> shift) & Uint32(0xFFFF), factor)
-                            wb[4 * nt] = b0
-                            wb[4 * nt + 1] = b1
-                            wb[4 * nt + 2] = b2
-                            wb[4 * nt + 3] = b3
-                        for mt in cutlass.range_constexpr(2):
-                            xa = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
-                            for r in cutlass.range_constexpr(4):
-                                exponent = (rsc[2 * mt + r % 2] >> Uint32(8 * ks)) & Uint32(0xFF)
-                                lo, hi = _e4m3x4_scaled_bf16x2x2(a[4 * mt + r], _u32_as_f32(exponent << Uint32(23)))
-                                xa[2 * r] = lo
-                                xa[2 * r + 1] = hi
-                            for q in cutlass.range_constexpr(2):
-                                for nt in cutlass.range_constexpr(4):
+                            col = Int32((nt // 2) * self.cols + (nt % 2) * 8) + warp_n * Int32(16) + g
+                            wsc[nt] = ld_shared_u32(sc + col * Int32(self.sc_stride) + step * Int32(4))
+                        for ks in cutlass.range_constexpr(4):
+                            a = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+                            for mt in cutlass.range_constexpr(2):
+                                row = warp_m * Int32(32) + Int32(16 * mt) + (lane % Int32(16))
+                                chunk = Int32(2 * ks) + lane // Int32(16)
+                                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                                    a_base + row * Int32(self.k_step) + ((chunk ^ (row % Int32(8))) * Int32(16)))
+                                a[4 * mt] = a0
+                                a[4 * mt + 1] = a1
+                                a[4 * mt + 2] = a2
+                                a[4 * mt + 3] = a3
+                            for nt in cutlass.range_constexpr(4):
+                                # Column g's K 4j..4j+3 (bytes 2j, 2j+1) and 16+4j.. (bytes 8+2j, 9+2j)
+                                # of the 32-K chunk's 16-byte unit.
+                                nrow = warp_n * Int32(16) + Int32((nt % 2) * 8) + g
+                                unit = half * Int32(4) + Int32(ks)
+                                v0, v1, v2, v3 = ld_shared_v4_u32(
+                                    w_base + Int32((nt // 2) * self.half_bytes) + nrow * Int32(self.k_step)
+                                    + ((unit ^ (nrow % Int32(8))) * Int32(16)))
+                                lo_word = v0
+                                hi_word = v2
+                                if j >= Int32(2):
+                                    lo_word = v1
+                                    hi_word = v3
+                                packed = ((lo_word >> shift) & Uint32(0xFFFF)) | (((hi_word >> shift) & Uint32(0xFFFF))
+                                                                                 << Uint32(16))
+                                b0, b1 = e2m1x8_to_qmma_e2m1x8(packed)
+                                for mt in cutlass.range_constexpr(2):
                                     f = 4 * (4 * mt + nt)
-                                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                    d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
                                         acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                                        xa[4 * q], xa[4 * q + 2], xa[4 * q + 1], xa[4 * q + 3],
-                                        wb[4 * nt + 2 * q], wb[4 * nt + 2 * q + 1])
+                                        a[4 * mt], a[4 * mt + 1], a[4 * mt + 2], a[4 * mt + 3], b0, b1,
+                                        asc[mt], wsc[nt], bid_a=ks, bid_b=ks)
                                     acc[f] = d0
                                     acc[f + 1] = d1
                                     acc[f + 2] = d2
                                     acc[f + 3] = d3
+                else:
+                    if active:
+                        stage = step % Int32(self.a_ring)
+                        a_base = sa + stage * Int32(self.a_bytes)
+                        w_base = sw + slot * Int32(2 * self.half_bytes)
+                        s_base = ss + stage * Int32(self.s_bytes)
+                        half = step % Int32(2)
+                        rsc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Uint32)
+                        for mt in cutlass.range_constexpr(2):
+                            for hi in cutlass.range_constexpr(2):
+                                srow = warp_m * Int32(32) + Int32(16 * mt + 8 * hi) + g
+                                rsc[2 * mt + hi] = ld_shared_u32(s_base + srow * Int32(4))
+                        # This step's four UE8M0 weight scales of each column tile nt.
+                        wsc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Uint32)
+                        for nt in cutlass.range_constexpr(4):
+                            col = Int32((nt // 2) * self.cols + (nt % 2) * 8) + warp_n * Int32(16) + g
+                            wsc[nt] = ld_shared_u32(sc + col * Int32(self.sc_stride) + step * Int32(4))
+                        for ks in cutlass.range_constexpr(4):
+                            a = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+                            for mt in cutlass.range_constexpr(2):
+                                row = warp_m * Int32(32) + Int32(16 * mt) + (lane % Int32(16))
+                                chunk = Int32(2 * ks) + lane // Int32(16)
+                                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                                    a_base + row * Int32(self.k_step) + ((chunk ^ (row % Int32(8))) * Int32(16)))
+                                a[4 * mt] = a0
+                                a[4 * mt + 1] = a1
+                                a[4 * mt + 2] = a2
+                                a[4 * mt + 3] = a3
+                            # B of the A permutation: MMA half q of this 32-K chunk takes
+                            # physical K 16q + 4j .. +3 of column g, E2M1 bytes 8q + 2j, +1
+                            # of the chunk's 16-byte unit (half * 4 + ks of the 128-byte row).
+                            wb = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
+                            for nt in cutlass.range_constexpr(4):
+                                nrow = warp_n * Int32(16) + Int32((nt % 2) * 8) + g
+                                unit = half * Int32(4) + Int32(ks)
+                                v0, v1, v2, v3 = ld_shared_v4_u32(
+                                    w_base + Int32((nt // 2) * self.half_bytes) + nrow * Int32(self.k_step)
+                                    + ((unit ^ (nrow % Int32(8))) * Int32(16)))
+                                lo_word = v0
+                                hi_word = v2
+                                if j >= Int32(2):
+                                    lo_word = v1
+                                    hi_word = v3
+                                factor = ue8m0_bf16x2((wsc[nt] >> Uint32(8 * ks)) & Uint32(0xFF))
+                                b0, b1 = e2m1x4_scaled_bf16((lo_word >> shift) & Uint32(0xFFFF), factor)
+                                b2, b3 = e2m1x4_scaled_bf16((hi_word >> shift) & Uint32(0xFFFF), factor)
+                                wb[4 * nt] = b0
+                                wb[4 * nt + 1] = b1
+                                wb[4 * nt + 2] = b2
+                                wb[4 * nt + 3] = b3
+                            for mt in cutlass.range_constexpr(2):
+                                xa = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+                                for r in cutlass.range_constexpr(4):
+                                    exponent = (rsc[2 * mt + r % 2] >> Uint32(8 * ks)) & Uint32(0xFF)
+                                    lo, hi = _e4m3x4_scaled_bf16x2x2(a[4 * mt + r], _u32_as_f32(exponent << Uint32(23)))
+                                    xa[2 * r] = lo
+                                    xa[2 * r + 1] = hi
+                                for q in cutlass.range_constexpr(2):
+                                    for nt in cutlass.range_constexpr(4):
+                                        f = 4 * (4 * mt + nt)
+                                        d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                            acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                            xa[4 * q], xa[4 * q + 2], xa[4 * q + 1], xa[4 * q + 3],
+                                            wb[4 * nt + 2 * q], wb[4 * nt + 2 * q + 1])
+                                        acc[f] = d0
+                                        acc[f + 1] = d1
+                                        acc[f + 2] = d2
+                                        acc[f + 3] = d3
             cute.arch.cp_async_wait_group(0)
             if active:
                 for mt in cutlass.range_constexpr(2):
