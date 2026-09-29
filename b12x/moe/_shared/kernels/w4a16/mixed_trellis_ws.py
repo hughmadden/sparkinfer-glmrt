@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32, Int64, Uint32, dsl_user_op
@@ -345,7 +346,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tier1_fc2_experts: cutlass.Int32,
         active_m: cutlass.Int32,
         grid_x: cutlass.Int32,
-        stream,
+        stream: cuda.CUstream,
         tier0_gate_experts: cutlass.Int32,
         tier1_gate_experts: cutlass.Int32,
         tier0_up_experts: cutlass.Int32,
