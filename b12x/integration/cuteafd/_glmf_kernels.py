@@ -232,14 +232,89 @@ class GlmfKdaConv:
         out[row, ch] = div_rn_f32(acc, Float32(1.0) + cute.math.exp(-acc, fastmath=False)).to(BFloat16)
 
 
+class GlmfKdaConvRows(GlmfKdaConv):
+    """``GlmfKdaConv`` for prefill capacities, with its arithmetic: a thread
+    owns ``VEC`` adjacent channels of ``ROWS`` consecutive rows and reads each
+    in-projection row once (a sliding window of ``ROWS + 3`` rows) instead of
+    once per tap. Grid ``(ceil(rows / ROWS), C / (256 * VEC))``."""
+
+    ROWS = 8
+    VEC = 4
+
+    def __init__(self, *, channels: int, proj_width: int):
+        super().__init__(channels=channels, proj_width=proj_width)
+        if self.channels % (self.threads * self.VEC) or self.proj_width % self.VEC:
+            raise ValueError("conv channels must divide into 4-channel CTA rows")
+
+    @cute.jit
+    def __call__(self, proj: cute.Pointer, weight: cute.Pointer, conv_state: cute.Pointer, slots: cute.Pointer,
+                 seq_first: cute.Pointer, out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        m = Int64(rows)
+        c = self.channels
+        self.kernel(
+            cute.make_tensor(proj, cute.make_layout((m, self.proj_width), stride=(self.proj_width, 1))),
+            cute.make_tensor(weight, cute.make_layout((c, CONV_TAPS), stride=(CONV_TAPS, 1))),
+            conv_state,
+            cute.make_tensor(slots, cute.make_layout((m,))),
+            cute.make_tensor(seq_first, cute.make_layout((m,))),
+            cute.make_tensor(out, cute.make_layout((m, c), stride=(c, 1))),
+            rows,
+        ).launch(grid=((rows + Int32(self.ROWS - 1)) // Int32(self.ROWS), c // (self.threads * self.VEC), 1),
+                 block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, proj: cute.Tensor, weight: cute.Tensor, conv_state: cute.Pointer, slots: cute.Tensor,
+               seq_first: cute.Tensor, out: cute.Tensor, rows: Int32):
+        r0 = Int64(cute.arch.block_idx()[0]) * Int64(self.ROWS)
+        ch0 = (Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])) \
+            * Int64(self.VEC)
+        n = Int64(rows)
+        window = self.ROWS + CONV_TAPS - 1
+        # xs[i, v]: in-projection row r0 - 3 + i, channel ch0 + v (zero outside [0, rows)).
+        xs = cute.make_rmem_tensor(cute.make_layout((window, self.VEC), stride=(self.VEC, 1)), Float32)
+        for i in cutlass.range_constexpr(window):
+            src = r0 - Int64(CONV_TAPS - 1) + Int64(i)
+            for v in cutlass.range_constexpr(self.VEC):
+                xs[i, v] = Float32(0.0)
+            if src >= Int64(0) and src < n:
+                for v in cutlass.range_constexpr(self.VEC):
+                    xs[i, v] = Float32(proj[src, ch0 + Int64(v)])
+        w = cute.make_rmem_tensor(cute.make_layout((self.VEC, CONV_TAPS), stride=(CONV_TAPS, 1)), Float32)
+        for v in cutlass.range_constexpr(self.VEC):
+            for j in cutlass.range_constexpr(CONV_TAPS):
+                w[v, j] = Float32(weight[ch0 + Int64(v), j])
+        for r in cutlass.range_constexpr(self.ROWS):
+            row = r0 + Int64(r)
+            if row < n:
+                first = Int64(seq_first[row])
+                slot = Int64(slots[row])
+                rel = row - first
+                state = _conv_state(conv_state, slot, self.channels)
+                for v in cutlass.range_constexpr(self.VEC):
+                    ch = ch0 + Int64(v)
+                    acc = Float32(0.0)
+                    for j in cutlass.range_constexpr(CONV_TAPS):
+                        s = rel - Int64(CONV_TAPS - 1 - j)
+                        x = Float32(0.0)
+                        if s >= Int64(0):
+                            x = xs[r + j, v]
+                        elif slot >= Int64(0):
+                            x = Float32(state[Int64(CONV_TAPS - 1) + s, ch])
+                        acc = acc + w[v, j] * x
+                    out[row, ch] = div_rn_f32(acc, Float32(1.0) + cute.math.exp(-acc, fastmath=False)).to(BFloat16)
+
+
 class GlmfKdaConvState:
     """After the conv: each sequence's last step row stores its last three
-    in-projection rows (older ones from the previous state) into its slot."""
+    in-projection rows (older ones from the previous state) into its slot.
+    ``row_block`` (prefill capacities): outside speculative steps a CTA scans
+    that many rows for sequence ends instead of one CTA per row."""
 
     threads = 256
 
-    def __init__(self, *, channels: int, proj_width: int):
+    def __init__(self, *, channels: int, proj_width: int, row_block: int = 0):
         self.channels, self.proj_width = int(channels), int(proj_width)
+        self.row_block = int(row_block)
 
     @cute.jit
     def __call__(self, proj: cute.Pointer, conv_state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
@@ -247,6 +322,10 @@ class GlmfKdaConvState:
         """With ``spec`` != 0 every row's q/k/v in-projection goes to ``replay``
         (``[REPLAY_ROWS, channels]`` BF16) and the state stays as it was."""
         m = Int64(rows)
+        grid_rows = rows
+        if cutlass.const_expr(self.row_block > 0):
+            if spec == Int32(0):
+                grid_rows = (rows + Int32(self.row_block - 1)) // Int32(self.row_block)
         self.kernel(
             cute.make_tensor(proj, cute.make_layout((m, self.proj_width), stride=(self.proj_width, 1))),
             conv_state,
@@ -254,11 +333,38 @@ class GlmfKdaConvState:
             cute.make_tensor(seq_first, cute.make_layout((m,))),
             cute.make_tensor(replay, cute.make_layout((m, self.channels), stride=(self.channels, 1))),
             spec, rows,
-        ).launch(grid=(rows, self.channels // self.threads, 1), block=(self.threads, 1, 1), stream=stream)
+        ).launch(grid=(grid_rows, self.channels // self.threads, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, proj: cute.Tensor, conv_state: cute.Pointer, slots: cute.Tensor, seq_first: cute.Tensor,
                replay: cute.Tensor, spec: Int32, rows: Int32):
+        if cutlass.const_expr(self.row_block > 0):
+            if spec == Int32(0):
+                self.scan(proj, conv_state, slots, seq_first, rows)
+            else:
+                self.one_row(proj, conv_state, slots, seq_first, replay, spec, rows)
+        else:
+            self.one_row(proj, conv_state, slots, seq_first, replay, spec, rows)
+
+    @cute.jit
+    def scan(self, proj: cute.Tensor, conv_state: cute.Pointer, slots: cute.Tensor, seq_first: cute.Tensor,
+             rows: Int32):
+        ch = Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
+        for r in cutlass.range_constexpr(self.row_block):
+            row = Int64(cute.arch.block_idx()[0]) * Int64(self.row_block) + Int64(r)
+            if row < Int64(rows):
+                first = Int64(seq_first[row])
+                last = row + Int64(1) == Int64(rows)
+                if not last:
+                    last = Int64(seq_first[row + Int64(1)]) != first
+                slot = Int64(slots[row])
+                if last and slot >= Int64(0):
+                    _shift_conv_state(_conv_state(conv_state, slot, self.channels), proj, first,
+                                      row - first + Int64(1), ch)
+
+    @cute.jit
+    def one_row(self, proj: cute.Tensor, conv_state: cute.Pointer, slots: cute.Tensor, seq_first: cute.Tensor,
+                replay: cute.Tensor, spec: Int32, rows: Int32):
         row = Int64(cute.arch.block_idx()[0])
         ch = Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
         first = Int64(seq_first[row])

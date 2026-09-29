@@ -80,6 +80,7 @@ from ._glmf_kernels import (
     GlmfKdaCommit,
     GlmfKdaConv,
     GlmfKdaConvCommit,
+    GlmfKdaConvRows,
     GlmfKdaConvState,
     GlmfKdaGatedNorm,
     GlmfKdaRecurrent,
@@ -384,8 +385,10 @@ class _Kda:
         # f_b(f_a) and g_b(g_a): two 128 -> D products off the in-projection row.
         self.fg = BatchedBf16Gemm(n=d, k=g.kda_head_dim, batch=2, a_row=p, a_batch=g.kda_head_dim,
                                   o_row=2 * d, o_batch=d)
-        self.conv = GlmfKdaConv(channels=3 * d, proj_width=p)
-        self.conv_state = GlmfKdaConvState(channels=3 * d, proj_width=p)
+        # Prefill capacities: the row-blocked conv and the scanning conv-state update.
+        wide = int(max_rows) > CHUNKED_MIN_ROWS
+        self.conv = (GlmfKdaConvRows if wide else GlmfKdaConv)(channels=3 * d, proj_width=p)
+        self.conv_state = GlmfKdaConvState(channels=3 * d, proj_width=p, row_block=64 if wide else 0)
         self.recurrent = GlmfKdaRecurrent(heads=g.kda_heads, lower_bound=g.gate_lower_bound, qkv_width=3 * d,
                                           g_stride=2 * d, b_stride=p)
         self.norm = GlmfKdaGatedNorm(heads=g.kda_heads, eps=g.norm_eps, gate_stride=2 * d)
