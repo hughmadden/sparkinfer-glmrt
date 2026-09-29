@@ -158,7 +158,10 @@ class _Route:
             warps_h = 8 if h >= 6144 else 4
             self.gate_up = GroupedFp8Gemv(n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
                                           gather=True)
-            self.down = GroupedFp8Gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=4 if i >= 512 else i // 128)
+            # K split over warps in whole 128 blocks: 4 where they divide evenly,
+            # else the largest divisor <= 8 of the blocks (Qwen's 640: 5 warps).
+            warps_i = 4 if i % 512 == 0 else max(d for d in range(1, 9) if (i // 128) % d == 0)
+            self.down = GroupedFp8Gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=warps_i)
         else:
             self.gate_up = GroupedFp8Gemm(n=i, k=h, experts=e, halves=2)
             self.down = GroupedFp8Gemm(n=h, k=i, experts=e, halves=1)
