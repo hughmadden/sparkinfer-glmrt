@@ -146,7 +146,7 @@ class _Fp8Switch:
     ``fp8_rows`` bits that turn this projection's FP8 route on."""
 
     def __init__(self, n: int, k: int, *, fp8: bool, row_scales: bool = False, prefill_rows: int | None = None,
-                 prefill_mask: int = 0xFF):
+                 prefill_mask: int = 0xFF, wide_rows: int = 0):
         from ._fp8_weights import MmaFp8Gemv, gemv_warps
         from ._glmf_fp8 import BlockFp8Projection
 
@@ -154,6 +154,7 @@ class _Fp8Switch:
         self.bf16 = glm_projection(self.n, self.k, wide=prefill_rows is not None)
         self.prefill = None
         self.fp8 = None
+        self.fp8_wide = None
         self.prefill_mask = int(prefill_mask)
         if fp8 and prefill_rows is not None:
             self.prefill = BlockFp8Projection(self.n, self.k, int(prefill_rows), row_scales=row_scales)
@@ -161,10 +162,17 @@ class _Fp8Switch:
             warps, groups = FP8_GEMV_CONFIG.get((self.n, self.k), (gemv_warps(self.k), 4))
             self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_ROWS, warps=warps, groups=groups,
                                   row_scales=row_scales)
+            # wide_rows: steps of FP8_ROWS < rows <= wide_rows (up to fp8_rows) run a
+            # multi-tile GEMV over the same E4M3 copy instead of the BF16 projection.
+            if int(wide_rows) > FP8_ROWS:
+                self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=int(wide_rows), warps=warps, groups=groups,
+                                           row_scales=row_scales)
+        self.max_fp8_rows = FP8_ROWS if self.fp8_wide is None else int(wide_rows)
 
     def key(self) -> tuple:
         return (self.bf16.key(), None if self.fp8 is None else self.fp8.key(),
-                None if self.prefill is None else (self.prefill.key(), self.prefill_mask))
+                None if self.prefill is None else (self.prefill.key(), self.prefill_mask),
+                None if self.fp8_wide is None else self.fp8_wide.key())
 
     @cute.jit
     def run(self, x: cute.Pointer, w: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
@@ -185,10 +193,16 @@ class _Fp8Switch:
             self.bf16(x, w, out, rows, stream)
         else:
             limit = fp8_rows
-            if limit > Int32(FP8_ROWS):
-                limit = Int32(FP8_ROWS)
+            if limit > Int32(self.max_fp8_rows):
+                limit = Int32(self.max_fp8_rows)
             if rows <= limit:
-                self.fp8(x, w_fp8, scale, out, rows, stream)
+                if cutlass.const_expr(self.fp8_wide is None):
+                    self.fp8(x, w_fp8, scale, out, rows, stream)
+                else:
+                    if rows <= Int32(FP8_ROWS):
+                        self.fp8(x, w_fp8, scale, out, rows, stream)
+                    else:
+                        self.fp8_wide(x, w_fp8, scale, out, rows, stream)
             else:
                 self.bf16(x, w, out, rows, stream)
 

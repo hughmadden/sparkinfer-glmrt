@@ -58,6 +58,7 @@ from ._common import MIMO_V2_FLASH, AotProgram, MiMoGeometry, Operand, Scalar, c
 from ._glm_kernels import GlmAddRmsNorm
 from ._mimo_kernels import RouterHiLoAdd
 from .glm_ffn import _Ffn, ffn_scratch_bytes
+from .mimo_attention import MIMO_FP8_ROWS
 from .glmf import _GlmfFfnFp8, _Fp8Switch, fp8_ops
 
 __all__ = [
@@ -94,8 +95,8 @@ class _FfnFp8(_GlmfFfnFp8):
         from ._glm_kernels import GlmSwiGLU
 
         self.h, self.i = g.hidden, int(inter)
-        self.gate_up = _Fp8Switch(2 * self.i, self.h, fp8=True, row_scales=True)
-        self.down = _Fp8Switch(self.h, self.i, fp8=True, row_scales=True)
+        self.gate_up = _Fp8Switch(2 * self.i, self.h, fp8=True, row_scales=True, wide_rows=MIMO_FP8_ROWS)
+        self.down = _Fp8Switch(self.h, self.i, fp8=True, row_scales=True, wide_rows=MIMO_FP8_ROWS)
         self.swiglu = GlmSwiGLU(self.i)
 
 

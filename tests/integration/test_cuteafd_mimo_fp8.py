@@ -1,7 +1,7 @@
 """cuteafd MiMo V2 Flash FP8 decode programs vs their BF16 programs.
 
 ``fp8=True`` producer / o / ffn programs and the FP8 LM head read E4M3 copies
-with per-row x 128-K FP32 scales for steps of ``rows <= fp8_rows`` (<= 16):
+with per-row x 128-K FP32 scales for steps of ``rows <= fp8_rows`` (<= 32; head <= 16):
 the checkpoint's own E4M3 bytes with its block grids expanded per row
 (q/k/v, dense gate/up/down: the BF16 programs' dequantized weights exactly),
 or a BF16 weight quantized per row and 128-K block (o_proj, lm_head).
@@ -74,7 +74,7 @@ def cosine(a, b):
 
 
 @pytest.mark.parametrize("layer", [0, 1])
-@pytest.mark.parametrize("rows", [1, 5, 16, 17, 64])
+@pytest.mark.parametrize("rows", [1, 5, 16, 17, 32, 64])
 def test_mimo_producer_fp8(g, layer, rows):
     kind = "full" if layer == 0 else "swa"
     names = [f"model.layers.{layer}.self_attn.{p}_proj.weight" for p in "qkv"]
@@ -103,26 +103,36 @@ def test_mimo_producer_fp8(g, layer, rows):
     if rows > 16:
         assert torch.equal(got, ref)
     assert c >= COS
+    # fp8_rows 32: steps of 17-32 rows read the E4M3 copy through the two-tile GEMV.
+    wide = run(fp8, bf16, q8, s8, scalars=(rows, 32))
+    if rows <= 16:
+        assert torch.equal(wide, got)
+    elif rows <= 32:
+        cw = cosine(wide, ref)
+        print(f"mimo_{kind}_producer fp8 rows={rows} fp8_rows=32: cosine {cw:.7f}")
+        assert cw >= COS
+    else:
+        assert torch.equal(wide, ref)
 
 
-@pytest.mark.parametrize("rows", [1, 16, 17])
-def test_mimo_o_fp8(g, rows):
+@pytest.mark.parametrize("rows,fp8_rows", [(1, 16), (16, 16), (17, 16), (17, 32), (32, 32)])
+def test_mimo_o_fp8(g, rows, fp8_rows):
     w = tensor("model.layers.1.self_attn.o_proj.weight")
     q8, s8 = quantize_rows(w)
     deq = (q8.float().view(4096, -1, 128) * s8[..., None]).view(4096, -1).bfloat16()
     attn = (golden_rows(2, rows * 2, seed=3).view(rows, 8192) * 0.2).contiguous()
     out = torch.empty((rows, 4096), dtype=torch.bfloat16, device="cuda")
-    _program("o", max_rows=64, fp8=True).launch(attn, w, q8, s8, out, scalars=(rows, 16))
+    _program("o", max_rows=64, fp8=True).launch(attn, w, q8, s8, out, scalars=(rows, fp8_rows))
     ref = torch.empty_like(out)
-    _program("o", max_rows=64).launch(attn, deq if rows <= 16 else w, ref, scalars=(rows,))
+    _program("o", max_rows=64).launch(attn, deq if rows <= fp8_rows else w, ref, scalars=(rows,))
     torch.cuda.synchronize()
     c = cosine(out, ref)
-    print(f"mimo_o fp8 rows={rows}: cosine {c:.7f} vs BF16 program over the dequantized weight")
+    print(f"mimo_o fp8 rows={rows} fp8_rows={fp8_rows}: cosine {c:.7f} vs BF16 program over the dequantized weight")
     assert c >= COS
 
 
-@pytest.mark.parametrize("rows", [1, 16])
-def test_mimo_ffn_fp8(g, rows):
+@pytest.mark.parametrize("rows,fp8_rows", [(1, 16), (16, 16), (24, 32), (32, 32)])
+def test_mimo_ffn_fp8(g, rows, fp8_rows):
     names = ["model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.up_proj.weight"]
     gate_up = torch.cat([tensor(n) for n in names]).contiguous()
     down = tensor("model.layers.0.mlp.down_proj.weight")
@@ -132,11 +142,11 @@ def test_mimo_ffn_fp8(g, rows):
     out = torch.empty((rows, 4096), dtype=torch.bfloat16, device="cuda")
     ref = torch.empty_like(out)
     p8, p = _program("ffn", max_rows=64, fp8=True), _program("ffn", max_rows=64)
-    p8.launch(x, gate_up, gu8, gus, down, d8, ds, out, _scratch(p8, rows), scalars=(rows, 16))
+    p8.launch(x, gate_up, gu8, gus, down, d8, ds, out, _scratch(p8, rows), scalars=(rows, fp8_rows))
     p.launch(x, gate_up, down, ref, _scratch(p, rows), scalars=(rows,))
     torch.cuda.synchronize()
     c = cosine(out, ref)
-    print(f"mimo_ffn fp8 rows={rows}: cosine {c:.7f}")
+    print(f"mimo_ffn fp8 rows={rows} fp8_rows={fp8_rows}: cosine {c:.7f}")
     assert c >= COS
 
 

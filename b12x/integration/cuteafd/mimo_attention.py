@@ -76,10 +76,10 @@ followed by ``w_fp8`` (E4M3 ``[N, K]``) and ``w_scale`` (FP32 ``[N, K/128]``,
 one scale per output row and 128-wide K block, so the checkpoint's 128x128
 grids and the per-head full-attention ``k_proj`` grid expand exactly, and a
 BF16 weight such as ``o_proj`` quantizes per row), and the scalar
-``fp8_rows`` follows ``rows``: steps of ``rows <= min(fp8_rows, 16)`` read the
-E4M3 copy through ``MmaFp8Gemv`` (weights widened to ``bf16(w * s)``, the BF16
-program's dequantized weight), longer steps the BF16 weight; ``fp8_rows`` 0
-turns FP8 off.
+``fp8_rows`` follows ``rows``: steps of ``rows <= min(fp8_rows, MIMO_FP8_ROWS)``
+read the E4M3 copy through ``MmaFp8Gemv`` (one 16-row tile up to 16 rows, two
+above; weights widened to ``bf16(w * s)``, the BF16 program's dequantized
+weight), longer steps the BF16 weight; ``fp8_rows`` 0 turns FP8 off.
 
 ``compile_mimo_head_fp8_aot(g)``: FP32 logits of up to 16 decode rows over an
 E4M3 LM head with per-row x 128-K scales::
@@ -103,6 +103,11 @@ from ._common import MIMO_V2_FLASH, MiMoGeometry, Operand, Scalar, compile_progr
 from ._glm_kernels import glm_projection
 from .glmf import FP8_GEMV_CONFIG, FP8_ROWS, _Fp8Switch, _HeadFp8, fp8_ops
 from ._mimo_kernels import MAX_SPLITS, MimoGqaAttention, MimoQkvRope, MimoRingCommit, MimoSplitMerge
+
+# Most rows a MiMo decode program reads the E4M3 copies for (qkv, o, dense FFN): DFlash
+# verify steps of 17-32 rows stay on FP8 (V2.6 Pro coordinator alone, 1 RTX PRO 6000:
+# 16 rows 23.3 ms, 24 rows 44.6 ms on the BF16 projections).
+MIMO_FP8_ROWS = 32
 
 __all__ = [
     "attention_scratch_bytes",
@@ -150,7 +155,7 @@ def prefill_tokens(g: MiMoGeometry, kind: str) -> int:
 class _Producer:
     def __init__(self, g: MiMoGeometry, kind: str, fp8: bool = False):
         self.g, self.kind, self.fp8 = g, kind, bool(fp8)
-        self.qkv = _Fp8Switch(g.qkv_width(kind), g.hidden, fp8=True, row_scales=True) if fp8 \
+        self.qkv = _Fp8Switch(g.qkv_width(kind), g.hidden, fp8=True, row_scales=True, wide_rows=MIMO_FP8_ROWS) if fp8 \
             else glm_projection(g.qkv_width(kind), g.hidden)
         self.post = MimoQkvRope(heads=g.heads, kv_heads=g.kv_heads(kind), v_scale=g.v_scale,
                                 head=g.qk_head_dim, v_head=g.v_head_dim, k_stride=g.qkv_k_stride)
@@ -327,7 +332,7 @@ def compile_mimo_attention_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, ro
 class _Output:
     def __init__(self, g: MiMoGeometry, fp8: bool = False):
         self.fp8 = bool(fp8)
-        self.o = _Fp8Switch(g.hidden, g.heads * g.v_head_dim, fp8=True, row_scales=True) if fp8 \
+        self.o = _Fp8Switch(g.hidden, g.heads * g.v_head_dim, fp8=True, row_scales=True, wide_rows=MIMO_FP8_ROWS) if fp8 \
             else glm_projection(g.hidden, g.heads * g.v_head_dim)
 
     def key(self) -> tuple:
