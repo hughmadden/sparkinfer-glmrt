@@ -141,9 +141,11 @@ class _Fp8Switch:
     the block-FP8 GEMM (``BlockFp8Projection``: E4M3 activations per row and
     128-K block, FP32 scales) when ``fp8_rows`` is nonzero; per-row weight
     scales are then stored K-block major, ``[K/128, N]``. ``qscratch`` holds
-    the quantized rows (``quant_scratch_bytes``)."""
+    the quantized rows (``quant_scratch_bytes``); ``prefill_mask`` selects the
+    ``fp8_rows`` bits that turn this projection's FP8 route on."""
 
-    def __init__(self, n: int, k: int, *, fp8: bool, row_scales: bool = False, prefill_rows: int | None = None):
+    def __init__(self, n: int, k: int, *, fp8: bool, row_scales: bool = False, prefill_rows: int | None = None,
+                 prefill_mask: int = 0xFF):
         from ._fp8_weights import MmaFp8Gemv, gemv_warps
         from ._glmf_fp8 import BlockFp8Projection
 
@@ -151,6 +153,7 @@ class _Fp8Switch:
         self.bf16 = glm_projection(self.n, self.k)
         self.prefill = None
         self.fp8 = None
+        self.prefill_mask = int(prefill_mask)
         if fp8 and prefill_rows is not None:
             self.prefill = BlockFp8Projection(self.n, self.k, int(prefill_rows), row_scales=row_scales)
         elif fp8:
@@ -160,14 +163,14 @@ class _Fp8Switch:
 
     def key(self) -> tuple:
         return (self.bf16.key(), None if self.fp8 is None else self.fp8.key(),
-                None if self.prefill is None else self.prefill.key())
+                None if self.prefill is None else (self.prefill.key(), self.prefill_mask))
 
     @cute.jit
     def run(self, x: cute.Pointer, w: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
             rows: Int32, fp8_rows: Int32, qscratch: Int64, stream: cuda.CUstream):
         """``__call__`` with the prefill route's quantization scratch."""
         if cutlass.const_expr(self.prefill is not None):
-            if fp8_rows != Int32(0) and rows > Int32(self.bf16.max_skinny_rows):
+            if (fp8_rows & Int32(self.prefill_mask)) != Int32(0) and rows > Int32(self.bf16.max_skinny_rows):
                 self.prefill(x, w_fp8, scale, out, qscratch, rows, stream)
             else:
                 self.bf16(x, w, out, rows, stream)
@@ -376,7 +379,8 @@ class _Kda:
         self.d, self.p = d, p
         prefill_rows = int(max_rows) if prefill else None
         self.chunked_bytes = 0 if self.chunked is None else self.chunked.nbytes
-        self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True, prefill_rows=prefill_rows)
+        # Prefill: fp8_rows bit 0 turns the in-projection's FP8 GEMM on, bit 1 o_proj's.
+        self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=1)
         # f_b(f_a) and g_b(g_a): two 128 -> D products off the in-projection row.
         self.fg = BatchedBf16Gemm(n=d, k=g.kda_head_dim, batch=2, a_row=p, a_batch=g.kda_head_dim,
                                   o_row=2 * d, o_batch=d)
@@ -385,7 +389,7 @@ class _Kda:
         self.recurrent = GlmfKdaRecurrent(heads=g.kda_heads, lower_bound=g.gate_lower_bound, qkv_width=3 * d,
                                           g_stride=2 * d, b_stride=p)
         self.norm = GlmfKdaGatedNorm(heads=g.kda_heads, eps=g.norm_eps, gate_stride=2 * d)
-        self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True, prefill_rows=prefill_rows)
+        self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=2)
 
     def key(self) -> tuple:
         return (self.in_proj.key(), self.fg.key(), self.o_proj.key(), self.g,
