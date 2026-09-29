@@ -102,7 +102,9 @@ def _rsqrt(value: Float32) -> Float32:
 
 @cute.jit
 def _bf16(value: Float32) -> Float32:
-    return Float32(value.to(BFloat16))
+    """Round to BF16 (RNE) through the packing instruction: ``Float32(x.to(BFloat16))``
+    lowers to a truncf/extf pair the compiler may fold away."""
+    return _bf16_lo(pack_f32x2_to_bfloat2(value, value))
 
 
 @cute.jit
