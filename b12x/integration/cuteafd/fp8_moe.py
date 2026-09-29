@@ -1,4 +1,6 @@
-"""Native AOT exact FP8 routed experts (checkpoint E4M3 + FP32 128x128 scales).
+"""Native AOT exact FP8 routed experts (checkpoint E4M3 + FP32 128x128 scales),
+and MXFP4 ones (``Fp8MoeGeometry.weights = "mxfp4"``: packed E2M1 ``w [E, N,
+K/2]`` with UE8M0 ``s [E, N, K/32]``, MiMo V2.6 Pro; ``_mxfp4_moe_kernels``).
 
 ``compile_fp8_moe_aot(geometry, route=..., max_rows=M, wire=True)``: one
 program computing a (TP slice of a) sigmoid-routed MoE layer's routed
@@ -59,6 +61,7 @@ from ._fp8_moe_kernels import (
     GatherRows, GroupedFp8Gemm, GroupedFp8Gemv, MoeCombine, MoePrep, MoeSwiGLU, meta_words,
 )
 from ._fp8_moe_stream import STREAM_TILE_M, StreamFp8Down, StreamFp8GateUp, stream_max_tiles
+from ._mxfp4_moe_kernels import GroupedMxfp4Gemv
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes"]
 
@@ -110,20 +113,31 @@ class Fp8MoeGeometry:
     intermediate: int
     tp: int = 1
     swiglu_limit: float = 0.0
+    # "fp8": E4M3 + FP32 128x128 scales; "mxfp4": packed E2M1 + UE8M0 per 32.
+    weights: str = "fp8"
 
     def __post_init__(self) -> None:
-        if self.hidden % 128 or self.intermediate % (128 * self.tp):
+        if self.weights not in ("fp8", "mxfp4"):
+            raise ValueError("weights is 'fp8' or 'mxfp4'")
+        if self.weights == "fp8" and (self.hidden % 128 or self.intermediate % (128 * self.tp)):
             raise ValueError("hidden and the intermediate slice must be 128-aligned")
+        if self.weights == "mxfp4" and (self.hidden % 128 or self.intermediate % 32 or self.intermediate // 32 < self.tp):
+            raise ValueError("MXFP4 experts need a 128-aligned hidden and whole 32-blocks per rank")
         if not 1 <= self.top_k <= 16:
             raise ValueError("top_k must be 1..16")
 
     @property
     def slice(self) -> int:
+        """Stored intermediate width of every rank. MXFP4 ranks own whole
+        32-blocks as evenly as possible, zero-padded to one 128-aligned width
+        (TP6 of 2048: 352/320 real rows in 384)."""
+        if self.weights == "mxfp4":
+            return -(-(-(-self.intermediate // 32) // self.tp) * 32 // 128) * 128
         return self.intermediate // self.tp
 
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
         return Fp8MoeGeometry(self.name, self.hidden, self.experts, self.top_k, self.intermediate, int(tp),
-                              self.swiglu_limit)
+                              self.swiglu_limit, self.weights)
 
 
 # MiMo V2 Flash (no SwiGLU clamp in its config) and the GLM 5.3 MTP layer.
@@ -134,6 +148,8 @@ GEOMETRIES = {
     "glmf": Fp8MoeGeometry("glmf", hidden=4096, experts=288, top_k=8, intermediate=2048, swiglu_limit=10.0),
     # Qwen 3.8 Flash Next: 512 experts, softmax top-10, unclamped SiLU.
     "qwen4": Fp8MoeGeometry("qwen4", hidden=2560, experts=512, top_k=10, intermediate=640),
+    # MiMo V2.6 Pro: MXFP4 experts, 384 of them, top-8, unclamped SiLU.
+    "mimop": Fp8MoeGeometry("mimop", hidden=6144, experts=384, top_k=8, intermediate=2048, weights="mxfp4"),
 }
 
 
@@ -171,13 +187,18 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
     ]
 
 
-def _resolve(route: str, max_rows: int, wire: bool = True) -> str:
-    """``auto`` compiles only the GEMV when the capacity never reaches the large route."""
+def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8") -> str:
+    """``auto`` compiles only the GEMV when the capacity never reaches the large
+    route; MXFP4 weights have only the GEMV route so far."""
+    if weights == "mxfp4":
+        if route not in ("auto", "decode"):
+            raise ValueError(f"MXFP4 experts have no {route} route yet")
+        return "decode"
     return "decode" if route == "auto" and int(max_rows) <= auto_large_rows(wire) else route
 
 
 def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True) -> int:
-    route = _resolve(route, rows, wire)
+    route = _resolve(route, rows, wire, g.weights)
     if route == "auto":
         return max(fp8_moe_scratch_bytes(g, "decode", rows, wire),
                    fp8_moe_scratch_bytes(g, _large_route(wire), rows, wire))
@@ -202,12 +223,13 @@ class _Route:
         if decode:
             tile_rows = min(int(max_rows), DECODE_MAX_ROWS)
             warps_h = 8 if h >= 6144 else 4
-            self.gate_up = GroupedFp8Gemv(n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
-                                          groups=_gate_up_groups(tile_rows), gather=True)
+            gemv = GroupedMxfp4Gemv if g.weights == "mxfp4" else GroupedFp8Gemv
+            self.gate_up = gemv(n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
+                                groups=_gate_up_groups(tile_rows), gather=True)
             # K split over warps in whole 128 blocks: 4 where they divide evenly,
             # else the largest divisor <= 8 of the blocks (Qwen's 640: 5 warps).
             warps_i = 4 if i % 512 == 0 else max(d for d in range(1, 9) if (i // 128) % d == 0)
-            self.down = GroupedFp8Gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=warps_i)
+            self.down = gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=warps_i)
         else:
             self.gate_up = GroupedFp8Gemm(n=i, k=h, experts=e, halves=2)
             self.down = GroupedFp8Gemm(n=h, k=i, experts=e, halves=1)
@@ -353,21 +375,34 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         raise ValueError("route is 'decode', 'prefill', 'stream' or 'auto'")
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
-    requested, route = route, _resolve(route, max_rows, wire)
+    requested, route = route, _resolve(route, max_rows, wire, g.weights)
     launch = _Fp8Moe(g, route, max_rows, wire)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
     x = (Operand("x", torch.uint8, f"[rows,{h + h // 32}]", note="FP8 K32 wire rows") if wire
          else Operand("x", torch.bfloat16, f"[rows,{h}]"))
+    if g.weights == "mxfp4":
+        weights = (
+            Operand("w1", torch.uint8, f"[{e},{i},{h // 2}]", note="packed E2M1 (even element low)"),
+            Operand("s1", torch.uint8, f"[{e},{i},{h // 32}]", align=4, note="UE8M0 per 32"),
+            Operand("w3", torch.uint8, f"[{e},{i},{h // 2}]"),
+            Operand("s3", torch.uint8, f"[{e},{i},{h // 32}]", align=4),
+            Operand("w2", torch.uint8, f"[{e},{h},{i // 2}]"),
+            Operand("s2", torch.uint8, f"[{e},{h},{i // 32}]", align=4),
+        )
+    else:
+        weights = (
+            Operand("w1", torch.float8_e4m3fn, f"[{e},{i},{h}]"),
+            Operand("s1", torch.float32, f"[{e},{i // 128},{h // 128}]", align=4),
+            Operand("w3", torch.float8_e4m3fn, f"[{e},{i},{h}]"),
+            Operand("s3", torch.float32, f"[{e},{i // 128},{h // 128}]", align=4),
+            Operand("w2", torch.float8_e4m3fn, f"[{e},{h},{i}]"),
+            Operand("s2", torch.float32, f"[{e},{h // 128},{i // 128}]", align=4),
+        )
     operands = (
         x,
         Operand("ids", torch.int32, f"[rows,{k}]", align=4),
         Operand("weights", torch.float32, f"[rows,{k}]", align=4),
-        Operand("w1", torch.float8_e4m3fn, f"[{e},{i},{h}]"),
-        Operand("s1", torch.float32, f"[{e},{i // 128},{h // 128}]", align=4),
-        Operand("w3", torch.float8_e4m3fn, f"[{e},{i},{h}]"),
-        Operand("s3", torch.float32, f"[{e},{i // 128},{h // 128}]", align=4),
-        Operand("w2", torch.float8_e4m3fn, f"[{e},{h},{i}]"),
-        Operand("s2", torch.float32, f"[{e},{h // 128},{i // 128}]", align=4),
+        *weights,
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
         Operand("scratch", torch.uint8, "[fp8_moe_scratch_bytes]", "scratch"),
     )
@@ -376,7 +411,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         key=launch.key(),
         geometry={"requested_route": requested, "hidden": h, "experts": e, "top_k": k, "intermediate": g.intermediate, "tp": g.tp,
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
-                  "wire": bool(wire)},
+                  "wire": bool(wire), "weights": g.weights},
         scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire)},
         doc=__doc__,
     )
