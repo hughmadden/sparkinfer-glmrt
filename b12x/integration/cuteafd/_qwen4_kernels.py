@@ -165,6 +165,73 @@ class Qwen4HcNorm:
             _store8(n_row + Int64(s * h * 2), values, s * VEC)
 
 
+class Qwen4MtpNorm:
+    """MTP feedback norms (``residual_linear_shared``, vLLM ``Qwen4ExpMultiTokenPredictor``):
+    ``nh = bf16(h * rsqrt(mean(h^2) + eps) * (1 + wh))`` over ALL ``streams * hidden``
+    values of the gathered source row ``h = hidden[hidden_rows[row]]`` (one variance
+    group, not per stream), ``ne = bf16(e * rsqrt(mean(e^2) + eps) * (1 + we))`` over
+    the token embedding row, and ``inject[row, :] = 1`` (the embedding branch joins
+    every stream with unit weight). Grid ``(rows)``, one thread per 8 values of a stream.
+    """
+
+    def __init__(self, hidden: int, streams: int, eps: float):
+        self.hidden, self.streams, self.eps = int(hidden), int(streams), float(eps)
+        self.threads = _row_threads(self.hidden)
+        self.warps = self.threads // 32
+
+    @cute.jit
+    def __call__(self, hidden: cute.Pointer, hidden_rows: cute.Pointer, embed: cute.Pointer, norm_hidden: cute.Pointer,
+                 norm_embed: cute.Pointer, normed_hidden: cute.Pointer, normed_embed: cute.Pointer,
+                 inject: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.kernel(hidden, cute.make_tensor(hidden_rows, cute.make_layout((Int64(rows),))), embed, norm_hidden,
+                    norm_embed, normed_hidden, normed_embed, inject).launch(
+            grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, hidden: cute.Pointer, hidden_rows: cute.Tensor, embed: cute.Pointer, norm_hidden: cute.Pointer,
+               norm_embed: cute.Pointer, normed_hidden: cute.Pointer, normed_embed: cute.Pointer,
+               inject: cute.Pointer):
+        h, n = self.hidden, self.streams
+        row = Int64(cute.arch.block_idx()[0])
+        tidx = Int64(cute.arch.thread_idx()[0])
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(_reduction_storage(2, self.warps))
+        sums = storage.sums.get_tensor(cute.make_layout((2, self.warps), stride=(self.warps, 1)))
+        source = Int64(hidden_rows[row])
+        s_row = Int64(hidden.toint()) + source * Int64(n * h * 2) + tidx * Int64(16)
+        values = cute.make_rmem_tensor(cute.make_layout((n * VEC,), stride=(1,)), Float32)
+        wv = cute.make_rmem_tensor(cute.make_layout((n * VEC,), stride=(1,)), Float32)
+        square = Float32(0.0)
+        for s in cutlass.range_constexpr(n):
+            _load8(s_row + Int64(s * h * 2), values, s * VEC)
+            _load8(Int64(norm_hidden.toint()) + Int64(s * h * 2) + tidx * Int64(16), wv, s * VEC)
+            for k in cutlass.range_constexpr(VEC):
+                square = square + values[s * VEC + k] * values[s * VEC + k]
+        e = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), Float32)
+        we = cute.make_rmem_tensor(cute.make_layout((VEC,), stride=(1,)), Float32)
+        e_at = row * Int64(h * 2) + tidx * Int64(16)
+        _load8(Int64(embed.toint()) + e_at, e, 0)
+        _load8(Int64(norm_embed.toint()) + tidx * Int64(16), we, 0)
+        e_square = Float32(0.0)
+        for k in cutlass.range_constexpr(VEC):
+            e_square = e_square + e[k] * e[k]
+        total = _block_sum(square, sums, Int32(0), self.warps)
+        e_total = _block_sum(e_square, sums, Int32(1), self.warps)
+        inv = _rsqrt(total / Float32(n * h) + Float32(self.eps))
+        e_inv = _rsqrt(e_total / Float32(h) + Float32(self.eps))
+        n_row = Int64(normed_hidden.toint()) + row * Int64(n * h * 2) + tidx * Int64(16)
+        for s in cutlass.range_constexpr(n):
+            for k in cutlass.range_constexpr(VEC):
+                values[s * VEC + k] = values[s * VEC + k] * inv * (Float32(1.0) + wv[s * VEC + k])
+            _store8(n_row + Int64(s * h * 2), values, s * VEC)
+        for k in cutlass.range_constexpr(VEC):
+            e[k] = e[k] * e_inv * (Float32(1.0) + we[k])
+        _store8(Int64(normed_embed.toint()) + e_at, e, 0)
+        if tidx < Int64(n):
+            inj = _row_scalars(inject, row, n)
+            inj[tidx] = Float32(1.0).to(BFloat16)
+
+
 class Qwen4HcGate:
     """``a = bf16(silu(bf16(d / hc)))`` over the first ``lowrank`` columns of
     ``d`` BF16 ``[rows, d_width]``; with ``inject``, ``inject_s =
@@ -534,9 +601,28 @@ class Qwen4PleConv:
         streams[row, ch] = (Float32(streams[row, ch]) + out).to(BFloat16)
 
 
+@cute.jit
+def _shift_ple_state(state: cute.Tensor, rows: cute.Tensor, first: Int64, n: Int64, ch: Int64,
+                     state_rows: cutlass.Constexpr):
+    """``state`` (a slot's ``[state_rows, C]``) becomes the last ``state_rows`` of its rows
+    followed by ``rows[first .. first + n]`` (column ``ch``)."""
+    kept = cute.make_rmem_tensor(cute.make_layout((state_rows,), stride=(1,)), BFloat16)
+    for i in cutlass.range_constexpr(state_rows):
+        s = n - Int64(state_rows - i)
+        if s >= Int64(0):
+            kept[i] = rows[first + s, ch]
+        else:
+            kept[i] = state[Int64(state_rows) + s, ch]
+    for i in cutlass.range_constexpr(state_rows):
+        state[i, ch] = kept[i]
+
+
 class Qwen4PleConvState:
     """After the conv: each sequence's last step row stores its last
-    ``(K-1)*dil`` ``gvn`` rows (older ones from the previous state)."""
+    ``(K-1)*dil`` ``gvn`` rows (older ones from the previous state). With
+    ``spec`` != 0 every row's ``gvn`` goes to ``replay`` (BF16 ``[64, C]``)
+    instead and the state stays as it was (``Qwen4PleCommit`` applies the
+    accepted rows)."""
 
     threads = 256
 
@@ -545,17 +631,18 @@ class Qwen4PleConvState:
 
     @cute.jit
     def __call__(self, gvn: cute.Pointer, conv_state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
-                 rows: Int32, stream: cuda.CUstream):
+                 replay: cute.Pointer, spec: Int32, rows: Int32, stream: cuda.CUstream):
         m = Int64(rows)
         c = self.channels
         self.kernel(cute.make_tensor(gvn, cute.make_layout((m, c), stride=(c, 1))), conv_state,
                     cute.make_tensor(slots, cute.make_layout((m,))),
-                    cute.make_tensor(seq_first, cute.make_layout((m,))), rows).launch(
+                    cute.make_tensor(seq_first, cute.make_layout((m,))),
+                    cute.make_tensor(replay, cute.make_layout((m, c), stride=(c, 1))), spec, rows).launch(
             grid=(rows, c // self.threads, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, gvn: cute.Tensor, conv_state: cute.Pointer, slots: cute.Tensor, seq_first: cute.Tensor,
-               rows: Int32):
+               replay: cute.Tensor, spec: Int32, rows: Int32):
         row = Int64(cute.arch.block_idx()[0])
         ch = Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
         first = Int64(seq_first[row])
@@ -563,15 +650,41 @@ class Qwen4PleConvState:
         if not last:
             last = Int64(seq_first[row + Int64(1)]) != first
         slot = Int64(slots[row])
-        if last and slot >= Int64(0):
-            state = _ple_state(conv_state, slot, self.state_rows, self.channels)
-            n = row - first + Int64(1)
-            kept = cute.make_rmem_tensor(cute.make_layout((self.state_rows,), stride=(1,)), BFloat16)
-            for i in cutlass.range_constexpr(self.state_rows):
-                s = n - Int64(self.state_rows - i)
-                if s >= Int64(0):
-                    kept[i] = gvn[first + s, ch]
-                else:
-                    kept[i] = state[Int64(self.state_rows) + s, ch]
-            for i in cutlass.range_constexpr(self.state_rows):
-                state[i, ch] = kept[i]
+        if spec != Int32(0):
+            replay[row, ch] = gvn[row, ch]
+        else:
+            if last and slot >= Int64(0):
+                state = _ple_state(conv_state, slot, self.state_rows, self.channels)
+                _shift_ple_state(state, gvn, first, row - first + Int64(1), ch, self.state_rows)
+
+
+class Qwen4PleCommit:
+    """Shifts each sequence's accepted ``gvn`` rows of a speculative step
+    (``replay`` BF16 ``[64, C]``) into its PLE conv state ``[slots, state_rows, C]``;
+    ``tables`` i32 ``[3, sequences]`` as ``Qwen4GdnCommit``. Grid ``(sequences, C / 256)``."""
+
+    threads = 256
+    replay_rows = 64
+
+    def __init__(self, channels: int, state_rows: int):
+        self.channels, self.state_rows = int(channels), int(state_rows)
+
+    @cute.jit
+    def __call__(self, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,
+                 stream: cuda.CUstream):
+        c = self.channels
+        self.kernel(conv_state, cute.make_tensor(replay, cute.make_layout((self.replay_rows, c), stride=(c, 1))),
+                    cute.make_tensor(tables, cute.make_layout((3, sequences), stride=(sequences, 1)))).launch(
+            grid=(sequences, c // self.threads, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, conv_state: cute.Pointer, replay: cute.Tensor, tables: cute.Tensor):
+        seq = Int32(cute.arch.block_idx()[0])
+        ch = Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
+        slot = Int64(tables[0, seq])
+        first = Int64(tables[1, seq])
+        keep = Int64(tables[2, seq])
+        if slot >= Int64(0):
+            if keep > Int64(0):
+                state = _ple_state(conv_state, slot, self.state_rows, self.channels)
+                _shift_ple_state(state, replay, first, keep, ch, self.state_rows)

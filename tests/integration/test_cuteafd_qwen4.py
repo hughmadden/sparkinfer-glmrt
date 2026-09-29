@@ -297,7 +297,7 @@ def test_ple():
         seq_first = torch.zeros(n, dtype=torch.int32, device="cuda")
         chunk = ours[first:first + n].clone()
         program.launch(chunk, local[first:first + n].contiguous(), table, scale_t, w_kv, *norms, conv_w, state,
-                       slots, seq_first, scratch(program, n), scalars=[n])
+                       slots, seq_first, None, scratch(program, n), scalars=[n, 0])
         ours[first:first + n] = chunk
     t0 = time.perf_counter()
     run(0, split)
