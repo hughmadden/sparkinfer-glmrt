@@ -121,6 +121,9 @@ CASES = [
     ("glm", 4, "auto", 256, 256),
     ("mimo", 4, "stream", 16, 5), ("mimo", 4, "stream", 256, 200), ("mimo", 4, "stream", 4096, 4096),
     ("mimo", 2, "stream", 1024, 1024), ("glm", 4, "stream", 4096, 3000), ("glm", 2, "stream", 256, 256),
+    # TP6 of 2048: 3-block (384) slices, the stored width of every rank.
+    ("mimo", 6, "decode", 1, 1), ("glm", 6, "decode", 16, 16), ("glmf", 6, "auto", 80, 80),
+    ("mimo", 6, "stream", 1024, 1024), ("glm", 6, "stream", 4096, 4096),
 ]
 
 
@@ -161,4 +164,35 @@ def test_fp8_moe_stream_clamp():
     g = Fp8MoeGeometry("clamped", hidden=4096, experts=256, top_k=8, intermediate=2048, tp=4, swiglu_limit=0.5)
     c, worst = _run(g, "stream", 256, 256)
     print(f"fp8_moe clamp 0.5 stream rows=256: cosine {c:.7f} worst row {worst:.6f}")
+    assert c >= COS
+
+
+@pytest.mark.parametrize("route,capacity,rows", [("decode", 1, 1), ("decode", 80, 80), ("stream", 1024, 1024)])
+def test_fp8_moe_tp6_zero_padding_is_exact(route, capacity, rows):
+    """A TP6 rank owning two of its three stored 128-blocks (ranks 4 and 5 of
+    2048) keeps zero gate/up rows and zero down columns in the third: its
+    output equals the reference over the unpadded 256-wide slice."""
+    g = _geometry("glm", 6)
+    w1, s1, w3, s3, w2, s2 = (t.clone() for t in _weights(g))
+    for w in (w1, w3):
+        w[:, 256:].zero_()
+    w2[:, :, 256:].zero_()
+    padded = (w1, s1, w3, s3, w2, s2)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    x = torch.randn(rows, g.hidden, device="cuda", generator=gen).bfloat16()
+    source, x_exact = wire_rows(x)
+    ids = torch.rand(rows, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int().contiguous()
+    weights = torch.rand(rows, g.top_k, device="cuda", generator=gen).contiguous()
+    from b12x.integration.cuteafd.fp8_moe import fp8_moe_scratch_bytes
+
+    out = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device="cuda")
+    scratch = torch.empty(fp8_moe_scratch_bytes(g, route, capacity), dtype=torch.uint8, device="cuda")
+    _program(g, route, capacity, True).launch(source, ids, weights, *padded, out, scratch, scalars=(rows,))
+    torch.cuda.synchronize()
+    narrow = (w1[:, :256].contiguous(), s1[:, :2].contiguous(), w3[:, :256].contiguous(), s3[:, :2].contiguous(),
+              w2[:, :, :256].contiguous(), s2[:, :, :2].contiguous())
+    expected = reference(x_exact, ids, weights, *narrow, limit=g.swiglu_limit)
+    a, b = out.float(), expected.float()
+    c = float((a * b).sum() / (a.norm() * b.norm()))
+    print(f"fp8_moe glm tp6 padded {route} rows={rows}: cosine {c:.7f}")
     assert c >= COS

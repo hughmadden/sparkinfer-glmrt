@@ -129,8 +129,8 @@ class Fp8MoeGeometry:
     def __post_init__(self) -> None:
         if self.weights not in ("fp8", "mxfp4"):
             raise ValueError("weights is 'fp8' or 'mxfp4'")
-        if self.weights == "fp8" and (self.hidden % 128 or self.intermediate % (128 * self.tp)):
-            raise ValueError("hidden and the intermediate slice must be 128-aligned")
+        if self.weights == "fp8" and (self.hidden % 128 or self.intermediate % 128 or self.intermediate // 128 < self.tp):
+            raise ValueError("FP8 experts need a 128-aligned hidden and intermediate with a 128-block per rank")
         if self.weights == "mxfp4" and (self.hidden % 128 or self.intermediate % 32 or self.intermediate // 32 < self.tp):
             raise ValueError("MXFP4 experts need a 128-aligned hidden and whole 32-blocks per rank")
         if not 1 <= self.top_k <= 16:
@@ -140,10 +140,13 @@ class Fp8MoeGeometry:
     def slice(self) -> int:
         """Stored intermediate width of every rank. MXFP4 ranks own whole
         32-blocks as evenly as possible, zero-padded to one 128-aligned width
-        (TP6 of 2048: 352/320 real rows in 384)."""
+        (TP6 of 2048: 352/320 real rows in 384). FP8 ranks own whole 128x128
+        scale blocks the same way (TP6 of 2048: 3, 3, 3, 3, 2, 2 blocks), each
+        stored as the widest (384): zero gate/up rows give SiLU(0) * 0 = 0 and
+        zero down columns add nothing, so the padding is exact."""
         if self.weights == "mxfp4":
             return -(-(-(-self.intermediate // 32) // self.tp) * 32 // 128) * 128
-        return self.intermediate // self.tp
+        return -(-(self.intermediate // 128) // self.tp) * 128
 
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
         return Fp8MoeGeometry(self.name, self.hidden, self.experts, self.top_k, self.intermediate, int(tp),
