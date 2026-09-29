@@ -67,7 +67,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Int32, Int64
+from cutlass import Float32, Int32, Int64
 
 from ._common import FLASH, GLM53_FLASH, AotProgram, GLMFGeometry, Operand, Scalar, compile_program
 from ._glm_kernels import BatchedBf16Gemm, GlmRankNormPackKV, GlmSwiGLU, glm_projection
