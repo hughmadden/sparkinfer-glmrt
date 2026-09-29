@@ -105,6 +105,9 @@ class MixedTrellisCompileResult:
     paired_boundary: str | None = field(default=None, kw_only=True)
     # FC1 rotates staged token rows itself; nothing writes rotation_up.
     fused_input_rotation: bool = field(default=False, kw_only=True)
+    # Warp-specialized prefill (mixed_trellis_ws): FC1, SwiGLU and FC2 as three
+    # launches of producer/consumer CTAs; FC1 rotates its input rows itself.
+    warp_specialized: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -2083,6 +2086,9 @@ def compile_mixed_trellis(
     paired_boundary: str | None = None,
     token_major_rotation: bool = False,
     fused_input_rotation: bool = False,
+    warp_specialized: bool = False,
+    ws_producer_warps: int = 4,
+    ws_decode_role: str = "consumer",
 ) -> MixedTrellisCompileResult:
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
@@ -2148,11 +2154,27 @@ def compile_mixed_trellis(
             broadcast_suh=broadcast_suh,
             direct_topk_routes=direct_topk_routes,
             schedule_whole_tiles=True,
-            fused_input_rotation=fused_input_rotation,
+            fused_input_rotation=fused_input_rotation and not warp_specialized,
         )
 
     def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellisKernel:
         common = {"grouped_m8_fc2": grouped_m8_fc2}
+        if warp_specialized:
+            from .mixed_trellis_ws import W4A16MixedTrellisWSKernel
+
+            if paired_boundary is not None or token_major_rotation:
+                raise ValueError(
+                    "warp-specialized mixed Trellis has its own input rotation "
+                    "and no paired boundary"
+                )
+            return W4A16MixedTrellisWSKernel(
+                driver=make_kernel(total_experts, tier0_bits, **common),
+                tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
+                tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
+                max_shared_mem=int(max_shared_mem),
+                producer_warps=int(ws_producer_warps),
+                decode_role=str(ws_decode_role),
+            )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
             tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
@@ -2161,12 +2183,17 @@ def compile_mixed_trellis(
             token_major_rotation=token_major_rotation,
         )
 
-    kernel = _select_mixed_fc2_kernel(
-        build_kernel,
-        moe_block_size=moe_block_size,
-        max_shared_mem=max_shared_mem,
-    )
-    _apply_mixed_residency(kernel, force_blocks_per_sm, max_shared_mem)
+    if warp_specialized:
+        if force_blocks_per_sm not in (None, 1):
+            raise ValueError("warp-specialized mixed Trellis runs one CTA per SM")
+        kernel = build_kernel(False)
+    else:
+        kernel = _select_mixed_fc2_kernel(
+            build_kernel,
+            moe_block_size=moe_block_size,
+            max_shared_mem=max_shared_mem,
+        )
+        _apply_mixed_residency(kernel, force_blocks_per_sm, max_shared_mem)
     # shared_words is the complete dynamically allocated MemRange used by the
     # cooperative kernel. CUDA permits a launch exactly at the device's
     # opt-in shared-memory limit; rejecting an additional 512 bytes here
@@ -2291,7 +2318,11 @@ def compile_mixed_trellis(
         kernel,
         *compile_args,
         compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a16.mixed_trellis", W4A16MixedTrellisKernel.ABI_VERSION, cache_key
+            "moe.w4a16.mixed_trellis_ws" if warp_specialized else "moe.w4a16.mixed_trellis",
+            (
+                getattr(kernel, "WS_ABI_VERSION", 0) * 1000 + W4A16MixedTrellisKernel.ABI_VERSION
+            ),
+            cache_key,
         ),
         dsl_compile_options=OptLevel(2),
     )
@@ -2329,7 +2360,8 @@ def compile_mixed_trellis(
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
         paired_boundary=paired_boundary,
-        fused_input_rotation=bool(fused_input_rotation),
+        fused_input_rotation=bool(fused_input_rotation) and not warp_specialized,
+        warp_specialized=bool(warp_specialized),
     )
     _CACHE[cache_key] = result
     return result
