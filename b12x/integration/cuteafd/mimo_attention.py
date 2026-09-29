@@ -18,7 +18,9 @@ max_rows``); regions start 1024-byte aligned.
     kv_slots    i64  [rows]           in     record slot per row (<0 skips): full = page*64+row
                                              of the paged cache; swa = the row's index in kv_step
     cos_sin     f32  [P,64]           in     cos(32) | sin(32) of theta^(-2i/64) (theta of the kind)
-    w_qkv       bf16 [N*192+R,H]      in     cat(q_proj, k_proj, v_proj)
+    w_qkv       bf16 [W,H]            in     cat(q_proj, k_proj, v_proj), W = N*192 + G*(k_stride+128)
+                                             (keys k_stride = 192 apart, or 256: V2.6 Pro zero-pads
+                                             every key to whole 128-row blocks)
     kv_cache    bf16 [slots,R]        inout  record at kv_slots[row] (full: paged cache; swa: kv_step)
     query       bf16 [rows,N,192]     out    RoPE on dims 0:64 of each head
     scratch     u8   producer_scratch_bytes(kind, rows): qkv BF16 [rows, N*192+R]
@@ -129,7 +131,7 @@ class _Producer:
         self.g, self.kind = g, kind
         self.qkv = glm_projection(g.qkv_width(kind), g.hidden)
         self.post = MimoQkvRope(heads=g.heads, kv_heads=g.kv_heads(kind), v_scale=g.v_scale,
-                                head=g.qk_head_dim, v_head=g.v_head_dim)
+                                head=g.qk_head_dim, v_head=g.v_head_dim, k_stride=g.qkv_k_stride)
 
     def key(self) -> tuple:
         return (self.qkv.key(), self.kind, self.g)
@@ -143,26 +145,56 @@ class _Producer:
         self.post(qkv, positions, cos_sin, kv_slots, query, kv_cache, rows, stream)
 
 
-def compile_mimo_producer_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, max_rows: int):
-    """QKV projection, partial RoPE and the KV record write; see the module docstring."""
+class _Fp8Producer(_Producer):
+    """The producer with the qkv projection over the checkpoint's FP8 weight
+    (``MmaFp8Gemv`` up to 16 rows, the BF16 TMA GEMM over ``w_qkv`` above)."""
+
+    def __init__(self, g: MiMoGeometry, kind: str):
+        from ._fp8_weights import RoutedFp8Projection
+
+        super().__init__(g, kind)
+        self.qkv = RoutedFp8Projection(g.qkv_width(kind), g.hidden)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
+                 w_qkv: cute.Pointer, w_qkv_fp8: cute.Pointer, w_qkv_scale: cute.Pointer, kv_cache: cute.Pointer,
+                 query: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        qkv = cute.make_ptr(cutlass.BFloat16, Int64(scratch.toint()), cute.AddressSpace.gmem, assumed_align=16)
+        self.qkv(x, w_qkv, w_qkv_fp8, w_qkv_scale, qkv, rows, stream)
+        self.post(qkv, positions, cos_sin, kv_slots, query, kv_cache, rows, stream)
+
+
+def compile_mimo_producer_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, max_rows: int, fp8: bool = False):
+    """QKV projection, partial RoPE and the KV record write; see the module
+    docstring. ``fp8`` (geometries with ``fp8_qkv``) adds ``w_qkv_fp8`` E4M3
+    ``[W, H]`` and ``w_qkv_scale`` FP32 ``[W/128, H/128]`` (the checkpoint's
+    blocks in the ``w_qkv`` row layout) and projects decode rows from them."""
     max_rows = _check(kind, max_rows)
-    launch = _Producer(g, kind)
-    h, n, r = g.hidden, g.heads, g.record_elems(kind)
+    if fp8 and not g.fp8_qkv:
+        raise ValueError(f"{g.name} has no FP8 qkv layout")
+    launch = (_Fp8Producer if fp8 else _Producer)(g, kind)
+    h, n, r, w = g.hidden, g.heads, g.record_elems(kind), g.qkv_width(kind)
+    weights = (Operand("w_qkv", torch.bfloat16, f"[{w},{h}]"),)
+    if fp8:
+        from ._fp8_weights import fp8_operands
+
+        weights += fp8_operands("w_qkv", w, h)
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         Operand("positions", torch.int64, "[rows]", align=8),
         Operand("kv_slots", torch.int64, "[rows]", align=8),
         Operand("cos_sin", torch.float32, "[P,64]", align=4),
-        Operand("w_qkv", torch.bfloat16, f"[{g.qkv_width(kind)},{h}]"),
+        *weights,
         Operand("kv_cache", torch.bfloat16, f"[slots,{r}]", "inout"),
         Operand("query", torch.bfloat16, f"[rows,{n},{g.qk_head_dim}]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name=f"mimo_{kind}_producer", operands=operands, scalars=(Scalar("rows"),),
-        key=(max_rows, launch.key()),
+        launch, name=f"mimo_{kind}_producer" + ("_fp8" if fp8 else ""), operands=operands, scalars=(Scalar("rows"),),
+        key=(max_rows, fp8, launch.key()),
         geometry={"kind": kind, "hidden": h, "heads": n, "kv_heads": g.kv_heads(kind), "record_elems": r,
-                  "max_rows": max_rows, "v_scale": g.v_scale, "rope_theta": g.rope_theta(kind)},
+                  "max_rows": max_rows, "v_scale": g.v_scale, "rope_theta": g.rope_theta(kind),
+                  "qkv_width": w, "k_stride": g.qkv_k_stride, "fp8": bool(fp8)},
         scratch={"scratch": lambda rows: producer_scratch_bytes(g, kind, rows)},
         doc=__doc__,
     )

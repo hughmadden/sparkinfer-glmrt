@@ -55,13 +55,16 @@ class MimoQkvRope:
 
     threads = 256
 
-    def __init__(self, *, heads: int, kv_heads: int, v_scale: float, head: int = 192, v_head: int = 128):
+    def __init__(self, *, heads: int, kv_heads: int, v_scale: float, head: int = 192, v_head: int = 128,
+                 k_stride: int | None = None):
         self.heads, self.kv_heads = int(heads), int(kv_heads)
         self.head, self.v_head = int(head), int(v_head)
+        # Key heads are k_stride apart in qkv (zero padding past each 192-wide key).
+        self.k_stride = self.head if k_stride is None else int(k_stride)
         self.v_scale = float(v_scale)
         self.q_width = self.heads * self.head
         self.record = self.kv_heads * (self.head + self.v_head)
-        self.width = self.q_width + self.record
+        self.width = self.q_width + self.kv_heads * (self.k_stride + self.v_head)
 
     @cute.jit
     def __call__(self, qkv: cute.Pointer, positions: cute.Pointer, cos_sin: cute.Pointer,
@@ -124,19 +127,20 @@ class MimoQkvRope:
                     i = Int32(idx % Int32(ROPE_HALF))
                     cos_v = Float32(cs[i])
                     sin_v = Float32(cs[Int32(ROPE_HALF) + i])
-                    self._rope(qkv, token, k0 + h * Int64(self.head), record, Int64(0), h * Int64(self.head),
+                    self._rope(qkv, token, k0 + h * Int64(self.k_stride), record, Int64(0), h * Int64(self.head),
                                cos_v, sin_v, Int64(i))
             for it in cutlass.range_constexpr(_ceil(self.kv_heads * pass_width, self.threads)):
                 idx = Int32(it * self.threads) + tidx
                 if idx < Int32(self.kv_heads * pass_width):
                     h = Int64(idx // Int32(pass_width))
                     d = Int64(2 * ROPE_HALF) + Int64(idx % Int32(pass_width))
-                    record[Int64(0), h * Int64(self.head) + d] = qkv[token, k0 + h * Int64(self.head) + d]
+                    record[Int64(0), h * Int64(self.head) + d] = qkv[token, k0 + h * Int64(self.k_stride) + d]
             v0 = Int64(self.kv_heads * self.head)
+            v_src = k0 + Int64(self.kv_heads * self.k_stride)
             for it in cutlass.range_constexpr(_ceil(self.kv_heads * self.v_head, self.threads)):
                 idx = Int32(it * self.threads) + tidx
                 if idx < Int32(self.kv_heads * self.v_head):
-                    value = Float32(qkv[token, k0 + v0 + Int64(idx)])
+                    value = Float32(qkv[token, v_src + Int64(idx)])
                     record[Int64(0), v0 + Int64(idx)] = (value * Float32(self.v_scale)).to(BFloat16)
 
 
