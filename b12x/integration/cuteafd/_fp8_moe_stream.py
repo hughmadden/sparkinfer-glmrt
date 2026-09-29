@@ -65,7 +65,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
 )
 
-from ._fp8_moe_kernels import META_HEAD, _i32_at, _u32_as_f32
+from ._fp8_moe_kernels import META_HEAD, _i32_at, _round_bf16, _u32_as_f32
 from ._fp8_weights import _e4m3x4_scaled_bf16x2x2, _e4m3x8_scaled_bf16
 
 __all__ = ["STREAM_TILE_M", "StreamFp8Down", "StreamFp8GateUp", "stream_max_tiles"]
@@ -95,13 +95,13 @@ def _chunk(meta: cute.Pointer, experts: cutlass.Constexpr, tile: Int32):
 
 @cute.jit
 def _swiglu(g: Float32, u: Float32, limit: cutlass.Constexpr) -> Float32:
-    gate = Float32(g.to(BFloat16))
-    up = Float32(u.to(BFloat16))
+    gate = _round_bf16(g)
+    up = _round_bf16(u)
     if const_expr(limit > 0.0):
         gate = cutlass.select_(gate > Float32(limit), Float32(limit), gate)
         up = cutlass.select_(up > Float32(limit), Float32(limit), up)
         up = cutlass.select_(up < Float32(-limit), Float32(-limit), up)
-    silu = Float32(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)).to(BFloat16))
+    silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
     return silu * up
 
 

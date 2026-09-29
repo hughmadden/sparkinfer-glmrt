@@ -67,6 +67,13 @@ from ._fp8_weights import _e4m3x4_scaled_bf16x2x2, _e4m3x8_scaled_bf16, _ld_f32
 META_HEAD = 4
 
 
+@cute.jit
+def _round_bf16(value: Float32) -> Float32:
+    """Round to BF16 (RNE) through the packing instruction: ``Float32(x.to(BFloat16))``
+    lowers to a truncf/extf pair the compiler may fold away."""
+    return _bf16_lo(pack_f32x2_to_bfloat2(value, value))
+
+
 def meta_words(experts: int, max_tiles: int) -> int:
     return META_HEAD + 3 * int(experts) + int(max_tiles)
 
@@ -353,7 +360,7 @@ class MoeSwiGLU:
                 gate = cutlass.select_(gate > Float32(self.limit), Float32(self.limit), gate)
                 up = cutlass.select_(up > Float32(self.limit), Float32(self.limit), up)
                 up = cutlass.select_(up < Float32(-self.limit), Float32(-self.limit), up)
-            silu = Float32(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)).to(BFloat16))
+            silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
             dst = cute.make_tensor(act, cute.make_layout((Int64(1) << Int64(40),)))
             dst[Int64(row) * Int64(self.inter) + Int64(col)] = (silu * up).to(BFloat16)
 
