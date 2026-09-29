@@ -195,7 +195,8 @@ class _Gdn:
         proj = _ptr(bf16, base)
         self.in_proj(x, w_in, w_in_fp8, w_in_scale, proj, rows, stream)
         self.conv(proj, conv_w, conv_state, slots, seq_first, _ptr(bf16, qkv_off), rows, stream)
-        self.conv_state(proj, conv_state, slots, seq_first, rows, stream)
+        # spec 0: the conv window advances in place; the replay pointer is not read.
+        self.conv_state(proj, conv_state, slots, seq_first, proj, Int32(0), rows, stream)
         z = _ptr(bf16, base + Int64(c * 2))
         b_raw = _ptr(bf16, base + Int64((c + v) * 2), 2)
         a_raw = _ptr(bf16, base + Int64((c + v + self.g.gdn_value_heads) * 2), 2)

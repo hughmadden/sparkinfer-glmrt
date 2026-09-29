@@ -70,6 +70,25 @@ probabilities, FP32 PV accumulation.
     w_o         bf16 [H,N*128]        in     o_proj (BF16 in the checkpoint)
     out         bf16 [rows,H]         out    before the residual add
     rows        int32
+
+FP8 decode weights (``fp8=True``, producer and o): each BF16 weight ``w`` is
+followed by ``w_fp8`` (E4M3 ``[N, K]``) and ``w_scale`` (FP32 ``[N, K/128]``,
+one scale per output row and 128-wide K block, so the checkpoint's 128x128
+grids and the per-head full-attention ``k_proj`` grid expand exactly, and a
+BF16 weight such as ``o_proj`` quantizes per row), and the scalar
+``fp8_rows`` follows ``rows``: steps of ``rows <= min(fp8_rows, 16)`` read the
+E4M3 copy through ``MmaFp8Gemv`` (weights widened to ``bf16(w * s)``, the BF16
+program's dequantized weight), longer steps the BF16 weight; ``fp8_rows`` 0
+turns FP8 off.
+
+``compile_mimo_head_fp8_aot(g)``: FP32 logits of up to 16 decode rows over an
+E4M3 LM head with per-row x 128-K scales::
+
+    x           bf16 [rows,H]         in     final norm output
+    w_fp8       e4m3 [V,H]            in
+    scale       f32  [V,H/128]        in
+    logits      f32  [rows,V]         out
+    rows        int32
 """
 
 from __future__ import annotations
@@ -82,11 +101,13 @@ from cutlass import Int32, Int64
 
 from ._common import MIMO_V2_FLASH, MiMoGeometry, Operand, Scalar, compile_program
 from ._glm_kernels import glm_projection
+from .glmf import FP8_GEMV_CONFIG, FP8_ROWS, _Fp8Switch, _HeadFp8, fp8_ops
 from ._mimo_kernels import MAX_SPLITS, MimoGqaAttention, MimoQkvRope, MimoRingCommit, MimoSplitMerge
 
 __all__ = [
     "attention_scratch_bytes",
     "compile_mimo_attention_aot",
+    "compile_mimo_head_fp8_aot",
     "compile_mimo_o_aot",
     "compile_mimo_producer_aot",
     "producer_scratch_bytes",
@@ -127,14 +148,15 @@ def prefill_tokens(g: MiMoGeometry, kind: str) -> int:
 
 
 class _Producer:
-    def __init__(self, g: MiMoGeometry, kind: str):
-        self.g, self.kind = g, kind
-        self.qkv = glm_projection(g.qkv_width(kind), g.hidden)
+    def __init__(self, g: MiMoGeometry, kind: str, fp8: bool = False):
+        self.g, self.kind, self.fp8 = g, kind, bool(fp8)
+        self.qkv = _Fp8Switch(g.qkv_width(kind), g.hidden, fp8=True, row_scales=True) if fp8 \
+            else glm_projection(g.qkv_width(kind), g.hidden)
         self.post = MimoQkvRope(heads=g.heads, kv_heads=g.kv_heads(kind), v_scale=g.v_scale,
                                 head=g.qk_head_dim, v_head=g.v_head_dim, k_stride=g.qkv_k_stride)
 
     def key(self) -> tuple:
-        return (self.qkv.key(), self.kind, self.g)
+        return (self.qkv.key(), self.kind, self.g, self.fp8)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
@@ -145,56 +167,43 @@ class _Producer:
         self.post(qkv, positions, cos_sin, kv_slots, query, kv_cache, rows, stream)
 
 
-class _Fp8Producer(_Producer):
-    """The producer with the qkv projection over the checkpoint's FP8 weight
-    (``MmaFp8Gemv`` up to 16 rows, the BF16 TMA GEMM over ``w_qkv`` above)."""
-
+class _ProducerFp8(_Producer):
     def __init__(self, g: MiMoGeometry, kind: str):
-        from ._fp8_weights import RoutedFp8Projection
-
-        super().__init__(g, kind)
-        self.qkv = RoutedFp8Projection(g.qkv_width(kind), g.hidden)
+        super().__init__(g, kind, fp8=True)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
                  w_qkv: cute.Pointer, w_qkv_fp8: cute.Pointer, w_qkv_scale: cute.Pointer, kv_cache: cute.Pointer,
-                 query: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+                 query: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
         qkv = cute.make_ptr(cutlass.BFloat16, Int64(scratch.toint()), cute.AddressSpace.gmem, assumed_align=16)
-        self.qkv(x, w_qkv, w_qkv_fp8, w_qkv_scale, qkv, rows, stream)
+        self.qkv(x, w_qkv, w_qkv_fp8, w_qkv_scale, qkv, rows, fp8_rows, stream)
         self.post(qkv, positions, cos_sin, kv_slots, query, kv_cache, rows, stream)
 
 
 def compile_mimo_producer_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, max_rows: int, fp8: bool = False):
-    """QKV projection, partial RoPE and the KV record write; see the module
-    docstring. ``fp8`` (geometries with ``fp8_qkv``) adds ``w_qkv_fp8`` E4M3
-    ``[W, H]`` and ``w_qkv_scale`` FP32 ``[W/128, H/128]`` (the checkpoint's
-    blocks in the ``w_qkv`` row layout) and projects decode rows from them."""
+    """QKV projection, partial RoPE and the KV record write; see the module docstring
+    (``fp8``: the E4M3 ``w_qkv`` copy for decode rows)."""
     max_rows = _check(kind, max_rows)
-    if fp8 and not g.fp8_qkv:
-        raise ValueError(f"{g.name} has no FP8 qkv layout")
-    launch = (_Fp8Producer if fp8 else _Producer)(g, kind)
-    h, n, r, w = g.hidden, g.heads, g.record_elems(kind), g.qkv_width(kind)
-    weights = (Operand("w_qkv", torch.bfloat16, f"[{w},{h}]"),)
-    if fp8:
-        from ._fp8_weights import fp8_operands
-
-        weights += fp8_operands("w_qkv", w, h)
+    launch = (_ProducerFp8(g, kind) if fp8 else _Producer(g, kind))
+    h, n, r = g.hidden, g.heads, g.record_elems(kind)
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         Operand("positions", torch.int64, "[rows]", align=8),
         Operand("kv_slots", torch.int64, "[rows]", align=8),
         Operand("cos_sin", torch.float32, "[P,64]", align=4),
-        *weights,
+        Operand("w_qkv", torch.bfloat16, f"[{g.qkv_width(kind)},{h}]"),
+        *(fp8_ops("w_qkv", g.qkv_width(kind), h, True) if fp8 else ()),
         Operand("kv_cache", torch.bfloat16, f"[slots,{r}]", "inout"),
         Operand("query", torch.bfloat16, f"[rows,{n},{g.qk_head_dim}]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name=f"mimo_{kind}_producer" + ("_fp8" if fp8 else ""), operands=operands, scalars=(Scalar("rows"),),
-        key=(max_rows, fp8, launch.key()),
+        launch, name=f"mimo_{kind}_producer", operands=operands,
+        scalars=(Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),),
+        key=(max_rows, launch.key()),
         geometry={"kind": kind, "hidden": h, "heads": n, "kv_heads": g.kv_heads(kind), "record_elems": r,
-                  "max_rows": max_rows, "v_scale": g.v_scale, "rope_theta": g.rope_theta(kind),
-                  "qkv_width": w, "k_stride": g.qkv_k_stride, "fp8": bool(fp8)},
+                  "max_rows": max_rows, "v_scale": g.v_scale, "rope_theta": g.rope_theta(kind), "fp8_weights": fp8,
+                  "qkv_width": g.qkv_width(kind), "k_stride": g.qkv_k_stride},
         scratch={"scratch": lambda rows: producer_scratch_bytes(g, kind, rows)},
         doc=__doc__,
     )
@@ -316,11 +325,13 @@ def compile_mimo_attention_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, ro
 
 
 class _Output:
-    def __init__(self, g: MiMoGeometry):
-        self.o = glm_projection(g.hidden, g.heads * g.v_head_dim)
+    def __init__(self, g: MiMoGeometry, fp8: bool = False):
+        self.fp8 = bool(fp8)
+        self.o = _Fp8Switch(g.hidden, g.heads * g.v_head_dim, fp8=True, row_scales=True) if fp8 \
+            else glm_projection(g.hidden, g.heads * g.v_head_dim)
 
     def key(self) -> tuple:
-        return self.o.key()
+        return (self.o.key(), self.fp8)
 
     @cute.jit
     def __call__(self, attn: cute.Pointer, w_o: cute.Pointer, out: cute.Pointer, rows: Int32,
@@ -328,15 +339,42 @@ class _Output:
         self.o(attn, w_o, out, rows, stream)
 
 
-def compile_mimo_o_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, max_rows: int):
-    """o_proj for ``rows <= max_rows``; see the module docstring."""
+class _OutputFp8(_Output):
+    def __init__(self, g: MiMoGeometry):
+        super().__init__(g, fp8=True)
+
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, w_o: cute.Pointer, w_o_fp8: cute.Pointer, w_o_scale: cute.Pointer,
+                 out: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.o(attn, w_o, w_o_fp8, w_o_scale, out, rows, fp8_rows, stream)
+
+
+def compile_mimo_o_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, max_rows: int, fp8: bool = False):
+    """o_proj for ``rows <= max_rows``; see the module docstring (``fp8``: the
+    E4M3 per-row-scaled copy for decode rows)."""
     max_rows = _check("full", max_rows)
-    launch = _Output(g)
+    launch = _OutputFp8(g) if fp8 else _Output(g)
     h, w = g.hidden, g.heads * g.v_head_dim
     return compile_program(
         launch, name="mimo_o",
         operands=(Operand("attn", torch.bfloat16, f"[rows,{w}]"), Operand("w_o", torch.bfloat16, f"[{h},{w}]"),
+                  *(fp8_ops("w_o", h, w, True) if fp8 else ()),
                   Operand("out", torch.bfloat16, f"[rows,{h}]", "out")),
-        scalars=(Scalar("rows"),), key=(max_rows, launch.key()),
-        geometry={"hidden": h, "width": w, "max_rows": max_rows}, doc=__doc__,
+        scalars=(Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),), key=(max_rows, launch.key()),
+        geometry={"hidden": h, "width": w, "max_rows": max_rows, "fp8_weights": fp8}, doc=__doc__,
+    )
+
+
+def compile_mimo_head_fp8_aot(g: MiMoGeometry = MIMO_V2_FLASH):
+    """FP32 logits of up to 16 decode rows over the E4M3 LM head; see the module docstring."""
+    h, v = g.hidden, g.vocab_size
+    launch = _HeadFp8(v, h)
+    return compile_program(
+        launch, name="mimo_head_fp8",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("w_fp8", torch.float8_e4m3fn, f"[{v},{h}]"),
+                  Operand("scale", torch.float32, f"[{v},{h // 128}]", align=4),
+                  Operand("logits", torch.float32, f"[rows,{v}]", "out")),
+        scalars=(Scalar("rows"),), key=(v, launch.key()),
+        geometry={"hidden": h, "vocab": v, "max_rows": FP8_ROWS}, doc=__doc__,
     )

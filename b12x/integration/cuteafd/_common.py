@@ -223,16 +223,15 @@ class MiMoGeometry:
     routed_experts: int = 256
     top_k: int = 8
     norm_eps: float = 1.0e-5
+    vocab_size: int = 152576
     # The router weight is stored FP32 (Flash: split into BF16 hi + lo) or
     # BF16 (V2.6 Pro: one BF16 product, FP32 accumulation).
     router_fp32: bool = True
     # Rows of each KV head's key in the qkv projection output: 192, or 256
-    # when every key is padded to whole 128-row blocks (V2.6 Pro: its fused
-    # qkv_proj grid restarts per head, so the padded layout keeps the
-    # checkpoint's 128x128 FP8 blocks for the FP8 decode projection).
+    # when every key is zero-padded to whole 128-row blocks (V2.6 Pro: its
+    # fused qkv_proj grid restarts per checkpoint TP shard; the padded layout
+    # keeps every checkpoint 128x128 block on whole 128-row blocks).
     qkv_k_stride: int = 192
-    # Export decode producers that read the qkv weight as the checkpoint's FP8.
-    fp8_qkv: bool = False
 
     def __post_init__(self) -> None:
         if (self.qk_head_dim, self.v_head_dim, self.rope_dim) != (192, 128, 64):
@@ -241,8 +240,6 @@ class MiMoGeometry:
             raise ValueError("query heads must divide into KV groups")
         if self.qkv_k_stride < self.qk_head_dim:
             raise ValueError("qkv_k_stride must hold a key head")
-        if self.fp8_qkv and (self.heads * self.qk_head_dim) % 128 or self.fp8_qkv and self.qkv_k_stride % 128:
-            raise ValueError("FP8 qkv needs 128-row blocks per query width and padded key")
         if self.ring_rows < self.window or self.ring_rows & (self.ring_rows - 1):
             raise ValueError("ring_rows must be a power of two covering the window")
 
@@ -271,7 +268,7 @@ MIMO_V2_FLASH = MiMoGeometry()
 MIMO_V26_PRO = MiMoGeometry(
     name="mimo_v2_pro", hidden=6144, heads=128, full_kv_heads=8, swa_kv_heads=8, v_scale=0.612,
     full_rope_theta=1.0e7, swa_rope_theta=1.0e4, dense_inter=16384, routed_experts=384, router_fp32=False,
-    qkv_k_stride=256, fp8_qkv=True,
+    qkv_k_stride=256,
 )
 
 
