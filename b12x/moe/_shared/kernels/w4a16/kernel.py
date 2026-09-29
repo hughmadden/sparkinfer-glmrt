@@ -41,6 +41,8 @@ from b12x._lib.intrinsics import (
     fp8x4_e4m3_to_half2x2,
     half2_to_float2_scaled,
     get_ptr_as_int64,
+    cvt_bf16x2_to_f16x2,
+    f16x2_to_f32x2,
     half2_mul,
     ld_global_acquire_i32,
     ld_global_nc_u32,
@@ -66,6 +68,7 @@ from b12x._lib.intrinsics import (
     packed_decode_sqg_fp16_d3l_to_bfloat2x4,
     packed_decode_sqg_fp16_d3l_to_half2x4,
     packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
+    ld_global_nc_v2_u32,
     ld_global_nc_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
@@ -935,6 +938,7 @@ class W4A16GemmKernel:
         schedule_whole_tiles: bool = False,
         dynamic_num_experts: bool = False,
         schedule_route_block_factor: int = 1,
+        fused_input_rotation: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1169,6 +1173,13 @@ class W4A16GemmKernel:
         self.route_major_a = bool(route_major_a)
         if self.route_major_a and not self.dual_a:
             raise ValueError("route_major_a requires the exact dual-A FC1 path")
+        # FC1 stages the token's BF16 input and applies the per-expert H128
+        # input rotation (x * suh, Walsh-Hadamard) to each pair of 64-wide K
+        # tiles in shared memory, instead of reading a materialized rotated
+        # copy per route. The caller binds the SUH tables and the expert.
+        self.fused_input_rotation = bool(fused_input_rotation)
+        # Trace-time binding (suh_gate, suh_up, expert) for the FC1 tile being traced.
+        self._rotation = None
         self.fused_topk_sum = bool(fused_topk_sum)
         self.fused_sum_topk = int(fused_sum_topk)
         # Whole-tile persistent scheduling: every mn-tile is computed by one
@@ -1256,6 +1267,17 @@ class W4A16GemmKernel:
         self.b_sh_stride_threads = self.b_sh_stride
         self.b_sh_stage = self.b_sh_stride * self.cta_k_blocks
         self.b_sh_wr_iters = self.b_sh_stage // self.cta_threads
+        if self.fused_input_rotation and (
+            not self.dual_a or self.route_major_a or self.direct_topk_routes
+            or not self.schedule_whole_tiles or self.uses_m_block_8
+            or not self.weight_layout_trellis256 or self.tile_k != 64
+            or self.size_k % 128 or self.b_sh_wr_iters < 2
+            or self.a_sh_stride != 8 or self.cta_threads % 32
+        ):
+            raise ValueError(
+                "fused input rotation requires packed whole-tile token-major dual-A "
+                "Trellis FC1 with 64-wide K tiles, H128-aligned K and 16+ row blocks"
+            )
         # Native t256 uses 4*bits bytes per 32 codes;
         # packed/modelopt use 16 bytes for the same logical unit.
         self.b_unit_bytes = 16
@@ -1369,6 +1391,7 @@ class W4A16GemmKernel:
             self.sqg_xor_cheb_t12_smem,
             self.small_m_splitk,
             self.skip_empty_m_blocks,
+            self.fused_input_rotation,
         )
 
     @cute.jit
@@ -5252,6 +5275,95 @@ class W4A16GemmKernel:
             )
 
     @cute.jit
+    def _rotate_a_pair(
+        self,
+        smem_base: Int32,
+        tid: Int32,
+        pipe0: Int32,
+        pipe1: Int32,
+        k_tile: Int32,
+        block_valid_rows: Int32,
+        output_n_tile: Int32,
+    ):
+        """Rotate one H128 input block in place: the BF16 token rows staged for
+        K tiles `k_tile` (stage `pipe0`) and `k_tile + 1` (stage `pipe1`) become
+        fp16(had128(fp16(fp16(x) * suh))), bit-identical to the materialized
+        per-route rotation (same roundings, same butterfly stage order).
+
+        Each half-warp owns one row: lane l (0..15) holds elements 8l..8l+7, one
+        16-byte shared chunk, so three butterfly stages run in registers and
+        four across the half-warp."""
+        if cutlass.const_expr(self._rotation is None):
+            raise ValueError("fused input rotation needs its SUH tables bound for the FC1 tile")
+        suh_gate, suh_up, expert = self._rotation
+        lane = tid & Int32(31)
+        l16 = lane & Int32(15)
+        half = lane >> Int32(4)
+        warp = tid >> Int32(5)
+        warps = self.cta_threads // 32
+        s_off = expert * Int32(self.size_k) + k_tile * Int32(64) + l16 * Int32(8)
+        s_addr = get_ptr_as_int64(suh_gate, s_off)
+        if output_n_tile >= Int32(self.n_tiles // 2):
+            s_addr = get_ptr_as_int64(suh_up, s_off)
+        suh = ld_global_nc_v4_u32(s_addr)
+        stage = pipe0
+        if l16 >= Int32(8):
+            stage = pipe1
+        chunk = l16 & Int32(7)
+        stage_base = (
+            smem_base + Int32(self.sh_a_off * 16) + stage * Int32(self.a_sh_stage * 16)
+        )
+        rows = 16 * self.cta_m_blocks
+        pairs_per_warp = rows // (2 * warps)
+        group = min(pairs_per_warp, 2)
+        for g in cutlass.range_constexpr(pairs_per_warp // group):
+            first_row = Int32(2) * (warp + Int32(warps * g * group))
+            if first_row < block_valid_rows:
+                addrs = []
+                loads = []
+                for j in cutlass.range_constexpr(group):
+                    row = Int32(2) * (warp + Int32(warps * (g * group + j))) + half
+                    addr = stage_base + (
+                        row * Int32(self.a_sh_stride) + (chunk ^ (row & Int32(7)))
+                    ) * Int32(16)
+                    addrs.append(addr)
+                    loads.append(ld_shared_v4_u32(addr))
+                for j in cutlass.range_constexpr(group):
+                    v = []
+                    for w in cutlass.range_constexpr(4):
+                        scaled = half2_mul(cvt_bf16x2_to_f16x2(loads[j][w]), suh[w])
+                        lo, hi = f16x2_to_f32x2(scaled)
+                        v.append(lo)
+                        v.append(hi)
+                    for bi in cutlass.range_constexpr(3):
+                        b = 1 << bi
+                        for e in cutlass.range_constexpr(8):
+                            if cutlass.const_expr(e & b == 0):
+                                lo = v[e]
+                                hi = v[e | b]
+                                v[e] = lo + hi
+                                v[e | b] = lo - hi
+                    for si in cutlass.range_constexpr(4):
+                        st = 1 << si
+                        # Lower lane: partner + own; upper lane: partner - own
+                        # (the lower element minus the upper one). The sign
+                        # multiply is exact, so either form rounds once.
+                        sign = cutlass.Float32(1.0) - cutlass.Float32(2.0) * (
+                            (l16 >> Int32(si)) & Int32(1)
+                        ).to(cutlass.Float32)
+                        for e in cutlass.range_constexpr(8):
+                            p = cute.arch.shuffle_sync_bfly(v[e], offset=st)
+                            v[e] = p + sign * v[e]
+                    rs = cutlass.Float32(0.088388347648)
+                    st_shared_v4_u32(
+                        addrs[j],
+                        pack_f32x2_to_f16x2(v[0] * rs, v[1] * rs),
+                        pack_f32x2_to_f16x2(v[2] * rs, v[3] * rs),
+                        pack_f32x2_to_f16x2(v[4] * rs, v[5] * rs),
+                        pack_f32x2_to_f16x2(v[6] * rs, v[7] * rs),
+                    )
+
+    @cute.jit
     def _prefetch_initial_tiles(
         self,
         a_bf16_flat: cute.Tensor,
@@ -5303,7 +5415,16 @@ class W4A16GemmKernel:
                 )
             else:
                 cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(_STAGES - 2)
+        if cutlass.const_expr(self.fused_input_rotation):
+            # The first H128 pair: tiles 0 and 1 must both have landed.
+            cute.arch.cp_async_wait_group(_STAGES - 3)
+            cute.arch.sync_threads()
+            self._rotate_a_pair(
+                smem_base, tid, Int32(0), Int32(1), reduce_k_tile,
+                block_valid_rows, output_n_tile,
+            )
+        else:
+            cute.arch.cp_async_wait_group(_STAGES - 2)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -5360,7 +5481,26 @@ class W4A16GemmKernel:
             )
         else:
             cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(_STAGES - 2)
+        if cutlass.const_expr(self.fused_input_rotation):
+            # When the next tile starts an H128 pair, wait for its partner too
+            # and rotate both stages before any A fragment of it is read.
+            next_tile = reduce_k_tile + tile_idx + Int32(1)
+            if tile_idx + Int32(1) < k_tiles and (next_tile & Int32(1)) == Int32(0):
+                cute.arch.cp_async_wait_group(_STAGES - 3)
+                cute.arch.sync_threads()
+                self._rotate_a_pair(
+                    smem_base,
+                    tid,
+                    Int32((pipe + 1) % _STAGES),
+                    Int32((pipe + 2) % _STAGES),
+                    next_tile,
+                    block_valid_rows,
+                    output_n_tile,
+                )
+            else:
+                cute.arch.cp_async_wait_group(_STAGES - 2)
+        else:
+            cute.arch.cp_async_wait_group(_STAGES - 2)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -6260,6 +6400,7 @@ class W4A16FusedMoeKernel:
         coupled_hadamard: bool = False,
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
+        fused_input_rotation: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6429,6 +6570,15 @@ class W4A16FusedMoeKernel:
                     "intermediate_rotation requires intermediate_size % 128 == 0"
                 )
         self.full_rotation = bool(full_rotation)
+        # FC1 rotates the staged token input itself (no rotation phase, no
+        # materialized per-route copies). Requires BF16 input, per-expert SUH
+        # and packed routes; the caller binds the SUH tables per FC1 tile.
+        self.fused_input_rotation = bool(fused_input_rotation)
+        if self.fused_input_rotation and (
+            not full_rotation or coupled_hadamard or broadcast_suh
+            or rotation_input_dtype != "bf16"
+        ):
+            raise ValueError("fused input rotation requires per-expert full rotation of BF16 input")
         self.coupled_hadamard = bool(coupled_hadamard)
         # suh tables hold one shared row (kquant shared-su artifacts): index
         # them with a zero expert stride.
@@ -6495,9 +6645,10 @@ class W4A16FusedMoeKernel:
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
             dual_a=self.dual_a,
-            route_major_a=self.full_rotation,
+            route_major_a=self.full_rotation and not self.fused_input_rotation,
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
+            fused_input_rotation=self.fused_input_rotation,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -6593,6 +6744,7 @@ class W4A16FusedMoeKernel:
             self.dual_a,
             self.full_rotation,
             self.coupled_hadamard,
+            self.fused_input_rotation,
             self.broadcast_suh,
             self.rotation_input_dtype,
             self.sqg_xor_cheb_t12_smem,
@@ -7130,7 +7282,9 @@ class W4A16FusedMoeKernel:
             )
             fc1_phase_lut = table_addr
             fc2_phase_lut = table_addr
-        if cutlass.const_expr(self.full_rotation and not input_rotated):
+        if cutlass.const_expr(
+            self.full_rotation and not input_rotated and not self.fused_input_rotation
+        ):
             if cutlass.const_expr(self.coupled_hadamard):
                 self._run_input_rotation_coupled(
                     rotation_input_flat,

@@ -103,6 +103,8 @@ class MixedTrellisCompileResult:
     broadcast_suh: bool
     broadcast_svh: bool
     paired_boundary: str | None = field(default=None, kw_only=True)
+    # FC1 rotates staged token rows itself; nothing writes rotation_up.
+    fused_input_rotation: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -234,7 +236,7 @@ class W4A16MixedTrellisKernel:
 
     # Persistent compile keys do not include launch source text. Change this
     # version whenever the compiled argument or tensor-layout contract changes.
-    ABI_VERSION = 19
+    ABI_VERSION = 20
     _token_major_rotation = False
 
     def __init__(
@@ -410,6 +412,16 @@ class W4A16MixedTrellisKernel:
                 active_size_m,
             )
 
+    def _dispatch_bound(self, is_fc1, combined_expert, gemm, *args):
+        """Trace-time Python: bind the fused FC1 input rotation (SUH tables and
+        the tile's combined expert) around one tier GEMM dispatch."""
+        if is_fc1 and self.driver.fused_input_rotation:
+            gemm._rotation = (*self._fused_suh, combined_expert)
+        try:
+            self._dispatch_tier_gemm(gemm, *args)
+        finally:
+            gemm._rotation = None
+
     @cute.jit
     def _emit_tier_tile(
         self,
@@ -517,7 +529,9 @@ class W4A16MixedTrellisKernel:
                         gemm = self.tier0.fc1
                     else:
                         gemm = self.tier0.fc2
-                    self._dispatch_tier_gemm(
+                    self._dispatch_bound(
+                        is_fc1,
+                        combined_expert,
                         gemm,
                         a_flat,
                         a_alt_flat,
@@ -553,7 +567,9 @@ class W4A16MixedTrellisKernel:
                         gemm = self.tier1.fc1
                     else:
                         gemm = self.tier1.fc2
-                    self._dispatch_tier_gemm(
+                    self._dispatch_bound(
+                        is_fc1,
+                        combined_expert,
                         gemm,
                         a_flat,
                         a_alt_flat,
@@ -868,6 +884,7 @@ class W4A16MixedTrellisKernel:
         routes instead of re-reading the token row per packed route."""
         return bool(
             self._token_major_rotation
+            and not self.driver.fused_input_rotation
             and not self.driver.direct_topk_routes
             and self.paired_boundary is None
             and not self.driver.broadcast_suh
@@ -1047,11 +1064,18 @@ class W4A16MixedTrellisKernel:
             phase_lut_addr = Int64(
                 smem_base + Int32(self.driver.sqg_xor_cheb_t12_smem_off)
             )
+        fc1_a = rotation_gate
+        fc1_a_alt = rotation_up
+        if cutlass.const_expr(self.driver.fused_input_rotation):
+            # FC1 stages the BF16 token rows and rotates them itself.
+            fc1_a = rotation_input
+            fc1_a_alt = rotation_input
+            self._fused_suh = (gate_suh, up_suh)
         fc1_emit = partial(
             self._emit_tier_tile,
             True,
-            rotation_gate,
-            rotation_up,
+            fc1_a,
+            fc1_a_alt,
             t0_w13,
             t0_w13_scales,
             t0_w13_global,
@@ -2058,6 +2082,7 @@ def compile_mixed_trellis(
     force_blocks_per_sm: int | None = None,
     paired_boundary: str | None = None,
     token_major_rotation: bool = False,
+    fused_input_rotation: bool = False,
 ) -> MixedTrellisCompileResult:
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
@@ -2123,6 +2148,7 @@ def compile_mixed_trellis(
             broadcast_suh=broadcast_suh,
             direct_topk_routes=direct_topk_routes,
             schedule_whole_tiles=True,
+            fused_input_rotation=fused_input_rotation,
         )
 
     def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellisKernel:
@@ -2303,6 +2329,7 @@ def compile_mixed_trellis(
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
         paired_boundary=paired_boundary,
+        fused_input_rotation=bool(fused_input_rotation),
     )
     _CACHE[cache_key] = result
     return result
@@ -2608,11 +2635,15 @@ def _make_mixed_trellis_buffers(
     rotation_gate = torch.empty(
         (capacity_rows, launch.hidden_size), dtype=torch.float16, device=device
     )
+    # A fused FC1 input rotation never writes or reads the per-route up copy.
+    rotation_up = rotation_gate
+    if not getattr(launch, "fused_input_rotation", False):
+        rotation_up = torch.empty(
+            (capacity_rows, launch.hidden_size), dtype=torch.float16, device=device
+        )
     return MixedTrellisBuffers(
         rotation_gate=rotation_gate,
-        rotation_up=torch.empty(
-            (capacity_rows, launch.hidden_size), dtype=torch.float16, device=device
-        ),
+        rotation_up=rotation_up,
         fc1=torch.empty((capacity_rows, fc1_cols), dtype=torch.float16, device=device),
         activated=torch.empty(
             (capacity_rows, launch.intermediate_size),
