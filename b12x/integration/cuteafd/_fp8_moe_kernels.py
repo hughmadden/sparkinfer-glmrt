@@ -126,14 +126,22 @@ def _atomic_add_shared_i32(address, value, *, loc=None, ip=None):
 class MoePrep:
     """Group the (row, slot) pairs by expert in one CTA (see module docstring).
     ``grouped_cap`` is the number of grouped rows the scratch holds (every
-    one is reset to padding first)."""
+    one is reset to padding first). Tiles cover ``tile_rows`` grouped rows of
+    one expert (default ``pad``); with ``chunked`` the tile table holds
+    ``expert | chunk << 16`` (chunk = the tile's index inside its expert's
+    group, for compact groups cut into ``tile_rows`` chunks)."""
 
     threads = 1024
 
-    def __init__(self, *, experts: int, top_k: int, pad: int, max_tiles: int):
+    def __init__(self, *, experts: int, top_k: int, pad: int, max_tiles: int, tile_rows: int | None = None,
+                 chunked: bool = False):
         self.experts, self.top_k, self.pad, self.max_tiles = int(experts), int(top_k), int(pad), int(max_tiles)
+        self.tile_rows = self.pad if tile_rows is None else int(tile_rows)
+        self.chunked = bool(chunked)
         if self.experts > self.threads:
             raise ValueError("MoePrep handles at most 1024 experts")
+        if self.tile_rows % self.pad:
+            raise ValueError("tile_rows must be a multiple of pad")
 
     def _storage(self):
         class Storage:
@@ -143,6 +151,7 @@ class MoePrep:
             "counts": cute.struct.Align[cute.struct.MemRange[Int32, self.experts], 16],
             "cursor": cute.struct.Align[cute.struct.MemRange[Int32, self.experts], 16],
             "flags": cute.struct.Align[cute.struct.MemRange[Int32, self.experts], 16],
+            "tiles": cute.struct.Align[cute.struct.MemRange[Int32, self.experts], 16],
         }
         return cute.struct(Storage)
 
@@ -161,6 +170,7 @@ class MoePrep:
         counts = storage.counts.get_tensor(cute.make_layout((self.experts,)))
         cursor = storage.cursor.get_tensor(cute.make_layout((self.experts,)))
         scan_flags = storage.flags.get_tensor(cute.make_layout((self.experts,)))
+        scan_tiles = storage.tiles.get_tensor(cute.make_layout((self.experts,)))
         counts_smem = shared_ptr_to_u32(storage.counts.data_ptr())
         cursor_smem = shared_ptr_to_u32(storage.cursor.data_ptr())
         e_count = Int32(self.experts)
@@ -192,40 +202,49 @@ class MoePrep:
         n = Int32(0)
         rows_e = Int32(0)
         flag = Int32(0)
+        tiles_e = Int32(0)
         if tidx < e_count:
             n = Int32(counts[tidx])
             rows_e = (n + Int32(self.pad - 1)) // Int32(self.pad) * Int32(self.pad)
+            tiles_e = (n + Int32(self.tile_rows - 1)) // Int32(self.tile_rows)
             flag = cutlass.select_(n > Int32(0), Int32(1), Int32(0))
             cursor[tidx] = rows_e
             scan_flags[tidx] = flag
+            scan_tiles[tidx] = tiles_e
         cute.arch.sync_threads()
         step = 1
         while step < self.experts:
             a = Int32(0)
             b = Int32(0)
+            c = Int32(0)
             if (tidx < e_count) & (tidx >= Int32(step)):
                 a = Int32(cursor[tidx - Int32(step)])
                 b = Int32(scan_flags[tidx - Int32(step)])
+                c = Int32(scan_tiles[tidx - Int32(step)])
             cute.arch.sync_threads()
             if (tidx < e_count) & (tidx >= Int32(step)):
                 cursor[tidx] = Int32(cursor[tidx]) + a
                 scan_flags[tidx] = Int32(scan_flags[tidx]) + b
+                scan_tiles[tidx] = Int32(scan_tiles[tidx]) + c
             cute.arch.sync_threads()
             step = step * 2
         if tidx < e_count:
             offset = Int32(cursor[tidx]) - rows_e
             active = Int32(scan_flags[tidx]) - flag
+            first_tile = Int32(scan_tiles[tidx]) - tiles_e
             _set_i32(counts_at, tidx, n)
             _set_i32(offsets_at, tidx, offset)
             if n > Int32(0):
                 _set_i32(active_at, active, tidx)
-                first_tile = offset // Int32(self.pad)
-                for t in cutlass.range(rows_e // Int32(self.pad), unroll=1):
+                for t in cutlass.range(tiles_e, unroll=1):
                     if first_tile + Int32(t) < Int32(self.max_tiles):
-                        _set_i32(tiles_at, first_tile + Int32(t), tidx)
+                        code = tidx
+                        if const_expr(self.chunked):
+                            code = tidx | (Int32(t) << Int32(16))
+                        _set_i32(tiles_at, first_tile + Int32(t), code)
             if tidx == e_count - Int32(1):
                 _set_i32(m, 0, active + flag)
-                _set_i32(m, 1, (offset + rows_e) // Int32(self.pad))
+                _set_i32(m, 1, first_tile + tiles_e)
                 _set_i32(m, 2, offset + rows_e)
         cute.arch.sync_threads()
         if tidx < e_count:
