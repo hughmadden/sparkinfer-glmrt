@@ -132,17 +132,128 @@ def _ptr(dtype, address: Int64, align: int = 16):
 # ---------------------------------------------------------------------------
 
 
-def kda_scratch_bytes(g: GLMFGeometry, rows: int) -> int:
-    """proj [rows,P], f|gate [rows,2,D], conv q|k|v [rows,3D], o [rows,D], y [rows,D] (BF16)."""
+# Live rows above which a prefill-capacity KDA program takes the chunked
+# recurrence (b12x delta_prefill: 16-token tiles on tensor cores) instead of
+# the token-sequential one.
+CHUNKED_MIN_ROWS = 64
+
+
+class _SequenceMeta:
+    """Writes one sequence's packed-prefill metadata: ``cu_seqlens = [0,
+    rows]``, ``num_seqs = 1``, ``num_tokens = rows``, initial = final state
+    slot ``slots[0]``, no checkpoint (``[-1]``, offset 0)."""
+
+    @cute.jit
+    def __call__(self, slots: cute.Pointer, meta: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.kernel(slots, meta, rows).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, slots: cute.Pointer, meta: cute.Pointer, rows: Int32):
+        if cute.arch.thread_idx()[0] == 0:
+            s = cute.make_tensor(slots, cute.make_layout((1,)))
+            m = cute.make_tensor(meta, cute.make_layout((8,)))
+            m[0] = Int32(0)
+            m[1] = rows
+            m[2] = Int32(1)
+            m[3] = rows
+            m[4] = s[0]
+            m[5] = s[0]
+            m[6] = Int32(-1)
+            m[7] = Int32(0)
+
+
+class _KdaChunked:
+    """One sequence's KDA recurrence through b12x's chunked delta-rule
+    prefill (prologue, then prepare + recurrence per window of tiles on one
+    stream), over the same q|k|v, gate, beta, state and output buffers as
+    ``GlmfKdaRecurrent``. Beta is ``sigmoid(b)`` in FP32 (the reference rounds
+    it to BF16 first)."""
+
+    def __init__(self, g: GLMFGeometry, max_rows: int):
+        from b12x.sequence._shared.delta_prefill import _cute_kernels as dk
+        from b12x.sequence._shared.delta_prefill.contract import materialize_layout
+        from b12x.sequence._shared.delta_prefill.workspace import default_window_tiles
+        from b12x.sequence.kda_prefill._impl import Caps, _Layout
+
+        heads, d = g.kda_heads, g.kda_width
+        caps = Caps(device=torch.device("cuda", torch.cuda.current_device()), max_tokens=int(max_rows), max_seqs=1,
+                    max_state_slots=1, heads=heads)
+        # The default KdaPrefillConfig: v_split 64, k_split 1, 3 stages.
+        layout = materialize_layout(caps, layout_type=_Layout, v_split=64, k_split=1, stages=3,
+                                    window_tiles=default_window_tiles(heads, int(max_rows), 1))
+        self.layout, self.heads, self.d = layout, heads, d
+        self.tiles_per_window = layout.window_tiles
+        self.lower_bound = float(g.gate_lower_bound)
+        self.meta = _SequenceMeta()
+        self.prologue = dk._PrologueKernel(
+            max_seqs=1, tiles_capacity=caps.tiles_capacity, window_tiles=layout.window_tiles,
+            max_windows=layout.max_windows, flag_count=layout.workspace_windows * layout.window_tiles * heads)
+        self.prepare = dk._PrepareKernel(
+            heads=heads, key_heads=heads, is_gdn=False, tiles_capacity=caps.tiles_capacity,
+            window_tiles=layout.window_tiles, qk_l2norm=True, a_log_type=cutlass.Float32,
+            dt_bias_type=cutlass.Float32)
+        self.recurrence = dk._RecurrenceKernel(
+            heads=heads, tiles_capacity=caps.tiles_capacity, window_tiles=layout.window_tiles,
+            rows=layout.recurrence_rows, v_split=64, k_split=1, stages=3, checkpoint_export=False,
+            null_state_index=None, index_type=Int32, max_sequence_tiles=layout.max_sequence_tiles, is_gdn=False)
+        self.nbytes = _align(int(layout.scratch_specs()[0].nbytes)) + _align(8 * 4)
+
+    def key(self) -> tuple:
+        lay = self.layout
+        return (lay.window_tiles, lay.max_windows, lay.recurrence_rows, lay.v_split, lay.k_split, lay.stages)
+
+    @cute.jit
+    def __call__(self, qkv: cute.Pointer, g_raw: cute.Pointer, b_raw: cute.Pointer, a_log: cute.Pointer,
+                 dt_bias: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, out: cute.Pointer,
+                 scratch: Int64, qkv_stride: cutlass.Constexpr, g_stride: cutlass.Constexpr,
+                 b_stride: cutlass.Constexpr, rows: Int32, stream: cuda.CUstream):
+        lay = self.layout
+        off = lay.offsets
+        meta_base = scratch + Int64(_align(int(lay.scratch_specs()[0].nbytes)))
+        i32 = lambda at: _ptr(Int32, at, 4)  # noqa: E731
+        self.meta(slots, i32(meta_base), rows, stream)
+        cu, num_seqs = i32(meta_base), i32(meta_base + Int64(8))
+        initial, final = i32(meta_base + Int64(16)), i32(meta_base + Int64(20))
+        checkpoint, checkpoint_offsets = i32(meta_base + Int64(24)), i32(meta_base + Int64(28))
+        band_base, sorted_seq = i32(scratch + Int64(off["band_base"])), i32(scratch + Int64(off["sorted_seq"]))
+        rank_of, pos_seq = i32(scratch + Int64(off["rank_of"])), i32(scratch + Int64(off["pos_seq"]))
+        pos_local, window_table = i32(scratch + Int64(off["pos_local"])), i32(scratch + Int64(off["window_table"]))
+        ready = i32(scratch + Int64(off["ready_flags"]))
+        ws = scratch + Int64(off["ws"])
+        d = self.d
+        q = _ptr(cutlass.BFloat16, Int64(qkv.toint()))
+        k = _ptr(cutlass.BFloat16, Int64(qkv.toint()) + Int64(d * 2))
+        v = _ptr(cutlass.BFloat16, Int64(qkv.toint()) + Int64(2 * d * 2))
+        self.prologue(cu, num_seqs, band_base, sorted_seq, rank_of, pos_seq, pos_local, window_table, ready,
+                      Int32(1), stream)
+        tiles = (rows + Int32(15)) // Int32(16)
+        windows = (tiles + Int32(self.tiles_per_window - 1)) // Int32(self.tiles_per_window)
+        for w in cutlass.range_constexpr(lay.max_windows):
+            if Int32(w) < windows:
+                self.prepare(q, k, g_raw, b_raw, a_log, dt_bias, cu, pos_seq, pos_local, ready,
+                             _ptr(cutlass.BFloat16, ws), _ptr(cutlass.Float32, ws),
+                             Int64(qkv_stride), Int64(qkv_stride), Int64(g_stride), Int64(b_stride), Int64(1),
+                             Float32(128.0 ** -0.5), Float32(self.lower_bound * 1.4426950408889634),
+                             Float32(1.0e-6), Int32(w), stream)
+                self.recurrence(v, cu, band_base, sorted_seq, window_table, initial, final, checkpoint,
+                                checkpoint_offsets, num_seqs, ready, _ptr(cutlass.Int8, ws, 16),
+                                state, out, Int64(qkv_stride), Int64(d), Int64(self.heads * 128 * 128), Int64(1),
+                                Int32(w), stream)
+
+
+def kda_scratch_bytes(g: GLMFGeometry, rows: int, chunked: int = 0) -> int:
+    """proj [rows,P], f|gate [rows,2,D], conv q|k|v [rows,3D], o [rows,D], y [rows,D] (BF16), then
+    the chunked recurrence's workspace (``chunked`` bytes, prefill capacities)."""
     rows = max(int(rows), 1)
     d = g.kda_width
     return (_align(rows * g.kda_in_width * 2) + _align(rows * 2 * d * 2) + _align(rows * 3 * d * 2)
-            + 2 * _align(rows * d * 2))
+            + 2 * _align(rows * d * 2) + _align(chunked))
 
 
 class _Kda:
-    def __init__(self, g: GLMFGeometry):
+    def __init__(self, g: GLMFGeometry, max_rows: int = 64):
         self.g = g
+        self.chunked = _KdaChunked(g, max_rows) if int(max_rows) > CHUNKED_MIN_ROWS else None
         d, p = g.kda_width, g.kda_in_width
         self.d, self.p = d, p
         self.in_proj = glm_projection(p, g.hidden)
@@ -157,7 +268,8 @@ class _Kda:
         self.o_proj = glm_projection(g.hidden, d)
 
     def key(self) -> tuple:
-        return (self.in_proj.key(), self.fg.key(), self.o_proj.key(), self.g)
+        return (self.in_proj.key(), self.fg.key(), self.o_proj.key(), self.g,
+                None if self.chunked is None else self.chunked.key())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_fg: cute.Pointer, conv_w: cute.Pointer,
@@ -177,8 +289,17 @@ class _Kda:
         self.fg(_ptr(bf16, base + Int64(3 * d * 2)), w_fg, _ptr(bf16, fg_off), rows, stream)
         self.conv(proj, conv_w, conv_state, slots, seq_first, _ptr(bf16, qkv_off), rows, stream)
         self.conv_state(proj, conv_state, slots, seq_first, rows, stream)
-        self.recurrent(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), _ptr(bf16, base + Int64((3 * d + 256) * 2), 2),
-                       a_log, dt_bias, state, slots, _ptr(bf16, o_off), rows, stream)
+        b_raw = _ptr(bf16, base + Int64((3 * d + 256) * 2), 2)
+        if cutlass.const_expr(self.chunked is None):
+            self.recurrent(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
+                           _ptr(bf16, o_off), rows, stream)
+        else:
+            if rows > Int32(CHUNKED_MIN_ROWS):
+                self.chunked(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
+                             _ptr(bf16, o_off), y_off + _align_i64(m * Int64(2 * d)), 3 * d, 2 * d, p, rows, stream)
+            else:
+                self.recurrent(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
+                               _ptr(bf16, o_off), rows, stream)
         self.norm(_ptr(bf16, o_off), _ptr(bf16, fg_off + Int64(d * 2)), o_norm, _ptr(bf16, y_off), rows, stream)
         self.o_proj(_ptr(bf16, y_off), w_o, out, rows, stream)
 
@@ -186,7 +307,8 @@ class _Kda:
 def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int) -> AotProgram:
     """One KDA layer for ``rows <= max_rows``; see the module docstring."""
     max_rows = _check_rows(max_rows)
-    launch = _Kda(g)
+    launch = _Kda(g, max_rows)
+    chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, d, p, heads = g.hidden, g.kda_width, g.kda_in_width, g.kda_heads
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
@@ -208,8 +330,9 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int) -> Aot
         launch, name="glmf_kda", operands=operands, scalars=(Scalar("rows"),),
         key=(max_rows, launch.key()),
         geometry={"hidden": h, "heads": heads, "head_dim": g.kda_head_dim, "max_rows": max_rows,
-                  "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps},
-        scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows)},
+                  "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps,
+                  "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None},
+        scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked)},
         doc=__doc__,
     )
 
