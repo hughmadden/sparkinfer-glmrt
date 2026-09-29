@@ -22,8 +22,9 @@ from cutlass import BFloat16, Float32, Int32, Int64
 
 from b12x._lib.intrinsics import div_rn_f32
 
-from ._glm_kernels import _bf16, _rsqrt, _warp_sum
+from ._glm_kernels import _rsqrt, _warp_sum
 from ._glmf_kernels import CONV_TAPS, _conv_state, _sigmoid
+from ._qwen4_kernels import _bf16
 
 HEAD = 128
 

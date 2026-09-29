@@ -48,9 +48,15 @@ from b12x._lib.intrinsics import (
 )
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 
-from ._glm_kernels import _bf16, _block_sum, _reduction_storage, _rsqrt
+from ._glm_kernels import _block_sum, _reduction_storage, _rsqrt
 
 VEC = 8
+
+
+@cute.jit
+def _bf16(value: Float32) -> Float32:
+    """Round to BF16 (RNE) through the packing instruction: a plain truncf/extf pair may be folded away."""
+    return _bf16_lo(pack_f32x2_to_bfloat2(value, value))
 
 
 @cute.jit
