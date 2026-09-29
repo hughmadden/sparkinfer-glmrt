@@ -231,7 +231,8 @@ def _fp8_mode(fp8) -> tuple[bool, bool]:
 
 def _fp8_scalars(fp8, prefill: bool) -> tuple:
     if prefill:
-        return (Scalar("rows"), Scalar("fp8", note="nonzero: rows past the skinny GEMV run block-FP8 GEMMs"))
+        return (Scalar("rows"), Scalar("fp8_rows", note="prefill: nonzero runs rows past the skinny GEMV "
+                                                        "through the block-FP8 GEMMs"))
     return (Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),)
 
 
@@ -455,9 +456,9 @@ class _KdaFp8Prefill(_Kda):
                  w_fg: cute.Pointer, conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer,
                  o_norm: cute.Pointer, w_o: cute.Pointer, w_o_fp8: cute.Pointer, w_o_kscale: cute.Pointer,
                  conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
-                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8: Int32, stream: cuda.CUstream):
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
         self.body(x, w_in, w_in_fp8, w_in_kscale, w_fg, conv_w, a_log, dt_bias, o_norm, w_o, w_o_fp8, w_o_kscale,
-                  conv_state, state, slots, seq_first, out, state, scratch, rows, fp8, Int32(0), stream)
+                  conv_state, state, slots, seq_first, out, state, scratch, rows, fp8_rows, Int32(0), stream)
 
 
 def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False) -> AotProgram:
@@ -465,7 +466,7 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
     adds ``w_in``/``w_o`` E4M3 copies with per-row scales and the ``fp8_rows``
     scalar (decode steps up to that many rows read them); ``fp8="prefill"``
     adds them with K-block-major scales (``w_in_kscale``/``w_o_kscale``) and
-    the ``fp8`` scalar (block-FP8 GEMMs, no replay record)."""
+    the ``fp8_rows`` scalar as an on/off switch (block-FP8 GEMMs, no replay record)."""
     max_rows = _check_rows(max_rows)
     fp8_on, prefill = _fp8_mode(fp8)
     launch = (_KdaFp8Prefill if prefill else _KdaFp8 if fp8_on else _Kda)(g, max_rows, fp8)
@@ -619,7 +620,7 @@ class _MlaProducerFp8(_MlaProducer):
 def compile_glmf_mla_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False) -> AotProgram:
     """MLA producer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds the checkpoint's E4M3 ``w_qkv_a``/``w_q_b`` with 128x128 scales and ``fp8_rows``
-    (``fp8="prefill"``: the ``fp8`` scalar, block-FP8 GEMMs)."""
+    (``fp8="prefill"``: ``fp8_rows`` switches block-FP8 GEMMs)."""
     max_rows = _check_rows(max_rows)
     fp8_on, prefill = _fp8_mode(fp8)
     launch = (_MlaProducerFp8 if fp8_on else _MlaProducer)(g, fp8, max_rows)
@@ -698,8 +699,8 @@ class _GlmfFfnFp8(_GlmfFfn):
 
 def compile_glmf_ffn_aot(g: GLMFGeometry = GLM53_FLASH, *, inter: int, max_rows: int, fp8=False) -> AotProgram:
     """Clamped SwiGLU MLP: the ``glm_ffn`` ABI (x, w_gate_up, w_down, out, scratch; rows); ``fp8`` adds
-    the checkpoint's E4M3 weights with 128x128 scales and ``fp8_rows`` (``fp8="prefill"``: the
-    ``fp8`` scalar, block-FP8 GEMMs)."""
+    the checkpoint's E4M3 weights with 128x128 scales and ``fp8_rows`` (``fp8="prefill"``:
+    ``fp8_rows`` switches block-FP8 GEMMs)."""
     from ._glmf_fp8 import quant_scratch_bytes
     from .glm_ffn import ffn_scratch_bytes
 
@@ -967,7 +968,7 @@ class _GlmfOutputFp8(_GlmfOutput):
 
 def compile_glmf_o_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False) -> AotProgram:
     """``glm_o`` (attn, w_uv, w_o, out, scratch; rows) with the FP8 o_proj switch when ``fp8``
-    (``fp8="prefill"``: the ``fp8`` scalar, block-FP8 GEMM)."""
+    (``fp8="prefill"``: ``fp8_rows`` switches the block-FP8 GEMM)."""
     from ._glmf_fp8 import quant_scratch_bytes
     from .glm_attention import o_scratch_bytes
 
