@@ -26,8 +26,17 @@ from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
+    atomic_add_global_i32,
+    atomic_add_shared_i32,
     bfloat2_to_float2_scaled,
+    discard_global_l2_line,
+    fma_rn_f32,
     get_ptr_as_int64,
+    ld_global_v2_u32,
+    ld_shared_i32_relaxed,
+    st_global_i32,
+    st_shared_i32,
+    threadfence,
     half2_to_float2_scaled,
     ld_global_nc_v2_u32,
     pack_f32x2_to_f16x2,
@@ -105,6 +114,11 @@ class MixedTrellisCompileResult:
     paired_boundary: str | None = field(default=None, kw_only=True)
     # FC1 rotates staged token rows itself; nothing writes rotation_up.
     fused_input_rotation: bool = field(default=False, kw_only=True)
+    # FC2 sums the top-k routes itself; no top-k sum launch follows. The
+    # workspace then also holds size_m x fc2 N tiles arrival counters from
+    # reduce_counter_base on, zeroed once and left zeroed by every launch.
+    fused_topk_reduce: bool = field(default=False, kw_only=True)
+    reduce_counter_base: int = field(default=0, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -236,8 +250,9 @@ class W4A16MixedTrellisKernel:
 
     # Persistent compile keys do not include launch source text. Change this
     # version whenever the compiled argument or tensor-layout contract changes.
-    ABI_VERSION = 20
+    ABI_VERSION = 21
     _token_major_rotation = False
+    _fused_topk_reduce = False
 
     def __init__(
         self,
@@ -247,6 +262,9 @@ class W4A16MixedTrellisKernel:
         tier1: W4A16FusedMoeKernel,
         paired_boundary: str | None = None,
         token_major_rotation: bool = False,
+        fused_topk_reduce: bool = False,
+        reduce_output_bf16: bool = False,
+        reduce_broadcast_svh: bool = False,
     ):
         for name, moe in (("driver", driver), ("tier0", tier0), ("tier1", tier1)):
             if not moe.full_rotation or not moe.intermediate_rotation:
@@ -316,6 +334,25 @@ class W4A16MixedTrellisKernel:
                     raise ValueError("paired boundary must align to FC1 N and FC2 K tiles")
         self.paired_boundary = paired_boundary
         self._token_major_rotation = bool(token_major_rotation)
+        # FC2 runs chunk by chunk (every route block of one output N tile) and
+        # the last route of a token to finish a chunk sums the token's routes
+        # for that chunk (rotation back, x svh, x gate weight, in route order:
+        # the top-k sum's arithmetic) while the partials are in L2. No top-k
+        # sum launch; the core kernel writes the output.
+        self._fused_topk_reduce = bool(fused_topk_reduce)
+        self._reduce_output_bf16 = bool(reduce_output_bf16) and self._fused_topk_reduce
+        self._reduce_broadcast_svh = bool(reduce_broadcast_svh) and self._fused_topk_reduce
+        self._reduce_discard = bool(__import__("os").environ.get("EXP_DISCARD"))
+        self._reduce_batch = int(__import__("os").environ.get("EXP_BATCH", "4"))
+        if self._fused_topk_reduce and (
+            driver.direct_topk_routes or paired_boundary is not None
+            or driver.coupled_hadamard
+            or len({moe.chunk_major_fc2 for moe in (driver, tier0, tier1)}) != 1
+            or driver.fc2.tile_n % 128
+            or driver.fc2.moe_block_size * driver.fc2.schedule_route_block_factor
+            > driver.cta_threads
+        ):
+            raise ValueError("fused top-k reduce requires packed, disjoint, chunk-major FC2 tiles")
         self.driver = driver
         self.tier0 = tier0
         self.tier1 = tier1
@@ -354,6 +391,12 @@ class W4A16MixedTrellisKernel:
             self.shared_words,
             self.paired_boundary,
             self.token_major_rotation,
+            self._fused_topk_reduce,
+            self._reduce_output_bf16,
+            self._reduce_broadcast_svh,
+            self._reduce_discard,
+            self._reduce_batch,
+            __import__("os").environ.get("EXP_NOREDUCE"),
         )
 
     @cute.jit
@@ -421,6 +464,192 @@ class W4A16MixedTrellisKernel:
             self._dispatch_tier_gemm(gemm, *args)
         finally:
             gemm._rotation = None
+
+    @property
+    def _reduce_counter_base(self) -> int:
+        """First int32 of the (token, FC2 chunk) arrival counters in the
+        workspace, past the lock slots and the grid barrier's two words."""
+        return max(self.sms * 4, self.blocks_per_sm * self.sms) + 2
+
+    @cute.jit
+    def _zero_unrouted_tokens(
+        self,
+        raw_ids: cute.Tensor,
+        g2c: cute.Tensor,
+        output: cute.Tensor,
+        route_num_experts: Int32,
+        active_m: Int32,
+        total_experts: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        tid: Int32,
+    ):
+        topk = self.top_k
+        token = cta * Int32(self.cta_threads) + tid
+        while token < active_m:
+            routed = Int32(0)
+            for j in cutlass.range_constexpr(topk):
+                raw = raw_ids[token * Int32(topk) + Int32(j)].to(Int32)
+                if raw >= Int32(0) and raw < route_num_experts:
+                    expert = g2c[raw].to(Int32)
+                    if expert >= Int32(0) and expert < total_experts:
+                        routed += Int32(1)
+            if routed == Int32(0):
+                col = Int32(0)
+                while col < Int32(self.hidden_size):
+                    if cutlass.const_expr(self._reduce_output_bf16):
+                        output[token * Int32(self.hidden_size) + col] = cutlass.BFloat16(0.0)
+                    else:
+                        output[token * Int32(self.hidden_size) + col] = cutlass.Float32(0.0)
+                    col += Int32(1)
+            token += grid_x * Int32(self.cta_threads)
+
+    @cute.jit
+    def _fused_topk_reduce_tile(
+        self,
+        fc2: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        route_block_idx: Int32,
+        chunk: Int32,
+        locks: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        total_experts: Int32,
+    ):
+        """After an FC2 tile: count its routes into their (token, chunk)
+        counters; the tile that completes a token's chunk sums that token's
+        routes there, with the top-k sum's operations and order."""
+        raw_ids, g2c, weights, svh, output, route_num_experts, active_m = self._reduce_ctx
+        topk = self.top_k
+        hidden = Int32(self.hidden_size)
+        rows = self.driver.fc2.moe_block_size * self.driver.fc2.schedule_route_block_factor
+        chunks = Int32(self.driver.fc2.n_tiles)
+        blocks_per_chunk = self.driver.fc2.tile_n // 128
+        live_routes = active_m * Int32(topk)
+        base = Int32(self._reduce_counter_base)
+        lane = tid & Int32(31)
+        warps = Int32(self.cta_threads // 32)
+        # Every thread publishes its FC2 stores before the tile's routes are
+        # counted (the reduction-sample fence pattern).
+        threadfence()
+        cute.arch.sync_threads()
+        if tid == Int32(0):
+            st_shared_i32(smem_base, Int32(0))
+        cute.arch.sync_threads()
+        if tid < Int32(rows):
+            route = packed_route_indices[route_block_idx * Int32(rows) + tid].to(Int32)
+            if route >= Int32(0) and route < live_routes:
+                token = route // Int32(topk)
+                expected = Int32(0)
+                for j in cutlass.range_constexpr(topk):
+                    raw = raw_ids[token * Int32(topk) + Int32(j)].to(Int32)
+                    if raw >= Int32(0) and raw < route_num_experts:
+                        expert = g2c[raw].to(Int32)
+                        if expert >= Int32(0) and expert < total_experts:
+                            expected += Int32(1)
+                counter = get_ptr_as_int64(locks, base + token * chunks + chunk)
+                if atomic_add_global_i32(counter, Int32(1)) == expected - Int32(1):
+                    st_global_i32(counter, Int32(0))
+                    slot = atomic_add_shared_i32(smem_base, Int32(1))
+                    st_shared_i32(smem_base + Int32(4) + slot * Int32(4), token)
+        cute.arch.sync_threads()
+        threadfence()
+        tasks = ld_shared_i32_relaxed(smem_base) * Int32(blocks_per_chunk)
+        if cutlass.const_expr(bool(__import__("os").environ.get("EXP_NOREDUCE"))):
+            tasks = Int32(0)
+        batch = self._reduce_batch
+        first = tid >> Int32(5)
+        while first < tasks:
+            # A warp owns `batch` (token, H128 block) tasks at once and issues
+            # all their route loads before the first butterfly, so it waits
+            # on memory once per batch.
+            plans = []
+            for g in cutlass.range_constexpr(batch):
+                task = first + Int32(g) * warps
+                live = Int32(0)
+                if task < tasks:
+                    live = Int32(1)
+                safe_task = Int32(0)
+                if live != Int32(0):
+                    safe_task = task
+                token = ld_shared_i32_relaxed(
+                    smem_base + Int32(4) + (safe_task // Int32(blocks_per_chunk)) * Int32(4)
+                )
+                blk = chunk * Int32(blocks_per_chunk) + safe_task % Int32(blocks_per_chunk)
+                col0 = blk * Int32(128) + lane * Int32(4)
+                experts = []
+                words = []
+                for j in cutlass.range_constexpr(topk):
+                    row = token * Int32(topk) + Int32(j)
+                    raw = raw_ids[row].to(Int32)
+                    expert = Int32(-1)
+                    if raw >= Int32(0) and raw < route_num_experts:
+                        expert = g2c[raw].to(Int32)
+                    src = token * Int32(topk) * hidden + col0
+                    if expert >= Int32(0) and expert < total_experts:
+                        src = row * hidden + col0
+                    experts.append(expert)
+                    words.append(ld_global_v2_u32(get_ptr_as_int64(fc2, src)))
+                plans.append((live, token, blk, col0, experts, words))
+            for g in cutlass.range_constexpr(batch):
+                live, token, blk, col0, experts, words = plans[g]
+                acc0 = cutlass.Float32(0.0)
+                acc1 = cutlass.Float32(0.0)
+                acc2 = cutlass.Float32(0.0)
+                acc3 = cutlass.Float32(0.0)
+                for j in cutlass.range_constexpr(topk):
+                    row = token * Int32(topk) + Int32(j)
+                    expert = experts[j]
+                    vw0, vw1 = words[j]
+                    v0, v1 = half2_to_float2_scaled(vw0, cutlass.Float32(1.0))
+                    v2, v3 = half2_to_float2_scaled(vw1, cutlass.Float32(1.0))
+                    # Expert validity is uniform across the warp, so the
+                    # butterfly always runs converged.
+                    h0, h1, h2, h3 = self.driver._had128_quad(v0, v1, v2, v3, lane)
+                    hs0 = cutlass.Float32(0.0)
+                    hs1 = cutlass.Float32(0.0)
+                    hs2 = cutlass.Float32(0.0)
+                    hs3 = cutlass.Float32(0.0)
+                    weight = cutlass.Float32(0.0)
+                    if expert >= Int32(0) and expert < total_experts:
+                        sbase = col0
+                        if cutlass.const_expr(not self._reduce_broadcast_svh):
+                            sbase = expert * hidden + col0
+                        hs0 = h0 * svh[sbase + Int32(0)].to(cutlass.Float32)
+                        hs1 = h1 * svh[sbase + Int32(1)].to(cutlass.Float32)
+                        hs2 = h2 * svh[sbase + Int32(2)].to(cutlass.Float32)
+                        hs3 = h3 * svh[sbase + Int32(3)].to(cutlass.Float32)
+                        weight = weights[row].to(cutlass.Float32)
+                        if cutlass.const_expr(self._reduce_discard):
+                            # The partial is consumed: drop its lines instead
+                            # of letting L2 write them back.
+                            if live != Int32(0) and lane < Int32(2):
+                                discard_global_l2_line(
+                                    get_ptr_as_int64(
+                                        fc2, row * hidden + blk * Int32(128) + lane * Int32(64)
+                                    )
+                                )
+                    # The top-k sum's fma(weight, value, acc), pinned: left
+                    # to the optimizer the product sinks into the branch
+                    # above and rounds on its own.
+                    acc0 = fma_rn_f32(weight, hs0, acc0)
+                    acc1 = fma_rn_f32(weight, hs1, acc1)
+                    acc2 = fma_rn_f32(weight, hs2, acc2)
+                    acc3 = fma_rn_f32(weight, hs3, acc3)
+                if live != Int32(0):
+                    out_base = token * hidden + col0
+                    if cutlass.const_expr(self._reduce_output_bf16):
+                        output[out_base + Int32(0)] = cutlass.BFloat16(acc0)
+                        output[out_base + Int32(1)] = cutlass.BFloat16(acc1)
+                        output[out_base + Int32(2)] = cutlass.BFloat16(acc2)
+                        output[out_base + Int32(3)] = cutlass.BFloat16(acc3)
+                    else:
+                        output[out_base + Int32(0)] = acc0
+                        output[out_base + Int32(1)] = acc1
+                        output[out_base + Int32(2)] = acc2
+                        output[out_base + Int32(3)] = acc3
+            first += warps * Int32(batch)
+        cute.arch.sync_threads()
 
     @cute.jit
     def _emit_tier_tile(
@@ -595,6 +824,12 @@ class W4A16MixedTrellisKernel:
                         active_size_m,
                     )
 
+        if cutlass.const_expr(not is_fc1 and self._fused_topk_reduce):
+            self._fused_topk_reduce_tile(
+                c_flat, packed_route_indices, route_block_idx, output_n_tile, locks,
+                smem_base, tid, tier0_num_experts + tier1_num_experts,
+            )
+
     @cute.jit
     def __call__(
         self,
@@ -645,6 +880,8 @@ class W4A16MixedTrellisKernel:
         tier0_up_experts: cutlass.Int32,
         tier1_up_experts: cutlass.Int32,
         route_num_experts: cutlass.Int32,
+        svh_ptr: cute.Pointer,
+        output_ptr: cute.Pointer,
     ):
         tier0_experts = cutlass.Int64(tier0_num_experts)
         # FC2 extents are independent of the FC1 slot counts.
@@ -827,6 +1064,16 @@ class W4A16MixedTrellisKernel:
                 (cutlass.Int64(_SQG_XOR_CHEB_T12_LUT_ENTRIES),), stride=(1,)
             ),
         )
+        down_svh = cute.make_tensor(
+            svh_ptr, layout=cute.make_layout((cutlass.Int64(self.hidden_size),), stride=(1,))
+        )
+        output = cute.make_tensor(
+            output_ptr,
+            layout=cute.make_layout(
+                (active_m.to(cutlass.Int64) * cutlass.Int64(self.hidden_size),),
+                stride=(1,),
+            ),
+        )
         self.kernel(
             rotation_input,
             rotation_gate,
@@ -870,6 +1117,8 @@ class W4A16MixedTrellisKernel:
             tier1_up_experts,
             route_num_experts,
             active_m,
+            down_svh,
+            output,
         ).launch(
             grid=(grid_x, 1, 1),
             block=[self.cta_threads, 1, 1],
@@ -1017,6 +1266,8 @@ class W4A16MixedTrellisKernel:
         tier1_up_experts: cutlass.Int32,
         route_num_experts: cutlass.Int32,
         active_m: cutlass.Int32,
+        down_svh: cute.Tensor,
+        output: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -1102,6 +1353,17 @@ class W4A16MixedTrellisKernel:
             tier0_up_experts,
             tier1_up_experts,
         )
+        if cutlass.const_expr(self._fused_topk_reduce):
+            self._reduce_ctx = (
+                raw_topk_ids, global_to_combined, topk_weights, down_svh, output,
+                route_num_experts, active_m,
+            )
+            # No FC2 tile reaches a token none of whose routes this shard
+            # owns; its output is the top-k sum's all-zero row.
+            self._zero_unrouted_tokens(
+                raw_topk_ids, global_to_combined, output, route_num_experts,
+                active_m, tier0_num_experts + tier1_num_experts, cta, grid_x, tid,
+            )
         fc2_emit = partial(
             self._emit_tier_tile,
             False,
@@ -2083,6 +2345,7 @@ def compile_mixed_trellis(
     paired_boundary: str | None = None,
     token_major_rotation: bool = False,
     fused_input_rotation: bool = False,
+    fused_topk_reduce: bool = False,
 ) -> MixedTrellisCompileResult:
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
@@ -2149,6 +2412,7 @@ def compile_mixed_trellis(
             direct_topk_routes=direct_topk_routes,
             schedule_whole_tiles=True,
             fused_input_rotation=fused_input_rotation,
+            chunk_major_fc2=bool(__import__("os").environ.get("EXP_CM")),
         )
 
     def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellisKernel:
@@ -2159,6 +2423,9 @@ def compile_mixed_trellis(
             tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
             paired_boundary=paired_boundary,
             token_major_rotation=token_major_rotation,
+            fused_topk_reduce=fused_topk_reduce,
+            reduce_output_bf16=full_rotation_output_dtype == "bf16",
+            reduce_broadcast_svh=broadcast_svh,
         )
 
     kernel = _select_mixed_fc2_kernel(
@@ -2283,6 +2550,14 @@ def compile_mixed_trellis(
         Int32(tier0_num_experts),
         Int32(tier1_num_experts),
         Int32(route_num_experts),
+        # Down SVH and output of the fused top-k reduce; unread otherwise.
+        make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            cutlass.BFloat16 if full_rotation_output_dtype == "bf16" else cutlass.Float32,
+            16,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -2330,6 +2605,8 @@ def compile_mixed_trellis(
         broadcast_svh=bool(broadcast_svh),
         paired_boundary=paired_boundary,
         fused_input_rotation=bool(fused_input_rotation),
+        fused_topk_reduce=bool(fused_topk_reduce),
+        reduce_counter_base=int(kernel._reduce_counter_base),
     )
     _CACHE[cache_key] = result
     return result
@@ -2688,11 +2965,22 @@ def _make_mixed_trellis_buffers(
             device=device,
         ),
         workspace=torch.zeros(
-            max(sms * 4, launch.blocks_per_sm * sms) + 2,
+            mixed_trellis_workspace_words(launch, sms=sms),
             dtype=torch.int32,
             device=device,
         ),
     )
+
+
+def mixed_trellis_workspace_words(launch, *, sms: int) -> int:
+    """Lock slots and the two grid-barrier words, then with a fused top-k
+    reduce one arrival counter per (token, FC2 N tile)."""
+    words = max(sms * 4, launch.blocks_per_sm * sms) + 2
+    if getattr(launch, "fused_topk_reduce", False):
+        if launch.reduce_counter_base != words:
+            raise ValueError("fused top-k reduce was compiled for another grid")
+        words += launch.size_m * (launch.hidden_size // launch.fc2_tile_n)
+    return words
 
 
 def make_mixed_trellis_buffers(
@@ -3474,7 +3762,20 @@ def run_bound_mixed_trellis(
         tier0_up_experts=Int32(binding.up_counts[0]),
         tier1_up_experts=Int32(binding.up_counts[1]),
         route_num_experts=Int32(binding.route_num_experts),
+        svh_ptr=binding.down_svh_ptr,
+        output_ptr=make_ptr(
+            (
+                cutlass.BFloat16
+                if launch.topk_sum.full_rotation_output_dtype == "bf16"
+                else cutlass.Float32
+            ),
+            buffers.output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
     )
+    if launch.fused_topk_reduce:
+        return buffers.output[:m]
     launch.topk_sum.compiled(
         make_ptr(
             cutlass.Float16,

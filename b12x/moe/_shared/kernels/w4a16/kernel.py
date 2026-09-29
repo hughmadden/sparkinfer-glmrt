@@ -939,6 +939,7 @@ class W4A16GemmKernel:
         dynamic_num_experts: bool = False,
         schedule_route_block_factor: int = 1,
         fused_input_rotation: bool = False,
+        chunk_major_schedule: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1178,8 +1179,15 @@ class W4A16GemmKernel:
         # tiles in shared memory, instead of reading a materialized rotated
         # copy per route. The caller binds the SUH tables and the expert.
         self.fused_input_rotation = bool(fused_input_rotation)
+        # Whole tiles in output-column-chunk order (every route block of one N
+        # tile, then the next), so a chunk's per-route outputs are consumed
+        # while they are still in L2.
+        self.chunk_major_schedule = bool(chunk_major_schedule)
         # Trace-time binding (suh_gate, suh_up, expert) for the FC1 tile being traced.
         self._rotation = None
+        self._exp_shstages = int(__import__("os").environ.get("EXP_SHSTAGES", "4"))
+        self._exp_rot = 0 if __import__("os").environ.get("EXP_NOROT") else 1
+        self._rot_chunks = int(__import__("os").environ.get("EXP_ROTCH", "1"))
         self.fused_topk_sum = bool(fused_topk_sum)
         self.fused_sum_topk = int(fused_sum_topk)
         # Whole-tile persistent scheduling: every mn-tile is computed by one
@@ -1392,6 +1400,8 @@ class W4A16GemmKernel:
             self.small_m_splitk,
             self.skip_empty_m_blocks,
             self.fused_input_rotation,
+            __import__("os").environ.get("EXP_SHSTAGES"), __import__("os").environ.get("EXP_NOROT"), __import__("os").environ.get("EXP_ROTCH"),
+            self.chunk_major_schedule,
         )
 
     @cute.jit
@@ -1728,6 +1738,13 @@ class W4A16GemmKernel:
             if in_tail_region == Int32(0) and full_grid_mn_iters > Int32(0):
                 route_block_idx = work_mn_tile // n_tiles
                 output_n_tile = work_mn_tile - route_block_idx * n_tiles
+                if cutlass.const_expr(self.chunk_major_schedule):
+                    output_n_tile = work_mn_tile // route_blocks
+                    route_block_idx = work_mn_tile - output_n_tile * route_blocks
+                    # The ragged last wave runs past the last chunk; the
+                    # route-block bound below skips it.
+                    if output_n_tile >= n_tiles:
+                        route_block_idx = route_blocks
                 reduce_k_tile = Int32(0)
                 reduce_tile_count = k_tiles
                 full_grid_mn_iters -= Int32(1)
@@ -5295,6 +5312,11 @@ class W4A16GemmKernel:
         four across the half-warp."""
         if cutlass.const_expr(self._rotation is None):
             raise ValueError("fused input rotation needs its SUH tables bound for the FC1 tile")
+        if cutlass.const_expr(self._rot_chunks > 1):
+            self._rotate_a_pair_wide(
+                smem_base, tid, pipe0, pipe1, k_tile, block_valid_rows, output_n_tile
+            )
+            return
         suh_gate, suh_up, expert = self._rotation
         lane = tid & Int32(31)
         l16 = lane & Int32(15)
@@ -5313,7 +5335,7 @@ class W4A16GemmKernel:
         stage_base = (
             smem_base + Int32(self.sh_a_off * 16) + stage * Int32(self.a_sh_stage * 16)
         )
-        rows = 16 * self.cta_m_blocks
+        rows = 16 * self.cta_m_blocks * self._exp_rot
         pairs_per_warp = rows // (2 * warps)
         group = min(pairs_per_warp, 2)
         for g in cutlass.range_constexpr(pairs_per_warp // group):
@@ -5343,7 +5365,7 @@ class W4A16GemmKernel:
                                 hi = v[e | b]
                                 v[e] = lo + hi
                                 v[e | b] = lo - hi
-                    for si in cutlass.range_constexpr(4):
+                    for si in cutlass.range_constexpr(self._exp_shstages):
                         st = 1 << si
                         # Lower lane: partner + own; upper lane: partner - own
                         # (the lower element minus the upper one). The sign
@@ -5361,6 +5383,108 @@ class W4A16GemmKernel:
                         pack_f32x2_to_f16x2(v[2] * rs, v[3] * rs),
                         pack_f32x2_to_f16x2(v[4] * rs, v[5] * rs),
                         pack_f32x2_to_f16x2(v[6] * rs, v[7] * rs),
+                    )
+
+    @cute.jit
+    def _rotate_a_pair_wide(
+        self,
+        smem_base: Int32,
+        tid: Int32,
+        pipe0: Int32,
+        pipe1: Int32,
+        k_tile: Int32,
+        block_valid_rows: Int32,
+        output_n_tile: Int32,
+    ):
+        """`_rotate_a_pair` with `_rot_chunks` 16-byte chunks per lane: lane q
+        of a row's 16 / _rot_chunks lanes holds chunks q, q + L, ... . Stage
+        order and every rounding are unchanged; only the element-bit stages
+        whose chunk bits live in one lane run in registers instead of
+        through shuffles."""
+        suh_gate, suh_up, expert = self._rotation
+        cpl = self._rot_chunks
+        lanes_per_row = 16 // cpl
+        rows_per_instr = 32 // lanes_per_row
+        self._rot_shfl = lanes_per_row.bit_length() - 1
+        self._rot_jstages = cpl.bit_length() - 1
+        self._rot_elems = 8 * cpl
+        lane = tid & Int32(31)
+        q = lane & Int32(lanes_per_row - 1)
+        sub = lane // Int32(lanes_per_row)
+        warp = tid >> Int32(5)
+        warps = self.cta_threads // 32
+        use_up = Int32(0)
+        if output_n_tile >= Int32(self.n_tiles // 2):
+            use_up = Int32(1)
+        self._rot_iters = (16 * self.cta_m_blocks) // (rows_per_instr * warps)
+        for it in cutlass.range_constexpr(self._rot_iters):
+            first_row = Int32(rows_per_instr) * (warp + Int32(warps * it))
+            if first_row < block_valid_rows:
+                row = first_row + sub
+                v = []
+                addrs = []
+                for j in cutlass.range_constexpr(self._rot_chunks):
+                    chunk16 = q + Int32(j * lanes_per_row)
+                    stage = pipe0
+                    if chunk16 >= Int32(8):
+                        stage = pipe1
+                    chunk = chunk16 & Int32(7)
+                    addr = (
+                        smem_base
+                        + Int32(self.sh_a_off * 16)
+                        + stage * Int32(self.a_sh_stage * 16)
+                        + (row * Int32(self.a_sh_stride) + (chunk ^ (row & Int32(7))))
+                        * Int32(16)
+                    )
+                    addrs.append(addr)
+                    s_off = expert * Int32(self.size_k) + k_tile * Int32(64) + chunk16 * Int32(8)
+                    s_addr = get_ptr_as_int64(suh_gate, s_off)
+                    if use_up != Int32(0):
+                        s_addr = get_ptr_as_int64(suh_up, s_off)
+                    suh = ld_global_nc_v4_u32(s_addr)
+                    words = ld_shared_v4_u32(addr)
+                    for w in cutlass.range_constexpr(4):
+                        scaled = half2_mul(cvt_bf16x2_to_f16x2(words[w]), suh[w])
+                        lo, hi = f16x2_to_f32x2(scaled)
+                        v.append(lo)
+                        v.append(hi)
+                # Element bits 0..2: inside each chunk.
+                for j in cutlass.range_constexpr(self._rot_chunks):
+                    for bi in cutlass.range_constexpr(3):
+                        b = 1 << bi
+                        for e in cutlass.range_constexpr(8):
+                            if cutlass.const_expr(e & b == 0):
+                                lo = v[j * 8 + e]
+                                hi = v[j * 8 + (e | b)]
+                                v[j * 8 + e] = lo + hi
+                                v[j * 8 + (e | b)] = lo - hi
+                # Element bits 3..: chunk bits held by the row's lanes.
+                for si in cutlass.range_constexpr(self._rot_shfl):
+                    st = 1 << si
+                    sign = cutlass.Float32(1.0) - cutlass.Float32(2.0) * (
+                        (q >> Int32(si)) & Int32(1)
+                    ).to(cutlass.Float32)
+                    for e in cutlass.range_constexpr(self._rot_elems):
+                        p = cute.arch.shuffle_sync_bfly(v[e], offset=st)
+                        v[e] = p + sign * v[e]
+                # Remaining element bits: chunk bits held in registers.
+                for jb in cutlass.range_constexpr(self._rot_jstages):
+                    b = 1 << jb
+                    for j in cutlass.range_constexpr(self._rot_chunks):
+                        if cutlass.const_expr(j & b == 0):
+                            for e in cutlass.range_constexpr(8):
+                                lo = v[j * 8 + e]
+                                hi = v[(j | b) * 8 + e]
+                                v[j * 8 + e] = lo + hi
+                                v[(j | b) * 8 + e] = lo - hi
+                rs = cutlass.Float32(0.088388347648)
+                for j in cutlass.range_constexpr(self._rot_chunks):
+                    st_shared_v4_u32(
+                        addrs[j],
+                        pack_f32x2_to_f16x2(v[j * 8 + 0] * rs, v[j * 8 + 1] * rs),
+                        pack_f32x2_to_f16x2(v[j * 8 + 2] * rs, v[j * 8 + 3] * rs),
+                        pack_f32x2_to_f16x2(v[j * 8 + 4] * rs, v[j * 8 + 5] * rs),
+                        pack_f32x2_to_f16x2(v[j * 8 + 6] * rs, v[j * 8 + 7] * rs),
                     )
 
     @cute.jit
@@ -6401,6 +6525,7 @@ class W4A16FusedMoeKernel:
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
         fused_input_rotation: bool = False,
+        chunk_major_fc2: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6573,6 +6698,7 @@ class W4A16FusedMoeKernel:
         # FC1 rotates the staged token input itself (no rotation phase, no
         # materialized per-route copies). Requires BF16 input, per-expert SUH
         # and packed routes; the caller binds the SUH tables per FC1 tile.
+        self.chunk_major_fc2 = bool(chunk_major_fc2)
         self.fused_input_rotation = bool(fused_input_rotation)
         if self.fused_input_rotation and (
             not full_rotation or coupled_hadamard or broadcast_suh
@@ -6682,6 +6808,7 @@ class W4A16FusedMoeKernel:
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
+            chunk_major_schedule=self.chunk_major_fc2,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:

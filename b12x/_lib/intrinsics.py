@@ -2160,6 +2160,44 @@ def st_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def fma_rn_f32(a: Float32, b: Float32, c: Float32, *, loc=None, ip=None) -> Float32:
+    """a * b + c with one rounding, opaque to the optimizer so a
+    multiply-add chain keeps its written order and fusion."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                Float32(c).ir_value(loc=loc, ip=ip),
+            ],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def discard_global_l2_line(addr: Int64, *, loc=None, ip=None):
+    """Drop one 128-byte L2 line without writing it back; its contents
+    become undefined. ``addr`` must be 128-byte aligned."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
+        "discard.global.L2 [$0], 128;",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 # =============================================================================
 # PTX Intrinsics - Global Memory Barriers
 # =============================================================================
