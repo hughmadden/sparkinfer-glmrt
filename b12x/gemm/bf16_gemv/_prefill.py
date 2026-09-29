@@ -22,6 +22,7 @@ from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
 from b12x._lib.compiler import DimKey, KernelCompileSpec, compile as b12x_compile, launch, run_compiled, tensor_key
 from b12x._lib.utils import current_cuda_stream
+from b12x._lib.intrinsics import pack_f32x2_to_bfloat2, st_global_u32
 
 def _to_kernel_tensor(tensor, dtype, *, dynamic_layout=False):
     if hasattr(tensor, "fake_mode"):
@@ -369,13 +370,25 @@ class Bf16PrefillKernel:
             coordinates = thr_mma.partition_C(
                 cute.make_identity_tensor((self.tile_m, self.tile_n))
             )
-            for index in cutlass.range_constexpr(cute.size(acc)):
-                coord = coordinates[index]
-                token = m_tile * Int32(self.tile_m) + coord[0]
-                column = n_tile * Int32(self.tile_n) + coord[1]
-                if token < num_tokens and column < Int32(self.n):
-                    output[Int64(token), Int64(column)] = acc[index].to(
-                        output.element_type)
+            if const_expr(output.element_type == cutlass.BFloat16 and self.n % 2 == 0):
+                # Accumulator pairs (2i, 2i + 1) are adjacent columns of one
+                # row: one packed BF16x2 store each (the same RN conversion).
+                base = Int64(output.iterator.toint())
+                for pair in cutlass.range_constexpr(cute.size(acc) // 2):
+                    coord = coordinates[2 * pair]
+                    token = m_tile * Int32(self.tile_m) + coord[0]
+                    column = n_tile * Int32(self.tile_n) + coord[1]
+                    if token < num_tokens and column < Int32(self.n):
+                        at = Int64(cute.crd2idx((Int64(token), Int64(column)), output.layout)) * Int64(2)
+                        st_global_u32(base + at, pack_f32x2_to_bfloat2(acc[2 * pair], acc[2 * pair + 1]))
+            else:
+                for index in cutlass.range_constexpr(cute.size(acc)):
+                    coord = coordinates[index]
+                    token = m_tile * Int32(self.tile_m) + coord[0]
+                    column = n_tile * Int32(self.tile_n) + coord[1]
+                    if token < num_tokens and column < Int32(self.n):
+                        output[Int64(token), Int64(column)] = acc[index].to(
+                            output.element_type)
 
         elif warp_idx == Int32(self.producer_warp):
             producer_state = pipeline.make_pipeline_state(

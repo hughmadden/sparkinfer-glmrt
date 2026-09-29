@@ -240,6 +240,13 @@ def _fp8_scalars(fp8, prefill: bool) -> tuple:
     return (Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),)
 
 
+def _batched_warps(max_rows: int) -> int:
+    """MMA warps (16 rows each) of the per-head batched BF16 GEMMs: 128-row
+    tiles at prefill capacities (4096 rows: fg 125 -> 96 us, absorb 373 -> 308,
+    uv 300 -> 276 on SM120), 64 below."""
+    return 8 if int(max_rows) > CHUNKED_MIN_ROWS else 4
+
+
 def _ptr(dtype, address: Int64, align: int = 16):
     return cute.make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=align)
 
@@ -384,7 +391,7 @@ class _Kda:
         self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=1)
         # f_b(f_a) and g_b(g_a): two 128 -> D products off the in-projection row.
         self.fg = BatchedBf16Gemm(n=d, k=g.kda_head_dim, batch=2, a_row=p, a_batch=g.kda_head_dim,
-                                  o_row=2 * d, o_batch=d)
+                                  o_row=2 * d, o_batch=d, compute_warps=_batched_warps(max_rows))
         # Prefill capacities: the row-blocked conv and the scanning conv-state update.
         wide = int(max_rows) > CHUNKED_MIN_ROWS
         self.conv = (GlmfKdaConvRows if wide else GlmfKdaConv)(channels=3 * d, proj_width=p)
@@ -580,7 +587,8 @@ class _MlaProducer:
         self.pack = GlmRankNormPackKV(q_rank=q, eps=g.norm_eps, page_rows=g.page_rows,
                                       record_bytes=g.record_bytes, rope=0)
         self.absorb = BatchedBf16Gemm(n=g.kv_lora_rank, k=g.qk_nope_dim, batch=n, a_row=n * g.qk_head_dim,
-                                      a_batch=g.qk_head_dim, o_row=n * g.latent_dim, o_batch=g.latent_dim)
+                                      a_batch=g.qk_head_dim, o_row=n * g.latent_dim, o_batch=g.latent_dim,
+                                      compute_warps=_batched_warps(max_rows))
 
     def key(self) -> tuple:
         return (self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
@@ -944,7 +952,8 @@ class _GlmfOutput:
         self.width = n * v
         fp8, prefill = _fp8_mode(fp8)
         self.uv = BatchedBf16Gemm(n=v, k=g.kv_lora_rank, batch=n, a_row=n * g.kv_lora_rank,
-                                  a_batch=g.kv_lora_rank, o_row=n * v, o_batch=v)
+                                  a_batch=g.kv_lora_rank, o_row=n * v, o_batch=v,
+                                  compute_warps=_batched_warps(max_rows))
         self.o = _Fp8Switch(g.hidden, n * v, fp8=fp8, prefill_rows=int(max_rows) if prefill else None)
 
     def key(self) -> tuple:
