@@ -361,6 +361,150 @@ class GLMFGeometry:
 GLM53_FLASH = GLMFGeometry()
 
 
+@dataclass(frozen=True)
+class Qwen4Geometry:
+    """Static Qwen 3.8 Flash Next (``qwen4_exp``) geometry baked into the ``qwen4_*`` programs.
+
+    48 layers: Gated DeltaNet (GDN) linear attention with every fourth layer
+    full attention. GDN: ``gdn_key_heads`` x 128 query/key heads shared by
+    ``gdn_value_heads`` x 128 value heads (value head ``h`` reads key head
+    ``h // 3``), a 4-tap causal conv + SiLU over ``[q; k; v]``, L2-normalized
+    q/k, per-head decay ``-exp(A_log) * softplus(a + dt_bias)`` and write
+    strength ``sigmoid(b)``, FP32 recurrent state, a gated RMSNorm with a
+    *sigmoid* gate ``z`` (weight used as ``w``, not ``1 + w``). Full
+    attention: GQA 24 query heads / 2 KV heads of 256, per-head
+    ``[q | gate]`` rows in q_proj, q/k RMSNorm (``1 + w``), NeoX RoPE on the
+    first ``rope_dim`` (64) dims (theta 1e7; the interleaved mRoPE sections
+    reduce to plain RoPE for text), a sigmoid output gate, and the QSA
+    indexer: ``index_heads`` query heads and one key of 128, 4-token key
+    blocks (mean of raw keys, then ``1 + w`` RMSNorm, then RoPE at the
+    block's first position), score ``sum_h relu(q_h . k) / sqrt(128)``, the
+    top ``index_budget / index_block`` blocks plus the open tail (every token
+    up to ``index_budget + index_block - 1``). Low-rank gated
+    hyper-connections (``hc_count`` BF16 streams of ``hidden``, rank
+    ``hc_lowrank``) around every sublayer, no final norm (the stream mixer
+    feeds lm_head). MoE: softmax top-10 of 512 experts (renormalized), one
+    shared expert with a sigmoid gate, SiLU without a clamp. PLE (layer 1):
+    16 hashed n-gram rows of 160 per token, key/value projections gating each
+    stream, and a dilated (``ngram_size``) depthwise conv of ``ple_conv``
+    taps.
+    """
+
+    name: str = "qwen38_flash_next"
+    hidden: int = 2560
+    hc_count: int = 4
+    hc_lowrank: int = 320
+    heads: int = 24
+    kv_heads: int = 2
+    head_dim: int = 256
+    rope_dim: int = 64
+    rope_theta: float = 10_000_000.0
+    index_heads: int = 4
+    index_head_dim: int = 128
+    index_budget: int = 2048
+    index_block: int = 4
+    gdn_key_heads: int = 16
+    gdn_value_heads: int = 48
+    gdn_head_dim: int = 128
+    conv_kernel: int = 4
+    moe_inter: int = 640
+    shared_inter: int = 640
+    routed_experts: int = 512
+    top_k: int = 10
+    vocab: int = 248320
+    norm_eps: float = 1.0e-6
+    ple_dim: int = 2560
+    ple_rows: int = 16
+    ple_row_dim: int = 160
+    ple_conv: int = 4
+    ngram_size: int = 3
+    page_rows: int = 64
+
+    def __post_init__(self) -> None:
+        if (self.gdn_head_dim, self.conv_kernel, self.hc_count) != (128, 4, 4):
+            raise ValueError("Qwen4 programs require 128-wide GDN heads, a 4-tap conv and 4 streams")
+        if self.gdn_value_heads % self.gdn_key_heads or self.heads % self.kv_heads:
+            raise ValueError("GDN value heads and attention heads must group evenly")
+
+    @property
+    def hc_width(self) -> int:
+        """Features of all streams of one row: ``hc_count * hidden``."""
+        return self.hc_count * self.hidden
+
+    # GDN
+    @property
+    def gdn_key_width(self) -> int:
+        return self.gdn_key_heads * self.gdn_head_dim
+
+    @property
+    def gdn_value_width(self) -> int:
+        return self.gdn_value_heads * self.gdn_head_dim
+
+    @property
+    def gdn_conv_width(self) -> int:
+        """Short-conv channels ``[q; k; v]``."""
+        return 2 * self.gdn_key_width + self.gdn_value_width
+
+    @property
+    def gdn_in_width(self) -> int:
+        """``[in_proj_qkv; in_proj_z; in_proj_b; in_proj_a]`` in-projection rows."""
+        return self.gdn_conv_width + self.gdn_value_width + 2 * self.gdn_value_heads
+
+    @property
+    def gdn_state_bytes(self) -> int:
+        """FP32 recurrent state of one sequence in one layer."""
+        return self.gdn_value_heads * self.gdn_head_dim * self.gdn_head_dim * 4
+
+    @property
+    def gdn_conv_state_bytes(self) -> int:
+        """BF16 short-conv state of one sequence in one layer: the last 3 q/k/v inputs."""
+        return (self.conv_kernel - 1) * self.gdn_conv_width * 2
+
+    # Full attention
+    @property
+    def attn_in_width(self) -> int:
+        """``[q_proj (q|gate per head); k_proj; v_proj; indexer.index_qk_proj]`` rows."""
+        return (2 * self.heads * self.head_dim + 2 * self.kv_heads * self.head_dim
+                + (self.index_heads + 1) * self.index_head_dim)
+
+    @property
+    def record_bytes(self) -> int:
+        """BF16 KV record of one token: K ``[kv_heads, head_dim]`` then V."""
+        return 2 * self.kv_heads * self.head_dim * 2
+
+    @property
+    def kv_page_bytes(self) -> int:
+        return self.page_rows * self.record_bytes
+
+    @property
+    def index_blocks(self) -> int:
+        """Selected key blocks per row past the dense limit."""
+        return self.index_budget // self.index_block
+
+    @property
+    def dense_limit(self) -> int:
+        """Visible tokens up to which every token is selected."""
+        return self.index_budget + self.index_block - 1
+
+    @property
+    def sparse_topk(self) -> int:
+        """Selected slots per row: the budget plus the open tail, padded to 64."""
+        return -(-self.dense_limit // 64) * 64
+
+    @property
+    def softmax_scale(self) -> float:
+        return self.head_dim ** -0.5
+
+    # PLE
+    @property
+    def ple_state_rows(self) -> int:
+        """Rows of the dilated PLE conv state: ``(ple_conv - 1) * ngram_size``."""
+        return (self.ple_conv - 1) * self.ngram_size
+
+
+QWEN38_FLASH_NEXT = Qwen4Geometry()
+
+
 _TORCH_TO_CUTE = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float16: cutlass.Float16,

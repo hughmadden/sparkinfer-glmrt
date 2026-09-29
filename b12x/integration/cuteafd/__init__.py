@@ -62,6 +62,8 @@ from ._common import (  # noqa: F401
     GLMGeometry,
     MIMO_V2_FLASH,
     MiMoGeometry,
+    QWEN38_FLASH_NEXT,
+    Qwen4Geometry,
     Operand,
     Scalar,
     exportable_compilation,
