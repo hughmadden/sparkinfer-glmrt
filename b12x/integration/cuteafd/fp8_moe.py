@@ -62,6 +62,7 @@ from ._fp8_moe_kernels import (
 )
 from ._fp8_moe_stream import STREAM_TILE_M, StreamFp8Down, StreamFp8GateUp, stream_max_tiles
 from ._mxfp4_moe_kernels import GroupedMxfp4Gemv
+from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes"]
 
@@ -75,6 +76,10 @@ AUTO_PREFILL_ROWS = 2048
 # (GB10, TP4 slices, us, GEMV / stream: MiMo 1024 rows 8467 / 8263, 2048 rows
 # 14109 / 9185; GLM 1024 rows 12932 / 13124, 2048 rows 20433 / 14426).
 AUTO_STREAM_ROWS = 1024
+# MXFP4 (MiMo V2.6 Pro) live rows above which ``auto`` streams (wire input);
+# RTX PRO 6000 (us, GEMV / stream): TP6 1024 rows 1662 / 1729, 2048 2598 / 1907;
+# TP1 512 8965 / 7952, 1024 13654 / 10653. GB10 to be measured.
+AUTO_MXFP4_STREAM_ROWS = 1024
 # Column groups (8 columns each) per CTA of the decode gate/up GEMV: one for
 # single-row programs (GB10, us, interleaved x3, 4 groups -> 1: MiMo TP4
 # 236 -> 230, GLM TP4 347 -> 341, MiMo TP2 450 -> 445; bitwise equal; the
@@ -86,19 +91,24 @@ def _gate_up_groups(tile_rows: int) -> int:
     return 1 if int(tile_rows) == 1 else DECODE_GATE_UP_GROUPS
 
 
-def _streams(wire: bool) -> bool:
+def _streams(wire: bool, weights: str = "fp8") -> bool:
     """``auto`` streams wire input on GB10 (SM121, weight-bandwidth bound);
-    SM120 (RTX PRO 6000) keeps the grouped GEMM it was measured with."""
+    SM120 (RTX PRO 6000) keeps the grouped GEMM it was measured with. MXFP4
+    weights have only the streaming large route (wire input), on both."""
+    if weights == "mxfp4":
+        return bool(wire)
     return bool(wire) and tuple(torch.cuda.get_device_capability()) == (12, 1)
 
 
-def auto_large_rows(wire: bool) -> int:
+def auto_large_rows(wire: bool, weights: str = "fp8") -> int:
     """Live-row threshold of ``auto``'s large route (``stream`` or ``prefill``)."""
+    if weights == "mxfp4":
+        return AUTO_MXFP4_STREAM_ROWS
     return AUTO_STREAM_ROWS if _streams(wire) else AUTO_PREFILL_ROWS
 
 
-def _large_route(wire: bool) -> str:
-    return "stream" if _streams(wire) else "prefill"
+def _large_route(wire: bool, weights: str = "fp8") -> str:
+    return "stream" if _streams(wire, weights) else "prefill"
 
 
 @dataclass(frozen=True)
@@ -189,19 +199,21 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
 
 def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8") -> str:
     """``auto`` compiles only the GEMV when the capacity never reaches the large
-    route; MXFP4 weights have only the GEMV route so far."""
+    route (always, for BF16-input MXFP4 packages: their only large route
+    streams wire rows); MXFP4 has no grouped-GEMM ``prefill`` route."""
     if weights == "mxfp4":
-        if route not in ("auto", "decode"):
-            raise ValueError(f"MXFP4 experts have no {route} route yet")
-        return "decode"
-    return "decode" if route == "auto" and int(max_rows) <= auto_large_rows(wire) else route
+        if route == "prefill":
+            raise ValueError("MXFP4 experts have no prefill route (use stream)")
+        if route == "auto" and not wire:
+            return "decode"
+    return "decode" if route == "auto" and int(max_rows) <= auto_large_rows(wire, weights) else route
 
 
 def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True) -> int:
     route = _resolve(route, rows, wire, g.weights)
     if route == "auto":
         return max(fp8_moe_scratch_bytes(g, "decode", rows, wire),
-                   fp8_moe_scratch_bytes(g, _large_route(wire), rows, wire))
+                   fp8_moe_scratch_bytes(g, _large_route(wire, g.weights), rows, wire))
     return sum(_align(b) for b in _regions(g, route, rows))
 
 
@@ -303,8 +315,12 @@ class _StreamRoute:
         self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
                             chunked=True)
-        self.gate_up = StreamFp8GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
-        self.down = StreamFp8Down(hidden=h, inter=i, experts=e)
+        if g.weights == "mxfp4":
+            self.gate_up = StreamMxfp4GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
+            self.down = StreamMxfp4Down(hidden=h, inter=i, experts=e)
+        else:
+            self.gate_up = StreamFp8GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
+            self.down = StreamFp8Down(hidden=h, inter=i, experts=e)
         self.combine = MoeCombine(hidden=h, top_k=k)
 
     def key(self) -> tuple:
@@ -345,9 +361,9 @@ def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool):
 class _Fp8Moe:
     def __init__(self, g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool):
         self.route = route
-        self.threshold = auto_large_rows(wire)
+        self.threshold = auto_large_rows(wire, g.weights)
         self.decode = _Route(g, "decode", max_rows, wire) if route in ("decode", "auto") else None
-        large = _large_route(wire) if route == "auto" else route
+        large = _large_route(wire, g.weights) if route == "auto" else route
         self.prefill = _make_route(g, large, max_rows, wire) if route in ("prefill", "stream", "auto") else None
 
     def key(self) -> tuple:
