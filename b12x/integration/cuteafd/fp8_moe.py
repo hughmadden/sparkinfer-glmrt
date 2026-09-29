@@ -78,8 +78,8 @@ class Fp8MoeGeometry:
     def __post_init__(self) -> None:
         if self.hidden % 128 or self.intermediate % (128 * self.tp):
             raise ValueError("hidden and the intermediate slice must be 128-aligned")
-        if not 1 <= self.top_k <= 8:
-            raise ValueError("top_k must be 1..8")
+        if not 1 <= self.top_k <= 16:
+            raise ValueError("top_k must be 1..16")
 
     @property
     def slice(self) -> int:
@@ -96,6 +96,8 @@ GEOMETRIES = {
     "glm": Fp8MoeGeometry("glm", hidden=6144, experts=256, top_k=8, intermediate=2048),
     # GLM 5.3 Flash: 288 experts, SwiGLU clamped at 10 as its config says.
     "glmf": Fp8MoeGeometry("glmf", hidden=4096, experts=288, top_k=8, intermediate=2048, swiglu_limit=10.0),
+    # Qwen 3.8 Flash Next: 512 experts, softmax top-10, unclamped SiLU.
+    "qwen4": Fp8MoeGeometry("qwen4", hidden=2560, experts=512, top_k=10, intermediate=640),
 }
 
 
@@ -156,7 +158,10 @@ class _Route:
             warps_h = 8 if h >= 6144 else 4
             self.gate_up = GroupedFp8Gemv(n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
                                           gather=True)
-            self.down = GroupedFp8Gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=4 if i >= 512 else i // 128)
+            # K split over warps in whole 128 blocks: 4 where they divide evenly,
+            # else the largest divisor <= 8 of the blocks (Qwen's 640: 5 warps).
+            warps_i = 4 if i % 512 == 0 else max(d for d in range(1, 9) if (i // 128) % d == 0)
+            self.down = GroupedFp8Gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=warps_i)
         else:
             self.gate_up = GroupedFp8Gemm(n=i, k=h, experts=e, halves=2)
             self.down = GroupedFp8Gemm(n=h, k=i, experts=e, halves=1)
