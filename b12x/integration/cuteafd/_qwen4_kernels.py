@@ -231,9 +231,9 @@ class Qwen4HcPost:
         self.threads = _row_threads(self.hidden)
 
     @cute.jit
-    def __call__(self, delta: cute.Pointer, residual: cute.Pointer, inject: cute.Pointer, out: cute.Pointer,
+    def __call__(self, x: cute.Pointer, residual: cute.Pointer, inject: cute.Pointer, out: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.kernel(delta, residual, inject, out).launch(grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+        self.kernel(x, residual, inject, out).launch(grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, delta: cute.Pointer, residual: cute.Pointer, inject: cute.Pointer, out: cute.Pointer):
