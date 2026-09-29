@@ -22,6 +22,11 @@ the MTP layers), ``I = 16384``, no clamp; the ``glm_ffn`` ABI::
     scratch    u8   ffn_scratch_bytes(I, rows): gate_up BF16 [rows,2I], hidden BF16 [rows,I]
     rows       int32
 
+``fp8=True`` (decode steps): ``w_gate_up_fp8``/``w_gate_up_scale`` and
+``w_down_fp8``/``w_down_scale`` (E4M3, FP32 ``[N, K/128]`` per-row scales, the
+checkpoint's 128x128 grid expanded) follow their BF16 weights and the scalar
+``fp8_rows`` follows ``rows`` (see ``mimo_attention``).
+
 ``compile_mimo_router_scores_aot(g)``: router logits ``x @ gate^T`` against
 the checkpoint's FP32 gate weight, as ``F.linear`` of FP32-promoted operands.
 The weight is split at load into BF16 high and low parts (``w_hi = bf16(w)``,
@@ -53,6 +58,7 @@ from ._common import MIMO_V2_FLASH, AotProgram, MiMoGeometry, Operand, Scalar, c
 from ._glm_kernels import GlmAddRmsNorm
 from ._mimo_kernels import RouterHiLoAdd
 from .glm_ffn import _Ffn, ffn_scratch_bytes
+from .glmf import _GlmfFfnFp8, _Fp8Switch, fp8_ops
 
 __all__ = [
     "compile_mimo_expert_input_quant_aot",
@@ -81,23 +87,39 @@ def compile_mimo_norm_aot(g: MiMoGeometry = MIMO_V2_FLASH) -> AotProgram:
     )
 
 
-def compile_mimo_ffn_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, max_rows: int, inter: int | None = None) -> AotProgram:
+class _FfnFp8(_GlmfFfnFp8):
+    """The unclamped SwiGLU MLP over per-row-scaled E4M3 copies for decode rows."""
+
+    def __init__(self, g: MiMoGeometry, inter: int):
+        from ._glm_kernels import GlmSwiGLU
+
+        self.h, self.i = g.hidden, int(inter)
+        self.gate_up = _Fp8Switch(2 * self.i, self.h, fp8=True, row_scales=True)
+        self.down = _Fp8Switch(self.h, self.i, fp8=True, row_scales=True)
+        self.swiglu = GlmSwiGLU(self.i)
+
+
+def compile_mimo_ffn_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, max_rows: int, inter: int | None = None,
+                         fp8: bool = False) -> AotProgram:
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
     i = int(g.dense_inter if inter is None else inter)
-    launch = _Ffn(g, i)
+    launch = _FfnFp8(g, i) if fp8 else _Ffn(g, i)
     h = g.hidden
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         Operand("w_gate_up", torch.bfloat16, f"[{2 * i},{h}]"),
+        *(fp8_ops("w_gate_up", 2 * i, h, True) if fp8 else ()),
         Operand("w_down", torch.bfloat16, f"[{h},{i}]"),
+        *(fp8_ops("w_down", h, i, True) if fp8 else ()),
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
         Operand("scratch", torch.uint8, "[ffn_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name="mimo_ffn", operands=operands, scalars=(Scalar("rows"),),
-        key=(int(max_rows), launch.key()),
-        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows)},
+        launch, name="mimo_ffn", operands=operands,
+        scalars=(Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),),
+        key=(int(max_rows), fp8, launch.key()),
+        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": fp8},
         scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows)},
         doc=__doc__,
     )

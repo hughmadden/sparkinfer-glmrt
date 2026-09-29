@@ -222,6 +222,7 @@ class MiMoGeometry:
     routed_experts: int = 256
     top_k: int = 8
     norm_eps: float = 1.0e-5
+    vocab_size: int = 152576
 
     def __post_init__(self) -> None:
         if (self.qk_head_dim, self.v_head_dim, self.rope_dim) != (192, 128, 64):
