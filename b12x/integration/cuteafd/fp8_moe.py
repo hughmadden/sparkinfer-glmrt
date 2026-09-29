@@ -78,8 +78,8 @@ class Fp8MoeGeometry:
     def __post_init__(self) -> None:
         if self.hidden % 128 or self.intermediate % (128 * self.tp):
             raise ValueError("hidden and the intermediate slice must be 128-aligned")
-        if not 1 <= self.top_k <= 8:
-            raise ValueError("top_k must be 1..8")
+        if not 1 <= self.top_k <= 16:
+            raise ValueError("top_k must be 1..16")
 
     @property
     def slice(self) -> int:
@@ -96,6 +96,8 @@ GEOMETRIES = {
     "glm": Fp8MoeGeometry("glm", hidden=6144, experts=256, top_k=8, intermediate=2048),
     # GLM 5.3 Flash: 288 experts, SwiGLU clamped at 10 as its config says.
     "glmf": Fp8MoeGeometry("glmf", hidden=4096, experts=288, top_k=8, intermediate=2048, swiglu_limit=10.0),
+    # Qwen 3.8 Flash Next: 512 experts, softmax top-10, unclamped SiLU.
+    "qwen4": Fp8MoeGeometry("qwen4", hidden=2560, experts=512, top_k=10, intermediate=640),
 }
 
 
