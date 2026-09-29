@@ -105,17 +105,28 @@ class Bf16PrefillKernel:
 
     def __init__(self, n: int, k: int, *, compute_warps: int | None = None,
                  tile_n: int | None = None, num_stages: int | None = None,
-                 compensated: bool = True):
+                 compensated: bool = True, warp_layout: tuple[int, int] | None = None,
+                 tile_m: int | None = None):
         """Defaults keep the original 64x64x64, two-stage, compensated kernel.
 
         ``compensated=False`` accumulates directly in the tensor-core FP32
         accumulators (cuBLAS-style). ``compute_warps`` sets tile_m = 16 x warps.
+        ``warp_layout`` ``(wm, wn)`` with ``tile_m`` arranges the MMA warps in
+        a grid (each owns a ``tile_m / wm`` x ``tile_n / wn`` block): the same
+        per-element K order, fewer shared-memory fragment reads per MMA.
         """
+        self.warp_layout = None
         if compute_warps is not None:
             self.num_compute_warps = int(compute_warps)
             self.producer_warp = self.num_compute_warps
             self.num_threads = 32 * (self.num_compute_warps + 1)
             self.tile_m = 16 * self.num_compute_warps
+        if warp_layout is not None:
+            self.warp_layout = (int(warp_layout[0]), int(warp_layout[1]))
+            self.num_compute_warps = self.warp_layout[0] * self.warp_layout[1]
+            self.producer_warp = self.num_compute_warps
+            self.num_threads = 32 * (self.num_compute_warps + 1)
+            self.tile_m = int(tile_m)
         if tile_n is not None:
             self.tile_n = int(tile_n)
         if num_stages is not None:
@@ -128,6 +139,12 @@ class Bf16PrefillKernel:
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
 
     def _get_tiled_mma(self) -> cute.TiledMma:
+        if self.warp_layout is not None:
+            return cute.make_tiled_mma(
+                warp.MmaF16BF16Op(cutlass.BFloat16, Float32, (16, 8, 16)),
+                (self.warp_layout[0], self.warp_layout[1], 1),
+                permutation_mnk=(self.tile_m, self.tile_n, 16),
+            )
         return cute.make_tiled_mma(
             warp.MmaF16BF16Op(cutlass.BFloat16, Float32, (16, 8, 16)),
             (self.num_compute_warps, 1, 1),

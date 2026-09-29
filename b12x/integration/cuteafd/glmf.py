@@ -151,7 +151,7 @@ class _Fp8Switch:
         from ._glmf_fp8 import BlockFp8Projection
 
         self.n, self.k = int(n), int(k)
-        self.bf16 = glm_projection(self.n, self.k)
+        self.bf16 = glm_projection(self.n, self.k, wide=prefill_rows is not None)
         self.prefill = None
         self.fp8 = None
         self.prefill_mask = int(prefill_mask)
@@ -825,10 +825,10 @@ def index_producer_scratch_bytes(g: GLMFGeometry, rows: int) -> int:
 
 
 class _IndexProducer:
-    def __init__(self, g: GLMFGeometry):
+    def __init__(self, g: GLMFGeometry, max_rows: int = 64):
         self.g = g
         i = g.index_heads
-        self.wq = glm_projection(i * 128, g.q_lora_rank)
+        self.wq = glm_projection(i * 128, g.q_lora_rank, wide=int(max_rows) > CHUNKED_MIN_ROWS)
         self.wk = glm_projection(256 + i, g.hidden)
         self.post = GlmfIndexPost(heads=i, eps=g.index_norm_eps, weight_scale=float(i) ** -0.5 * 128.0 ** -0.5)
         self.pool = GlmfPoolKeys(kpool=g.index_kpool, page_rows=g.page_rows)
@@ -865,7 +865,7 @@ def compile_glmf_index_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: 
     inout, ``q_fp8`` fp8 [rows,I,128] out, ``head_weights`` f32 [rows,I] out.
     """
     max_rows = _check_rows(max_rows)
-    launch = _IndexProducer(g)
+    launch = _IndexProducer(g, max_rows)
     h, q, i = g.hidden, g.q_lora_rank, g.index_heads
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
