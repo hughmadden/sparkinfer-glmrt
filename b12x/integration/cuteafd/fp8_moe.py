@@ -122,7 +122,13 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
     ]
 
 
+def _resolve(route: str, max_rows: int) -> str:
+    """``auto`` compiles only the GEMV when the capacity never reaches the GEMM."""
+    return "decode" if route == "auto" and int(max_rows) <= AUTO_PREFILL_ROWS else route
+
+
 def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int) -> int:
+    route = _resolve(route, rows)
     if route == "auto":
         return max(fp8_moe_scratch_bytes(g, "decode", rows), fp8_moe_scratch_bytes(g, "prefill", rows))
     return sum(_align(b) for b in _regions(g, route, rows))
@@ -240,6 +246,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         raise ValueError("route is 'decode', 'prefill' or 'auto'")
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
+    requested, route = route, _resolve(route, max_rows)
     launch = _Fp8Moe(g, route, max_rows, wire)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
     x = (Operand("x", torch.uint8, f"[rows,{h + h // 32}]", note="FP8 K32 wire rows") if wire
@@ -260,7 +267,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
     return compile_program(
         launch, name=f"fp8_moe_{g.name}_tp{g.tp}_{route}", operands=operands, scalars=(Scalar("rows"),),
         key=launch.key(),
-        geometry={"hidden": h, "experts": e, "top_k": k, "intermediate": g.intermediate, "tp": g.tp,
+        geometry={"requested_route": requested, "hidden": h, "experts": e, "top_k": k, "intermediate": g.intermediate, "tp": g.tp,
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
                   "wire": bool(wire)},
         scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows)},
