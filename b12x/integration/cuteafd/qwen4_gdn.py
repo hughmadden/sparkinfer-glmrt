@@ -43,6 +43,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
 
+from ._fp8_weights import fp8_operands, projection
 from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
 from ._glm_kernels import glm_projection
 from ._glmf_kernels import GlmfKdaConvState
@@ -153,20 +154,21 @@ def gdn_scratch_bytes(g: Qwen4Geometry, rows: int, chunked: int = 0) -> int:
 
 
 class _Gdn:
-    def __init__(self, g: Qwen4Geometry, max_rows: int = 64):
+    def __init__(self, g: Qwen4Geometry, max_rows: int = 64, fp8: bool = False):
         self.g = g
         self.chunked = _GdnChunked(g, max_rows) if int(max_rows) > CHUNKED_MIN_ROWS else None
         c, v, p = g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width
         self.c, self.v, self.p = c, v, p
-        self.in_proj = glm_projection(p, g.hidden)
+        self.fp8 = bool(fp8)
+        self.in_proj = projection(p, g.hidden, self.fp8)
         self.conv = Qwen4GdnConv(channels=c, proj_width=p)
         self.conv_state = GlmfKdaConvState(channels=c, proj_width=p)
         self.recurrent = Qwen4GdnRecurrent(heads=g.gdn_value_heads, key_heads=g.gdn_key_heads, ab_stride=p)
         self.norm = Qwen4GdnGatedNorm(heads=g.gdn_value_heads, eps=g.norm_eps, gate_stride=p)
-        self.o_proj = glm_projection(g.hidden, v)
+        self.o_proj = projection(g.hidden, v, self.fp8)
 
     def key(self) -> tuple:
-        return (self.in_proj.key(), self.o_proj.key(), self.g,
+        return (self.in_proj.key(), self.o_proj.key(), self.g, self.fp8,
                 None if self.chunked is None else self.chunked.key())
 
     @cute.jit
@@ -174,6 +176,15 @@ class _Gdn:
                  dt_bias: cute.Pointer, norm_w: cute.Pointer, w_out: cute.Pointer, conv_state: cute.Pointer,
                  state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer, out: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_in, w_in, w_in, conv_w, a_log, dt_bias, norm_w, w_out, w_out, w_out, conv_state, state,
+                  slots, seq_first, out, scratch, rows, stream)
+
+    @cute.jit
+    def body(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
+             conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer, norm_w: cute.Pointer,
+             w_out: cute.Pointer, w_out_fp8: cute.Pointer, w_out_scale: cute.Pointer, conv_state: cute.Pointer,
+             state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer, out: cute.Pointer,
+             scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         c, v, p = self.c, self.v, self.p
         m = Int64(rows)
         base = Int64(scratch.toint())
@@ -182,7 +193,7 @@ class _Gdn:
         y_off = o_off + _align_i64(m * Int64(v * 2))
         bf16 = cutlass.BFloat16
         proj = _ptr(bf16, base)
-        self.in_proj(x, w_in, proj, rows, stream)
+        self.in_proj(x, w_in, w_in_fp8, w_in_scale, proj, rows, stream)
         self.conv(proj, conv_w, conv_state, slots, seq_first, _ptr(bf16, qkv_off), rows, stream)
         self.conv_state(proj, conv_state, slots, seq_first, rows, stream)
         z = _ptr(bf16, base + Int64(c * 2))
@@ -199,26 +210,47 @@ class _Gdn:
                 self.recurrent(_ptr(bf16, qkv_off), a_raw, b_raw, a_log, dt_bias, state, slots,
                                _ptr(bf16, o_off), rows, stream)
         self.norm(_ptr(bf16, o_off), z, norm_w, _ptr(bf16, y_off), rows, stream)
-        self.o_proj(_ptr(bf16, y_off), w_out, out, rows, stream)
+        self.o_proj(_ptr(bf16, y_off), w_out, w_out_fp8, w_out_scale, out, rows, stream)
 
 
-def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int) -> AotProgram:
-    """One GDN layer for ``rows <= max_rows``; see the module docstring."""
+class _GdnFp8(_Gdn):
+    """The GDN layer with FP8 in/out projections for decode rows (<= 16 live
+    rows read the E4M3 copies, more rows the BF16 weights)."""
+
+    def __init__(self, g: Qwen4Geometry, max_rows: int = 64):
+        super().__init__(g, max_rows, fp8=True)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
+                 conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer, norm_w: cute.Pointer,
+                 w_out: cute.Pointer, w_out_fp8: cute.Pointer, w_out_scale: cute.Pointer, conv_state: cute.Pointer,
+                 state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer, out: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_in, w_in_fp8, w_in_scale, conv_w, a_log, dt_bias, norm_w, w_out, w_out_fp8, w_out_scale,
+                  conv_state, state, slots, seq_first, out, scratch, rows, stream)
+
+
+def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int, fp8: bool = False) -> AotProgram:
+    """One GDN layer for ``rows <= max_rows``; see the module docstring. ``fp8``
+    adds ``w_in_fp8``/``w_in_scale`` and ``w_out_fp8``/``w_out_scale`` (E4M3 with
+    FP32 128x128 block scales) after each BF16 weight for rows <= 16."""
     max_rows = int(max_rows)
     if max_rows <= 0:
         raise ValueError("max_rows must be positive")
-    launch = _Gdn(g, max_rows)
+    launch = (_GdnFp8 if fp8 else _Gdn)(g, max_rows)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, c, v, p, heads = g.hidden, g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width, g.gdn_value_heads
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         Operand("w_in", torch.bfloat16, f"[{p},{h}]",
                 note="cat(in_proj_qkv, in_proj_z, in_proj_b, in_proj_a)"),
+        *(fp8_operands("w_in", p, h) if fp8 else ()),
         Operand("conv_w", torch.float32, f"[{c},4]", align=4),
         Operand("a_log", torch.float32, f"[{heads}]", align=4),
         Operand("dt_bias", torch.float32, f"[{heads}]", align=4),
         Operand("norm_w", torch.bfloat16, f"[{g.gdn_head_dim}]"),
         Operand("w_out", torch.bfloat16, f"[{h},{v}]"),
+        *(fp8_operands("w_out", h, v) if fp8 else ()),
         Operand("conv_state", torch.bfloat16, f"[slots,3,{c}]", "inout", align=2),
         Operand("state", torch.float32, f"[slots,{heads},128,128]", "inout"),
         Operand("slots", torch.int32, "[rows]", align=4),
@@ -230,7 +262,7 @@ def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int
         launch, name="qwen4_gdn", operands=operands, scalars=(Scalar("rows"),),
         key=(max_rows, launch.key()),
         geometry={"hidden": h, "key_heads": g.gdn_key_heads, "value_heads": heads, "head_dim": g.gdn_head_dim,
-                  "max_rows": max_rows, "in_width": p, "eps": g.norm_eps,
+                  "max_rows": max_rows, "in_width": p, "eps": g.norm_eps, "fp8_weights": fp8,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None},
         scratch={"scratch": lambda rows: gdn_scratch_bytes(g, rows, chunked)},
         doc=__doc__,

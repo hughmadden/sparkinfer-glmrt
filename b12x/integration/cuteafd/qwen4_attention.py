@@ -105,6 +105,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
 
+from ._fp8_weights import fp8_operands, projection
 from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
 from ._glm_kernels import glm_projection
 from ._qwen4_attention_kernels import (
@@ -164,14 +165,14 @@ def attn_producer_scratch_bytes(g: Qwen4Geometry, rows: int) -> int:
 
 
 class _Producer:
-    def __init__(self, g: Qwen4Geometry):
-        self.g = g
-        self.proj = glm_projection(g.attn_in_width, g.hidden)
+    def __init__(self, g: Qwen4Geometry, fp8: bool = False):
+        self.g, self.fp8 = g, bool(fp8)
+        self.proj = projection(g.attn_in_width, g.hidden, self.fp8)
         self.post = Qwen4AttnPost(g)
         self.pool = Qwen4PoolKeys(g)
 
     def key(self) -> tuple:
-        return (self.proj.key(), self.g)
+        return (self.proj.key(), self.g, self.fp8)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, q_norm: cute.Pointer, k_norm: cute.Pointer,
@@ -179,21 +180,47 @@ class _Producer:
                  pool_slots: cute.Pointer, kv_cache: cute.Pointer, token_keys: cute.Pointer,
                  index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_in, w_in, w_in, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, pool_slots, kv_cache,
+                  token_keys, index_cache, query, gate, index_q, scratch, rows, stream)
+
+    @cute.jit
+    def body(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
+             q_norm: cute.Pointer, k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer,
+             positions: cute.Pointer, kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer,
+             token_keys: cute.Pointer, index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer,
+             index_q: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         proj = _ptr(cutlass.BFloat16, Int64(scratch.toint()))
-        self.proj(x, w_in, proj, rows, stream)
+        self.proj(x, w_in, w_in_fp8, w_in_scale, proj, rows, stream)
         self.post(proj, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, kv_cache, token_keys, query, gate,
                   index_q, rows, stream)
         self.pool(positions, kv_slots, pool_slots, ik_norm, token_keys, index_cache, rows, stream)
 
 
-def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int) -> AotProgram:
-    """Full-attention producer for ``rows <= max_rows``; see the module docstring."""
+class _ProducerFp8(_Producer):
+    def __init__(self, g: Qwen4Geometry):
+        super().__init__(g, fp8=True)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
+                 q_norm: cute.Pointer, k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer,
+                 positions: cute.Pointer, kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer,
+                 token_keys: cute.Pointer, index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer,
+                 index_q: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_in, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, pool_slots,
+                  kv_cache, token_keys, index_cache, query, gate, index_q, scratch, rows, stream)
+
+
+def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
+                                    fp8: bool = False) -> AotProgram:
+    """Full-attention producer for ``rows <= max_rows``; see the module docstring.
+    ``fp8`` adds ``w_in_fp8``/``w_in_scale`` (E4M3, FP32 128x128 block scales) for rows <= 16."""
     max_rows = _check_rows(max_rows)
-    launch = _Producer(g)
+    launch = (_ProducerFp8 if fp8 else _Producer)(g)
     h, n, d, ih = g.hidden, g.heads, g.head_dim, g.index_heads
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         Operand("w_in", torch.bfloat16, f"[{g.attn_in_width},{h}]"),
+        *(fp8_operands("w_in", g.attn_in_width, h) if fp8 else ()),
         Operand("q_norm", torch.bfloat16, f"[{d}]"),
         Operand("k_norm", torch.bfloat16, f"[{d}]"),
         Operand("iq_norm", torch.bfloat16, f"[{g.index_head_dim}]"),
@@ -214,7 +241,7 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
         key=(max_rows, launch.key()),
         geometry={"hidden": h, "heads": n, "kv_heads": g.kv_heads, "head_dim": d, "index_heads": ih,
                   "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "record_bytes": g.record_bytes,
-                  "page_rows": g.page_rows, "eps": g.norm_eps, "max_rows": max_rows},
+                  "page_rows": g.page_rows, "eps": g.norm_eps, "max_rows": max_rows, "fp8_weights": fp8},
         scratch={"scratch": lambda rows: attn_producer_scratch_bytes(g, rows)},
         doc=__doc__,
     )
@@ -462,37 +489,56 @@ def attn_o_scratch_bytes(g: Qwen4Geometry, rows: int) -> int:
 
 
 class _AttnO:
-    def __init__(self, g: Qwen4Geometry):
-        self.g = g
+    def __init__(self, g: Qwen4Geometry, fp8: bool = False):
+        self.g, self.fp8 = g, bool(fp8)
         self.gate = Qwen4GateMul(g.heads * g.head_dim)
-        self.o_proj = glm_projection(g.hidden, g.heads * g.head_dim)
+        self.o_proj = projection(g.hidden, g.heads * g.head_dim, self.fp8)
 
     def key(self) -> tuple:
-        return (self.o_proj.key(), self.g)
+        return (self.o_proj.key(), self.g, self.fp8)
 
     @cute.jit
     def __call__(self, attn: cute.Pointer, gate: cute.Pointer, w_o: cute.Pointer, out: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.body(attn, gate, w_o, w_o, w_o, out, scratch, rows, stream)
+
+    @cute.jit
+    def body(self, attn: cute.Pointer, gate: cute.Pointer, w_o: cute.Pointer, w_o_fp8: cute.Pointer,
+             w_o_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         gated = _ptr(cutlass.BFloat16, Int64(scratch.toint()))
         self.gate(attn, gate, gated, rows, stream)
-        self.o_proj(gated, w_o, out, rows, stream)
+        self.o_proj(gated, w_o, w_o_fp8, w_o_scale, out, rows, stream)
 
 
-def compile_qwen4_attn_o_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int) -> AotProgram:
-    """``o_proj(attn * sigmoid(gate))``; see the module docstring."""
+class _AttnOFp8(_AttnO):
+    def __init__(self, g: Qwen4Geometry):
+        super().__init__(g, fp8=True)
+
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, gate: cute.Pointer, w_o: cute.Pointer, w_o_fp8: cute.Pointer,
+                 w_o_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        self.body(attn, gate, w_o, w_o_fp8, w_o_scale, out, scratch, rows, stream)
+
+
+def compile_qwen4_attn_o_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
+                             fp8: bool = False) -> AotProgram:
+    """``o_proj(attn * sigmoid(gate))``; see the module docstring. ``fp8`` adds
+    ``w_o_fp8``/``w_o_scale`` for rows <= 16."""
     max_rows = _check_rows(max_rows)
-    launch = _AttnO(g)
+    launch = (_AttnOFp8 if fp8 else _AttnO)(g)
     h, w = g.hidden, g.heads * g.head_dim
     operands = (
         Operand("attn", torch.bfloat16, f"[rows,{w}]"),
         Operand("gate", torch.bfloat16, f"[rows,{w}]"),
         Operand("w_o", torch.bfloat16, f"[{h},{w}]"),
+        *(fp8_operands("w_o", h, w) if fp8 else ()),
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
         Operand("scratch", torch.uint8, "[attn_o_scratch_bytes]", "scratch"),
     )
     return compile_program(
         launch, name="qwen4_attn_o", operands=operands, scalars=(Scalar("rows"),), key=(max_rows, launch.key()),
-        geometry={"hidden": h, "width": w, "max_rows": max_rows},
+        geometry={"hidden": h, "width": w, "max_rows": max_rows, "fp8_weights": fp8},
         scratch={"scratch": lambda rows: attn_o_scratch_bytes(g, rows)},
         doc=__doc__,
     )
