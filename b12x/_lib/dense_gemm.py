@@ -1492,6 +1492,17 @@ class DenseGemmKernel:
             flat[idx] = scale
 
     @cute.jit
+    def _load_row_b_scales(self, scale_cols: cute.Tensor, coord_mn: cute.Tensor, sfb: cute.Tensor, tile_coord_mnl,
+                           k_tile_global: Int32) -> None:
+        """The accumulator columns' per-row weight scales of K block ``k_tile_global`` (zero past N)."""
+        n0 = tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
+        for acc_n in cutlass.range_constexpr(cute.size(scale_cols)):
+            n_coord = n0 + coord_mn[0, acc_n][1]
+            scale_cols[acc_n] = cutlass.Float32(0.0)
+            if n_coord < Int32(sfb.shape[0]):
+                scale_cols[acc_n] = cutlass.Float32(sfb[(n_coord, k_tile_global, tile_coord_mnl[2])])
+
+    @cute.jit
     def _accumulate_block_fp8_stage(
         self,
         accumulators: cute.Tensor,
@@ -1501,19 +1512,14 @@ class DenseGemmKernel:
         sfb: cute.Tensor,
         tile_coord_mnl,
         k_tile_global: Int32,
+        scale_cols: cute.Tensor = None,
     ) -> None:
         accum_mn = _reshape_acc_to_mn(accumulators)
         stage_accum_mn = _reshape_acc_to_mn(stage_accumulators)
         if cutlass.const_expr(self.block_fp8_row_b):
-            # Per-row weight scales: one per accumulator column (zero past N).
-            n0 = tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
+            # Per-row weight scales: one per accumulator column (zero past N),
+            # loaded one K block ahead into ``scale_cols``.
             columns = cute.size(accum_mn.shape[1])
-            scale_cols = cute.make_rmem_tensor(cute.make_layout((columns,), stride=(1,)), cutlass.Float32)
-            for acc_n in cutlass.range_constexpr(columns):
-                n_coord = n0 + coord_mn[0, acc_n][1]
-                scale_cols[acc_n] = cutlass.Float32(0.0)
-                if n_coord < Int32(sfb.shape[0]):
-                    scale_cols[acc_n] = cutlass.Float32(sfb[(n_coord, k_tile_global, tile_coord_mnl[2])])
             for acc_m in cutlass.range_constexpr(cute.size(accum_mn.shape[0])):
                 coord = coord_mn[acc_m, 0]
                 m_coord = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + coord[0]
@@ -1523,6 +1529,8 @@ class DenseGemmKernel:
                 for acc_n in cutlass.range_constexpr(columns):
                     accum_mn[acc_m, acc_n] += stage_accum_mn[acc_m, acc_n] * (scale_a * scale_cols[acc_n])
                     stage_accum_mn[acc_m, acc_n] = 0.0
+            if k_tile_global + Int32(1) < Int32(sfb.shape[1]):
+                self._load_row_b_scales(scale_cols, coord_mn, sfb, tile_coord_mnl, k_tile_global + Int32(1))
         else:
             scale_n = (tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])) // Int32(128)
             scale_b = cutlass.Float32(sfb[(scale_n, k_tile_global, tile_coord_mnl[2])])
@@ -2137,6 +2145,11 @@ class DenseGemmKernel:
             block_fp8_coord_mn = _reshape_acc_to_mn(
                 thr_mma.partition_C(block_fp8_c_identity)
             )
+            row_b_scales = None
+            if cutlass.const_expr(self.block_fp8_row_b):
+                row_b_scales = cute.make_rmem_tensor(
+                    cute.make_layout((cute.size(block_fp8_coord_mn.shape[1]),), stride=(1,)), self.acc_dtype
+                )
         if cutlass.const_expr(self.swap_ab):
             swap_ab_acc_mn = _reshape_acc_to_mn(accumulators, transpose=True)
             swap_ab_c_identity = cute.make_identity_tensor(
@@ -2368,6 +2381,9 @@ class DenseGemmKernel:
                 accumulators.fill(0.0)
                 if cutlass.const_expr(self.block_fp8):
                     stage_accumulators.fill(0.0)
+                    if cutlass.const_expr(self.block_fp8_row_b):
+                        self._load_row_b_scales(row_b_scales, block_fp8_coord_mn, directSFB_nkl, tile_coord_mnl,
+                                                k_tile_start)
 
                 # Pipelined MAINLOOP
                 mainloop_consumer_state.reset_count()
@@ -2629,6 +2645,7 @@ class DenseGemmKernel:
                                     directSFB_nkl,
                                     tile_coord_mnl,
                                     k_tile_start + Int32(k_tile),
+                                    row_b_scales,
                                 )
                         if cutlass.const_expr(self.b_packed):
                             # Deferred expansion barrier (see expansion call
@@ -2795,6 +2812,7 @@ class DenseGemmKernel:
                                 directSFB_nkl,
                                 tile_coord_mnl,
                                 k_tile_start + Int32(k_tile_iter_cnt - 1),
+                                row_b_scales,
                             )
 
                 if cutlass.const_expr(self.swap_ab):
