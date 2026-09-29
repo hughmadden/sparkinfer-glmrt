@@ -136,7 +136,8 @@ class _Fp8Switch:
 
         self.n, self.k = int(n), int(k)
         self.bf16 = glm_projection(self.n, self.k)
-        self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_ROWS, warps=gemv_warps(self.k), row_scales=row_scales) \
+        warps, groups = FP8_GEMV_CONFIG.get((self.n, self.k), (gemv_warps(self.k), 4))
+        self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_ROWS, warps=warps, groups=groups, row_scales=row_scales) \
             if fp8 else None
 
     def key(self) -> tuple:
@@ -159,6 +160,17 @@ class _Fp8Switch:
 
 # Most rows a decode program runs through the FP8 GEMV (MmaFp8Gemv's M-tile ceiling).
 FP8_ROWS = 16
+# MmaFp8Gemv (warps, groups) per GLM 5.3 Flash projection (RTX PRO 6000 at 325 W, one
+# row, L2-cold, us, default 4 warps x 4 groups -> chosen): KDA in 24896x4096 67.8 -> 62.7,
+# KDA o 4096x8192 23.5 -> 22.5, MLA o 4096x16384 44.6 -> 44.0, q_b 16384x1536 18.6 -> 16.9,
+# qkv_a 2048x4096 12.4 -> 12.0, shared gate_up 4096x4096 13.7 -> 13.0, shared down
+# 4096x2048 12.4 -> 12.0, dense gate_up 24576x4096 69.9 -> 64.5, dense down 4096x12288
+# 38.4 -> 34.5.
+FP8_GEMV_CONFIG = {
+    (24896, 4096): (8, 2), (4096, 8192): (8, 2), (4096, 16384): (4, 2), (16384, 1536): (2, 2),
+    (2048, 4096): (8, 4), (4096, 4096): (8, 2), (4096, 2048): (2, 2), (24576, 4096): (8, 4),
+    (4096, 12288): (8, 2),
+}
 
 
 def fp8_ops(name: str, n: int, k: int, row_scales: bool) -> tuple:
