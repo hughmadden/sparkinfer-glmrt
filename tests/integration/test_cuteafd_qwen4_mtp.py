@@ -214,7 +214,29 @@ def test_mtp_feedback():
               f"exact {100 * (diff == 0).float().mean().item():.2f}%")
 
 
+def test_head_fp8():
+    from b12x.integration.cuteafd import QWEN38_FLASH_NEXT as g
+    from b12x.integration.cuteafd.qwen4 import compile_qwen4_head_fp8_aot
+
+    prog = compile_qwen4_head_fp8_aot(g)
+    torch.manual_seed(3)
+    h, v = g.hidden, g.vocab
+    w = _bf16(v, h, scale=0.02)
+    blocks = w.float().view(v, h // 128, 128)
+    scale = (blocks.abs().amax(-1) / 448.0).clamp_min(1e-12)
+    q = (blocks / scale[..., None]).to(torch.float8_e4m3fn).view(v, h)
+    for rows in (1, 3, 16):
+        x = _bf16(rows, h)
+        logits = torch.empty(rows, v, device="cuda")
+        prog.launch(x, q, scale.contiguous(), logits, scalars=[rows])
+        ref = x.float() @ (q.float().view(v, h // 128, 128) * scale[..., None]).view(v, h).T
+        cos = torch.nn.functional.cosine_similarity(logits.flatten(), ref.flatten(), dim=0).item()
+        assert cos > 0.99999 and torch.equal(logits.argmax(-1), ref.argmax(-1)), cos
+        print(f"head fp8 rows {rows}: cosine {cos:.7f}")
+
+
 if __name__ == "__main__":
+    test_head_fp8()
     test_mtp_feedback()
     test_gdn_verify_by_replay(True)
     test_gdn_verify_by_replay(False)

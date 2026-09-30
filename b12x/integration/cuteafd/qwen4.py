@@ -75,6 +75,7 @@ __all__ = [
     "compile_qwen4_hc_post_pre_aot",
     "compile_qwen4_hc_pre_aot",
     "compile_qwen4_head_aot",
+    "compile_qwen4_head_fp8_aot",
     "compile_qwen4_mtp_feedback_aot",
     "compile_qwen4_ple_aot",
     "compile_qwen4_ple_commit_aot",
@@ -262,6 +263,26 @@ def compile_qwen4_head_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
     return compile_program(launch, name="qwen4_head", operands=operands, scalars=(Scalar("rows"),),
                            key=launch.key(), geometry=_hc_geometry(g),
                            scratch={"scratch": lambda rows: hc_scratch_bytes(g, rows, inject=False)}, doc=__doc__)
+
+
+def compile_qwen4_head_fp8_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
+    """FP32 logits of up to 16 rows over an E4M3 copy of ``lm_head`` with per-row
+    x 128-K scales (the MTP drafts' head; the target keeps the BF16 head): x bf16
+    [rows,H], w_fp8 [V,H], scale f32 [V,H/128], logits f32 [rows,V]."""
+    from .glmf import FP8_ROWS, _HeadFp8
+
+    h, vocab = g.hidden, g.vocab
+    launch = _HeadFp8(vocab, h)
+    return compile_program(
+        launch, name="qwen4_head_fp8",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("w_fp8", torch.float8_e4m3fn, f"[{vocab},{h}]"),
+                  Operand("scale", torch.float32, f"[{vocab},{h // 128}]", align=4),
+                  Operand("logits", torch.float32, f"[rows,{vocab}]", "out")),
+        scalars=(Scalar("rows"),), key=(vocab, launch.key()),
+        geometry={"hidden": h, "vocab": vocab, "max_rows": FP8_ROWS},
+        doc=compile_qwen4_head_fp8_aot.__doc__,
+    )
 
 
 # ---------------------------------------------------------------------------
