@@ -222,9 +222,11 @@ def timing(layer_id: int = 0) -> list:
         slots = torch.zeros(rows, dtype=torch.int32, device="cuda")
         first = torch.zeros(rows, dtype=torch.int32, device="cuda")
 
+        spec = [op.name for op in prog.operands].count("replay")
+
         def launch():
             prog.launch(x, o["w_in"], o["conv_w"], o["a_log"], o["dt_bias"], o["norm_w"], o["w_out"], pools.conv,
-                        pools.state, slots, first, out, scratch, scalars=[rows])
+                        pools.state, slots, first, out, *([None] * spec), scratch, scalars=[rows] + [0] * spec)
 
         for _ in range(3):
             launch()
