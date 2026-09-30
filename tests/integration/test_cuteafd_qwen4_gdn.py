@@ -139,9 +139,12 @@ def run(prog, layer: Layer, pools: Pools, x: torch.Tensor, slots: list[int], seq
     out = torch.empty(rows, pools.g.hidden, dtype=torch.bfloat16, device="cuda")
     scratch = torch.empty(prog.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
     o = layer.ops
+    # Decode capacities carry the speculative replay record (unused with spec 0).
+    spec = [op.name for op in prog.operands].count("replay")
     prog.launch(x, o["w_in"], o["conv_w"], o["a_log"], o["dt_bias"], o["norm_w"], o["w_out"], pools.conv,
                 pools.state, torch.tensor(slots, dtype=torch.int32, device="cuda"),
-                torch.tensor(seq_first, dtype=torch.int32, device="cuda"), out, scratch, scalars=[rows])
+                torch.tensor(seq_first, dtype=torch.int32, device="cuda"), out, *([None] * spec), scratch,
+                scalars=[rows] + [0] * spec)
     return out
 
 
@@ -219,9 +222,11 @@ def timing(layer_id: int = 0) -> list:
         slots = torch.zeros(rows, dtype=torch.int32, device="cuda")
         first = torch.zeros(rows, dtype=torch.int32, device="cuda")
 
+        spec = [op.name for op in prog.operands].count("replay")
+
         def launch():
             prog.launch(x, o["w_in"], o["conv_w"], o["a_log"], o["dt_bias"], o["norm_w"], o["w_out"], pools.conv,
-                        pools.state, slots, first, out, scratch, scalars=[rows])
+                        pools.state, slots, first, out, *([None] * spec), scratch, scalars=[rows] + [0] * spec)
 
         for _ in range(3):
             launch()

@@ -37,7 +37,10 @@ PLE (layer 1, ``Qwen4ExpTextPLELayer``) ``qwen4_ple_{bf16,fp8}``::
     conv_w     f32  [C,4]                in     ple.conv1d.weight (dilation 3)
     conv_state bf16 [slots,9,C]          inout  the sequence's last 9 norm_conv(gv) rows
     slots, seq_first i32 [rows]          in     as the GDN program
+    replay     bf16 [64,C]               out    speculative steps: every row's norm_conv(gv)
     scratch
+    rows, spec int32                            spec != 0 (rows <= 64) leaves conv_state as it was
+                                                and records the rows for ``qwen4_ple_commit``
 """
 
 from __future__ import annotations
@@ -55,7 +58,9 @@ from ._qwen4_kernels import (
     Qwen4HcMix,
     Qwen4HcNorm,
     Qwen4HcPost,
+    Qwen4MtpNorm,
     Qwen4PleConv,
+    Qwen4PleCommit,
     Qwen4PleConvState,
     Qwen4PleGate,
     Qwen4PleGather,
@@ -70,10 +75,14 @@ __all__ = [
     "compile_qwen4_hc_post_pre_aot",
     "compile_qwen4_hc_pre_aot",
     "compile_qwen4_head_aot",
+    "compile_qwen4_head_fp8_aot",
+    "compile_qwen4_mtp_feedback_aot",
     "compile_qwen4_ple_aot",
+    "compile_qwen4_ple_commit_aot",
     "compile_qwen4_router_scores_aot",
     "compile_qwen4_shared_aot",
     "hc_scratch_bytes",
+    "mtp_feedback_scratch_bytes",
     "ple_scratch_bytes",
     "shared_scratch_bytes",
 ]
@@ -256,6 +265,93 @@ def compile_qwen4_head_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
                            scratch={"scratch": lambda rows: hc_scratch_bytes(g, rows, inject=False)}, doc=__doc__)
 
 
+def compile_qwen4_head_fp8_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
+    """FP32 logits of up to 16 rows over an E4M3 copy of ``lm_head`` with per-row
+    x 128-K scales (the MTP drafts' head; the target keeps the BF16 head): x bf16
+    [rows,H], w_fp8 [V,H], scale f32 [V,H/128], logits f32 [rows,V]."""
+    from .glmf import FP8_ROWS, _HeadFp8
+
+    h, vocab = g.hidden, g.vocab
+    launch = _HeadFp8(vocab, h)
+    return compile_program(
+        launch, name="qwen4_head_fp8",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("w_fp8", torch.float8_e4m3fn, f"[{vocab},{h}]"),
+                  Operand("scale", torch.float32, f"[{vocab},{h // 128}]", align=4),
+                  Operand("logits", torch.float32, f"[rows,{vocab}]", "out")),
+        scalars=(Scalar("rows"),), key=(vocab, launch.key()),
+        geometry={"hidden": h, "vocab": vocab, "max_rows": FP8_ROWS},
+        doc=compile_qwen4_head_fp8_aot.__doc__,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MTP feedback
+# ---------------------------------------------------------------------------
+
+
+def mtp_feedback_scratch_bytes(g: Qwen4Geometry, rows: int) -> int:
+    """normed hidden [rows,4,H], normed embedding [rows,H] (BF16)."""
+    rows = max(int(rows), 1)
+    return _align(rows * g.hc_width * 2) + _align(rows * g.hidden * 2)
+
+
+class _MtpFeedback:
+    def __init__(self, g: Qwen4Geometry):
+        self.g = g
+        self.norm = Qwen4MtpNorm(g.hidden, g.hc_count, g.norm_eps)
+        self.fc = _projection(g.hidden, g.hidden)
+
+    def key(self) -> tuple:
+        return (self.g, _key(self.fc))
+
+    @cute.jit
+    def __call__(self, hidden: cute.Pointer, hidden_rows: cute.Pointer, embed: cute.Pointer,
+                 norm_hidden: cute.Pointer, norm_embed: cute.Pointer, fc_hidden: cute.Pointer,
+                 fc_embed: cute.Pointer, streams: cute.Pointer, delta: cute.Pointer, inject: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        g = self.g
+        m = Int64(rows)
+        base = Int64(scratch.toint())
+        e_off = base + _align_i64(m * Int64(g.hc_width * 2))
+        bf16 = cutlass.BFloat16
+        self.norm(hidden, hidden_rows, embed, norm_hidden, norm_embed, _ptr(bf16, base), _ptr(bf16, e_off), inject,
+                  rows, stream)
+        # fc_hidden is shared by the streams: one GEMM over rows * 4 stream rows.
+        self.fc(_ptr(bf16, base), fc_hidden, streams, rows * Int32(g.hc_count), stream)
+        self.fc(_ptr(bf16, e_off), fc_embed, delta, rows, stream)
+
+
+def compile_qwen4_mtp_feedback_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
+    """The MTP layer's input (``residual_linear_shared``, vLLM ``Qwen4ExpMultiTokenPredictor``):
+    ``streams[r, s] = bf16(fc_hidden(n_h)[s])`` with ``n_h`` the ``1 + w`` RMSNorm of the
+    gathered source row ``hidden[hidden_rows[r]]`` over all ``4H`` values, and ``delta[r] =
+    bf16(fc_embedding(n_e))`` with ``n_e`` the ``1 + w`` RMSNorm of the next token's
+    embedding; ``inject[r, :] = 1``. ``qwen4_hc_post_pre`` with the MTP attention site then
+    adds ``delta`` to every stream (vLLM's combine with no injection logits) and mixes
+    the attention input. The source rows are the target's pre-mixer streams (first
+    draft step) or the previous MTP step's streams (later steps)."""
+    launch = _MtpFeedback(g)
+    h, n = g.hidden, g.hc_count
+    operands = (
+        Operand("hidden", torch.bfloat16, f"[source_rows,{n},{h}]"),
+        Operand("hidden_rows", torch.int32, "[rows]", align=4),
+        Operand("embed", torch.bfloat16, f"[rows,{h}]"),
+        Operand("norm_hidden", torch.bfloat16, f"[{n * h}]", note="mtp.pre_fc_norm_hidden.weight"),
+        Operand("norm_embed", torch.bfloat16, f"[{h}]", note="mtp.pre_fc_norm_embedding.weight"),
+        Operand("fc_hidden", torch.bfloat16, f"[{h},{h}]", note="mtp.fc_hidden.weight"),
+        Operand("fc_embed", torch.bfloat16, f"[{h},{h}]", note="mtp.fc_embedding.weight"),
+        Operand("streams", torch.bfloat16, f"[rows,{n},{h}]", "out"),
+        Operand("delta", torch.bfloat16, f"[rows,{h}]", "out"),
+        Operand("inject", torch.bfloat16, f"[rows,{n}]", "out", align=2),
+        Operand("scratch", torch.uint8, "[mtp_feedback_scratch_bytes]", "scratch"),
+    )
+    return compile_program(launch, name="qwen4_mtp_feedback", operands=operands, scalars=(Scalar("rows"),),
+                           key=launch.key(), geometry={"hidden": h, "streams": n, "eps": g.norm_eps},
+                           scratch={"scratch": lambda rows: mtp_feedback_scratch_bytes(g, rows)},
+                           doc=compile_qwen4_mtp_feedback_aot.__doc__)
+
+
 # ---------------------------------------------------------------------------
 # MoE front
 # ---------------------------------------------------------------------------
@@ -389,7 +485,7 @@ class _Ple:
     def __call__(self, streams: cute.Pointer, ids: cute.Pointer, table: cute.Pointer, scale: cute.Pointer,
                  w_kv: cute.Pointer, norm_key: cute.Pointer, norm_query: cute.Pointer, norm_conv: cute.Pointer,
                  conv_w: cute.Pointer, conv_state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
-                 scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+                 replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, spec: Int32, stream: cuda.CUstream):
         g = self.g
         m = Int64(rows)
         c, h = g.hc_width, g.hidden
@@ -404,7 +500,7 @@ class _Ple:
                   _ptr(bf16, gvn_off), rows, stream)
         self.conv(_ptr(bf16, gv_off), _ptr(bf16, gvn_off), conv_w, conv_state, slots, seq_first, streams, rows,
                   stream)
-        self.state(_ptr(bf16, gvn_off), conv_state, slots, seq_first, rows, stream)
+        self.state(_ptr(bf16, gvn_off), conv_state, slots, seq_first, replay, spec, rows, stream)
 
 
 def compile_qwen4_ple_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, fp8: bool) -> AotProgram:
@@ -425,12 +521,33 @@ def compile_qwen4_ple_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, fp8: bool) ->
         Operand("conv_state", torch.bfloat16, f"[slots,{g.ple_state_rows},{c}]", "inout", align=2),
         Operand("slots", torch.int32, "[rows]", align=4),
         Operand("seq_first", torch.int32, "[rows]", align=4),
+        Operand("replay", torch.bfloat16, f"[64,{c}]", "out",
+                note="speculative steps (spec != 0, rows <= 64): every row's norm_conv(gv)"),
         Operand("scratch", torch.uint8, "[ple_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name=f"qwen4_ple_{'fp8' if fp8 else 'bf16'}", operands=operands, scalars=(Scalar("rows"),),
+        launch, name=f"qwen4_ple_{'fp8' if fp8 else 'bf16'}", operands=operands,
+        scalars=(Scalar("rows"), Scalar("spec")),
         key=launch.key(),
         geometry={"hidden": h, "streams": g.hc_count, "rows_per_token": g.ple_rows, "row_dim": g.ple_row_dim,
                   "taps": g.ple_conv, "dilation": g.ngram_size, "state_rows": g.ple_state_rows, "fp8": fp8},
         scratch={"scratch": lambda rows: ple_scratch_bytes(g, rows)}, doc=__doc__,
+    )
+
+
+def compile_qwen4_ple_commit_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
+    """After a speculative step (``qwen4_ple_*`` with ``spec`` = 1): shift each
+    sequence's accepted ``norm_conv(gv)`` rows from ``replay`` into its PLE conv
+    state. ``tables`` i32 ``[3, sequences]``: state slot (negative: skip), first
+    step row and accepted rows."""
+    c = g.hc_width
+    launch = Qwen4PleCommit(c, g.ple_state_rows)
+    return compile_program(
+        launch, name="qwen4_ple_commit",
+        operands=(Operand("conv_state", torch.bfloat16, f"[slots,{g.ple_state_rows},{c}]", "inout", align=2),
+                  Operand("replay", torch.bfloat16, f"[64,{c}]"),
+                  Operand("tables", torch.int32, "[3,sequences]", align=4)),
+        scalars=(Scalar("sequences"),), key=(c, g.ple_state_rows),
+        geometry={"channels": c, "state_rows": g.ple_state_rows, "replay_rows": 64},
+        doc=compile_qwen4_ple_commit_aot.__doc__,
     )

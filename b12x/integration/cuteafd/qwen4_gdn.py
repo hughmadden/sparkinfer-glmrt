@@ -22,8 +22,18 @@ projection rows ``C + V + 2 * 48`` = 16480. ``rows`` is the live row count
     seq_first  i32  [rows]               in   first step row of each row's sequence (rows of a sequence
                                               are contiguous and in position order)
     out        bf16 [rows,H]             out  attention output (before the hyper-connection injection)
+    replay     f32  [replay_bytes / 4]   out  decode capacities only: the step's replay record
     scratch    u8   qwen4_gdn_scratch_bytes(rows)
     rows       int32
+    spec       int32                          decode capacities only: nonzero leaves the conv and
+                                              recurrent state as they were and records every row's
+                                              replay inputs (``gdn_replay_layout``) for
+                                              ``qwen4_gdn_commit``
+
+``compile_qwen4_gdn_commit_aot(g)`` (``qwen4_gdn_commit``) applies each
+sequence's accepted rows of a speculative step to every GDN layer's recurrent
+and conv state in one launch; the state is bit-identical to serial steps over
+those rows.
 
 The recurrence is token-sequential (``Qwen4GdnRecurrent``: any mix of
 sequences, e.g. decode or verify steps) unless the program was built for more
@@ -47,10 +57,19 @@ from ._fp8_weights import fp8_operands, projection
 from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
 from ._glm_kernels import glm_projection
 from ._glmf_kernels import GlmfKdaConvState
-from ._qwen4_gdn_kernels import Qwen4GdnConv, Qwen4GdnGatedNorm, Qwen4GdnRecurrent
+from ._qwen4_gdn_kernels import (
+    REPLAY_ROWS,
+    Qwen4GdnCommit,
+    Qwen4GdnConv,
+    Qwen4GdnConvCommit,
+    Qwen4GdnGatedNorm,
+    Qwen4GdnRecurrent,
+    gdn_replay_layout,
+)
 from .glmf import _SequenceMeta
 
-__all__ = ["CHUNKED_MIN_ROWS", "compile_qwen4_gdn_aot", "gdn_scratch_bytes"]
+__all__ = ["CHUNKED_MIN_ROWS", "compile_qwen4_gdn_aot", "compile_qwen4_gdn_commit_aot", "gdn_replay_layout",
+           "gdn_scratch_bytes"]
 
 _ALIGN = 1024
 
@@ -166,6 +185,9 @@ class _Gdn:
         self.recurrent = Qwen4GdnRecurrent(heads=g.gdn_value_heads, key_heads=g.gdn_key_heads, ab_stride=p)
         self.norm = Qwen4GdnGatedNorm(heads=g.gdn_value_heads, eps=g.norm_eps, gate_stride=p)
         self.o_proj = projection(g.hidden, v, self.fp8)
+        self.replay = gdn_replay_layout(g.gdn_key_heads, g.gdn_value_heads, c)
+        # Speculative steps (replay records) are decode-capacity programs only.
+        self.spec = self.chunked is None
 
     def key(self) -> tuple:
         return (self.in_proj.key(), self.o_proj.key(), self.g, self.fp8,
@@ -177,14 +199,14 @@ class _Gdn:
                  state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer, out: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         self.body(x, w_in, w_in, w_in, conv_w, a_log, dt_bias, norm_w, w_out, w_out, w_out, conv_state, state,
-                  slots, seq_first, out, scratch, rows, stream)
+                  slots, seq_first, out, state, scratch, rows, Int32(0), stream)
 
     @cute.jit
     def body(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
              conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer, norm_w: cute.Pointer,
              w_out: cute.Pointer, w_out_fp8: cute.Pointer, w_out_scale: cute.Pointer, conv_state: cute.Pointer,
              state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer, out: cute.Pointer,
-             scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+             replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, spec: Int32, stream: cuda.CUstream):
         c, v, p = self.c, self.v, self.p
         m = Int64(rows)
         base = Int64(scratch.toint())
@@ -195,40 +217,56 @@ class _Gdn:
         proj = _ptr(bf16, base)
         self.in_proj(x, w_in, w_in_fp8, w_in_scale, proj, rows, stream)
         self.conv(proj, conv_w, conv_state, slots, seq_first, _ptr(bf16, qkv_off), rows, stream)
-        # spec 0: the conv window advances in place; the replay pointer is not read.
-        self.conv_state(proj, conv_state, slots, seq_first, proj, Int32(0), rows, stream)
+        # spec 0: the conv window advances in place; otherwise the rows go to the replay record.
+        self.conv_state(proj, conv_state, slots, seq_first,
+                        _ptr(bf16, Int64(replay.toint()) + Int64(self.replay["proj"])), spec, rows, stream)
         z = _ptr(bf16, base + Int64(c * 2))
         b_raw = _ptr(bf16, base + Int64((c + v) * 2), 2)
         a_raw = _ptr(bf16, base + Int64((c + v + self.g.gdn_value_heads) * 2), 2)
         if cutlass.const_expr(self.chunked is None):
             self.recurrent(_ptr(bf16, qkv_off), a_raw, b_raw, a_log, dt_bias, state, slots, _ptr(bf16, o_off),
-                           rows, stream)
+                           replay, spec, rows, stream)
         else:
             if rows > Int32(CHUNKED_MIN_ROWS):
                 self.chunked(_ptr(bf16, qkv_off), a_raw, b_raw, a_log, dt_bias, state, slots, _ptr(bf16, o_off),
                              y_off + _align_i64(m * Int64(v * 2)), p, rows, stream)
             else:
                 self.recurrent(_ptr(bf16, qkv_off), a_raw, b_raw, a_log, dt_bias, state, slots,
-                               _ptr(bf16, o_off), rows, stream)
+                               _ptr(bf16, o_off), replay, spec, rows, stream)
         self.norm(_ptr(bf16, o_off), z, norm_w, _ptr(bf16, y_off), rows, stream)
         self.o_proj(_ptr(bf16, y_off), w_out, w_out_fp8, w_out_scale, out, rows, stream)
 
 
+class _GdnSpec(_Gdn):
+    """The BF16 decode-capacity GDN layer with the speculative replay record."""
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_in: cute.Pointer, conv_w: cute.Pointer, a_log: cute.Pointer,
+                 dt_bias: cute.Pointer, norm_w: cute.Pointer, w_out: cute.Pointer, conv_state: cute.Pointer,
+                 state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer, out: cute.Pointer,
+                 replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, spec: Int32, stream: cuda.CUstream):
+        self.body(x, w_in, w_in, w_in, conv_w, a_log, dt_bias, norm_w, w_out, w_out, w_out, conv_state, state,
+                  slots, seq_first, out, replay, scratch, rows, spec, stream)
+
+
 class _GdnFp8(_Gdn):
     """The GDN layer with FP8 in/out projections for decode rows (<= 16 live
-    rows read the E4M3 copies, more rows the BF16 weights)."""
+    rows read the E4M3 copies, more rows the BF16 weights) and the speculative
+    replay record."""
 
     def __init__(self, g: Qwen4Geometry, max_rows: int = 64):
         super().__init__(g, max_rows, fp8=True)
+        if not self.spec:
+            raise ValueError("FP8 GDN programs are decode capacities (<= CHUNKED_MIN_ROWS rows)")
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
                  conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer, norm_w: cute.Pointer,
                  w_out: cute.Pointer, w_out_fp8: cute.Pointer, w_out_scale: cute.Pointer, conv_state: cute.Pointer,
                  state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer, out: cute.Pointer,
-                 scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+                 replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, spec: Int32, stream: cuda.CUstream):
         self.body(x, w_in, w_in_fp8, w_in_scale, conv_w, a_log, dt_bias, norm_w, w_out, w_out_fp8, w_out_scale,
-                  conv_state, state, slots, seq_first, out, scratch, rows, stream)
+                  conv_state, state, slots, seq_first, out, replay, scratch, rows, spec, stream)
 
 
 def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int, fp8: bool = False) -> AotProgram:
@@ -238,8 +276,10 @@ def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int
     max_rows = int(max_rows)
     if max_rows <= 0:
         raise ValueError("max_rows must be positive")
-    launch = (_GdnFp8 if fp8 else _Gdn)(g, max_rows)
+    spec = max_rows <= CHUNKED_MIN_ROWS
+    launch = (_GdnFp8 if fp8 else _GdnSpec if spec else _Gdn)(g, max_rows)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
+    record = launch.replay["bytes"]
     h, c, v, p, heads = g.hidden, g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width, g.gdn_value_heads
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
@@ -257,14 +297,62 @@ def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int
         Operand("slots", torch.int32, "[rows]", align=4),
         Operand("seq_first", torch.int32, "[rows]", align=4),
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+        *((Operand("replay", torch.float32, f"[{record // 4}]", "out",
+                   note="speculative replay record (gdn_replay_layout)"),) if spec else ()),
         Operand("scratch", torch.uint8, "[qwen4_gdn_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name="qwen4_gdn", operands=operands, scalars=(Scalar("rows"),),
+        launch, name="qwen4_gdn", operands=operands,
+        scalars=(Scalar("rows"), Scalar("spec")) if spec else (Scalar("rows"),),
         key=(max_rows, launch.key()),
         geometry={"hidden": h, "key_heads": g.gdn_key_heads, "value_heads": heads, "head_dim": g.gdn_head_dim,
                   "max_rows": max_rows, "in_width": p, "eps": g.norm_eps, "fp8_weights": fp8,
-                  "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None},
+                  "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
+                  "replay_rows": REPLAY_ROWS if spec else None, "replay_bytes": record if spec else None},
         scratch={"scratch": lambda rows: gdn_scratch_bytes(g, rows, chunked)},
         doc=__doc__,
+    )
+
+
+class _GdnCommit:
+    def __init__(self, g: Qwen4Geometry):
+        self.g = g
+        c = g.gdn_conv_width
+        self.recurrent = Qwen4GdnCommit(heads=g.gdn_value_heads, key_heads=g.gdn_key_heads, channels=c)
+        self.conv = Qwen4GdnConvCommit(heads=g.gdn_value_heads, key_heads=g.gdn_key_heads, channels=c)
+
+    @cute.jit
+    def __call__(self, state: cute.Pointer, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer,
+                 sequences: Int32, layers: Int32, slots: Int32, stream: cuda.CUstream):
+        self.recurrent(state, replay, tables, sequences, layers, slots, stream)
+        self.conv(conv_state, replay, tables, sequences, layers, slots, stream)
+
+
+def compile_qwen4_gdn_commit_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
+    """Verify-by-replay for the GDN layers: after a speculative decode step
+    (``qwen4_gdn`` with ``spec`` = 1, which records each row's replay inputs and
+    leaves the state alone), apply each sequence's accepted rows to its
+    recurrent and conv state in every GDN layer.
+
+    ``state`` FP32 ``[layers, slots, 48, 128, 128]`` and ``conv_state`` BF16
+    ``[layers, slots, 3, C]`` (the layers' pools back to back), ``replay`` the
+    layers' records back to back (``replay_bytes`` each), ``tables`` i32
+    ``[3, sequences]``: state slot (negative: skip), first step row and
+    accepted rows per sequence. The recurrent update repeats ``qwen4_gdn``'s
+    arithmetic, so the state is bit-identical to serial steps over those rows.
+    """
+    launch = _GdnCommit(g)
+    heads, c = g.gdn_value_heads, g.gdn_conv_width
+    record = gdn_replay_layout(g.gdn_key_heads, heads, c)["bytes"]
+    return compile_program(
+        launch, name="qwen4_gdn_commit",
+        operands=(Operand("state", torch.float32, f"[layers,slots,{heads},128,128]", "inout"),
+                  Operand("conv_state", torch.bfloat16, f"[layers,slots,3,{c}]", "inout", align=2),
+                  Operand("replay", torch.float32, f"[layers,{record // 4}]"),
+                  Operand("tables", torch.int32, "[3,sequences]", align=4)),
+        scalars=(Scalar("sequences"), Scalar("layers"), Scalar("slots")),
+        key=(heads, g.gdn_key_heads, c, REPLAY_ROWS),
+        geometry={"value_heads": heads, "key_heads": g.gdn_key_heads, "channels": c, "replay_rows": REPLAY_ROWS,
+                  "replay_bytes": record},
+        doc=compile_qwen4_gdn_commit_aot.__doc__,
     )
