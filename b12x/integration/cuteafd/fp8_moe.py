@@ -1,6 +1,9 @@
 """Native AOT exact FP8 routed experts (checkpoint E4M3 + FP32 128x128 scales),
-and MXFP4 ones (``Fp8MoeGeometry.weights = "mxfp4"``: packed E2M1 ``w [E, N,
-K/2]`` with UE8M0 ``s [E, N, K/32]``, MiMo V2.6 Pro; ``_mxfp4_moe_kernels``).
+MXFP4 ones (``Fp8MoeGeometry.weights = "mxfp4"``: packed E2M1 ``w [E, N,
+K/2]`` with UE8M0 ``s [E, N, K/32]``, MiMo V2.6 Pro; ``_mxfp4_moe_kernels``)
+and NVIDIA ModelOpt NVFP4 ones (``weights = "nvfp4"``: packed E2M1 ``w [E, N,
+K/2]`` with E4M3 ``s [E, N, K/16]`` followed by the experts' FP32
+``weight_scale_2`` ``[E]``, run W4A16; ``_nvfp4_moe_kernels``).
 
 ``compile_fp8_moe_aot(geometry, route=..., max_rows=M, wire=True)``: one
 program computing a (TP slice of a) sigmoid-routed MoE layer's routed
@@ -63,6 +66,7 @@ from ._fp8_moe_kernels import (
 from ._fp8_moe_stream import STREAM_TILE_M, StreamFp8Down, StreamFp8GateUp, stream_max_tiles
 from ._mxfp4_moe_kernels import GroupedMxfp4Gemv
 from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
+from ._nvfp4_moe_kernels import GroupedNvfp4Gemv, nvfp4_alpha_offset
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes"]
 
@@ -133,12 +137,15 @@ class Fp8MoeGeometry:
     intermediate: int
     tp: int = 1
     swiglu_limit: float = 0.0
-    # "fp8": E4M3 + FP32 128x128 scales; "mxfp4": packed E2M1 + UE8M0 per 32.
+    # "fp8": E4M3 + FP32 128x128 scales; "mxfp4": packed E2M1 + UE8M0 per 32;
+    # "nvfp4": packed E2M1 + E4M3 per 16 + an FP32 alpha per expert.
     weights: str = "fp8"
 
     def __post_init__(self) -> None:
-        if self.weights not in ("fp8", "mxfp4"):
-            raise ValueError("weights is 'fp8' or 'mxfp4'")
+        if self.weights not in ("fp8", "mxfp4", "nvfp4"):
+            raise ValueError("weights is 'fp8', 'mxfp4' or 'nvfp4'")
+        if self.weights == "nvfp4" and (self.hidden % 128 or self.intermediate % 16 or self.intermediate // 16 < self.tp):
+            raise ValueError("NVFP4 experts need a 128-aligned hidden and whole 16-blocks per rank")
         if self.weights == "fp8" and (self.hidden % 128 or self.intermediate % 128 or self.intermediate // 128 < self.tp):
             raise ValueError("FP8 experts need a 128-aligned hidden and intermediate with a 128-block per rank")
         if self.weights == "mxfp4" and (self.hidden % 128 or self.intermediate % 32 or self.intermediate // 32 < self.tp):
@@ -156,6 +163,9 @@ class Fp8MoeGeometry:
         zero down columns add nothing, so the padding is exact."""
         if self.weights == "mxfp4":
             return -(-(-(-self.intermediate // 32) // self.tp) * 32 // 128) * 128
+        if self.weights == "nvfp4":
+            # Whole 16-value scale blocks per rank (TP6 of 2048: 352/336 rows in 384).
+            return -(-(-(-self.intermediate // 16) // self.tp) * 16 // 128) * 128
         return -(-(self.intermediate // 128) // self.tp) * 128
 
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
@@ -173,6 +183,12 @@ GEOMETRIES = {
     "qwen4": Fp8MoeGeometry("qwen4", hidden=2560, experts=512, top_k=10, intermediate=640),
     # MiMo V2.6 Pro: MXFP4 experts, 384 of them, top-8, unclamped SiLU.
     "mimop": Fp8MoeGeometry("mimop", hidden=6144, experts=384, top_k=8, intermediate=2048, weights="mxfp4"),
+    # NVIDIA ModelOpt NVFP4 releases of GLM 5.3, GLM 5.3 Flash and Qwen 3.8 Flash Next (W4A16).
+    "glm_nvfp4": Fp8MoeGeometry("glm_nvfp4", hidden=6144, experts=256, top_k=8, intermediate=2048, weights="nvfp4"),
+    "glmf_nvfp4": Fp8MoeGeometry("glmf_nvfp4", hidden=4096, experts=288, top_k=8, intermediate=2048,
+                                 swiglu_limit=10.0, weights="nvfp4"),
+    "qwen4_nvfp4": Fp8MoeGeometry("qwen4_nvfp4", hidden=2560, experts=512, top_k=10, intermediate=640,
+                                  weights="nvfp4"),
 }
 
 
@@ -213,7 +229,12 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
 def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8") -> str:
     """``auto`` compiles only the GEMV when the capacity never reaches the large
     route (always, for BF16-input MXFP4 packages: their only large route
-    streams wire rows); MXFP4 has no grouped-GEMM ``prefill`` route."""
+    streams wire rows); MXFP4 has no grouped-GEMM ``prefill`` route. NVFP4
+    runs the grouped GEMV at every row count."""
+    if weights == "nvfp4":
+        if route not in ("decode", "auto"):
+            raise ValueError("NVFP4 experts run the grouped GEMV only (route decode or auto)")
+        return "decode"
     if weights == "mxfp4":
         if route == "prefill":
             raise ValueError("MXFP4 experts have no prefill route (use stream)")
@@ -248,7 +269,7 @@ class _Route:
         if decode:
             tile_rows = min(int(max_rows), DECODE_MAX_ROWS)
             warps_h = 8 if h >= 6144 else 4
-            gemv = GroupedMxfp4Gemv if g.weights == "mxfp4" else GroupedFp8Gemv
+            gemv = {"mxfp4": GroupedMxfp4Gemv, "nvfp4": GroupedNvfp4Gemv}.get(g.weights, GroupedFp8Gemv)
             self.gate_up = gemv(n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
                                 groups=_gate_up_groups(tile_rows), gather=True)
             # K split over warps in whole 128 blocks: 4 where they divide evenly,
@@ -410,7 +431,20 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
     x = (Operand("x", torch.uint8, f"[rows,{h + h // 32}]", note="FP8 K32 wire rows") if wire
          else Operand("x", torch.bfloat16, f"[rows,{h}]"))
-    if g.weights == "mxfp4":
+    if g.weights == "nvfp4":
+        gate_up_scales = nvfp4_alpha_offset(e, i, h) + 4 * e
+        down_scales = nvfp4_alpha_offset(e, h, i) + 4 * e
+        weights = (
+            Operand("w1", torch.uint8, f"[{e},{i},{h // 2}]", note="packed E2M1 (even element low)"),
+            Operand("s1", torch.uint8, f"[{gate_up_scales}]", align=4,
+                    note=f"E4M3 [{e},{i},{h // 16}] then FP32 alpha [{e}]"),
+            Operand("w3", torch.uint8, f"[{e},{i},{h // 2}]"),
+            Operand("s3", torch.uint8, f"[{gate_up_scales}]", align=4),
+            Operand("w2", torch.uint8, f"[{e},{h},{i // 2}]"),
+            Operand("s2", torch.uint8, f"[{down_scales}]", align=4,
+                    note=f"E4M3 [{e},{h},{i // 16}] then FP32 alpha [{e}]"),
+        )
+    elif g.weights == "mxfp4":
         weights = (
             Operand("w1", torch.uint8, f"[{e},{i},{h // 2}]", note="packed E2M1 (even element low)"),
             Operand("s1", torch.uint8, f"[{e},{i},{h // 32}]", align=4, note="UE8M0 per 32"),
