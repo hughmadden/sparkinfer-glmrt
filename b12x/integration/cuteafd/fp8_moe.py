@@ -79,7 +79,7 @@ from ._mxfp4_moe_kernels import GroupedMxfp4Gemv
 from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
 from ._nvfp4_moe_kernels import GroupedNvfp4Gemv, nvfp4_alpha_offset
 from ._nvfp4_moe_stream import ChunkRows, ChunkSwiGLU, StreamNvfp4Linear
-from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4LinearA4
+from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, StreamNvfp4LinearA4
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
            "prefill_forms"]
@@ -324,14 +324,15 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True) -> lis
     if route == "stream" and g.activations == "a4":
         pairs = rows * g.top_k
         padded = stream_max_tiles(g.experts, pairs) * STREAM_TILE_M
+        split = 0 if nvfp4_a4_fused() else pairs * g.slice * 2
         return [
             meta_words(g.experts, stream_max_tiles(g.experts, pairs)) * 4,
             pairs * 4,                                 # pair_row
             pairs * 4,                                 # pair_pos
             padded * g.hidden // 2,                    # packed input rows
             padded * g.hidden // 16,                   # their E4M3 scales
-            pairs * g.slice * 2,                       # gate
-            pairs * g.slice * 2,                       # up
+            split,                                     # gate (unfused route only)
+            split,                                     # up (unfused route only)
             padded * g.slice // 2,                     # packed SwiGLU rows
             padded * g.slice // 16,                    # their scales
             pairs * g.hidden * 2,                      # down output
@@ -367,6 +368,15 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True) -> lis
         grouped * 2 * g.slice * 2,                     # gate | up
         grouped * g.slice * 2,                         # SwiGLU
     ]
+
+
+def nvfp4_a4_fused() -> bool:
+    """The W4A4 stream route's gate/up: one fused gate/up + SwiGLU + NVFP4 quantization
+    launch (``StreamNvfp4GateUpA4``, default), or with ``B12X_NVFP4_A4_FUSED=0`` at
+    export the separate gate GEMM, up GEMM and ``ChunkSwiGLUA4`` (A/B)."""
+    import os
+
+    return os.environ.get("B12X_NVFP4_A4_FUSED", "1") != "0"
 
 
 def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8", prefill: str = "auto") -> str:
@@ -609,8 +619,9 @@ class _StreamNvfp4Route:
 
 class _StreamNvfp4A4Route:
     """The W4A4 NVFP4 ``stream`` route (``_nvfp4_moe_a4``): chunk-padded NVFP4
-    input rows, gate and up block-scaled FP4 GEMMs, SwiGLU quantized to NVFP4,
-    the down GEMM, route combine."""
+    input rows, gate/up block-scaled FP4 GEMMs with SwiGLU and its NVFP4
+    quantization fused (``StreamNvfp4GateUpA4``; ``nvfp4_a4_fused``), the down
+    GEMM, route combine."""
 
     def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool):
         self.g = g
@@ -619,14 +630,19 @@ class _StreamNvfp4A4Route:
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
                             chunked=True)
         self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i)
-        self.gate_up = StreamNvfp4LinearA4(n=i, k=h, experts=e)
-        self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
+        self.fused = nvfp4_a4_fused()
+        if self.fused:
+            self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
+            self.swiglu = None
+        else:
+            self.gate_up = StreamNvfp4LinearA4(n=i, k=h, experts=e)
+            self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
         self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e)
         self.combine = MoeCombine(hidden=h, top_k=k)
 
     def key(self) -> tuple:
-        return ("stream_nvfp4_a4", self.max_tiles, self.rows_in.key(), self.gate_up.key(), self.swiglu.key(),
-                self.down.key(), self.combine.key())
+        return ("stream_nvfp4_a4", self.max_tiles, self.rows_in.key(), self.gate_up.key(),
+                None if self.swiglu is None else self.swiglu.key(), self.down.key(), self.combine.key())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
@@ -645,8 +661,9 @@ class _StreamNvfp4A4Route:
         xq_at = pair_pos_at + _al(Int64(pairs) * Int64(4))
         xs_at = xq_at + _al(padded * Int64(g.hidden // 2))
         gate_at = xs_at + _al(padded * Int64(g.hidden // 16))
-        up_at = gate_at + _al(Int64(pairs) * Int64(g.slice * 2))
-        aq_at = up_at + _al(Int64(pairs) * Int64(g.slice * 2))
+        split = Int64(0) if self.fused else Int64(pairs) * Int64(g.slice * 2)
+        up_at = gate_at + _al(split)
+        aq_at = up_at + _al(split)
         as_at = aq_at + _al(padded * Int64(g.slice // 2))
         y_at = as_at + _al(padded * Int64(g.slice // 16))
         ptr = lambda dtype, at: cute.make_ptr(dtype, at, cute.AddressSpace.gmem, assumed_align=16)  # noqa: E731
@@ -660,9 +677,12 @@ class _StreamNvfp4A4Route:
         ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
         self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
         self.rows_in(x, pair_row, meta, s1, xq, xs, max_tiles, stream)
-        self.gate_up(xq, xs, meta, w1, s1, gate, max_tiles, stream)
-        self.gate_up(xq, xs, meta, w3, s3, up, max_tiles, stream)
-        self.swiglu(gate, up, meta, s2, aq, a_s, max_tiles, stream)
+        if cutlass.const_expr(self.fused):
+            self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
+        else:
+            self.gate_up(xq, xs, meta, w1, s1, gate, max_tiles, stream)
+            self.gate_up(xq, xs, meta, w3, s3, up, max_tiles, stream)
+            self.swiglu(gate, up, meta, s2, aq, a_s, max_tiles, stream)
         self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream)
         self.combine(y, pair_pos, weights, out, rows, stream)
 

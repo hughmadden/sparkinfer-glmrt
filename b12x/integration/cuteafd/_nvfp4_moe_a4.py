@@ -23,6 +23,12 @@ rounding.
     warps, 32 x 64 each), streams 256-K (or 128-K) blocks of both operands
     and their scales through a two-stage ``cp.async`` ring (padded rows:
     conflict-free fragment loads) and runs 16 MMAs per warp per 64 K.
+``StreamNvfp4GateUpA4``  gate/up, SwiGLU and the down-input quantization in
+    one launch: the same GEMM with the CTA's 128 weight rows taken as 64
+    gate rows then the matching 64 up rows, both BF16-rounded exactly as the
+    linear's output, exchanged through shared memory and written as
+    ``ChunkSwiGLUA4`` writes them (bit-identical ``act`` bytes, no BF16
+    ``[pairs, 2I]`` round trip).
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ from b12x._lib.intrinsics import (
     cp_async_u32_shared_global,
     div_rn_f32,
     ld_shared_u32,
+    ld_shared_v4_u32,
     max_abs_16,
     nvfp4_mma_m16n8k64_f32_e2m1,
     pack_f32x2_to_bfloat2,
@@ -46,6 +53,7 @@ from b12x._lib.intrinsics import (
     st_global_u32,
     st_global_u64,
     st_global_u8,
+    st_shared_u32,
 )
 
 from ._fp8_moe_kernels import _ceil, _i32_at, _ld_u8, _ld_v2_u32, _round_bf16, _u32_as_f32
@@ -54,7 +62,7 @@ from ._fp8_weights import _e4m3x8_scaled_bf16, _ld_f32
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 from ._nvfp4_moe_kernels import nvfp4_alpha_offset
 
-__all__ = ["ChunkRowsA4", "ChunkSwiGLUA4", "StreamNvfp4LinearA4", "nvfp4_input_scale_offset"]
+__all__ = ["ChunkRowsA4", "ChunkSwiGLUA4", "StreamNvfp4GateUpA4", "StreamNvfp4LinearA4", "nvfp4_input_scale_offset"]
 
 
 def nvfp4_input_scale_offset(experts: int, rows: int, k: int) -> int:
@@ -338,3 +346,198 @@ class StreamNvfp4LinearA4:
                                 col = n0 + warp_n * Int32(64) + Int32(8 * nt) + Int32(2) * c
                                 st_global_u32(Int64(y.toint()) + (Int64(first + row) * Int64(self.n) + Int64(col))
                                               * Int64(2), pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
+
+
+@cute.jit
+def _swiglu16(gw, uw, values: cute.Tensor, base: cutlass.Constexpr, limit: cutlass.Constexpr):
+    """``values[base + j] = bf16(bf16(silu(g)) * u)`` of eight BF16 gate/up pairs (``ChunkSwiGLUA4``'s math)."""
+    for q in cutlass.range_constexpr(4):
+        for side in cutlass.range_constexpr(2):
+            gate = _bf16_lo(gw[q]) if side == 0 else _bf16_hi(gw[q])
+            up = _bf16_lo(uw[q]) if side == 0 else _bf16_hi(uw[q])
+            if const_expr(limit > 0.0):
+                gate = cutlass.select_(gate > Float32(limit), Float32(limit), gate)
+                up = cutlass.select_(up > Float32(limit), Float32(limit), up)
+                up = cutlass.select_(up < Float32(-limit), Float32(-limit), up)
+            silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
+            values[base + 2 * q + side] = _round_bf16(silu * up)
+
+
+class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
+    """Fused W4A4 gate/up + SwiGLU + NVFP4 quantization of the down input.
+
+    Grid ``(I / 64, max_tiles)``, 256 threads. A CTA streams its chunk's packed
+    activations against 128 weight rows, gate rows ``n0 .. n0+63`` of ``w1``
+    then up rows ``n0 .. n0+63`` of ``w3`` (warps ``warp_n`` 0 and 1), so the
+    main loop is ``StreamNvfp4LinearA4``'s. Each warp scales its accumulators by
+    its projection's ``alpha_e * in_e`` and rounds them to BF16 into shared
+    memory (the ring, after the last K block); then each thread takes 16
+    columns of one row, computes ``bf16(bf16(silu(g)) * u)`` and writes them as
+    NVFP4 with the expert's down ``input_scale`` into ``aq [max_tiles * 128,
+    I/2]`` / ``a_s [max_tiles * 128, I/16]``."""
+
+    half_n = 64
+    # Exchange rows: 64 gate then 64 up BF16 columns, padded (conflict-free stores).
+    x_stride = 2 * 64 * 2 + 16
+
+    def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0):
+        super().__init__(n=2 * int(inter), k=hidden, experts=experts)
+        self.inter, self.limit = int(inter), float(limit)
+        if self.inter % self.half_n:
+            raise ValueError("the fused NVFP4 A4 gate/up needs I % 64 == 0")
+        # Gate and up scale operands share the [E, I, H/16] shape.
+        self.alpha_offset = nvfp4_alpha_offset(experts, self.inter, self.k)
+        self.in_offset = nvfp4_input_scale_offset(experts, self.inter, self.k)
+        self.down_in_offset = nvfp4_input_scale_offset(experts, hidden, self.inter)
+        if STREAM_TILE_M * self.x_stride > 2 * self.stage_bytes:
+            raise ValueError("the gate/up exchange does not fit the ring")
+
+    def key(self) -> tuple:
+        return ("stream_gate_up_nvfp4_a4", 1, self.inter, self.k, self.experts, self.k_block, self.limit,
+                self.down_in_offset)
+
+    @cute.jit
+    def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w1: cute.Pointer, s1: cute.Pointer,
+                 w3: cute.Pointer, s3: cute.Pointer, s2: cute.Pointer, act: cute.Pointer, act_s: cute.Pointer,
+                 max_tiles: Int32, stream: cuda.CUstream):
+        self.fused(aq, a_s, meta, w1, s1, w3, s3, s2, act, act_s).launch(
+            grid=(self.inter // self.half_n, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
+            min_blocks_per_mp=1)
+
+    @cute.jit
+    def _load2(self, block, ring, a_rows: Int64, as_rows: Int64, w_rows: Int64, w_up: Int64, s_rows: Int64,
+               s_up: Int64, tidx):
+        """``_load`` with weight rows 64.. of the tile taken from ``w_up`` / ``s_up`` (the up rows)."""
+        stage = ring + (Int32(block) % Int32(2)) * Int32(self.stage_bytes)
+        chunks = self.row_bytes // 16
+        k_bytes = Int64(block) * Int64(self.row_bytes)
+        for q in cutlass.range_constexpr(STREAM_TILE_M * chunks // self.threads):
+            c = tidx + Int32(q * self.threads)
+            row = c // Int32(chunks)
+            piece = c % Int32(chunks)
+            dst = row * Int32(self.stride) + piece * Int32(16)
+            cp_async4_shared_global(stage + dst, a_rows + Int64(row) * Int64(self.k // 2) + k_bytes + Int64(piece) * Int64(16))
+            wb = cutlass.select_(row < Int32(self.half_n), w_rows, w_up - Int64(self.half_n * (self.k // 2)))
+            cp_async4_shared_global(stage + Int32(self.tile_bytes) + dst,
+                                    wb + Int64(row) * Int64(self.k // 2) + k_bytes + Int64(piece) * Int64(16))
+        words = self.s_bytes // 4
+        s_k = Int64(block) * Int64(self.s_bytes)
+        for q in cutlass.range_constexpr(_ceil(STREAM_TILE_M * words, self.threads)):
+            c = tidx + Int32(q * self.threads)
+            if c < Int32(STREAM_TILE_M * words):
+                row = c // Int32(words)
+                word = c % Int32(words)
+                dst = Int32(2 * self.tile_bytes) + row * Int32(self.s_stride) + word * Int32(4)
+                cp_async_u32_shared_global(stage + dst, as_rows + Int64(row) * Int64(self.k // 16) + s_k
+                                           + Int64(word) * Int64(4))
+                sb = cutlass.select_(row < Int32(self.half_n), s_rows, s_up - Int64(self.half_n * (self.k // 16)))
+                cp_async_u32_shared_global(stage + dst + Int32(self.sc_bytes),
+                                           sb + Int64(row) * Int64(self.k // 16) + s_k + Int64(word) * Int64(4))
+        cute.arch.cp_async_commit_group()
+
+    @cute.kernel
+    def fused(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w1: cute.Pointer, s1: cute.Pointer,
+              w3: cute.Pointer, s3: cute.Pointer, s2: cute.Pointer, act: cute.Pointer, act_s: cute.Pointer):
+        n_blk = Int32(cute.arch.block_idx()[0])
+        tile = Int32(cute.arch.block_idx()[1])
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
+        if tile < _i32_at(Int64(meta.toint()), 1):
+            e, first, live = _chunk(meta, self.experts, tile)
+            tidx = Int32(cute.arch.thread_idx()[0])
+            warp_id = tidx // Int32(32)
+            lane = tidx % Int32(32)
+            ring = shared_ptr_to_u32(storage.ring.data_ptr())
+            n0 = n_blk * Int32(self.half_n)
+            a_rows = Int64(aq.toint()) + Int64(tile) * Int64(STREAM_TILE_M) * Int64(self.k // 2)
+            as_rows = Int64(a_s.toint()) + Int64(tile) * Int64(STREAM_TILE_M) * Int64(self.k // 16)
+            w_off = Int64(e) * Int64(self.inter) + Int64(n0)
+            w_rows = Int64(w1.toint()) + w_off * Int64(self.k // 2)
+            w_up = Int64(w3.toint()) + w_off * Int64(self.k // 2)
+            s_rows = Int64(s1.toint()) + w_off * Int64(self.k // 16)
+            s_up = Int64(s3.toint()) + w_off * Int64(self.k // 16)
+            self._load2(0, ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up, tidx)
+            if const_expr(self.blocks > 1):
+                self._load2(1, ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up, tidx)
+            warp_m = warp_id // Int32(2)
+            warp_n = warp_id % Int32(2)
+            # warp_n 0: gate columns (w1 / s1); 1: up columns (w3 / s3).
+            sp = cutlass.select_(warp_n == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
+            factor = _ld_f32(sp + Int64(self.alpha_offset) + Int64(e) * Int64(4)) \
+                * _ld_f32(sp + Int64(self.in_offset) + Int64(e) * Int64(4))
+            active = warp_m * Int32(32) < live
+            q = lane // Int32(4)
+            c = lane % Int32(4)
+            acc = cute.make_rmem_tensor(cute.make_layout((64,), stride=(1,)), Float32)
+            for v in cutlass.range_constexpr(64):
+                acc[v] = Float32(0.0)
+            for block in cutlass.range(self.blocks, unroll=1):
+                if block + Int32(1) < Int32(self.blocks):
+                    cute.arch.cp_async_wait_group(1)
+                else:
+                    cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+                if active:
+                    stage = ring + (block % Int32(2)) * Int32(self.stage_bytes)
+                    sa = stage
+                    sw = stage + Int32(self.tile_bytes)
+                    ssa = stage + Int32(2 * self.tile_bytes)
+                    ssb = ssa + Int32(self.sc_bytes)
+                    for step in cutlass.range_constexpr(self.k_block // 64):
+                        k_byte = 32 * step
+                        sfa = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Uint32)
+                        a = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+                        for mt in cutlass.range_constexpr(2):
+                            r0 = warp_m * Int32(32) + Int32(16 * mt) + q
+                            sfa[mt] = ld_shared_u32(ssa + (r0 + Int32(8) * (c & Int32(1))) * Int32(self.s_stride)
+                                                    + Int32(4 * step))
+                            for reg in cutlass.range_constexpr(4):
+                                row = r0 + Int32(8 * (reg % 2))
+                                a[4 * mt + reg] = ld_shared_u32(sa + row * Int32(self.stride)
+                                                                + Int32(k_byte + 16 * (reg // 2)) + c * Int32(4))
+                        for nt in cutlass.range_constexpr(8):
+                            col = warp_n * Int32(64) + Int32(8 * nt) + q
+                            sfb = ld_shared_u32(ssb + col * Int32(self.s_stride) + Int32(4 * step))
+                            b0 = ld_shared_u32(sw + col * Int32(self.stride) + Int32(k_byte) + c * Int32(4))
+                            b1 = ld_shared_u32(sw + col * Int32(self.stride) + Int32(k_byte + 16) + c * Int32(4))
+                            for mt in cutlass.range_constexpr(2):
+                                f = 4 * (8 * mt + nt)
+                                d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                    a[4 * mt], a[4 * mt + 1], a[4 * mt + 2], a[4 * mt + 3], b0, b1, sfa[mt], sfb)
+                                acc[f] = d0
+                                acc[f + 1] = d1
+                                acc[f + 2] = d2
+                                acc[f + 3] = d3
+                cute.arch.sync_threads()
+                if block + Int32(2) < Int32(self.blocks):
+                    self._load2(block + Int32(2), ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up, tidx)
+            # The ring is free (every K block consumed, last barrier passed): exchange the
+            # BF16-rounded gate / up tiles, row r at ring + r * x_stride (gate 0..127 B, up 128..255 B).
+            if active:
+                for mt in cutlass.range_constexpr(2):
+                    for half in cutlass.range_constexpr(2):
+                        row = warp_m * Int32(32) + Int32(16 * mt + 8 * half) + q
+                        for nt in cutlass.range_constexpr(8):
+                            f = 4 * (8 * mt + nt) + 2 * half
+                            col = warp_n * Int32(64) + Int32(8 * nt) + Int32(2) * c
+                            st_shared_u32(ring + row * Int32(self.x_stride) + col * Int32(2),
+                                          pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
+            cute.arch.sync_threads()
+            gs = Float32(1.0) / _ld_f32(Int64(s2.toint()) + Int64(self.down_in_offset) + Int64(e) * Int64(4))
+            groups = self.half_n // 16
+            for it in cutlass.range_constexpr(STREAM_TILE_M * groups // self.threads):
+                gi = tidx + Int32(it * self.threads)
+                row = gi // Int32(groups)
+                grp = gi % Int32(groups)
+                if row < live:
+                    values = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
+                    at = ring + row * Int32(self.x_stride) + grp * Int32(32)
+                    for half in cutlass.range_constexpr(2):
+                        gw = ld_shared_v4_u32(at + Int32(16 * half))
+                        uw = ld_shared_v4_u32(at + Int32(128 + 16 * half))
+                        _swiglu16(gw, uw, values, 8 * half, self.limit)
+                    i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(row)
+                    col16 = Int64(n0 // Int32(16) + grp)
+                    _quantize_row16(values, gs, Int64(act.toint()) + i * Int64(self.inter // 2) + col16 * Int64(8),
+                                    Int64(act_s.toint()) + i * Int64(self.inter // 16) + col16)

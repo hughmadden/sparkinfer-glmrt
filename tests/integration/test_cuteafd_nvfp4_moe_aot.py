@@ -249,6 +249,42 @@ def test_nvfp4_moe_a4(name, tp, real, capacity, rows, wire, hot, scale, route):
     assert c >= 0.9999 and worst >= 0.999
 
 
+FUSED_CASES = [
+    # (geometry, tp, real rows, capacity, rows, wire, hot, scale): fused vs separate W4A4 gate/up.
+    ("glmf_nvfp4a4", 1, 2048, 4096, 4096, False, 0, 1.0), ("glmf_nvfp4a4", 1, 2048, 256, 17, False, 0, 40.0),
+    ("glmf_nvfp4a4", 6, 336, 1024, 1000, True, 8, 1.0), ("qwen4_nvfp4a4", 1, 640, 4096, 3000, False, 0, 1.0),
+    ("qwen4_nvfp4a4", 6, 112, 1024, 1000, True, 0, 1.0), ("glmfdense_nvfp4a4", 1, 12288, 2048, 1500, False, 0, 1.0),
+]
+
+
+@pytest.mark.parametrize("name,tp,real,capacity,rows,wire,hot,scale", FUSED_CASES)
+def test_nvfp4_moe_a4_fused_exact(name, tp, real, capacity, rows, wire, hot, scale, monkeypatch):
+    """The fused gate/up + SwiGLU + NVFP4 quantization keeps every rounding point: the
+    stream route's output is bit-identical to the separate GEMMs + ``ChunkSwiGLUA4``."""
+    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
+
+    g = _geometry(name, tp)
+    w = _weights(g, real)
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    x = (torch.randn(rows, g.hidden, device="cuda", generator=gen) * scale).bfloat16()
+    source, _ = wire_rows(x) if wire else (x, x)
+    scores = torch.rand(rows, g.experts, device="cuda", generator=gen)
+    if hot:
+        scores[:, :hot] += 2.0
+    ids = scores.topk(g.top_k, -1).indices.int().contiguous()
+    weights = torch.rand(rows, g.top_k, device="cuda", generator=gen).contiguous()
+    outs = []
+    for fused in ("1", "0"):
+        monkeypatch.setenv("B12X_NVFP4_A4_FUSED", fused)
+        program = compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=wire)
+        out = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device="cuda")
+        scratch = torch.empty(fp8_moe_scratch_bytes(g, "stream", capacity, wire), dtype=torch.uint8, device="cuda")
+        program.launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
+        torch.cuda.synchronize()
+        outs.append(out)
+    assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
+
+
 def test_nvfp4_geometry():
     assert [_geometry("glmf_nvfp4", tp).slice for tp in (1, 2, 3, 4, 6)] == [2048, 1024, 768, 512, 384]
     assert [_geometry("qwen4_nvfp4", tp).slice for tp in (1, 2, 3, 4, 6)] == [640, 384, 256, 256, 128]
