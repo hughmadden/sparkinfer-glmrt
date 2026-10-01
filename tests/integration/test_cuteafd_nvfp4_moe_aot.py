@@ -35,7 +35,13 @@ def dequant(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def split_scales(s: torch.Tensor, experts: int, rows: int, k: int):
     """An NVFP4 scale operand -> (E4M3 bytes ``[E, rows, K/16]``, FP32 alphas ``[E]``)."""
     grid = experts * rows * (k // 16)
-    return s[:grid].view(experts, rows, k // 16), s[grid:].view(torch.float32)
+    return s[:grid].view(experts, rows, k // 16), s[grid:grid + 4 * experts].view(torch.float32)
+
+
+def input_scales(s: torch.Tensor, experts: int, rows: int, k: int) -> torch.Tensor:
+    """The FP32 input scales ``[E]`` after an NVFP4 scale operand's alphas."""
+    grid = experts * rows * (k // 16)
+    return s[grid + 4 * experts:].view(torch.float32)
 
 
 def _geometry(name, tp):
@@ -72,29 +78,65 @@ def _weights(g, real: int):
                 w[:, :, real_k // 2:] = 0
                 s[:, :, real_k // 16:] = 0
             alpha = (torch.rand(e, device="cuda", generator=gen) * 4e-3 + 1e-3).float()
-            return w, torch.cat([s.flatten(), alpha.view(torch.uint8)]).contiguous()
+            # One static input scale per layer and projection, as the ModelOpt releases store it
+            # (amax / (6 * 448) of activations ~N(0, 1) and of the SwiGLU outputs).
+            inscale = torch.full((e,), float(k_scale[0]), device="cuda")
+            return w, torch.cat([s.flatten(), alpha.view(torch.uint8), inscale.view(torch.uint8)]).contiguous()
 
+        k_scale = [5.0 / (6 * 448)]
         w1, s1 = operand(i, h, real_rows=real)
         w3, s3 = operand(i, h, real_rows=real)
+        k_scale[0] = 100.0 / (6 * 448)
         w2, s2 = operand(h, i, real_k=real)
         _WEIGHTS[key] = (w1, s1, w3, s3, w2, s2)
     return _WEIGHTS[key]
 
 
-def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2):
+_THRESHOLDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def quantize_nvfp4(x: torch.Tensor, inscale: float) -> torch.Tensor:
+    """FP32 ``[rows, K]`` -> its NVFP4 value (``quantize_block_fp4``: E4M3 scale of
+    ``amax * gs / 6`` per 16, E2M1 nearest-even), dequantized with ``input_scale``."""
+    gs = torch.tensor(1.0, dtype=torch.float32) / torch.tensor(inscale, dtype=torch.float32)
+    gs = gs.to(x.device)
+    blocks = x.float().reshape(x.shape[0], -1, 16)
+    amax = blocks.abs().amax(-1, keepdim=True)
+    sf = (amax * gs / 6.0).clamp(max=448.0).to(torch.float8_e4m3fn).float()
+    vs = sf / gs
+    mag = blocks.abs()
+    t = [vs * v for v in _THRESHOLDS]
+    code = torch.zeros_like(mag)
+    code = torch.where((mag > t[0]) & (mag < t[1]), 0.5, code)
+    code = torch.where((mag >= t[1]) & (mag <= t[2]), 1.0, code)
+    code = torch.where((mag > t[2]) & (mag < t[3]), 1.5, code)
+    code = torch.where((mag >= t[3]) & (mag <= t[4]), 2.0, code)
+    code = torch.where((mag > t[4]) & (mag < t[5]), 3.0, code)
+    code = torch.where((mag >= t[5]) & (mag <= t[6]), 4.0, code)
+    code = torch.where(mag > t[6], 6.0, code)
+    code = torch.where(sf == 0, 0.0, code)
+    return (torch.sign(blocks) * code * sf * inscale).reshape(x.shape)
+
+
+def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
     h, i, e = g.hidden, g.slice, g.experts
     (q1, a1), (q3, a3), (q2, a2) = (split_scales(s1, e, i, h), split_scales(s3, e, i, h),
                                     split_scales(s2, e, h, i))
     limit = g.swiglu_limit
+    in1, in2 = input_scales(s1, e, i, h), input_scales(s2, e, h, i)
     out = torch.zeros(x.shape, device=x.device)
     for expert in ids.unique().tolist():
         rows, slots = torch.where(ids == expert)
         xr = x[rows].float()
+        if a4:
+            xr = quantize_nvfp4(xr, float(in1[expert]))
         gate = (xr @ dequant(w1[expert], q1[expert]).T * a1[expert]).bfloat16().float()
         up = (xr @ dequant(w3[expert], q3[expert]).T * a3[expert]).bfloat16().float()
         if limit > 0:
             gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
         act = (torch.nn.functional.silu(gate).bfloat16().float() * up).bfloat16().float()
+        if a4:
+            act = quantize_nvfp4(act, float(in2[expert]))
         y = (act @ dequant(w2[expert], q2[expert]).T * a2[expert]).bfloat16()
         out.index_add_(0, rows, y.float() * weights[rows, slots][:, None])
     return out.bfloat16()
@@ -119,10 +161,16 @@ def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, scale=1.0, route="au
     scratch = torch.empty(fp8_moe_scratch_bytes(g, route, capacity, wire), dtype=torch.uint8, device="cuda")
     _PROGRAMS[key].launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
     torch.cuda.synchronize()
-    expected = reference(g, x_exact, ids, weights, *w)
+    from b12x.integration.cuteafd.fp8_moe import auto_large_rows
+
+    a4 = g.activations == "a4" and (route == "stream" or (route == "auto" and rows > auto_large_rows(wire, g.kind)))
+    expected = reference(g, x_exact, ids, weights, *w, a4=a4)
     a, b = out.float(), expected.float()
     c = float((a * b).sum() / (a.norm() * b.norm()))
     worst = float(torch.nn.functional.cosine_similarity(a, b, dim=1).min())
+    if a4:
+        exact = reference(g, x_exact, ids, weights, *w).float()
+        print(f"  W4A4 vs the W4A16 reference: cosine {float((a * exact).sum() / (a.norm() * exact.norm())):.6f}")
     return c, worst
 
 
@@ -176,6 +224,25 @@ def test_nvfp4_moe_stream(name, tp, real, capacity, rows, wire, hot, scale, rout
     print(f"nvfp4_moe {name} tp{tp} (slice {g.slice}, {real} real) {route} m{capacity} rows={rows} "
           f"{'wire' if wire else 'bf16'} x{scale}: cosine {c:.7f} worst row {worst:.6f}")
     assert c >= 0.99999 and worst >= 0.9999
+
+
+A4_CASES = [
+    # (geometry, tp, real rows, capacity, rows, wire, hot, scale, route): the W4A4 stream route,
+    # forced and via auto (decode rows stay W4A16).
+    ("glmf_nvfp4a4", 1, 2048, 4096, 4096, False, 0, 1.0, "stream"), ("glmf_nvfp4a4", 1, 2048, 256, 17, False, 0, 40.0, "stream"),
+    ("glmf_nvfp4a4", 4, 512, 4096, 3000, True, 8, 1.0, "auto"), ("glmf_nvfp4a4", 6, 336, 1024, 1000, True, 0, 1.0, "stream"),
+    ("qwen4_nvfp4a4", 1, 640, 4096, 4096, False, 0, 1.0, "auto"), ("qwen4_nvfp4a4", 3, 224, 2048, 2000, True, 0, 1.0, "stream"),
+    ("qwen4_nvfp4a4", 1, 640, 4096, 300, False, 0, 1.0, "auto"),
+]
+
+
+@pytest.mark.parametrize("name,tp,real,capacity,rows,wire,hot,scale,route", A4_CASES)
+def test_nvfp4_moe_a4(name, tp, real, capacity, rows, wire, hot, scale, route):
+    g = _geometry(name, tp)
+    c, worst = _run(g, real, capacity, rows, wire=wire, hot=hot, scale=scale, route=route)
+    print(f"nvfp4_moe {name} tp{tp} (slice {g.slice}, {real} real) a4 m{capacity} rows={rows} "
+          f"{'wire' if wire else 'bf16'} x{scale}: cosine {c:.7f} worst row {worst:.6f}")
+    assert c >= 0.9999 and worst >= 0.999
 
 
 def test_nvfp4_geometry():

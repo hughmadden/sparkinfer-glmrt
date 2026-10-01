@@ -13,9 +13,10 @@ rounding: ``bf16(alpha * (x . bf16(e2m1 * e4m3)))``, the W4A16 reading of
 NVIDIA's weights (no activation quantization; the checkpoint's static
 ``input_scale`` belongs to its W4A4 recipe and is not used).
 
-Scale operands carry the alphas: ``s`` is E4M3 ``[E, N, K/16]`` followed by
-FP32 ``[E]`` (the experts' ``weight_scale_2``) at byte ``E * N * K / 16``
-(a multiple of 16 for every 128-aligned K).
+Scale operands carry the per-expert scalars: ``s`` is E4M3 ``[E, N, K/16]``
+followed by FP32 ``[E]`` (the experts' ``weight_scale_2``) at byte ``E * N *
+K / 16`` (a multiple of 16 for every 128-aligned K), then FP32 ``[E]`` (their
+``input_scale``, read only by the W4A4 route).
 
 ``GroupedNvfp4Gemv``  every row count: ``GroupedMxfp4Gemv``'s grouped
     weight-streaming GEMV with each lane reading 32 consecutive K values (16

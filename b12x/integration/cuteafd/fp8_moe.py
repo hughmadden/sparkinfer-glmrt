@@ -68,6 +68,7 @@ from ._mxfp4_moe_kernels import GroupedMxfp4Gemv
 from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
 from ._nvfp4_moe_kernels import GroupedNvfp4Gemv, nvfp4_alpha_offset
 from ._nvfp4_moe_stream import ChunkRows, ChunkSwiGLU, StreamNvfp4Linear
+from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4LinearA4
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes"]
 
@@ -107,6 +108,12 @@ DECODE_GATE_UP_GROUPS = 4
 # 1024 2389 / 3064, 2048 3474 / 3582, 4096 6384 / 4610; GLM Flash TP4 wire
 # 2048 2867 / 2759, 4096 5454 / 3854.
 AUTO_NVFP4_STREAM_ROWS = 2048
+# W4A4 (``activations="a4"``) live rows above which ``auto`` streams. RTX PRO
+# 6000 (us, W4A16 GEMV / W4A4 stream, CUDA graphs): GLM 5.3 Flash TP1 256
+# rows 2719 / 4453, 512 4726 / 4204, 1024 6616 / 4459, 4096 20544 / 6372;
+# Qwen 3.8 TP1 512 2334 / 1430, 4096 6475 / 2323; GLM Flash TP4 wire 512
+# 975 / 1218, 1024 1585 / 1302, 4096 5446 / 1994.
+AUTO_NVFP4A4_STREAM_ROWS = 512
 
 
 def _gate_up_groups(tile_rows: int) -> int:
@@ -119,7 +126,7 @@ def _streams(wire: bool, weights: str = "fp8") -> bool:
     weights have only the streaming large route (wire input), on both."""
     if weights == "mxfp4":
         return bool(wire)
-    if weights == "nvfp4":
+    if weights in ("nvfp4", "nvfp4a4"):
         return True
     return bool(wire) and tuple(torch.cuda.get_device_capability()) == (12, 1)
 
@@ -128,6 +135,8 @@ def auto_large_rows(wire: bool, weights: str = "fp8") -> int:
     """Live-row threshold of ``auto``'s large route (``stream`` or ``prefill``)."""
     if weights == "nvfp4":
         return AUTO_NVFP4_STREAM_ROWS
+    if weights == "nvfp4a4":
+        return AUTO_NVFP4A4_STREAM_ROWS
     if weights == "mxfp4":
         gb10 = tuple(torch.cuda.get_device_capability()) == (12, 1)
         return AUTO_MXFP4_STREAM_ROWS_SM121 if gb10 else AUTO_MXFP4_STREAM_ROWS
@@ -153,8 +162,14 @@ class Fp8MoeGeometry:
     # "fp8": E4M3 + FP32 128x128 scales; "mxfp4": packed E2M1 + UE8M0 per 32;
     # "nvfp4": packed E2M1 + E4M3 per 16 + an FP32 alpha per expert.
     weights: str = "fp8"
+    # NVFP4 only: "a16" (BF16 activations: W4A16, exact widening) or "a4" (the
+    # stream route quantizes activations to NVFP4 with the checkpoint's static
+    # input_scale and runs block-scaled FP4 MMAs: W4A4; the GEMV stays W4A16).
+    activations: str = "a16"
 
     def __post_init__(self) -> None:
+        if self.activations not in ("a16", "a4") or (self.activations == "a4" and self.weights != "nvfp4"):
+            raise ValueError("activations is 'a16', or 'a4' with NVFP4 weights")
         if self.weights not in ("fp8", "mxfp4", "nvfp4"):
             raise ValueError("weights is 'fp8', 'mxfp4' or 'nvfp4'")
         if self.weights == "nvfp4" and (self.hidden % 128 or self.intermediate % 16 or self.intermediate // 16 < self.tp):
@@ -181,9 +196,14 @@ class Fp8MoeGeometry:
             return -(-(-(-self.intermediate // 16) // self.tp) * 16 // 128) * 128
         return -(-(self.intermediate // 128) // self.tp) * 128
 
+    @property
+    def kind(self) -> str:
+        """The weight format, ``nvfp4a4`` for NVFP4 with the W4A4 stream route."""
+        return "nvfp4a4" if self.activations == "a4" else self.weights
+
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
         return Fp8MoeGeometry(self.name, self.hidden, self.experts, self.top_k, self.intermediate, int(tp),
-                              self.swiglu_limit, self.weights)
+                              self.swiglu_limit, self.weights, self.activations)
 
 
 # MiMo V2 Flash (no SwiGLU clamp in its config) and the GLM 5.3 MTP layer.
@@ -202,6 +222,13 @@ GEOMETRIES = {
                                  swiglu_limit=10.0, weights="nvfp4"),
     "qwen4_nvfp4": Fp8MoeGeometry("qwen4_nvfp4", hidden=2560, experts=512, top_k=10, intermediate=640,
                                   weights="nvfp4"),
+    # The same with W4A4 large-row (stream) steps.
+    "glm_nvfp4a4": Fp8MoeGeometry("glm_nvfp4a4", hidden=6144, experts=256, top_k=8, intermediate=2048,
+                                  weights="nvfp4", activations="a4"),
+    "glmf_nvfp4a4": Fp8MoeGeometry("glmf_nvfp4a4", hidden=4096, experts=288, top_k=8, intermediate=2048,
+                                   swiglu_limit=10.0, weights="nvfp4", activations="a4"),
+    "qwen4_nvfp4a4": Fp8MoeGeometry("qwen4_nvfp4a4", hidden=2560, experts=512, top_k=10, intermediate=640,
+                                    weights="nvfp4", activations="a4"),
 }
 
 
@@ -218,6 +245,21 @@ def _grouped_rows(g: Fp8MoeGeometry, route: str, rows: int) -> int:
 
 def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
     rows = max(int(rows), 1)
+    if route == "stream" and g.activations == "a4":
+        pairs = rows * g.top_k
+        padded = stream_max_tiles(g.experts, pairs) * STREAM_TILE_M
+        return [
+            meta_words(g.experts, stream_max_tiles(g.experts, pairs)) * 4,
+            pairs * 4,                                 # pair_row
+            pairs * 4,                                 # pair_pos
+            padded * g.hidden // 2,                    # packed input rows
+            padded * g.hidden // 16,                   # their E4M3 scales
+            pairs * g.slice * 2,                       # gate
+            pairs * g.slice * 2,                       # up
+            padded * g.slice // 2,                     # packed SwiGLU rows
+            padded * g.slice // 16,                    # their scales
+            pairs * g.hidden * 2,                      # down output
+        ]
     if route == "stream" and g.weights == "nvfp4":
         pairs = rows * g.top_k
         padded = stream_max_tiles(g.experts, pairs) * STREAM_TILE_M
@@ -256,7 +298,7 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8")
     route (always, for BF16-input MXFP4 packages: their only large route
     streams wire rows); MXFP4 and NVFP4 have no grouped-GEMM ``prefill``
     route (NVFP4 streams BF16 or wire input above ``AUTO_NVFP4_STREAM_ROWS``)."""
-    if weights == "nvfp4" and route == "prefill":
+    if weights in ("nvfp4", "nvfp4a4") and route == "prefill":
         raise ValueError("NVFP4 experts have no prefill route (use stream)")
     if weights == "mxfp4":
         if route == "prefill":
@@ -267,10 +309,10 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8")
 
 
 def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True) -> int:
-    route = _resolve(route, rows, wire, g.weights)
+    route = _resolve(route, rows, wire, g.kind)
     if route == "auto":
         return max(fp8_moe_scratch_bytes(g, "decode", rows, wire),
-                   fp8_moe_scratch_bytes(g, _large_route(wire, g.weights), rows, wire))
+                   fp8_moe_scratch_bytes(g, _large_route(wire, g.kind), rows, wire))
     return sum(_align(b) for b in _regions(g, route, rows))
 
 
@@ -470,7 +512,69 @@ class _StreamNvfp4Route:
         self.combine(xb, pair_pos, weights, out, rows, stream)
 
 
+class _StreamNvfp4A4Route:
+    """The W4A4 NVFP4 ``stream`` route (``_nvfp4_moe_a4``): chunk-padded NVFP4
+    input rows, gate and up block-scaled FP4 GEMMs, SwiGLU quantized to NVFP4,
+    the down GEMM, route combine."""
+
+    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool):
+        self.g = g
+        h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
+        self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
+        self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
+                            chunked=True)
+        self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i)
+        self.gate_up = StreamNvfp4LinearA4(n=i, k=h, experts=e)
+        self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
+        self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e)
+        self.combine = MoeCombine(hidden=h, top_k=k)
+
+    def key(self) -> tuple:
+        return ("stream_nvfp4_a4", self.max_tiles, self.rows_in.key(), self.gate_up.key(), self.swiglu.key(),
+                self.down.key(), self.combine.key())
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
+                 s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer, w2: cute.Pointer, s2: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        g = self.g
+        pairs = rows * Int32(g.top_k)
+        groups = pairs
+        if groups > Int32(g.experts):
+            groups = Int32(g.experts)
+        max_tiles = (pairs + Int32(STREAM_TILE_M - 1)) // Int32(STREAM_TILE_M) + groups
+        padded = Int64(max_tiles) * Int64(STREAM_TILE_M)
+        base = Int64(scratch.toint())
+        pair_row_at = base + _al(Int64(4 * meta_words(g.experts, self.max_tiles)))
+        pair_pos_at = pair_row_at + _al(Int64(pairs) * Int64(4))
+        xq_at = pair_pos_at + _al(Int64(pairs) * Int64(4))
+        xs_at = xq_at + _al(padded * Int64(g.hidden // 2))
+        gate_at = xs_at + _al(padded * Int64(g.hidden // 16))
+        up_at = gate_at + _al(Int64(pairs) * Int64(g.slice * 2))
+        aq_at = up_at + _al(Int64(pairs) * Int64(g.slice * 2))
+        as_at = aq_at + _al(padded * Int64(g.slice // 2))
+        y_at = as_at + _al(padded * Int64(g.slice // 16))
+        ptr = lambda dtype, at: cute.make_ptr(dtype, at, cute.AddressSpace.gmem, assumed_align=16)  # noqa: E731
+        meta = ptr(cutlass.Int32, base)
+        pair_row = ptr(cutlass.Int32, pair_row_at)
+        pair_pos = ptr(cutlass.Int32, pair_pos_at)
+        xq, xs = ptr(cutlass.Uint8, xq_at), ptr(cutlass.Uint8, xs_at)
+        gate, up = ptr(cutlass.BFloat16, gate_at), ptr(cutlass.BFloat16, up_at)
+        aq, a_s = ptr(cutlass.Uint8, aq_at), ptr(cutlass.Uint8, as_at)
+        y = ptr(cutlass.BFloat16, y_at)
+        ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
+        self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
+        self.rows_in(x, pair_row, meta, s1, xq, xs, max_tiles, stream)
+        self.gate_up(xq, xs, meta, w1, s1, gate, max_tiles, stream)
+        self.gate_up(xq, xs, meta, w3, s3, up, max_tiles, stream)
+        self.swiglu(gate, up, meta, s2, aq, a_s, max_tiles, stream)
+        self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream)
+        self.combine(y, pair_pos, weights, out, rows, stream)
+
+
 def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool):
+    if route == "stream" and g.activations == "a4":
+        return _StreamNvfp4A4Route(g, max_rows, wire)
     if route == "stream" and g.weights == "nvfp4":
         return _StreamNvfp4Route(g, max_rows, wire)
     return _StreamRoute(g, max_rows, wire) if route == "stream" else _Route(g, route, max_rows, wire)
@@ -479,9 +583,9 @@ def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool):
 class _Fp8Moe:
     def __init__(self, g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool):
         self.route = route
-        self.threshold = auto_large_rows(wire, g.weights)
+        self.threshold = auto_large_rows(wire, g.kind)
         self.decode = _Route(g, "decode", max_rows, wire) if route in ("decode", "auto") else None
-        large = _large_route(wire, g.weights) if route == "auto" else route
+        large = _large_route(wire, g.kind) if route == "auto" else route
         self.prefill = _make_route(g, large, max_rows, wire) if route in ("prefill", "stream", "auto") else None
 
     def key(self) -> tuple:
@@ -509,23 +613,23 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         raise ValueError("route is 'decode', 'prefill', 'stream' or 'auto'")
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
-    requested, route = route, _resolve(route, max_rows, wire, g.weights)
+    requested, route = route, _resolve(route, max_rows, wire, g.kind)
     launch = _Fp8Moe(g, route, max_rows, wire)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
     x = (Operand("x", torch.uint8, f"[rows,{h + h // 32}]", note="FP8 K32 wire rows") if wire
          else Operand("x", torch.bfloat16, f"[rows,{h}]"))
     if g.weights == "nvfp4":
-        gate_up_scales = nvfp4_alpha_offset(e, i, h) + 4 * e
-        down_scales = nvfp4_alpha_offset(e, h, i) + 4 * e
+        gate_up_scales = nvfp4_alpha_offset(e, i, h) + 8 * e
+        down_scales = nvfp4_alpha_offset(e, h, i) + 8 * e
         weights = (
             Operand("w1", torch.uint8, f"[{e},{i},{h // 2}]", note="packed E2M1 (even element low)"),
             Operand("s1", torch.uint8, f"[{gate_up_scales}]", align=4,
-                    note=f"E4M3 [{e},{i},{h // 16}] then FP32 alpha [{e}]"),
+                    note=f"E4M3 [{e},{i},{h // 16}] then FP32 alpha [{e}] and input_scale [{e}]"),
             Operand("w3", torch.uint8, f"[{e},{i},{h // 2}]"),
             Operand("s3", torch.uint8, f"[{gate_up_scales}]", align=4),
             Operand("w2", torch.uint8, f"[{e},{h},{i // 2}]"),
             Operand("s2", torch.uint8, f"[{down_scales}]", align=4,
-                    note=f"E4M3 [{e},{h},{i // 16}] then FP32 alpha [{e}]"),
+                    note=f"E4M3 [{e},{h},{i // 16}] then FP32 alpha [{e}] and input_scale [{e}]"),
         )
     elif g.weights == "mxfp4":
         weights = (
@@ -558,7 +662,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         key=launch.key(),
         geometry={"requested_route": requested, "hidden": h, "experts": e, "top_k": k, "intermediate": g.intermediate, "tp": g.tp,
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
-                  "wire": bool(wire), "weights": g.weights},
+                  "wire": bool(wire), "weights": g.weights, "activations": g.activations},
         scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire)},
         doc=__doc__,
     )
