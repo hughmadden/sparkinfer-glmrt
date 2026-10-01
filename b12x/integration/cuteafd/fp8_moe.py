@@ -222,6 +222,12 @@ GEOMETRIES = {
                                  swiglu_limit=10.0, weights="nvfp4"),
     "qwen4_nvfp4": Fp8MoeGeometry("qwen4_nvfp4", hidden=2560, experts=512, top_k=10, intermediate=640,
                                   weights="nvfp4"),
+    # GLM 5.3 Flash's NVFP4 dense MLPs (layers 0-2 of nvidia/GLM-5.3-Flash-NVFP4)
+    # as one always-selected expert: the coordinator runs them with ids 0, weight 1.
+    "glmfdense_nvfp4": Fp8MoeGeometry("glmfdense_nvfp4", hidden=4096, experts=1, top_k=1, intermediate=12288,
+                                      swiglu_limit=10.0, weights="nvfp4"),
+    "glmfdense_nvfp4a4": Fp8MoeGeometry("glmfdense_nvfp4a4", hidden=4096, experts=1, top_k=1, intermediate=12288,
+                                        swiglu_limit=10.0, weights="nvfp4", activations="a4"),
     # The same with W4A4 large-row (stream) steps.
     "glm_nvfp4a4": Fp8MoeGeometry("glm_nvfp4a4", hidden=6144, experts=256, top_k=8, intermediate=2048,
                                   weights="nvfp4", activations="a4"),

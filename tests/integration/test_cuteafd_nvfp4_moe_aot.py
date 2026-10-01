@@ -194,6 +194,9 @@ CASES = [
     ("qwen4_nvfp4", 1, 640, 4096, 4096, False, 0, 1.0),
     # Qwen TP2 / TP3 of 640: 20 blocks (320) in 384, 14 blocks (224) in 256.
     ("qwen4_nvfp4", 2, 320, 16, 16, True, 0, 1.0), ("qwen4_nvfp4", 3, 224, 256, 200, True, 0, 1.0),
+    # GLM 5.3 Flash's dense MLP as one expert (ids 0).
+    ("glmfdense_nvfp4", 1, 12288, 1, 1, False, 0, 1.0), ("glmfdense_nvfp4", 1, 12288, 16, 16, False, 0, 1.0),
+    ("glmfdense_nvfp4", 1, 12288, 4096, 3000, False, 0, 1.0),
 ]
 
 
@@ -233,6 +236,7 @@ A4_CASES = [
     ("glmf_nvfp4a4", 4, 512, 4096, 3000, True, 8, 1.0, "auto"), ("glmf_nvfp4a4", 6, 336, 1024, 1000, True, 0, 1.0, "stream"),
     ("qwen4_nvfp4a4", 1, 640, 4096, 4096, False, 0, 1.0, "auto"), ("qwen4_nvfp4a4", 3, 224, 2048, 2000, True, 0, 1.0, "stream"),
     ("qwen4_nvfp4a4", 1, 640, 4096, 300, False, 0, 1.0, "auto"),
+    ("glmfdense_nvfp4a4", 1, 12288, 4096, 1500, False, 0, 1.0, "auto"),
 ]
 
 
