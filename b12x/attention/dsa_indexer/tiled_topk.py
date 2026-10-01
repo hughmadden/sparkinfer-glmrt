@@ -1480,24 +1480,30 @@ class DSATiledTopkKernel:
                         bits = Int32(s_cand1[w - Int32(smem_candidate_capacity)])
                     count = count + Int32(cute.arch.popc(Uint32(bits)))
                     w = w + Int32(1)
-                s_hist0[tx] = count
+                # Exclusive scan of the thread counts: warp shuffles, then the
+                # 32 warp totals.
+                lane = Int32(tx) & Int32(31)
+                warp = Int32(tx) >> Int32(5)
+                inclusive = count
+                for stage in cutlass.range_constexpr(5):
+                    up = Int32(cute.arch.shuffle_sync_up(inclusive, 1 << stage, mask_and_clamp=0))
+                    if lane >= Int32(1 << stage):
+                        inclusive = inclusive + up
+                if lane == Int32(31):
+                    s_hist1[warp] = inclusive
                 cute.arch.sync_threads()
-                # Inclusive scan over the 1024 thread counts (ends in s_hist0).
-                for stage in cutlass.range_constexpr(10):
-                    j = Int32(1 << stage)
-                    if (stage & 1) == 0:
-                        value = Int32(s_hist0[tx])
-                        if tx >= j:
-                            value = value + Int32(s_hist0[tx - j])
-                        s_hist1[tx] = value
-                    else:
-                        value = Int32(s_hist1[tx])
-                        if tx >= j:
-                            value = value + Int32(s_hist1[tx - j])
-                        s_hist0[tx] = value
-                    cute.arch.sync_threads()
-                position = Int32(s_hist0[tx]) - count
-                valid_total = Int32(s_hist0[Int32(_THREADS_PER_CTA - 1)])
+                if warp == Int32(0):
+                    total = Int32(s_hist1[lane])
+                    for stage in cutlass.range_constexpr(5):
+                        up = Int32(cute.arch.shuffle_sync_up(total, 1 << stage, mask_and_clamp=0))
+                        if lane >= Int32(1 << stage):
+                            total = total + up
+                    s_hist1[lane] = total
+                cute.arch.sync_threads()
+                position = inclusive - count
+                if warp > Int32(0):
+                    position = position + Int32(s_hist1[warp - Int32(1)])
+                valid_total = Int32(s_hist1[Int32(31)])
                 w = first_word
                 while w < last_word:
                     bits = Uint32(0)
@@ -1505,53 +1511,31 @@ class DSATiledTopkKernel:
                         bits = Uint32(s_cand0[w])
                     else:
                         bits = Uint32(s_cand1[w - Int32(smem_candidate_capacity)])
-                    for b in cutlass.range_constexpr(32):
-                        if ((bits >> Uint32(b)) & Uint32(1)) != Uint32(0):
-                            rank = w * Int32(32) + Int32(b)
-                            vidx = rank - carry_slots
-                            if not cutlass.const_expr(self.is_first):
-                                if rank < carry_slots:
-                                    vidx = rank + length
-                            if cutlass.const_expr(self.write_values):
-                                values[out_base + position] = _load_value_virtual(
-                                    input_tensor,
-                                    carry_values,
-                                    row_base,
-                                    row_start,
-                                    out_base,
-                                    length,
-                                    vidx,
-                                    self.block_q,
-                                    self.block_k,
-                                    self.is_tiled,
-                                    self.is_first,
-                                )
-                            indices[out_base + position] = _emit_global_index_virtual(
-                                carry_indices,
-                                output_page_table,
-                                output_page_table_row_stride,
-                                row_start,
-                                output_index_offset,
-                                out_base,
-                                length,
-                                vidx,
-                                bid,
-                                output_page_size,
-                                self.is_first,
-                                self.output_physical_slots,
-                            )
-                            position = position + Int32(1)
+                    while bits != Uint32(0):
+                        low = bits & (~bits + Uint32(1))
+                        bits = bits ^ low
+                        rank = w * Int32(32) + Int32(cute.arch.popc(low - Uint32(1)))
+                        vidx = rank - carry_slots
+                        if not cutlass.const_expr(self.is_first):
+                            if rank < carry_slots:
+                                vidx = rank + length
+                        s_out[position] = vidx
+                        position = position + Int32(1)
                     w = w + Int32(1)
                 pad = valid_total + Int32(tx)
                 while pad < topk_static:
-                    if cutlass.const_expr(self.write_values):
-                        values[out_base + pad] = Float32(float("-inf"))
-                    indices[out_base + pad] = Int32(-1)
+                    s_out[pad] = Int32(-1)
                     pad = pad + Int32(_THREADS_PER_CTA)
-            else:
-                idx0 = Int32(tx)
-                if idx0 < topk_static:
-                    selected0 = Int32(s_out[idx0])
+                # s_out now holds the picks in canonical order (-1: padding).
+                cute.arch.sync_threads()
+            idx0 = Int32(tx)
+            if idx0 < topk_static:
+                selected0 = Int32(s_out[idx0])
+                if selected0 < Int32(0):
+                    if cutlass.const_expr(self.write_values):
+                        values[out_base + idx0] = Float32(float("-inf"))
+                    indices[out_base + idx0] = Int32(-1)
+                else:
                     if cutlass.const_expr(self.write_values):
                         values[out_base + idx0] = _load_value_virtual(
                             input_tensor,
@@ -1580,9 +1564,14 @@ class DSATiledTopkKernel:
                         self.is_first,
                         self.output_physical_slots,
                     )
-                idx1 = idx0 + Int32(_THREADS_PER_CTA)
-                if idx1 < topk_static:
-                    selected1 = Int32(s_out[idx1])
+            idx1 = idx0 + Int32(_THREADS_PER_CTA)
+            if idx1 < topk_static:
+                selected1 = Int32(s_out[idx1])
+                if selected1 < Int32(0):
+                    if cutlass.const_expr(self.write_values):
+                        values[out_base + idx1] = Float32(float("-inf"))
+                    indices[out_base + idx1] = Int32(-1)
+                else:
                     if cutlass.const_expr(self.write_values):
                         values[out_base + idx1] = _load_value_virtual(
                             input_tensor,
