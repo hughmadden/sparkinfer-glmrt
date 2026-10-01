@@ -129,6 +129,7 @@ class _TopK:
         from b12x.attention.dsa_indexer.tiled_topk import (
             _build_tiled_topk_kernel,
             _resolve_smem_candidate_capacity,
+            deterministic_topk,
         )
 
         self.heads = int(heads)
@@ -182,9 +183,13 @@ class _TopK:
         self.k_tiles = self.supertile // self.block_k
         capacity = _resolve_smem_candidate_capacity(topk=self.topk)
         # (is_first, physical output); non-final chunks keep values for the carry.
+        # Deterministic select (index tie-break, canonical ascending output) unless
+        # B12X_DSA_TOPK_DETERMINISTIC=0 (A/B builds).
+        self.deterministic = deterministic_topk()
         self.topk_kernels = {
             (first, phys): _build_tiled_topk_kernel(
-                _TILE_BLOCK_Q, self.block_k, self.topk, True, first, phys, 1, capacity, not phys)
+                _TILE_BLOCK_Q, self.block_k, self.topk, True, first, phys, 1, capacity, not phys,
+                self.deterministic)
             for first in (True, False) for phys in (True, False)
         }
 
@@ -193,7 +198,8 @@ class _TopK:
         key = (self.route, self.topk, self.max_rows, self.max_pages, self.supertile,
                L.prefill_block_k, L.fused_ctas_per_group, L.fused_merge_threshold,
                L.stream_scorer_ctas, L.max_chunks, L.nbytes, self.num_sms)
-        return key if self.heads == _HEADS else key + (self.heads,)
+        key = key if self.heads == _HEADS else key + (self.heads,)
+        return key if getattr(self, "deterministic", True) else key + ("arrival-order",)
 
     # -- helpers ------------------------------------------------------------
     @cute.jit

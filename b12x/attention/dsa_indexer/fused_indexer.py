@@ -1483,6 +1483,9 @@ def _fused_radix_select(
             block_k=1,
             is_tiled=False,
             is_first=True,
+            tie_break=False,
+            carry_indices=vin_v,
+            output_index_offset=Int32(0),
         )
     cute.arch.sync_threads()
     i = Int32(tx)
