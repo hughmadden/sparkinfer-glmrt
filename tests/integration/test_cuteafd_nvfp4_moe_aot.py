@@ -100,7 +100,7 @@ def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2):
     return out.bfloat16()
 
 
-def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, scale=1.0):
+def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, scale=1.0, route="auto"):
     from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
 
     gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -112,11 +112,11 @@ def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, scale=1.0):
         scores[:, :hot] += 2.0
     ids = scores.topk(g.top_k, -1).indices.int().contiguous()
     weights = torch.rand(rows, g.top_k, device="cuda", generator=gen).contiguous()
-    key = (g, capacity, wire)
+    key = (g, capacity, wire, route)
     if key not in _PROGRAMS:
-        _PROGRAMS[key] = compile_fp8_moe_aot(g, route="auto", max_rows=capacity, wire=wire)
+        _PROGRAMS[key] = compile_fp8_moe_aot(g, route=route, max_rows=capacity, wire=wire)
     out = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device="cuda")
-    scratch = torch.empty(fp8_moe_scratch_bytes(g, "auto", capacity, wire), dtype=torch.uint8, device="cuda")
+    scratch = torch.empty(fp8_moe_scratch_bytes(g, route, capacity, wire), dtype=torch.uint8, device="cuda")
     _PROGRAMS[key].launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
     torch.cuda.synchronize()
     expected = reference(g, x_exact, ids, weights, *w)
@@ -156,6 +156,26 @@ def test_nvfp4_moe(name, tp, real, capacity, rows, wire, hot, scale):
     print(f"nvfp4_moe {name} tp{tp} (slice {g.slice}, {real} real) m{capacity} rows={rows} "
           f"{'wire' if wire else 'bf16'} x{scale}: cosine {c:.7f} worst row {worst:.6f}")
     assert c >= COS and worst >= 0.999
+
+
+STREAM_CASES = [
+    # (geometry, tp, real rows, capacity, rows, wire, hot, scale, route): the stream route, forced and via auto.
+    ("glmf_nvfp4", 1, 2048, 4096, 4096, False, 0, 1.0, "stream"), ("glmf_nvfp4", 1, 2048, 4096, 3000, False, 8, 1.0, "auto"),
+    ("glmf_nvfp4", 1, 2048, 256, 17, False, 0, 40.0, "stream"),
+    ("glmf_nvfp4", 4, 512, 4096, 4096, True, 0, 1.0, "stream"), ("glmf_nvfp4", 6, 336, 1024, 1000, True, 8, 1.0, "stream"),
+    ("glmf_nvfp4", 3, 688, 4096, 2100, True, 0, 1.0, "auto"),
+    ("qwen4_nvfp4", 1, 640, 4096, 4096, False, 0, 1.0, "stream"), ("qwen4_nvfp4", 1, 640, 4096, 4000, False, 0, 1.0, "auto"),
+    ("qwen4_nvfp4", 2, 320, 1024, 1024, True, 0, 1.0, "stream"), ("qwen4_nvfp4", 6, 112, 4096, 4096, True, 0, 1.0, "stream"),
+]
+
+
+@pytest.mark.parametrize("name,tp,real,capacity,rows,wire,hot,scale,route", STREAM_CASES)
+def test_nvfp4_moe_stream(name, tp, real, capacity, rows, wire, hot, scale, route):
+    g = _geometry(name, tp)
+    c, worst = _run(g, real, capacity, rows, wire=wire, hot=hot, scale=scale, route=route)
+    print(f"nvfp4_moe {name} tp{tp} (slice {g.slice}, {real} real) {route} m{capacity} rows={rows} "
+          f"{'wire' if wire else 'bf16'} x{scale}: cosine {c:.7f} worst row {worst:.6f}")
+    assert c >= 0.99999 and worst >= 0.9999
 
 
 def test_nvfp4_geometry():

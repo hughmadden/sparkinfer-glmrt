@@ -67,6 +67,7 @@ from ._fp8_moe_stream import STREAM_TILE_M, StreamFp8Down, StreamFp8GateUp, stre
 from ._mxfp4_moe_kernels import GroupedMxfp4Gemv
 from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
 from ._nvfp4_moe_kernels import GroupedNvfp4Gemv, nvfp4_alpha_offset
+from ._nvfp4_moe_stream import ChunkRows, ChunkSwiGLU, StreamNvfp4Linear
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes"]
 
@@ -100,6 +101,14 @@ MXFP4_STREAM_QMMA = True
 DECODE_GATE_UP_GROUPS = 4
 
 
+# NVFP4 live rows above which ``auto`` takes the stream route (BF16 or wire
+# input). RTX PRO 6000 (us, GEMV / stream, CUDA graphs): GLM 5.3 Flash TP1
+# 1024 rows 6577 / 8236, 2048 10533 / 9789, 4096 20352 / 13830; Qwen 3.8 TP1
+# 1024 2389 / 3064, 2048 3474 / 3582, 4096 6384 / 4610; GLM Flash TP4 wire
+# 2048 2867 / 2759, 4096 5454 / 3854.
+AUTO_NVFP4_STREAM_ROWS = 2048
+
+
 def _gate_up_groups(tile_rows: int) -> int:
     return 1 if int(tile_rows) == 1 else DECODE_GATE_UP_GROUPS
 
@@ -110,11 +119,15 @@ def _streams(wire: bool, weights: str = "fp8") -> bool:
     weights have only the streaming large route (wire input), on both."""
     if weights == "mxfp4":
         return bool(wire)
+    if weights == "nvfp4":
+        return True
     return bool(wire) and tuple(torch.cuda.get_device_capability()) == (12, 1)
 
 
 def auto_large_rows(wire: bool, weights: str = "fp8") -> int:
     """Live-row threshold of ``auto``'s large route (``stream`` or ``prefill``)."""
+    if weights == "nvfp4":
+        return AUTO_NVFP4_STREAM_ROWS
     if weights == "mxfp4":
         gb10 = tuple(torch.cuda.get_device_capability()) == (12, 1)
         return AUTO_MXFP4_STREAM_ROWS_SM121 if gb10 else AUTO_MXFP4_STREAM_ROWS
@@ -205,6 +218,18 @@ def _grouped_rows(g: Fp8MoeGeometry, route: str, rows: int) -> int:
 
 def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
     rows = max(int(rows), 1)
+    if route == "stream" and g.weights == "nvfp4":
+        pairs = rows * g.top_k
+        padded = stream_max_tiles(g.experts, pairs) * STREAM_TILE_M
+        return [
+            meta_words(g.experts, stream_max_tiles(g.experts, pairs)) * 4,
+            pairs * 4,                                 # pair_row
+            pairs * 4,                                 # pair_pos
+            padded * g.hidden * 2,                     # chunk-padded input rows, then the down output
+            pairs * g.slice * 2,                       # gate
+            pairs * g.slice * 2,                       # up
+            padded * g.slice * 2,                      # chunk-padded SwiGLU
+        ]
     if route == "stream":
         pairs = rows * g.top_k
         return [
@@ -229,12 +254,10 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
 def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8") -> str:
     """``auto`` compiles only the GEMV when the capacity never reaches the large
     route (always, for BF16-input MXFP4 packages: their only large route
-    streams wire rows); MXFP4 has no grouped-GEMM ``prefill`` route. NVFP4
-    runs the grouped GEMV at every row count."""
-    if weights == "nvfp4":
-        if route not in ("decode", "auto"):
-            raise ValueError("NVFP4 experts run the grouped GEMV only (route decode or auto)")
-        return "decode"
+    streams wire rows); MXFP4 and NVFP4 have no grouped-GEMM ``prefill``
+    route (NVFP4 streams BF16 or wire input above ``AUTO_NVFP4_STREAM_ROWS``)."""
+    if weights == "nvfp4" and route == "prefill":
+        raise ValueError("NVFP4 experts have no prefill route (use stream)")
     if weights == "mxfp4":
         if route == "prefill":
             raise ValueError("MXFP4 experts have no prefill route (use stream)")
@@ -389,7 +412,67 @@ class _StreamRoute:
         self.combine(y, pair_pos, weights, out, rows, stream)
 
 
+class _StreamNvfp4Route:
+    """The NVFP4 ``stream`` route: compact expert groups in 128-row chunks,
+    chunk-padded BF16 input rows, gate and up streaming GEMMs, SwiGLU, the
+    down streaming GEMM, route combine (``_nvfp4_moe_stream``)."""
+
+    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool):
+        self.g = g
+        h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
+        self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
+        self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
+                            chunked=True)
+        self.rows_in = ChunkRows(k=h, wire=wire, experts=e)
+        self.gate_up = StreamNvfp4Linear(n=i, k=h, experts=e)
+        self.swiglu = ChunkSwiGLU(inter=i, experts=e, limit=g.swiglu_limit)
+        self.down = StreamNvfp4Linear(n=h, k=i, experts=e)
+        self.combine = MoeCombine(hidden=h, top_k=k)
+
+    def key(self) -> tuple:
+        return ("stream_nvfp4", self.max_tiles, self.rows_in.key(), self.gate_up.key(), self.swiglu.key(),
+                self.down.key(), self.combine.key())
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
+                 s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer, w2: cute.Pointer, s2: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        g = self.g
+        pairs = rows * Int32(g.top_k)
+        groups = pairs
+        if groups > Int32(g.experts):
+            groups = Int32(g.experts)
+        max_tiles = (pairs + Int32(STREAM_TILE_M - 1)) // Int32(STREAM_TILE_M) + groups
+        padded = Int64(max_tiles) * Int64(STREAM_TILE_M)
+        base = Int64(scratch.toint())
+        pair_row_at = base + _al(Int64(4 * meta_words(g.experts, self.max_tiles)))
+        pair_pos_at = pair_row_at + _al(Int64(pairs) * Int64(4))
+        xb_at = pair_pos_at + _al(Int64(pairs) * Int64(4))
+        gate_at = xb_at + _al(padded * Int64(g.hidden * 2))
+        up_at = gate_at + _al(Int64(pairs) * Int64(g.slice * 2))
+        act_at = up_at + _al(Int64(pairs) * Int64(g.slice * 2))
+        ptr = lambda dtype, at: cute.make_ptr(dtype, at, cute.AddressSpace.gmem, assumed_align=16)  # noqa: E731
+        meta = ptr(cutlass.Int32, base)
+        pair_row = ptr(cutlass.Int32, pair_row_at)
+        pair_pos = ptr(cutlass.Int32, pair_pos_at)
+        xb = ptr(cutlass.BFloat16, xb_at)
+        gate = ptr(cutlass.BFloat16, gate_at)
+        up = ptr(cutlass.BFloat16, up_at)
+        act = ptr(cutlass.BFloat16, act_at)
+        ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
+        self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
+        self.rows_in(x, pair_row, meta, xb, max_tiles, stream)
+        self.gate_up(xb, meta, w1, s1, gate, max_tiles, stream)
+        self.gate_up(xb, meta, w3, s3, up, max_tiles, stream)
+        self.swiglu(gate, up, meta, act, max_tiles, stream)
+        # The down output reuses the input rows' region (pairs <= chunk-padded rows).
+        self.down(act, meta, w2, s2, xb, max_tiles, stream)
+        self.combine(xb, pair_pos, weights, out, rows, stream)
+
+
 def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool):
+    if route == "stream" and g.weights == "nvfp4":
+        return _StreamNvfp4Route(g, max_rows, wire)
     return _StreamRoute(g, max_rows, wire) if route == "stream" else _Route(g, route, max_rows, wire)
 
 
