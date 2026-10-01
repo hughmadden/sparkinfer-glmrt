@@ -4,10 +4,12 @@ Random E4M3 expert weights with FP32 128x128 block scales at the MiMo V2
 Flash (H 4096) and GLM 5.3 (H 6144) geometries, full width (TP1, the RTX
 local/MTP layers) and the TP4 Spark slice (I 512); FP8 K32 wire or BF16
 input rows; decode (grouped GEMV), prefill (grouped TMA GEMM), stream
-(expert-stationary streaming GEMMs, FP8 wire input) and auto routes. The
+(expert-stationary streaming GEMMs over FP8 wire rows; BF16 rows quantized
+to wire rows first) and auto routes, in each ``prefill`` form (auto, w8a8, w8a16). The
 reference is the checkpoint semantics: ``F.linear`` of BF16 activations
 with ``bf16(w * s)`` weights, BF16 gate/up, ``bf16(silu(g)) *
-u``, BF16 down output, FP32 weighted route sum.
+u``, BF16 down output, FP32 weighted route sum; ``exact=True`` takes the
+weights ``w * s`` unrounded (FP64), which the W8A8 gate/up computes.
 """
 
 from __future__ import annotations
@@ -46,13 +48,23 @@ def _weights(g):
     return _WEIGHTS[key]
 
 
-def _program(g, route, capacity, wire):
+def _program(g, route, capacity, wire, prefill="auto"):
     from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot
 
-    key = (g, route, capacity, wire)
+    key = (g, route, capacity, wire, prefill)
     if key not in _PROGRAMS:
-        _PROGRAMS[key] = compile_fp8_moe_aot(g, route=route, max_rows=capacity, wire=wire)
+        _PROGRAMS[key] = compile_fp8_moe_aot(g, route=route, max_rows=capacity, wire=wire, prefill=prefill)
     return _PROGRAMS[key]
+
+
+def _quantizes_input(g, route, rows, wire, prefill):
+    """Whether a BF16-input program runs these rows through its wire quantizer."""
+    from b12x.integration.cuteafd.fp8_moe import auto_large_rows
+
+    if wire:
+        return False
+    return route == "stream" or (route == "auto" and prefill == "w8a8"
+                                 and rows > auto_large_rows(False, g.weights, prefill))
 
 
 def wire_rows(x: torch.Tensor):
@@ -65,10 +77,25 @@ def wire_rows(x: torch.Tensor):
     return wire, (q.float() * torch.exp2(exponent)[..., None]).view(rows, h).bfloat16()
 
 
-def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, limit=0.0):
+def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, limit=0.0, exact=False):
     def dequant(w, s):
-        return (w.float() * s.repeat_interleave(128, 0).repeat_interleave(128, 1)).bfloat16()
+        d = w.double() * s.double().repeat_interleave(128, 0).repeat_interleave(128, 1)
+        return d if exact else d.float().bfloat16()
 
+    if exact:
+        x = x.double()
+        out = torch.zeros(x.shape, device=x.device, dtype=torch.float64)
+        for expert in ids.unique().tolist():
+            rows, slots = torch.where(ids == expert)
+            rnd = lambda t: t.float().bfloat16().double()  # noqa: E731
+            gate = rnd(x[rows] @ dequant(w1[expert], s1[expert]).T)
+            up = rnd(x[rows] @ dequant(w3[expert], s3[expert]).T)
+            if limit > 0:
+                gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+            act = rnd(rnd(torch.nn.functional.silu(gate)) * up)
+            y = rnd(act @ dequant(w2[expert], s2[expert]).T)
+            out.index_add_(0, rows, y * weights[rows, slots][:, None].double())
+        return out.float().bfloat16()
     out = torch.zeros(x.shape, device=x.device)
     for expert in ids.unique().tolist():
         rows, slots = torch.where(ids == expert)
@@ -81,11 +108,13 @@ def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, limit=0.0):
     return out.bfloat16()
 
 
-def _run(g, route, capacity, rows, wire=True, seed=1, hot=0):
+def _run(g, route, capacity, rows, wire=True, seed=1, hot=0, prefill="auto", exact=False):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     w = _weights(g)
     x = torch.randn(rows, g.hidden, device="cuda", generator=gen).bfloat16()
     source, x_exact = wire_rows(x) if wire else (x, x)
+    if _quantizes_input(g, route, rows, wire, prefill):
+        x_exact = wire_rows(x)[1]
     scores = torch.rand(rows, g.experts, device="cuda", generator=gen)
     if hot:
         scores[:, :hot] += 2.0  # every row routes to the first `hot` experts (multi-chunk groups)
@@ -93,12 +122,13 @@ def _run(g, route, capacity, rows, wire=True, seed=1, hot=0):
     weights = torch.rand(rows, g.top_k, device="cuda", generator=gen).contiguous()
     from b12x.integration.cuteafd.fp8_moe import fp8_moe_scratch_bytes
 
-    program = _program(g, route, capacity, wire)
+    program = _program(g, route, capacity, wire, prefill)
     out = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device="cuda")
-    scratch = torch.empty(fp8_moe_scratch_bytes(g, route, capacity), dtype=torch.uint8, device="cuda")
+    scratch = torch.empty(fp8_moe_scratch_bytes(g, route, capacity, wire, prefill), dtype=torch.uint8,
+                          device="cuda")
     program.launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
     torch.cuda.synchronize()
-    expected = reference(x_exact, ids, weights, *w, limit=g.swiglu_limit)
+    expected = reference(x_exact, ids, weights, *w, limit=g.swiglu_limit, exact=exact)
     a, b = out.float(), expected.float()
     c = float((a * b).sum() / (a.norm() * b.norm()))
     worst = float(torch.nn.functional.cosine_similarity(a, b, dim=1).min())
@@ -121,6 +151,7 @@ CASES = [
     ("glm", 4, "auto", 256, 256),
     ("mimo", 4, "stream", 16, 5), ("mimo", 4, "stream", 256, 200), ("mimo", 4, "stream", 4096, 4096),
     ("mimo", 2, "stream", 1024, 1024), ("glm", 4, "stream", 4096, 3000), ("glm", 2, "stream", 256, 256),
+    ("glmf", 4, "stream", 4096, 4096), ("glmf", 4, "auto", 1024, 900),
     # TP6 of 2048: 3-block (384) slices, the stored width of every rank.
     ("mimo", 6, "decode", 1, 1), ("glm", 6, "decode", 16, 16), ("glmf", 6, "auto", 80, 80),
     ("mimo", 6, "stream", 1024, 1024), ("glm", 6, "stream", 4096, 4096),
@@ -140,6 +171,36 @@ def test_fp8_moe_bf16_input():
     c, worst = _run(g, "auto", 80, 33, wire=False)
     print(f"fp8_moe mimo tp4 bf16 input rows=33: cosine {c:.7f} worst row {worst:.6f}")
     assert c >= COS
+
+
+@pytest.mark.parametrize("name,tp,route,capacity,rows,prefill", [
+    ("mimo", 1, "auto", 4096, 3000, "w8a8"), ("mimo", 1, "auto", 4096, 3000, "auto"),
+    ("mimo", 1, "auto", 1024, 700, "w8a8"), ("glmf", 1, "stream", 1024, 1000, "auto"),
+    ("mimo", 4, "stream", 256, 200, "auto"),
+])
+def test_fp8_moe_bf16_input_large(name, tp, route, capacity, rows, prefill):
+    """BF16 rows at large row counts: W8A8 programs quantize them to wire rows
+    (the reference takes the same quantized rows), "auto" ones keep them exact."""
+    g = _geometry(name, tp)
+    c, worst = _run(g, route, capacity, rows, wire=False, prefill=prefill)
+    print(f"fp8_moe {name} tp{tp} bf16 input {route} m{capacity} rows={rows} {prefill}: cosine {c:.7f} "
+          f"worst row {worst:.6f}")
+    assert c >= COS and worst >= 0.999
+
+
+@pytest.mark.parametrize("name,tp,capacity,rows", [("mimo", 4, 4096, 4096), ("glm", 2, 1024, 1000),
+                                                   ("glmf", 6, 1024, 1024)])
+def test_fp8_moe_stream_w8a8_vs_exact_weights(name, tp, capacity, rows):
+    """The W8A8 stream gate/up computes x . (w * s) with the weights unrounded:
+    against the exact-weight (FP64) reference it is at least as close as the
+    W8A16 form, which rounds them to bf16(w * s)."""
+    g = _geometry(name, tp)
+    a8 = _run(g, "stream", capacity, rows, exact=True)
+    a16 = _run(g, "stream", capacity, rows, exact=True, prefill="w8a16")
+    oracle_a8 = _run(g, "stream", capacity, rows)
+    print(f"fp8_moe {name} tp{tp} stream rows={rows} vs exact weights: W8A8 {a8[0]:.8f} W8A16 {a16[0]:.8f}; "
+          f"W8A8 vs bf16(w*s) reference {oracle_a8[0]:.8f}")
+    assert a8[0] >= 0.99999 and a8[0] >= a16[0] - 1e-7 and oracle_a8[0] >= COS
 
 
 def test_fp8_moe_clamp():

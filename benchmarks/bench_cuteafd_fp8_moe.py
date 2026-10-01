@@ -48,7 +48,11 @@ def main() -> None:
     parser.add_argument("--route", default="auto")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--prefill", choices=("auto", "w8a8", "w8a16"), default="auto",
+                        help="large-row form of FP8 programs (auto: W8A8 for wire input, W8A16 for BF16 rows)")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--input", choices=("wire", "bf16"), default="wire",
+                        help="expert input rows (bf16: the coordinator packages' input)")
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
 
@@ -71,17 +75,21 @@ def main() -> None:
     per_expert = 3 * i * h + (2 * (i // 128) * (h // 128) + (h // 128) * (i // 128)) * 4
     results = []
     for rows in [int(r) for r in args.rows.split(",")]:
-        program = compile_fp8_moe_aot(g, route=args.route, max_rows=rows, wire=True)
+        wire_in = args.input == "wire"
+        program = compile_fp8_moe_aot(g, route=args.route, max_rows=rows, wire=wire_in, prefill=args.prefill)
         x = torch.randn(rows, h, device=dev, generator=gen).bfloat16()
         groups = x.float().view(rows, h // 32, 32)
         exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448.0)).clamp(-127, 127)
         q = (groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
         wire = torch.cat([q.view(rows, h).view(torch.uint8), (exponent + 127).to(torch.uint8)], 1).contiguous()
         x_exact = (q.float() * torch.exp2(exponent)[..., None]).view(rows, h).bfloat16()
+        if not wire_in:
+            wire, x_exact = x, x
         ids = torch.empty(rows, k, dtype=torch.int32, device=dev)
         weights = torch.rand(rows, k, device=dev, generator=gen).contiguous()
         out = torch.empty(rows, h, dtype=torch.bfloat16, device=dev)
-        scratch = torch.empty(fp8_moe_scratch_bytes(g, args.route, rows), dtype=torch.uint8, device=dev)
+        scratch = torch.empty(fp8_moe_scratch_bytes(g, args.route, rows, wire_in, args.prefill), dtype=torch.uint8,
+                              device=dev)
         unique = []
 
         def prepare(seed):
@@ -93,7 +101,9 @@ def main() -> None:
 
         us = time_us(run, args.iters, flush, prepare)
         experts = sum(unique) / len(unique)
-        record = {"geometry": g.name, "tp": g.tp, "route": args.route, "rows": rows, "us": round(us, 1),
+        record = {"geometry": g.name, "tp": g.tp, "input": args.input,
+                  "route": args.route + ("" if args.prefill == "auto" else "/" + args.prefill),
+                  "rows": rows, "us": round(us, 1),
                   "experts": round(experts, 1), "gbps": round(experts * per_expert / us / 1e3, 1),
                   "tflops": round(rows * k * 3 * 2 * i * h / us / 1e6, 1)}
         if args.check:

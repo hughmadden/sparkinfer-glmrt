@@ -36,17 +36,25 @@ Routes: ``decode`` groups the (row, route) pairs by expert without padding and
 streams each active expert's weights through the grouped FP8 GEMV (64-row
 chunks per expert; weight-bandwidth bound, the choice up to ~1024 rows);
 ``prefill`` pads each expert's group to 64 rows and runs the grouped TMA GEMM;
-``stream`` (FP8 K32 wire input only) groups the pairs without padding into
-128-row chunks and runs the expert-stationary streaming GEMMs of
-``_fp8_moe_stream`` (each expert weight byte read once per layer; gate/up
-straight from the wire rows with SwiGLU fused; both over widened ``bf16(w *
-s)``, the same semantics as the other routes); ``auto`` branches on the live
-row count (the large route above ``auto_large_rows``: ``stream`` for wire
-input on GB10, ``prefill`` otherwise) and sizes its scratch for both.
+``stream`` groups the pairs without padding into 128-row chunks and runs the
+expert-stationary streaming GEMMs of ``_fp8_moe_stream`` (each expert weight
+byte read once per layer; gate/up straight from the FP8 K32 wire rows with
+SwiGLU fused; BF16 input rows are first quantized to wire rows in scratch).
+For FP8 weights its gate/up is W8A8: block-scaled E4M3 x E4M3 MMAs with the
+FP32 weight block scales promoted per 128-K step, i.e. ``x . (w * s)`` with
+the exact checkpoint weights; the down projection keeps BF16 activations over
+widened ``bf16(w * s)``. ``prefill`` picks the large-row form of FP8
+programs: ``"auto"`` (default) runs wire input W8A8 and BF16 input as before
+(W8A16, its rows exact); ``"w8a8"`` also quantizes BF16 rows to wire rows
+and streams them W8A8; ``"w8a16"`` is the former programs exactly (gate/up
+over widened ``bf16(w * s)``). ``auto`` branches on the live row count (the
+large route above ``auto_large_rows``: the W8A8 ``stream``; else the W8A16
+``stream`` for wire input on GB10 and ``prefill`` otherwise) and sizes its
+scratch for both.
 Scratch (1024-aligned regions, live row layout): metadata, ``pair_row`` / ``pair_pos``, BF16 activations (reused
 for the down projection's output), ``gate|up`` BF16, SwiGLU BF16; ``stream``:
 metadata, ``pair_row`` / ``pair_pos``, SwiGLU BF16 ``[max_tiles * 128, I]``
-(chunk-padded rows), down output BF16 ``[pairs, H]``.
+(chunk-padded rows), down output BF16 ``[pairs, H]``, (BF16 input) wire rows.
 """
 
 from __future__ import annotations
@@ -57,7 +65,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Int32, Int64
+from cutlass import BFloat16, Int32, Int64
+
+from b12x._lib.quant.mxfp8_rows import _THREADS as _QUANT_THREADS
+from b12x._lib.quant.mxfp8_rows import _WARP_SUBGROUP_WIDTH, _MXFP8RowsQuantLaunch
 
 from ._common import AotProgram, Operand, Scalar, compile_program
 from ._fp8_moe_kernels import (
@@ -70,18 +81,32 @@ from ._nvfp4_moe_kernels import GroupedNvfp4Gemv, nvfp4_alpha_offset
 from ._nvfp4_moe_stream import ChunkRows, ChunkSwiGLU, StreamNvfp4Linear
 from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4LinearA4
 
-__all__ = ["Fp8MoeGeometry", "GEOMETRIES", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes"]
+__all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
+           "prefill_forms"]
 
 _ALIGN = 1024
 TILE_M = 64
 DECODE_MAX_ROWS = 64
 # Live rows above which ``auto`` takes the grouped GEMM (RTX PRO 6000, MiMo
 # TP4 slice, us: 1024 rows GEMV 1753 / GEMM 2059; 4096 rows 5728 / 5374).
+# W8A16 programs (``prefill="w8a16"``, and BF16 input under "auto") keep
+# these routes and thresholds exactly.
 AUTO_PREFILL_ROWS = 2048
-# Live rows above which ``auto`` takes the streaming route for wire input
-# (GB10, TP4 slices, us, GEMV / stream: MiMo 1024 rows 8467 / 8263, 2048 rows
-# 14109 / 9185; GLM 1024 rows 12932 / 13124, 2048 rows 20433 / 14426).
+# Live rows above which ``auto`` takes the W8A16 streaming route for wire
+# input (GB10, TP4 slices, us, GEMV / stream: MiMo 1024 rows 8467 / 8263, 2048
+# rows 14109 / 9185; GLM 1024 rows 12932 / 13124, 2048 rows 20433 / 14426).
 AUTO_STREAM_ROWS = 1024
+# W8A8 stream (the default for FP8 weights): live rows above which ``auto``
+# streams. GB10 wire input, us, GEMV / stream: MiMo TP4 768 rows 8097 / 8198,
+# 1024 8591 / 8439; MiMo TP2 768 15870 / 14971; GLM TP4 768 12597 / 12236,
+# 1024 13032 / 12577; GLM Flash TP4 768 9016 / 9049, 1024 9353 / 9293.
+AUTO_W8A8_STREAM_ROWS_SM121 = 768
+# RTX PRO 6000 (SM120): wire input, and BF16 input with ``prefill="w8a8"``
+# (the program quantizes its rows to the wire format).
+# MiMo TP1, BF16 input, us, GEMV / W8A8 stream / grouped GEMM: 512 rows 4060 /
+# 4101 / 7300; 1024 5724 / 4178 / 7492; 2048 10528 / 4438 / 10246; 4096 21160 /
+# 5916 / 16882.
+AUTO_W8A8_STREAM_ROWS_SM120 = 512
 # MXFP4 (MiMo V2.6 Pro) live rows above which ``auto`` streams (wire input);
 # RTX PRO 6000 (us, GEMV / stream): TP6 1024 rows 1662 / 1729, 2048 2598 / 1907;
 # TP1 512 8965 / 7952, 1024 13654 / 10653.
@@ -95,11 +120,16 @@ AUTO_MXFP4_STREAM_ROWS_SM121 = 640
 # (us, widen / block-scaled): 4096 rows 7175 / 5833, 1024 5012 / 4794; the
 # layer outputs match the widening kernel's in all but ~1e-4 of BF16 values.
 MXFP4_STREAM_QMMA = True
+# The FP8 stream gate/up of W8A8 programs: block-scaled E4M3 x E4M3 MMAs
+# (False: the W8A16 widening kernel everywhere, as ``prefill="w8a16"``).
+FP8_STREAM_QMMA = True
 # Column groups (8 columns each) per CTA of the decode gate/up GEMV: one for
 # single-row programs (GB10, us, interleaved x3, 4 groups -> 1: MiMo TP4
 # 236 -> 230, GLM TP4 347 -> 341, MiMo TP2 450 -> 445; bitwise equal; the
 # CTAs even out over the 48 SMs), four above (4 and 16 rows: within noise).
 DECODE_GATE_UP_GROUPS = 4
+# CTAs of the in-program BF16 -> wire row quantizer (grid-stride over rows).
+_QUANT_MAX_CTAS = 512
 
 
 # NVFP4 live rows above which ``auto`` takes the stream route (BF16 or wire
@@ -125,18 +155,40 @@ def _gate_up_groups(tile_rows: int) -> int:
     return 1 if int(tile_rows) == 1 else DECODE_GATE_UP_GROUPS
 
 
-def _streams(wire: bool, weights: str = "fp8") -> bool:
-    """``auto`` streams wire input on GB10 (SM121, weight-bandwidth bound);
-    SM120 (RTX PRO 6000) keeps the grouped GEMM it was measured with. MXFP4
-    weights have only the streaming large route (wire input), on both."""
+def _sm121() -> bool:
+    return tuple(torch.cuda.get_device_capability()) == (12, 1)
+
+
+# Large-row forms of FP8 programs (``compile_fp8_moe_aot(prefill=...)``).
+PREFILL_FORMS = ("auto", "w8a8", "w8a16")
+
+
+def _w8a8(wire: bool, weights: str, prefill: str) -> bool:
+    """FP8 programs whose large route is the W8A8 stream: wire input unless
+    ``prefill="w8a16"``; BF16 input only with ``prefill="w8a8"`` (its rows are
+    then quantized to wire rows: measurably less exact than BF16 rows)."""
+    if prefill not in PREFILL_FORMS:
+        raise ValueError(f"prefill is one of {PREFILL_FORMS}")
+    if weights != "fp8" or prefill == "w8a16":
+        return False
+    return bool(wire) or prefill == "w8a8"
+
+
+def _streams(wire: bool, weights: str = "fp8", prefill: str = "auto") -> bool:
+    """Whether ``auto``'s large route is ``stream``: MXFP4 weights (wire
+    input; their only large route), NVFP4 (BF16 or wire input), W8A8 FP8
+    programs (``_w8a8``), and W8A16 FP8 wire input on GB10 (weight-bandwidth
+    bound); otherwise the grouped GEMM SM120 was measured with."""
     if weights == "mxfp4":
         return bool(wire)
     if weights in ("nvfp4", "nvfp4a4"):
         return True
-    return bool(wire) and tuple(torch.cuda.get_device_capability()) == (12, 1)
+    if _w8a8(wire, weights, prefill):
+        return True
+    return bool(wire) and _sm121()
 
 
-def auto_large_rows(wire: bool, weights: str = "fp8") -> int:
+def auto_large_rows(wire: bool, weights: str = "fp8", prefill: str = "auto") -> int:
     """Live-row threshold of ``auto``'s large route (``stream`` or ``prefill``)."""
     if weights == "nvfp4":
         return AUTO_NVFP4_STREAM_ROWS
@@ -144,13 +196,25 @@ def auto_large_rows(wire: bool, weights: str = "fp8") -> int:
         gb10 = tuple(torch.cuda.get_device_capability()) == (12, 1)
         return AUTO_NVFP4A4_STREAM_ROWS_SM121 if gb10 else AUTO_NVFP4A4_STREAM_ROWS
     if weights == "mxfp4":
-        gb10 = tuple(torch.cuda.get_device_capability()) == (12, 1)
-        return AUTO_MXFP4_STREAM_ROWS_SM121 if gb10 else AUTO_MXFP4_STREAM_ROWS
-    return AUTO_STREAM_ROWS if _streams(wire) else AUTO_PREFILL_ROWS
+        return AUTO_MXFP4_STREAM_ROWS_SM121 if _sm121() else AUTO_MXFP4_STREAM_ROWS
+    if _w8a8(wire, weights, prefill):
+        return AUTO_W8A8_STREAM_ROWS_SM121 if _sm121() else AUTO_W8A8_STREAM_ROWS_SM120
+    return AUTO_STREAM_ROWS if _streams(wire, weights, prefill) else AUTO_PREFILL_ROWS
 
 
-def _large_route(wire: bool, weights: str = "fp8") -> str:
-    return "stream" if _streams(wire, weights) else "prefill"
+def _large_route(wire: bool, weights: str = "fp8", prefill: str = "auto") -> str:
+    return "stream" if _streams(wire, weights, prefill) else "prefill"
+
+
+def prefill_forms(g: "Fp8MoeGeometry", max_rows: int, wire: bool = True) -> list[str]:
+    """The ``prefill`` forms besides "auto" whose program of ``g`` at capacity
+    ``max_rows`` differs from the "auto" one (packages carry those too)."""
+    def policy(prefill):
+        return _large_route(wire, g.kind, prefill), auto_large_rows(wire, g.kind, prefill), _w8a8(wire, g.kind, prefill)
+
+    base = policy("auto")
+    return [form for form in PREFILL_FORMS[1:] if policy(form) != base
+            and int(max_rows) > min(base[1], policy(form)[1])]
 
 
 @dataclass(frozen=True)
@@ -255,7 +319,7 @@ def _grouped_rows(g: Fp8MoeGeometry, route: str, rows: int) -> int:
     return TILE_M * (-(-pairs // TILE_M) + min(g.experts, pairs))
 
 
-def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
+def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True) -> list[int]:
     rows = max(int(rows), 1)
     if route == "stream" and g.activations == "a4":
         pairs = rows * g.top_k
@@ -292,7 +356,7 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
             pairs * 4,                                 # pair_pos
             stream_max_tiles(g.experts, pairs) * STREAM_TILE_M * g.slice * 2,  # SwiGLU, chunk-padded rows
             pairs * g.hidden * 2,                      # down output
-        ]
+        ] + ([] if wire else [rows * (g.hidden + g.hidden // 32)])  # BF16 input: its wire rows
     grouped = _grouped_rows(g, route, rows)
     act_rows = rows if route == "decode" else grouped
     return [
@@ -305,7 +369,7 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int) -> list[int]:
     ]
 
 
-def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8") -> str:
+def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8", prefill: str = "auto") -> str:
     """``auto`` compiles only the GEMV when the capacity never reaches the large
     route (always, for BF16-input MXFP4 packages: their only large route
     streams wire rows); MXFP4 and NVFP4 have no grouped-GEMM ``prefill``
@@ -317,15 +381,17 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8")
             raise ValueError("MXFP4 experts have no prefill route (use stream)")
         if route == "auto" and not wire:
             return "decode"
-    return "decode" if route == "auto" and int(max_rows) <= auto_large_rows(wire, weights) else route
+    large = auto_large_rows(wire, weights, prefill)
+    return "decode" if route == "auto" and int(max_rows) <= large else route
 
 
-def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True) -> int:
-    route = _resolve(route, rows, wire, g.kind)
+def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
+                          prefill: str = "auto") -> int:
+    route = _resolve(route, rows, wire, g.kind, prefill)
     if route == "auto":
-        return max(fp8_moe_scratch_bytes(g, "decode", rows, wire),
-                   fp8_moe_scratch_bytes(g, _large_route(wire, g.kind), rows, wire))
-    return sum(_align(b) for b in _regions(g, route, rows))
+        return max(fp8_moe_scratch_bytes(g, "decode", rows, wire, prefill),
+                   fp8_moe_scratch_bytes(g, _large_route(wire, g.kind, prefill), rows, wire, prefill))
+    return sum(_align(b) for b in _regions(g, route, rows, wire))
 
 
 @cute.jit
@@ -418,10 +484,14 @@ class _StreamRoute:
     """The ``stream`` route: compact expert groups in 128-row chunks, streaming
     gate/up (FP8 wire rows, SwiGLU fused) and down GEMMs, route combine."""
 
-    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool):
-        if not wire:
-            raise ValueError("the stream route takes FP8 K32 wire rows")
-        self.g = g
+    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool, prefill: str = "auto"):
+        if not wire and g.weights != "fp8":
+            raise ValueError("the MXFP4 stream route takes FP8 K32 wire rows")
+        self.g, self.wire = g, bool(wire)
+        # BF16 input: the rows are first quantized to FP8 K32 wire rows (the
+        # coordinator's expert-input rule: UE8M0 per 32, amax floor 1e-4).
+        self.quant = None if wire else _MXFP8RowsQuantLaunch(
+            g.hidden, BFloat16, _WARP_SUBGROUP_WIDTH, _QUANT_THREADS, 32, False, 1e-4, wire_rows=True)
         h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
         self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
@@ -431,12 +501,13 @@ class _StreamRoute:
                                              qmma=MXFP4_STREAM_QMMA)
             self.down = StreamMxfp4Down(hidden=h, inter=i, experts=e)
         else:
-            self.gate_up = StreamFp8GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
+            self.gate_up = StreamFp8GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+                                           qmma=FP8_STREAM_QMMA and prefill != "w8a16")
             self.down = StreamFp8Down(hidden=h, inter=i, experts=e)
         self.combine = MoeCombine(hidden=h, top_k=k)
 
     def key(self) -> tuple:
-        return ("stream", self.max_tiles, self.gate_up.key(), self.down.key(), self.combine.key())
+        return ("stream", self.max_tiles, self.wire, self.gate_up.key(), self.down.key(), self.combine.key())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
@@ -454,6 +525,18 @@ class _StreamRoute:
         act_at = pair_pos_at + _al(Int64(pairs) * Int64(4))
         y_at = act_at + _al(Int64(max_tiles) * Int64(STREAM_TILE_M * 2 * g.slice))
         ptr = lambda dtype, at: cute.make_ptr(dtype, at, cute.AddressSpace.gmem, assumed_align=16)  # noqa: E731
+        rows_x = x
+        if cutlass.const_expr(not self.wire):
+            wire_at = y_at + _al(Int64(pairs) * Int64(g.hidden * 2))
+            # One warp quantizes 8 K32 groups of a row (subgroups of 4 lanes); grid-stride over rows.
+            tasks = rows * Int32((g.hidden // 32 + 7) // 8)
+            grid = (tasks + Int32(_QUANT_THREADS // 32 - 1)) // Int32(_QUANT_THREADS // 32)
+            if grid > Int32(_QUANT_MAX_CTAS):
+                grid = Int32(_QUANT_MAX_CTAS)
+            self.quant(cute.make_ptr(cutlass.BFloat16, Int64(x.toint()), cute.AddressSpace.gmem, assumed_align=16),
+                       ptr(cutlass.Uint32, wire_at), ptr(cutlass.Uint8, wire_at + Int64(g.hidden)),
+                       ptr(cutlass.Uint8, wire_at), rows, Int32(g.hidden), grid, stream)
+            rows_x = ptr(cutlass.Uint8, wire_at)
         meta = ptr(cutlass.Int32, base)
         pair_row = ptr(cutlass.Int32, pair_row_at)
         pair_pos = ptr(cutlass.Int32, pair_pos_at)
@@ -461,7 +544,7 @@ class _StreamRoute:
         y = ptr(cutlass.BFloat16, y_at)
         ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
         self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
-        self.gate_up(x, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream)
+        self.gate_up(rows_x, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream)
         self.down(act, meta, w2, s2, y, max_tiles, stream)
         self.combine(y, pair_pos, weights, out, rows, stream)
 
@@ -584,21 +667,24 @@ class _StreamNvfp4A4Route:
         self.combine(y, pair_pos, weights, out, rows, stream)
 
 
-def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool):
+def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto"):
     if route == "stream" and g.activations == "a4":
         return _StreamNvfp4A4Route(g, max_rows, wire)
     if route == "stream" and g.weights == "nvfp4":
         return _StreamNvfp4Route(g, max_rows, wire)
-    return _StreamRoute(g, max_rows, wire) if route == "stream" else _Route(g, route, max_rows, wire)
+    if route == "stream":
+        return _StreamRoute(g, max_rows, wire, prefill)
+    return _Route(g, route, max_rows, wire)
 
 
 class _Fp8Moe:
-    def __init__(self, g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool):
+    def __init__(self, g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto"):
         self.route = route
-        self.threshold = auto_large_rows(wire, g.kind)
+        self.threshold = auto_large_rows(wire, g.kind, prefill)
         self.decode = _Route(g, "decode", max_rows, wire) if route in ("decode", "auto") else None
-        large = _large_route(wire, g.kind) if route == "auto" else route
-        self.prefill = _make_route(g, large, max_rows, wire) if route in ("prefill", "stream", "auto") else None
+        large = _large_route(wire, g.kind, prefill) if route == "auto" else route
+        self.prefill = (_make_route(g, large, max_rows, wire, prefill)
+                        if route in ("prefill", "stream", "auto") else None)
 
     def key(self) -> tuple:
         return (self.threshold,) + tuple(part.key() if part is not None else None
@@ -619,14 +705,16 @@ class _Fp8Moe:
                 self.prefill(x, ids, weights, w1, s1, w3, s3, w2, s2, out, scratch, rows, stream)
 
 
-def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: bool = True) -> AotProgram:
-    """Routed FP8 experts of ``g`` for ``rows <= max_rows``; see the module docstring."""
+def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: bool = True,
+                        prefill: str = "auto") -> AotProgram:
+    """Routed FP8 experts of ``g`` for ``rows <= max_rows``; see the module docstring
+    (``prefill``: the large-row form of FP8 programs, "auto", "w8a8" or "w8a16")."""
     if route not in ("decode", "prefill", "stream", "auto"):
         raise ValueError("route is 'decode', 'prefill', 'stream' or 'auto'")
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
-    requested, route = route, _resolve(route, max_rows, wire, g.kind)
-    launch = _Fp8Moe(g, route, max_rows, wire)
+    requested, route = route, _resolve(route, max_rows, wire, g.kind, prefill)
+    launch = _Fp8Moe(g, route, max_rows, wire, prefill)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
     x = (Operand("x", torch.uint8, f"[rows,{h + h // 32}]", note="FP8 K32 wire rows") if wire
          else Operand("x", torch.bfloat16, f"[rows,{h}]"))
@@ -674,7 +762,8 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         key=launch.key(),
         geometry={"requested_route": requested, "hidden": h, "experts": e, "top_k": k, "intermediate": g.intermediate, "tp": g.tp,
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
-                  "wire": bool(wire), "weights": g.weights, "activations": g.activations},
-        scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire)},
+                  "wire": bool(wire), "weights": g.weights, "activations": g.activations,
+                  "prefill": prefill},
+        scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire, prefill)},
         doc=__doc__,
     )
