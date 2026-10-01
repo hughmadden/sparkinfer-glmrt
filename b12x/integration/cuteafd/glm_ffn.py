@@ -25,6 +25,23 @@ the previous residual add, and the final ``model.norm``)::
 
 ``hidden = bf16(bf16(silu(gate)) * up)``, the reference's rounding points.
 
+``compile_glm_ffn_aot(g, inter=I, max_rows=R, fp8_only="prefill", tensor_scales=True)``:
+the prefill MLP over ModelOpt per-tensor FP8 weights (``_tensor_fp8``: static
+W8A8 with the checkpoint's ``input_scale`` and ``weight_scale``)::
+
+    x                 bf16 [rows,H]   in
+    w_gate_up_fp8     fp8  [2I,H]     in    cat(gate_proj, up_proj) E4M3 bytes
+    w_gate_up_tscale  f32  [4]        in    [gate/up input_scale, alpha_gate, alpha_up, 0]
+    w_down_fp8        fp8  [H,I]      in
+    w_down_tscale     f32  [4]        in    [down input_scale, alpha_down, 0, 0]
+    out               bf16 [rows,H]   out
+    scratch           u8              x E4M3 [rows,H], gate and up BF16 [rows,I] each,
+                                      hidden E4M3 [rows,I]
+    rows              int32
+
+``alpha = input_scale * weight_scale`` (FP32); gate and up run as two GEMMs so
+each keeps its own weight scale exactly.
+
 ``compile_glm_router_scores_aot(g)``: FP32 router logits ``x @ gate^T``
 (``F.linear`` of FP32-promoted BF16 operands); the sigmoid, bias, top-8 and
 x2.5 stay native::
@@ -53,6 +70,7 @@ from ._common import GLM53, AotProgram, GLMGeometry, Operand, Scalar, compile_pr
 from ._fp8_weights import FP8_GEMV_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
     w8_scalars
 from ._glm_kernels import GlmAddRmsNorm, GlmSwiGLU
+from ._tensor_fp8 import ALPHA0, ALPHA1
 
 __all__ = [
     "compile_glm_expert_input_quant_aot",
@@ -185,6 +203,74 @@ class _FfnW8Prefill(_FfnW8):
                   stream)
 
 
+class _FfnTensorW8:
+    """The prefill SwiGLU MLP over per-tensor FP8 weights (see the module docstring)."""
+
+    def __init__(self, g: GLMGeometry, inter: int, max_rows: int):
+        from ._tensor_fp8 import QuantRowsStatic, SwiGLUStaticFp8, TensorFp8Gemm
+
+        self.h, self.i = g.hidden, int(inter)
+        self.quant = QuantRowsStatic(self.h)
+        # 128x128 tiles, 128-wide K (SM120 at 325 W, I = 12288, whole MLP, us at 333 / 1024 / 4096
+        # rows: 453 / 870 / 2851; the 4096-row plan's (128, 64) / 64-K picks 1163 / 862 / 3025;
+        # block W8A8 724 / 962 / 4044).
+        self.gate_up = TensorFp8Gemm(self.i, self.h, max_rows, tile_k=128, tile=(128, 128))
+        self.swiglu = SwiGLUStaticFp8(self.i)
+        self.down = TensorFp8Gemm(self.h, self.i, max_rows, tile_k=128, tile=(128, 128))
+
+    def key(self) -> tuple:
+        return ("tensor_w8", self.h, self.i, self.quant.key(), self.gate_up.key(), self.swiglu.key(),
+                self.down.key())
+
+    def scratch_bytes(self, rows: int) -> int:
+        rows = max(int(rows), 1)
+        return _align(rows * self.h) + 2 * _align(rows * self.i * 2) + _align(rows * self.i)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_gate_up_fp8: cute.Pointer, w_gate_up_tscale: cute.Pointer,
+                 w_down_fp8: cute.Pointer, w_down_tscale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        gmem = cute.AddressSpace.gmem
+        xq = Int64(scratch.toint())
+        gate = xq + _align_i64(Int64(rows) * Int64(self.h))
+        up = gate + _align_i64(Int64(rows) * Int64(2 * self.i))
+        hq = up + _align_i64(Int64(rows) * Int64(2 * self.i))
+        gu_scales = Int64(w_gate_up_tscale.toint())
+        down_scales = Int64(w_down_tscale.toint())
+        self.quant(x, cute.make_ptr(cutlass.Float8E4M3FN, xq, gmem, assumed_align=16), w_gate_up_tscale, rows,
+                   stream)
+        w_gu = Int64(w_gate_up_fp8.toint())
+        self.gate_up(xq, w_gu, gu_scales + Int64(4 * ALPHA0), gate, rows, stream)
+        self.gate_up(xq, w_gu + Int64(self.i * self.h), gu_scales + Int64(4 * ALPHA1), up, rows, stream)
+        self.swiglu(cute.make_ptr(cutlass.BFloat16, gate, gmem, assumed_align=16),
+                    cute.make_ptr(cutlass.BFloat16, up, gmem, assumed_align=16),
+                    cute.make_ptr(cutlass.Float8E4M3FN, hq, gmem, assumed_align=16), w_down_tscale, rows, stream)
+        self.down(hq, Int64(w_down_fp8.toint()), down_scales + Int64(4 * ALPHA0), Int64(out.toint()), rows, stream)
+
+
+def _compile_glm_ffn_tensor_w8(g: GLMGeometry, inter: int, max_rows: int) -> AotProgram:
+    from ._tensor_fp8 import tensor_scales_operand
+
+    launch = _FfnTensorW8(g, inter, int(max_rows))
+    h, i = g.hidden, int(inter)
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{h}]"),
+        Operand("w_gate_up_fp8", torch.float8_e4m3fn, f"[{2 * i},{h}]", note="cat(gate_proj, up_proj) E4M3"),
+        tensor_scales_operand("w_gate_up"),
+        Operand("w_down_fp8", torch.float8_e4m3fn, f"[{h},{i}]", note="down_proj E4M3"),
+        tensor_scales_operand("w_down"),
+        Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+        Operand("scratch", torch.uint8, "[ffn_scratch_bytes]", "scratch"),
+    )
+    return compile_program(
+        launch, name="glm_ffn", operands=operands, scalars=(Scalar("rows"),),
+        key=(int(max_rows), "tensor", launch.key()),
+        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": "tensor", "mode": "prefill"},
+        scratch={"scratch": launch.scratch_bytes},
+        doc=__doc__,
+    )
+
+
 def _compile_glm_ffn_w8(g: GLMGeometry, inter: int, max_rows: int, mode: str) -> AotProgram:
     prefill = mode == "prefill"
     launch = (_FfnW8Prefill if prefill else _FfnW8Decode)(g, inter, int(max_rows) if prefill else None)
@@ -206,13 +292,18 @@ def _compile_glm_ffn_w8(g: GLMGeometry, inter: int, max_rows: int, mode: str) ->
 
 
 def compile_glm_ffn_aot(g: GLMGeometry = GLM53, *, inter: int, max_rows: int, fp8: bool = False,
-                        fp8_only: str | None = None) -> AotProgram:
+                        fp8_only: str | None = None, tensor_scales: bool = False) -> AotProgram:
     """SwiGLU MLP of intermediate ``inter`` for ``rows <= max_rows``; ``fp8``
     adds the decode FP8 weight operands. ``fp8_only`` (``"decode"`` or ``"prefill"``)
     takes the weights as E4M3 + FP32 128x128 scales only, no BF16 copies (see
-    ``glm_attention``'s docstring)."""
+    ``glm_attention``'s docstring). ``tensor_scales`` (prefill only): per-tensor FP8 weights,
+    static W8A8 (see the module docstring)."""
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
+    if tensor_scales:
+        if fp8_only != "prefill":
+            raise ValueError("tensor_scales programs are prefill programs (fp8_only='prefill')")
+        return _compile_glm_ffn_tensor_w8(g, inter, max_rows)
     if fp8_only is not None:
         return _compile_glm_ffn_w8(g, inter, max_rows, check_w8_mode(fp8_only))
     launch = (_FfnFp8 if fp8 else _Ffn)(g, inter, fp8)
