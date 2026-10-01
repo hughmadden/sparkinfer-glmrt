@@ -114,6 +114,11 @@ AUTO_NVFP4_STREAM_ROWS = 2048
 # Qwen 3.8 TP1 512 2334 / 1430, 4096 6475 / 2323; GLM Flash TP4 wire 512
 # 975 / 1218, 1024 1585 / 1302, 4096 5446 / 1994.
 AUTO_NVFP4A4_STREAM_ROWS = 512
+# GB10 (SM121, us, wire input, W4A16 GEMV / W4A16 stream / W4A4 stream): GLM 5.3
+# Flash TP4 1024 rows 7303 / 9353 / 7713, 2048 11646 / 10800 / 8642, 4096
+# 21077 / 14439 / 10752; GLM 5.3 TP6 1024 8906 / 11279 / 8244; Qwen 3.8 TP3
+# 2048 5359 / 8179 / 5679, 4096 9817 / 10268 / 7193.
+AUTO_NVFP4A4_STREAM_ROWS_SM121 = 1024
 
 
 def _gate_up_groups(tile_rows: int) -> int:
@@ -136,7 +141,8 @@ def auto_large_rows(wire: bool, weights: str = "fp8") -> int:
     if weights == "nvfp4":
         return AUTO_NVFP4_STREAM_ROWS
     if weights == "nvfp4a4":
-        return AUTO_NVFP4A4_STREAM_ROWS
+        gb10 = tuple(torch.cuda.get_device_capability()) == (12, 1)
+        return AUTO_NVFP4A4_STREAM_ROWS_SM121 if gb10 else AUTO_NVFP4A4_STREAM_ROWS
     if weights == "mxfp4":
         gb10 = tuple(torch.cuda.get_device_capability()) == (12, 1)
         return AUTO_MXFP4_STREAM_ROWS_SM121 if gb10 else AUTO_MXFP4_STREAM_ROWS
