@@ -8,6 +8,10 @@ heads, ``G`` KV heads of the kind, ``R = G * 320`` BF16 elements per KV record
 are BF16 (the checkpoint's FP8 blocks times their FP32 scales, dequantized at
 load; ``o_proj`` is stored BF16). Projections are ``RoutedBf16Projection``
 (skinny GEMV for few rows, TMA tensor-core GEMM above; FP32 accumulation).
+With ``fp8_only`` (the exported producers) ``w_qkv`` is ``w_qkv_fp8`` E4M3 +
+FP32 per-row x 128-K scales only (``w_qkv_scale [W, K/128]`` in decode programs,
+``w_qkv_kscale [K/128, W]`` in prefill programs; ``mimo_w8``: decode GEMVs to 32
+rows then W8A16; prefill W8A8 or W8A16 on the ``fp8_rows`` switch).
 Scratch is laid out from the live row count (size it with ``rows =
 max_rows``); regions start 1024-byte aligned.
 
@@ -185,10 +189,102 @@ class _ProducerFp8(_Producer):
         self.post(qkv, positions, cos_sin, kv_slots, query, kv_cache, rows, stream)
 
 
-def compile_mimo_producer_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, max_rows: int, fp8: bool = False):
+def mimo_w8(n: int, k: int, prefill_rows: int | None):
+    """An ``Fp8Projection`` over a per-row x 128-K scaled E4M3 weight (MiMo's FP8 tensors: the
+    checkpoint's E4M3 bytes with its 128x128 or per-head grid expanded per row; decode programs
+    take the scales row major, ``{w}_scale [N, K/128]``, prefill programs K-block major,
+    ``{w}_kscale [K/128, N]``): decode rows run the 16-row GEMV, the two-tile GEMV up to
+    ``MIMO_FP8_ROWS`` and the W8A16 TMA GEMM above; prefill rows run W8A8 (``fp8_rows`` nonzero)
+    or W8A16. (A K-block-major decode GEMV reads its scales one cache line per K block: SM120,
+    16 rows of 14848x4096 back to back over 40 weights, 40.5 -> 48.7 us.)"""
+    from ._fp8_weights import Fp8Projection, gemv_warps
+
+    warps, groups = FP8_GEMV_CONFIG.get((n, k), (gemv_warps(k), 4))
+    return Fp8Projection(n, k, prefill_rows=prefill_rows, row_scales=True, gemv_rows=FP8_ROWS,
+                         wide_rows=MIMO_FP8_ROWS, warps=warps, groups=groups)
+
+
+def mimo_w8_scratch_bytes(k: int, rows: int, prefill: bool) -> int:
+    from ._glmf_fp8 import quant_scratch_bytes
+
+    return quant_scratch_bytes(k, rows) if prefill else 0
+
+
+class _ProducerW8(_Producer):
+    """The QKV producer over the FP8-only ``w_qkv`` (no BF16 copy)."""
+
+    def __init__(self, g: MiMoGeometry, kind: str, max_rows: int, prefill: bool):
+        super().__init__(g, kind, fp8=False)
+        self.fp8 = "only"
+        self.qkv = mimo_w8(g.qkv_width(kind), g.hidden, int(max_rows) if prefill else None)
+
+    @cute.jit
+    def body(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
+             w_qkv_fp8: cute.Pointer, w_qkv_scale: cute.Pointer, kv_cache: cute.Pointer, query: cute.Pointer,
+             scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        qkv = cute.make_ptr(cutlass.BFloat16, Int64(scratch.toint()), cute.AddressSpace.gmem, assumed_align=16)
+        # The quantized rows follow the projection output (producer_scratch_bytes).
+        qkv_bytes = Int64(rows) * Int64(self.g.qkv_width(self.kind) * 2)
+        qscratch = Int64(scratch.toint()) + (qkv_bytes + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
+        self.qkv(x, w_qkv_fp8, w_qkv_scale, qkv, rows, fp8_rows, qscratch, stream)
+        self.post(qkv, positions, cos_sin, kv_slots, query, kv_cache, rows, stream)
+
+
+class _ProducerW8Decode(_ProducerW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
+                 w_qkv_fp8: cute.Pointer, w_qkv_scale: cute.Pointer, kv_cache: cute.Pointer, query: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.body(x, positions, kv_slots, cos_sin, w_qkv_fp8, w_qkv_scale, kv_cache, query, scratch, rows, fp8_rows,
+                  stream)
+
+
+class _ProducerW8Prefill(_ProducerW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
+                 w_qkv_fp8: cute.Pointer, w_qkv_kscale: cute.Pointer, kv_cache: cute.Pointer, query: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.body(x, positions, kv_slots, cos_sin, w_qkv_fp8, w_qkv_kscale, kv_cache, query, scratch, rows, fp8_rows,
+                  stream)
+
+
+def _compile_mimo_producer_w8(g: MiMoGeometry, kind: str, max_rows: int, mode: str):
+    from ._fp8_weights import check_w8_mode, fp8_only_operands
+
+    prefill = check_w8_mode(mode) == "prefill"
+    launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, kind, max_rows, prefill)
+    h, n, r, w = g.hidden, g.heads, g.record_elems(kind), g.qkv_width(kind)
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{h}]"),
+        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("kv_slots", torch.int64, "[rows]", align=8),
+        Operand("cos_sin", torch.float32, "[P,64]", align=4),
+        *fp8_only_operands("w_qkv", w, h, row_scales=True, prefill=prefill),
+        Operand("kv_cache", torch.bfloat16, f"[slots,{r}]", "inout"),
+        Operand("query", torch.bfloat16, f"[rows,{n},{g.qk_head_dim}]", "out"),
+        Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"),
+    )
+    return compile_program(
+        launch, name=f"mimo_{kind}_producer", operands=operands,
+        scalars=(Scalar("rows"), Scalar("fp8_rows", note="decode: most rows on the FP8 GEMV; prefill: nonzero "
+                                                         "runs W8A8, 0 W8A16")),
+        key=(max_rows, mode, launch.key()),
+        geometry={"kind": kind, "hidden": h, "heads": n, "kv_heads": g.kv_heads(kind), "record_elems": r,
+                  "max_rows": max_rows, "v_scale": g.v_scale, "rope_theta": g.rope_theta(kind), "fp8_weights": "only",
+                  "mode": mode, "qkv_width": w, "k_stride": g.qkv_k_stride},
+        scratch={"scratch": lambda rows: producer_scratch_bytes(g, kind, rows) + mimo_w8_scratch_bytes(h, rows, prefill)},
+        doc=__doc__,
+    )
+
+
+def compile_mimo_producer_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, max_rows: int, fp8: bool = False,
+                              fp8_only: str | None = None):
     """QKV projection, partial RoPE and the KV record write; see the module docstring
-    (``fp8``: the E4M3 ``w_qkv`` copy for decode rows)."""
+    (``fp8``: the E4M3 ``w_qkv`` copy for decode rows; ``fp8_only`` ``"decode"`` /
+    ``"prefill"``: ``w_qkv`` as E4M3 + per-row scales only, see ``mimo_w8``)."""
     max_rows = _check(kind, max_rows)
+    if fp8_only is not None:
+        return _compile_mimo_producer_w8(g, kind, max_rows, fp8_only)
     launch = (_ProducerFp8(g, kind) if fp8 else _Producer(g, kind))
     h, n, r = g.hidden, g.heads, g.record_elems(kind)
     operands = (

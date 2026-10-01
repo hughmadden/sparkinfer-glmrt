@@ -1,7 +1,12 @@
 """Native AOT GLM 5.3 Flash (``glm5_next``) coordinator programs, family ``glmf``.
 
 Weights are BF16 (the EXL3 checkpoints' dense tensors, or FP8 blocks x FP32
-scales dequantized at load); ``H`` hidden 4096, ``D`` KDA width 64 x 128,
+scales dequantized at load), except with ``fp8_only`` (the exported MLA
+producer, o and FFN programs): ``w_qkv_a``, ``w_q_b``, ``w_o``, ``w_gate_up``
+and ``w_down`` are then ``{w}_fp8`` E4M3 + ``{w}_scale`` FP32 128x128 grids
+only (the official FP8 release's tensors), decode rows up to ``fp8_rows`` on
+the FP8 GEMV and W8A16 GEMMs above, prefill W8A8 (``fp8_rows`` nonzero) or
+W8A16; ``H`` hidden 4096, ``D`` KDA width 64 x 128,
 ``P`` KDA in-projection rows ``3D + 2*128 + 64``, ``N`` MLA heads 64, ``Q``
 q_lora 1536, ``E`` routed experts 288. ``rows`` is the live row count
 (``rows <= max_rows``); scratch regions are laid out from it (size with
@@ -252,6 +257,30 @@ def _fp8_scalars(fp8, prefill: bool) -> tuple:
         return (Scalar("rows"), Scalar("fp8_rows", note="prefill: nonzero runs rows past the skinny GEMV "
                                                         "through the block-FP8 GEMMs"))
     return (Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),)
+
+
+def _w8_mode(fp8_only) -> bool | None:
+    """``fp8_only`` of the compile functions: None (the ``fp8`` routes over BF16 + FP8 copies),
+    ``"decode"`` or ``"prefill"`` (E4M3 weights only); returns whether a prefill program."""
+    if fp8_only is None:
+        return None
+    from ._fp8_weights import check_w8_mode
+
+    return check_w8_mode(fp8_only) == "prefill"
+
+
+def _w8(n: int, k: int, prefill_rows: int | None):
+    """An ``Fp8Projection`` over the checkpoint's 128x128 grid with this family's GEMV tuning."""
+    from ._fp8_weights import Fp8Projection, gemv_warps
+
+    warps, groups = FP8_GEMV_CONFIG.get((n, k), (gemv_warps(k), 4))
+    return Fp8Projection(n, k, prefill_rows=prefill_rows, gemv_rows=FP8_ROWS, warps=warps, groups=groups)
+
+
+def _w8_operands(name: str, n: int, k: int, prefill: bool) -> tuple:
+    from ._fp8_weights import fp8_only_operands
+
+    return fp8_only_operands(name, n, k, prefill=prefill)
 
 
 def _batched_warps(max_rows: int) -> int:
@@ -646,11 +675,71 @@ class _MlaProducerFp8(_MlaProducer):
                   w_q_b_scale, w_uk, kv_cache, query, q_resid, scratch, rows, fp8_rows, stream)
 
 
-def compile_glmf_mla_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False) -> AotProgram:
+class _MlaProducerW8(_MlaProducer):
+    """The MLA producer over FP8-only ``q_a|kv_a`` and ``q_b`` (``Fp8Projection``)."""
+
+    def __init__(self, g: GLMFGeometry, max_rows: int, prefill: bool):
+        super().__init__(g, False, max_rows)
+        prefill_rows = int(max_rows) if prefill else None
+        self.qkv_a = _w8(g.qkv_a_width, g.hidden, prefill_rows)
+        self.q_b = _w8(g.heads * g.qk_head_dim, g.q_lora_rank, prefill_rows)
+
+    def key(self) -> tuple:
+        return ("w8",) + super().key()
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, kv_slots: cute.Pointer, w_qkv_a_fp8: cute.Pointer,
+                 w_qkv_a_scale: cute.Pointer, q_a_norm: cute.Pointer, kv_a_norm: cute.Pointer,
+                 w_q_b_fp8: cute.Pointer, w_q_b_scale: cute.Pointer, w_uk: cute.Pointer, kv_cache: cute.Pointer,
+                 query: cute.Pointer, q_resid: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
+                 stream: cuda.CUstream):
+        g = self.g
+        base = Int64(scratch.toint())
+        qkv = _ptr(cutlass.BFloat16, base)
+        q_at = base + _align_i64(Int64(rows) * Int64(g.qkv_a_width * 2))
+        q = _ptr(cutlass.BFloat16, q_at)
+        qscratch = q_at + _align_i64(Int64(rows) * Int64(g.heads * g.qk_head_dim * 2))
+        self.qkv_a(x, w_qkv_a_fp8, w_qkv_a_scale, qkv, rows, fp8_rows, qscratch, stream)
+        self.pack(qkv, q_a_norm, kv_a_norm, kv_slots, kv_slots, _ptr(cutlass.Float32, Int64(kv_slots.toint()), 4),
+                  q_resid, kv_cache, rows, stream)
+        self.q_b(q_resid, w_q_b_fp8, w_q_b_scale, q, rows, fp8_rows, qscratch, stream)
+        self.absorb(q, w_uk, query, rows, stream)
+
+
+def compile_glmf_mla_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False,
+                                  fp8_only: str | None = None) -> AotProgram:
     """MLA producer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds the checkpoint's E4M3 ``w_qkv_a``/``w_q_b`` with 128x128 scales and ``fp8_rows``
-    (``fp8="prefill"``: ``fp8_rows`` switches block-FP8 GEMMs)."""
+    (``fp8="prefill"``: ``fp8_rows`` switches block-FP8 GEMMs). ``fp8_only`` (``"decode"`` /
+    ``"prefill"``) takes ``w_qkv_a``/``w_q_b`` as E4M3 + scales only: decode rows up to
+    ``fp8_rows`` run the GEMV, the rest the W8A16 TMA GEMM; prefill rows run W8A8 when
+    ``fp8_rows`` is nonzero, else W8A16."""
     max_rows = _check_rows(max_rows)
+    w8_prefill = _w8_mode(fp8_only)
+    if w8_prefill is not None:
+        launch = _MlaProducerW8(g, max_rows, w8_prefill)
+        h, q, n = g.hidden, g.q_lora_rank, g.heads
+        operands = (
+            Operand("x", torch.bfloat16, f"[rows,{h}]"),
+            Operand("kv_slots", torch.int64, "[rows]", align=8),
+            *_w8_operands("w_qkv_a", g.qkv_a_width, h, w8_prefill),
+            Operand("q_a_norm", torch.bfloat16, f"[{q}]"),
+            Operand("kv_a_norm", torch.bfloat16, f"[{g.kv_lora_rank}]"),
+            *_w8_operands("w_q_b", n * g.qk_head_dim, q, w8_prefill),
+            Operand("w_uk", torch.bfloat16, f"[{n},{g.kv_lora_rank},{g.qk_nope_dim}]"),
+            Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]", "inout"),
+            Operand("query", torch.bfloat16, f"[rows,{n},{g.latent_dim}]", "out"),
+            Operand("q_resid", torch.bfloat16, f"[rows,{q}]", "out"),
+            Operand("scratch", torch.uint8, "[mla_producer_scratch_bytes]", "scratch"),
+        )
+        return compile_program(
+            launch, name="glmf_mla_producer", operands=operands, scalars=_fp8_scalars(True, w8_prefill),
+            key=(max_rows, "w8", fp8_only, launch.key()),
+            geometry={"hidden": h, "q_lora_rank": q, "heads": n, "max_rows": max_rows, "fp8_weights": "only",
+                      "record_bytes": g.record_bytes, "page_rows": g.page_rows, "eps": g.norm_eps},
+            scratch={"scratch": lambda rows: mla_producer_scratch_bytes(g, rows, w8_prefill)},
+            doc=__doc__,
+        )
     fp8_on, prefill = _fp8_mode(fp8)
     launch = (_MlaProducerFp8 if fp8_on else _MlaProducer)(g, fp8, max_rows)
     h, q, n = g.hidden, g.q_lora_rank, g.heads
@@ -726,15 +815,61 @@ class _GlmfFfnFp8(_GlmfFfn):
                   rows, fp8_rows, stream)
 
 
-def compile_glmf_ffn_aot(g: GLMFGeometry = GLM53_FLASH, *, inter: int, max_rows: int, fp8=False) -> AotProgram:
+class _GlmfFfnW8(_GlmfFfn):
+    def __init__(self, g: GLMFGeometry, inter: int, max_rows: int, prefill: bool):
+        super().__init__(g, inter, False, max_rows)
+        prefill_rows = int(max_rows) if prefill else None
+        self.gate_up = _w8(2 * self.i, self.h, prefill_rows)
+        self.down = _w8(self.h, self.i, prefill_rows)
+
+    def key(self) -> tuple:
+        return ("w8",) + super().key()
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_gate_up_fp8: cute.Pointer, w_gate_up_scale: cute.Pointer,
+                 w_down_fp8: cute.Pointer, w_down_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer,
+                 rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        base = Int64(scratch.toint())
+        gate_up = _ptr(cutlass.BFloat16, base)
+        hidden_at = base + _align_i64(Int64(rows) * Int64(4 * self.i))
+        hidden = _ptr(cutlass.BFloat16, hidden_at)
+        qscratch = hidden_at + _align_i64(Int64(rows) * Int64(2 * self.i))
+        self.gate_up(x, w_gate_up_fp8, w_gate_up_scale, gate_up, rows, fp8_rows, qscratch, stream)
+        self.swiglu(gate_up, hidden, rows, stream)
+        self.down(hidden, w_down_fp8, w_down_scale, out, rows, fp8_rows, qscratch, stream)
+
+
+def compile_glmf_ffn_aot(g: GLMFGeometry = GLM53_FLASH, *, inter: int, max_rows: int, fp8=False,
+                         fp8_only: str | None = None) -> AotProgram:
     """Clamped SwiGLU MLP: the ``glm_ffn`` ABI (x, w_gate_up, w_down, out, scratch; rows); ``fp8`` adds
     the checkpoint's E4M3 weights with 128x128 scales and ``fp8_rows`` (``fp8="prefill"``:
-    ``fp8_rows`` switches block-FP8 GEMMs)."""
+    ``fp8_rows`` switches block-FP8 GEMMs). ``fp8_only`` takes the weights as E4M3 + scales only
+    (see ``compile_glmf_mla_producer_aot``)."""
     from ._glmf_fp8 import quant_scratch_bytes
     from .glm_ffn import ffn_scratch_bytes
 
     max_rows = _check_rows(max_rows)
     i = int(inter)
+    w8_prefill = _w8_mode(fp8_only)
+    if w8_prefill is not None:
+        launch = _GlmfFfnW8(g, i, max_rows, w8_prefill)
+        h = g.hidden
+        operands = (
+            Operand("x", torch.bfloat16, f"[rows,{h}]"),
+            *_w8_operands("w_gate_up", 2 * i, h, w8_prefill),
+            *_w8_operands("w_down", h, i, w8_prefill),
+            Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+            Operand("scratch", torch.uint8, "[ffn_scratch_bytes]", "scratch"),
+        )
+        return compile_program(
+            launch, name="glmf_ffn", operands=operands, scalars=_fp8_scalars(True, w8_prefill),
+            key=(max_rows, "w8", fp8_only, launch.key()),
+            geometry={"hidden": h, "inter": i, "max_rows": max_rows, "swiglu_limit": g.swiglu_limit,
+                      "fp8_weights": "only"},
+            scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows)
+                     + (quant_scratch_bytes(max(h, i), rows) if w8_prefill else 0)},
+            doc=__doc__,
+        )
     fp8_on, prefill = _fp8_mode(fp8)
     launch = (_GlmfFfnFp8 if fp8_on else _GlmfFfn)(g, i, fp8, max_rows)
     h = g.hidden
@@ -996,13 +1131,51 @@ class _GlmfOutputFp8(_GlmfOutput):
         self.body(attn, w_uv, w_o, w_o_fp8, w_o_scale, out, scratch, rows, fp8_rows, stream)
 
 
-def compile_glmf_o_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False) -> AotProgram:
+class _GlmfOutputW8(_GlmfOutput):
+    def __init__(self, g: GLMFGeometry, max_rows: int, prefill: bool):
+        super().__init__(g, False, max_rows)
+        self.o = _w8(g.hidden, self.width, int(max_rows) if prefill else None)
+
+    def key(self) -> tuple:
+        return ("w8",) + super().key()
+
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, w_uv: cute.Pointer, w_o_fp8: cute.Pointer, w_o_scale: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        values = _ptr(cutlass.BFloat16, Int64(scratch.toint()))
+        qscratch = Int64(scratch.toint()) + _align_i64(Int64(rows) * Int64(self.width * 2))
+        self.uv(attn, w_uv, values, rows, stream)
+        self.o(values, w_o_fp8, w_o_scale, out, rows, fp8_rows, qscratch, stream)
+
+
+def compile_glmf_o_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False,
+                       fp8_only: str | None = None) -> AotProgram:
     """``glm_o`` (attn, w_uv, w_o, out, scratch; rows) with the FP8 o_proj switch when ``fp8``
-    (``fp8="prefill"``: ``fp8_rows`` switches the block-FP8 GEMM)."""
+    (``fp8="prefill"``: ``fp8_rows`` switches the block-FP8 GEMM). ``fp8_only`` takes o_proj
+    as E4M3 + scales only (see ``compile_glmf_mla_producer_aot``)."""
     from ._glmf_fp8 import quant_scratch_bytes
     from .glm_attention import o_scratch_bytes
 
     max_rows = _check_rows(max_rows)
+    w8_prefill = _w8_mode(fp8_only)
+    if w8_prefill is not None:
+        launch = _GlmfOutputW8(g, max_rows, w8_prefill)
+        h, n, v = g.hidden, g.heads, g.v_head_dim
+        operands = (
+            Operand("attn", torch.bfloat16, f"[rows,{n},{g.kv_lora_rank}]"),
+            Operand("w_uv", torch.bfloat16, f"[{n},{v},{g.kv_lora_rank}]"),
+            *_w8_operands("w_o", h, n * v, w8_prefill),
+            Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+            Operand("scratch", torch.uint8, "[o_scratch_bytes]", "scratch"),
+        )
+        return compile_program(
+            launch, name="glmf_o", operands=operands, scalars=_fp8_scalars(True, w8_prefill),
+            key=(max_rows, "w8", fp8_only, launch.key()),
+            geometry={"hidden": h, "heads": n, "v_head_dim": v, "max_rows": max_rows, "fp8_weights": "only"},
+            scratch={"scratch": lambda rows: o_scratch_bytes(g, rows)
+                     + (quant_scratch_bytes(n * v, rows) if w8_prefill else 0)},
+            doc=compile_glmf_o_aot.__doc__,
+        )
     fp8_on, prefill = _fp8_mode(fp8)
     launch = (_GlmfOutputFp8 if fp8_on else _GlmfOutput)(g, fp8, max_rows)
     h, n, v = g.hidden, g.heads, g.v_head_dim

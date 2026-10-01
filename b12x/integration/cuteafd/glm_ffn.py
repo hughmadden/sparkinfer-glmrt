@@ -50,7 +50,8 @@ import torch
 from cutlass import Int32, Int64
 
 from ._common import GLM53, AotProgram, GLMGeometry, Operand, Scalar, compile_program
-from ._fp8_weights import fp8_operands, projection
+from ._fp8_weights import FP8_GEMV_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
+    w8_scalars
 from ._glm_kernels import GlmAddRmsNorm, GlmSwiGLU
 
 __all__ = [
@@ -134,11 +135,86 @@ class _FfnFp8(_Ffn):
                   scratch, rows, stream)
 
 
-def compile_glm_ffn_aot(g: GLMGeometry = GLM53, *, inter: int, max_rows: int, fp8: bool = False) -> AotProgram:
+class _FfnW8:
+    """The SwiGLU MLP over FP8-only weights (``Fp8Projection``: decode GEMV / W8A16 TMA, or
+    prefill W8A8 / W8A16 on the ``fp8_rows`` switch)."""
+
+    def __init__(self, g: GLMGeometry, inter: int, prefill_rows: int | None):
+        self.h, self.i = g.hidden, int(inter)
+        self.prefill = prefill_rows is not None
+        self.gate_up = Fp8Projection(2 * self.i, self.h, prefill_rows=prefill_rows)
+        self.down = Fp8Projection(self.h, self.i, prefill_rows=prefill_rows)
+        self.swiglu = GlmSwiGLU(self.i)
+
+    def key(self) -> tuple:
+        return ("w8", self.h, self.i, self.gate_up.key(), self.down.key())
+
+    def scratch_bytes(self, rows: int) -> int:
+        return ffn_scratch_bytes(self.i, rows) + self.gate_up.prefill_scratch_bytes(rows) \
+            + self.down.prefill_scratch_bytes(rows)
+
+    @cute.jit
+    def body(self, x: cute.Pointer, w_gate_up_fp8: cute.Pointer, w_gate_up_scale: cute.Pointer,
+             w_down_fp8: cute.Pointer, w_down_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer,
+             rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        base = Int64(scratch.toint())
+        gate_up = cute.make_ptr(cutlass.BFloat16, base, cute.AddressSpace.gmem, assumed_align=16)
+        hidden_at = base + _align_i64(Int64(rows) * Int64(4 * self.i))
+        hidden = cute.make_ptr(cutlass.BFloat16, hidden_at, cute.AddressSpace.gmem, assumed_align=16)
+        qscratch = hidden_at + _align_i64(Int64(rows) * Int64(2 * self.i))
+        self.gate_up(x, w_gate_up_fp8, w_gate_up_scale, gate_up, rows, fp8_rows, qscratch, stream)
+        self.swiglu(gate_up, hidden, rows, stream)
+        self.down(hidden, w_down_fp8, w_down_scale, out, rows, fp8_rows, qscratch, stream)
+
+
+class _FfnW8Decode(_FfnW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_gate_up_fp8: cute.Pointer, w_gate_up_scale: cute.Pointer,
+                 w_down_fp8: cute.Pointer, w_down_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_gate_up_fp8, w_gate_up_scale, w_down_fp8, w_down_scale, out, scratch, rows,
+                  Int32(FP8_GEMV_ROWS), stream)
+
+
+class _FfnW8Prefill(_FfnW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_gate_up_fp8: cute.Pointer, w_gate_up_scale: cute.Pointer,
+                 w_down_fp8: cute.Pointer, w_down_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer,
+                 rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_gate_up_fp8, w_gate_up_scale, w_down_fp8, w_down_scale, out, scratch, rows, fp8_rows,
+                  stream)
+
+
+def _compile_glm_ffn_w8(g: GLMGeometry, inter: int, max_rows: int, mode: str) -> AotProgram:
+    prefill = mode == "prefill"
+    launch = (_FfnW8Prefill if prefill else _FfnW8Decode)(g, inter, int(max_rows) if prefill else None)
+    h, i = g.hidden, int(inter)
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{h}]"),
+        *fp8_only_operands("w_gate_up", 2 * i, h, prefill=prefill),
+        *fp8_only_operands("w_down", h, i, prefill=prefill),
+        Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+        Operand("scratch", torch.uint8, "[ffn_scratch_bytes]", "scratch"),
+    )
+    return compile_program(
+        launch, name="glm_ffn", operands=operands, scalars=w8_scalars(prefill),
+        key=(int(max_rows), mode, launch.key()),
+        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": "only", "mode": mode},
+        scratch={"scratch": launch.scratch_bytes},
+        doc=__doc__,
+    )
+
+
+def compile_glm_ffn_aot(g: GLMGeometry = GLM53, *, inter: int, max_rows: int, fp8: bool = False,
+                        fp8_only: str | None = None) -> AotProgram:
     """SwiGLU MLP of intermediate ``inter`` for ``rows <= max_rows``; ``fp8``
-    adds the decode FP8 weight operands."""
+    adds the decode FP8 weight operands. ``fp8_only`` (``"decode"`` or ``"prefill"``)
+    takes the weights as E4M3 + FP32 128x128 scales only, no BF16 copies (see
+    ``glm_attention``'s docstring)."""
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
+    if fp8_only is not None:
+        return _compile_glm_ffn_w8(g, inter, max_rows, check_w8_mode(fp8_only))
     launch = (_FfnFp8 if fp8 else _Ffn)(g, inter, fp8)
     h, i = g.hidden, int(inter)
     operands = (

@@ -10,9 +10,13 @@ powers of two costs 0.025 nats, so these kernels apply them exactly:
     accumulation; reads half the weight bytes of the BF16 GEMV.
 ``TmaFp8Gemm``    the BF16 TMA tensor-core GEMM with E4M3 weight tiles widened
     to ``bf16(w * s)`` in shared memory; bitwise equal to the BF16 kernel over
-    dequantized weights. Measured for prefill (not used by the programs yet).
+    dequantized weights (W8A16; block, per-row or K-block-major per-row scales).
 ``RoutedFp8Projection``  ``MmaFp8Gemv`` up to 16 live rows, the BF16 TMA GEMM
     over the BF16 copy of the weight above.
+``Fp8Projection``  a weight held only as E4M3 + scales (no BF16 copy): decode
+    programs run ``MmaFp8Gemv`` then ``TmaFp8Gemm``; prefill programs W8A8
+    (``BlockFp8Projection``: E4M3 activations per row and 128-K block, the
+    official FP8 releases' served numerics) or ``TmaFp8Gemm`` on a launch switch.
 """
 
 from __future__ import annotations
@@ -33,8 +37,8 @@ from b12x._lib.intrinsics import bf16_mma_m16n8k16_f32, ld_shared_v2_u32, shared
 
 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_stream
 
-__all__ = ["MmaFp8Gemv", "RoutedFp8Projection", "TmaFp8Gemm", "fp8_operands", "fp8_scale_shape", "gemv_warps",
-           "projection"]
+__all__ = ["FP8_GEMV_ROWS", "Fp8Projection", "decode_tile_n", "MmaFp8Gemv", "RoutedFp8Projection", "TmaFp8Gemm", "check_w8_mode",
+           "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps", "projection", "w8_scalars"]
 
 
 def fp8_scale_shape(n: int, k: int) -> tuple[int, int]:
@@ -96,6 +100,144 @@ class _Bf16Projection:
 def projection(n: int, k: int, fp8: bool):
     """A GLM projection with the ``(x, w, w_fp8, scale, out, rows, stream)`` call."""
     return RoutedFp8Projection(n, k) if fp8 else _Bf16Projection(n, k)
+
+
+class Fp8Projection:
+    """``out = x @ dequant(w)^T`` over a weight held only as E4M3 ``[N, K]`` plus FP32 scales
+    (no BF16 copy). ``row_scales``: one scale per output row and 128-wide K block instead of
+    the checkpoint's 128x128 grid (``[N, K/128]`` in decode programs, K-block major
+    ``[K/128, N]`` in prefill programs).
+
+    Decode programs (``prefill_rows`` None): ``MmaFp8Gemv`` for ``rows <= min(fp8_rows,
+    gemv_rows)`` (a 16-row tile, plus a ``wide_rows`` multi-tile GEMV above 16 when given),
+    ``TmaFp8Gemm`` above: W8A16, bitwise the BF16 programs over ``bf16(w * s)`` weights.
+
+    Prefill programs: W8A8 when ``fp8_rows & prefill_mask`` is nonzero (``BlockFp8Projection``:
+    E4M3 activations per row and 128-K block with FP32 ``amax / 448`` scales, the official FP8
+    releases' served numerics), else ``TmaFp8Gemm`` (W8A16). ``qscratch`` holds the quantized
+    rows (``prefill_scratch_bytes``)."""
+
+    def __init__(self, n: int, k: int, *, prefill_rows: int | None = None, row_scales: bool = False,
+                 kmajor: bool = False, gemv_rows: int = 16, wide_rows: int = 0, warps: int | None = None,
+                 groups: int = 4, prefill_mask: int = 0xFF):
+        self.n, self.k = int(n), int(k)
+        self.row_scales = bool(row_scales)
+        # Per-row scales K-block major in decode programs too (one copy serves both).
+        self.kmajor = bool(kmajor) or (self.row_scales and prefill_rows is not None)
+        self.prefill_mask = int(prefill_mask)
+        self.prefill = prefill_rows is not None
+        self.gemv = self.gemv_wide = self.w8a8 = None
+        if self.prefill:
+            from ._glmf_fp8 import BlockFp8Projection
+
+            self.w8a8 = BlockFp8Projection(self.n, self.k, int(prefill_rows), row_scales=self.row_scales)
+            # 128-row tiles: the E4M3 tile is widened once per 128 rows (SM120 at 325 W, 4096 rows,
+            # 6144x16384: 4 warps 3650 us, 8 warps 2779 us; BF16 TMA 128x128 tiles 2244 us).
+            self.w8a16 = TmaFp8Gemm(self.n, self.k, scales="row_kmajor" if self.row_scales else "block",
+                                    compute_warps=8, num_stages=3)
+            self.max_gemv_rows = 0
+        else:
+            warps = gemv_warps(self.k) if warps is None else int(warps)
+            self.gemv = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows), warps=warps, groups=int(groups),
+                                   row_scales=self.row_scales, kmajor=self.kmajor)
+            if int(wide_rows) > int(gemv_rows):
+                self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=int(wide_rows), warps=warps,
+                                            groups=int(groups), row_scales=self.row_scales, kmajor=self.kmajor)
+            self.gemv_rows = int(gemv_rows)
+            self.max_gemv_rows = max(int(gemv_rows), int(wide_rows))
+            tile_n = decode_tile_n(self.n)
+            self.w8a16 = TmaFp8Gemm(self.n, self.k, scales=("row_kmajor" if self.kmajor else "row")
+                                    if self.row_scales else "block", tile_n=tile_n,
+                                    num_stages=4 if tile_n == 128 else 6)
+
+    def key(self) -> tuple:
+        return (self.n, self.k, self.row_scales, self.kmajor, self.prefill_mask, self.max_gemv_rows,
+                None if self.gemv is None else self.gemv.key(),
+                None if self.gemv_wide is None else self.gemv_wide.key(),
+                None if self.w8a8 is None else self.w8a8.key(), self.w8a16.key())
+
+    def prefill_scratch_bytes(self, rows: int) -> int:
+        from ._glmf_fp8 import quant_scratch_bytes
+
+        return quant_scratch_bytes(self.k, rows) if self.prefill else 0
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, fp8_rows: Int32, qscratch: Int64, stream: cuda.CUstream):
+        if cutlass.const_expr(self.prefill):
+            if (fp8_rows & Int32(self.prefill_mask)) != Int32(0):
+                self.w8a8(x, w_fp8, scale, out, qscratch, rows, stream)
+            else:
+                self.w8a16(x, w_fp8, scale, out, rows, stream)
+        else:
+            limit = fp8_rows
+            if limit > Int32(self.max_gemv_rows):
+                limit = Int32(self.max_gemv_rows)
+            if rows <= limit:
+                if cutlass.const_expr(self.gemv_wide is None):
+                    self.gemv(x, w_fp8, scale, out, rows, stream)
+                else:
+                    if rows <= Int32(self.gemv_rows):
+                        self.gemv(x, w_fp8, scale, out, rows, stream)
+                    else:
+                        self.gemv_wide(x, w_fp8, scale, out, rows, stream)
+            else:
+                self.w8a16(x, w_fp8, scale, out, rows, stream)
+
+
+# Most decode rows the FP8-only programs run through the tensor-core GEMV (MmaFp8Gemv's 16-row tile).
+FP8_GEMV_ROWS = 16
+
+
+def decode_tile_n(n: int) -> int:
+    """``TmaFp8Gemm`` N tile for decode steps above the GEMV rows (17-64 rows: a single M tile,
+    so the CTA count is the N tiles): 128 from 16384 outputs, 64 from 4096, else 32. SM120 at
+    325 W, L2-cold, 17/64 rows, us (BF16 TMA -> FP8 128 / chosen): GLM 5.3 o_proj 6144x16384
+    143/145 -> 188/191 / 125/131 (64), q_b 16384x2048 51/53 -> 37/35 (128), q_a|kv_a 2624x6144
+    59/59 -> 74/76 / 37/43 (32), dense down 6144x12288 127/127 -> 145/145 / 94/100 (64)."""
+    n = int(n)
+    if n >= 16384:
+        return 128
+    return 64 if n >= 4096 and n % 64 == 0 else 32
+
+
+def check_w8_mode(mode: str) -> str:
+    """``fp8_only`` of the compile functions: ``"decode"`` or ``"prefill"``."""
+    if mode not in ("decode", "prefill"):
+        raise ValueError(f"fp8_only must be 'decode' or 'prefill', got {mode!r}")
+    return mode
+
+
+def w8_scalars(prefill: bool) -> tuple:
+    """Launch scalars of FP8-only programs: ``rows``, plus the prefill W8A8 switch."""
+    from ._common import Scalar
+
+    if prefill:
+        return (Scalar("rows"), Scalar("fp8_rows", note="prefill: nonzero runs W8A8 (E4M3 activations per "
+                                                        "row and 128-K block), 0 W8A16"))
+    return (Scalar("rows"),)
+
+
+def fp8_only_operands(name: str, n: int, k: int, *, row_scales: bool = False, prefill: bool = False,
+                      kmajor: bool = False) -> tuple:
+    """The ``{name}_fp8`` E4M3 ``[n, k]`` and ``{name}_scale`` FP32 operands of an ``Fp8Projection``:
+    the checkpoint's 128x128 grid ``[ceil(n/128), k/128]``, or with ``row_scales`` one scale per
+    row and 128-K block (``[n, k/128]``; prefill programs, and ``kmajor`` decode programs, take
+    them K-block major as ``{name}_kscale [k/128, n]``)."""
+    from ._common import Operand
+    import torch
+
+    kb = -(-int(k) // 128)
+    if row_scales and (prefill or kmajor):
+        return (Operand(f"{name}_fp8", torch.float8_e4m3fn, f"[{n},{k}]", note="checkpoint E4M3 weight"),
+                Operand(f"{name}_kscale", torch.float32, f"[{kb},{n}]", align=16,
+                        note="per-row x 128-K FP32 scales, K-block major"))
+    if row_scales:
+        shape, note = f"[{n},{kb}]", "per-row x 128-K FP32 scales"
+    else:
+        shape, note = f"[{-(-int(n) // 128)},{kb}]", "checkpoint weight_scale_inv (FP32 128x128 block scales)"
+    return (Operand(f"{name}_fp8", torch.float8_e4m3fn, f"[{n},{k}]", note="checkpoint E4M3 weight"),
+            Operand(f"{name}_scale", torch.float32, shape, align=16 if prefill else 4, note=note))
 
 
 def fp8_operands(name: str, n: int, k: int) -> tuple:
@@ -173,23 +315,34 @@ def _e4m3x8_scaled_bf16(lo, hi, s, *, loc=None, ip=None):
 
 
 class TmaFp8Gemm:
-    """``out = x @ (w * s)^T`` over E4M3 ``w [N, K]`` with FP32 128x128 scales.
+    """``out = x @ (w * s)^T`` over E4M3 ``w [N, K]`` with FP32 scales per 128-wide K block.
 
     The Bf16PrefillKernel pipeline (TMA producer warp, warp MMA m16n8k16,
     FP32 accumulators) with the weight tile fetched as E4M3 (half the bytes).
     After each stage lands, the compute warps widen it to ``bf16(w * s)``
-    into a swizzled BF16 tile (one scale per 128x64 tile) and run the MMAs
-    from it, so results equal the BF16 program over ``bf16(w * s)`` weights.
+    into a swizzled BF16 tile and run the MMAs from it, so results equal the
+    BF16 program over ``bf16(w * s)`` weights (W8A16, bitwise).
+
+    ``scales``: ``"block"`` the checkpoint's 128x128 grid ``[ceil(N/128),
+    K/128]`` (one scale per 128x64 tile); ``"row"`` one scale per output row
+    and K block, ``[N, K/128]``; ``"row_kmajor"`` the same scales K-block
+    major, ``[K/128, N]`` (the block-FP8 prefill GEMM's layout).
     """
 
     tile_k = 64
-    tile_n = 128
     buffer_align_bytes = 1024
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, compute_warps: int = 4,
-                 num_stages: int = 4):
+                 num_stages: int = 4, scales: str = "block", tile_n: int = 128):
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
+        # Narrower N tiles give narrow, long-K projections more CTAs (each widens fewer rows).
+        if int(tile_n) not in (32, 64, 128):
+            raise ValueError("FP8 TMA GEMM tile_n is 32, 64 or 128")
+        self.tile_n = int(tile_n)
+        if scales not in ("block", "row", "row_kmajor"):
+            raise ValueError(f"scales must be block, row or row_kmajor, got {scales!r}")
+        self.scales = scales
         self.num_compute_warps = int(compute_warps)
         self.compute_threads = 32 * self.num_compute_warps
         self.producer_warp = self.num_compute_warps
@@ -204,7 +357,8 @@ class TmaFp8Gemm:
         self.chunks = self.tile_n * self.tile_k // 8 // self.compute_threads
 
     def key(self) -> tuple:
-        return (self.n, self.k, str(self.out_dtype), self.num_compute_warps, self.num_stages)
+        return (self.n, self.k, str(self.out_dtype), self.num_compute_warps, self.num_stages, self.scales,
+                self.tile_n)
 
     def _tiled_mma(self):
         return cute.make_tiled_mma(
@@ -212,6 +366,21 @@ class TmaFp8Gemm:
             (self.num_compute_warps, 1, 1),
             permutation_mnk=(self.num_compute_warps * 16, self.tile_n, 16),
         )
+
+    @cute.jit
+    def _scale(self, scale: cute.Pointer, n_tile: Int32, n: Int32, k_tile: Int32) -> Float32:
+        """The scale of weight row ``n`` of ``n_tile`` at K tile ``k_tile`` (rows past N clamp to
+        the last one: their E4M3 values are TMA zero fill)."""
+        kb = k_tile // Int32(2)
+        if cutlass.const_expr(self.scales == "block"):
+            block = n_tile // Int32(128 // self.tile_n)
+            return _ld_f32(Int64(scale.toint()) + (Int64(block) * Int64(self.k_blocks) + Int64(kb)) * Int64(4))
+        row = n_tile * Int32(self.tile_n) + n
+        if row > Int32(self.n - 1):
+            row = Int32(self.n - 1)
+        if cutlass.const_expr(self.scales == "row"):
+            return _ld_f32(Int64(scale.toint()) + (Int64(row) * Int64(self.k_blocks) + Int64(kb)) * Int64(4))
+        return _ld_f32(Int64(scale.toint()) + (Int64(kb) * Int64(self.n) + Int64(row)) * Int64(4))
 
     def _layouts(self):
         atom = warpgroup.make_smem_layout_atom(
@@ -308,15 +477,16 @@ class TmaFp8Gemm:
             t_ssb = copy_b.partition_S(s_b)
             w_base = shared_ptr_to_u32(storage.sW.data_ptr())
             b_base = shared_ptr_to_u32(storage.sB.data_ptr())
-            scale_row = Int64(scale.toint()) + Int64(n_tile) * Int64(self.k_blocks * 4)
             for k_tile in cutlass.range(self.k_tiles, unroll_full=False):
-                s = _ld_f32(scale_row + Int64(k_tile // Int32(2)) * Int64(4))
+                s = self._scale(scale, n_tile, Int32(0), k_tile)
                 load_pipeline.consumer_wait(consumer_state)
                 stage = w_base + Int32(consumer_state.index) * Int32(self.tile_n * self.tile_k)
                 for i in cutlass.range_constexpr(self.chunks):
                     chunk = Int32(i * self.compute_threads) + Int32(tidx)
                     n = chunk // Int32(self.tile_k // 8)
                     c = chunk % Int32(self.tile_k // 8)
+                    if cutlass.const_expr(self.scales != "block"):
+                        s = self._scale(scale, n_tile, n, k_tile)
                     lo, hi = ld_shared_v2_u32(stage + n * Int32(self.tile_k) + c * Int32(8))
                     v0, v1, v2, v3 = _e4m3x8_scaled_bf16(lo, hi, s)
                     # 128-byte swizzle: 16-byte chunk c of row n sits at chunk c ^ (n % 8).
@@ -411,12 +581,16 @@ class MmaFp8Gemv:
 
     ``row_scales``: the scale grid is ``[N, K/128]`` FP32, one scale per
     output row and 128-wide K block (per-channel or row-block quantization of
-    a BF16 weight); each lane scales its own row's weights.
+    a BF16 weight); each lane scales its own row's weights. ``kmajor``: those
+    per-row scales stored K-block major, ``[K/128, N]``.
     """
 
     def __init__(self, n: int, k: int, *, max_rows: int = 64, warps: int = 4, groups: int = 4,
-                 out_dtype=cutlass.BFloat16, row_scales: bool = False):
+                 out_dtype=cutlass.BFloat16, row_scales: bool = False, kmajor: bool = False):
         self.row_scales = bool(row_scales)
+        self.kmajor = bool(kmajor)
+        if self.kmajor and not self.row_scales:
+            raise ValueError("K-block-major scales are per-row scales")
         self.n, self.k = int(n), int(k)
         self.warps, self.groups = int(warps), int(groups)
         self.cols = 8 * self.groups
@@ -431,7 +605,8 @@ class MmaFp8Gemv:
         self.frags = self.m_tiles * self.groups * 4
 
     def key(self) -> tuple:
-        return (self.n, self.k, self.warps, self.groups, self.m_tiles, str(self.out_dtype), self.row_scales)
+        return (self.n, self.k, self.warps, self.groups, self.m_tiles, str(self.out_dtype), self.row_scales,
+                self.kmajor)
 
     def _storage(self):
         class Storage:
@@ -476,8 +651,11 @@ class MmaFp8Gemv:
         # Scale of (row group gi, K block): one per CTA column block, or per lane row.
         s_rows = self.groups if self.row_scales else 1
         s_first = (n0 + Int64(g)) if self.row_scales else (n0 // Int64(128))
-        s_row = Int64(scale.toint()) + s_first * Int64(self.k_blocks * 4) + (k_begin // Int64(128)) * Int64(4)
-        s_gi = Int64(8 * self.k_blocks * 4)
+        # Byte strides between a lane's scales of consecutive K blocks and row groups.
+        s_kb = Int64(self.n * 4) if self.kmajor else Int64(4)
+        s_gi = Int64(8 * 4) if self.kmajor else Int64(8 * self.k_blocks * 4)
+        s_row = Int64(scale.toint()) + s_first * (Int64(4) if self.kmajor else Int64(self.k_blocks * 4)) \
+            + (k_begin // Int64(128)) * s_kb
         live_tiles = (rows + Int32(15)) // Int32(16)
         per_block = 2 * self.groups * 4
         # Register double buffer: block b+1's weights and scales load while b computes.
@@ -494,7 +672,7 @@ class MmaFp8Gemv:
             if block + 1 < self.blocks:
                 self._load_block(nxt, w_row, Int64(block + 1) * Int64(128))
                 for si in cutlass.range_constexpr(s_rows):
-                    s_nxt[si] = _ld_f32(s_row + Int64(si) * s_gi + Int64(block + 1) * Int64(4))
+                    s_nxt[si] = _ld_f32(s_row + Int64(si) * s_gi + Int64(block + 1) * s_kb)
             for chunk in cutlass.range_constexpr(2):
                 k_off = Int64(block) * Int64(128) + Int64(chunk * 64)
                 bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)

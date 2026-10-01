@@ -3,7 +3,19 @@
 Weights are BF16 (the checkpoint's FP8 128x128 blocks times their FP32
 scales, dequantized at load); every projection is ``RoutedBf16Projection``
 (skinny GEMV up to 8 live rows when N >= 2048, else up to its default; the
-TMA tensor-core GEMM above; FP32 accumulation, BF16 out). ``H`` hidden 6144, ``N`` heads 64, ``Q`` q_lora
+TMA tensor-core GEMM above; FP32 accumulation, BF16 out).
+
+``fp8_only="decode"`` / ``"prefill"`` (the exported programs): every FP8
+checkpoint weight is passed only as ``{w}_fp8`` E4M3 plus ``{w}_scale`` (its
+128x128 grid) in place of the BF16 operand, and ``w_uk`` / ``w_uv`` as
+``{w}_fp8`` per-head E4M3 slices of ``kv_b_proj`` with ``{w}_scale`` one FP32
+scale per weight row and 64-wide K tile (``[N,512,3]``, ``[N,256,8]``). Decode
+programs run the FP8 GEMV up to 16 rows and W8A16 GEMMs above (bitwise the
+BF16 programs over the dequantized weights); prefill programs take a second
+scalar ``fp8_rows`` (nonzero: W8A8, E4M3 activations per row and 128-K block;
+0: W8A16) and read ``q_a|kv_a`` with per-row scales K-block major
+(``w_qkv_a_kscale [48, 2624]``). ``w_ik`` stays BF16 (``wk`` FP8 and
+``weights_proj`` BF16 in the release). ``H`` hidden 6144, ``N`` heads 64, ``Q`` q_lora
 2048, ``D`` qk_nope 192, ``V`` v_head 256, ``I`` index heads 32; ``rows``
 live tokens (``rows <= max_rows``); ``P`` positions in the RoPE table.
 Scratch is laid out from the live row count (size it with ``rows =
@@ -68,8 +80,10 @@ import torch
 from cutlass import Int32, Int64
 
 from ._common import GLM53, GLMGeometry, Operand, Scalar, compile_program
-from ._fp8_weights import fp8_operands, projection
-from ._glm_kernels import BatchedBf16Gemm, GlmIndexPost, GlmQueryRope, GlmRankNormPackKV, glm_projection
+from ._fp8_weights import FP8_GEMV_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
+    w8_scalars
+from ._glm_kernels import (BatchedBf16Gemm, BatchedFp8Gemm, GlmIndexPost, GlmQueryRope, GlmRankNormPackKV,
+                           glm_projection)
 
 __all__ = [
     "compile_glm_index_producer_aot",
@@ -258,9 +272,265 @@ class _OutputFp8(_Output):
         self.body(attn, w_uv, w_o, w_o_fp8, w_o_scale, out, scratch, rows, stream)
 
 
-def compile_glm_producer_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool = False):
+# ---------------------------------------------------------------------------
+# FP8-only weights (``fp8_only``: no BF16 copies)
+# ---------------------------------------------------------------------------
+
+
+def kv_b_fp8_operands(name: str, g: GLMGeometry) -> tuple:
+    """``w_uk`` / ``w_uv`` as E4M3 per-head slices of ``kv_b_proj`` with one FP32 scale per
+    weight row and 64-wide K tile (the 128x128 grid's value there; heads span 3.5 blocks)."""
+    n, c = g.heads, g.kv_lora_rank
+    if name == "w_uk":
+        shape, scale = f"[{n},{c},{g.qk_nope_dim}]", f"[{n},{c},{g.qk_nope_dim // 64}]"
+    else:
+        shape, scale = f"[{n},{g.v_head_dim},{c}]", f"[{n},{g.v_head_dim},{c // 64}]"
+    return (Operand(f"{name}_fp8", torch.float8_e4m3fn, shape, note="kv_b_proj E4M3, per head"),
+            Operand(f"{name}_scale", torch.float32, scale, align=4,
+                    note="kv_b_proj block scale per weight row and 64-K tile"))
+
+
+def _w8_batched_warps(prefill_rows: int | None) -> int:
+    """MMA warps of the FP8 kv_b GEMMs: 128-row tiles in prefill programs (the E4M3 tile is
+    widened once per 128 rows; SM120 at 325 W, 4096 rows, us: absorb 412 -> 262, values
+    354 -> 269; BF16 with 4 warps 318 and 304), 64 in decode programs."""
+    return 4 if prefill_rows is None else 8
+
+
+def _w8_projection(n: int, k: int, prefill_rows: int | None, row_scales: bool = False) -> Fp8Projection:
+    return Fp8Projection(n, k, prefill_rows=prefill_rows, row_scales=row_scales and prefill_rows is not None)
+
+
+class _ProducerW8:
+    """MLA producer over FP8-only weights. Prefill programs take ``q_a|kv_a`` (2624 rows: the
+    block-FP8 GEMM wants whole 128-row blocks) with per-row scales, K-block major."""
+
+    def __init__(self, g: GLMGeometry, prefill_rows: int | None):
+        self.g = g
+        n, q = g.heads, g.q_lora_rank
+        self.qkv_a = _w8_projection(g.qkv_a_width, g.hidden, prefill_rows, row_scales=True)
+        self.q_b = _w8_projection(n * g.qk_head_dim, q, prefill_rows)
+        self.pack = GlmRankNormPackKV(q_rank=q, eps=g.norm_eps, page_rows=g.page_rows,
+                                      record_bytes=g.record_bytes)
+        self.absorb = BatchedFp8Gemm(
+            n=g.kv_lora_rank, k=g.qk_nope_dim, batch=n, a_row=n * g.qk_head_dim,
+            a_batch=g.qk_head_dim, o_row=n * g.latent_dim, o_batch=g.latent_dim,
+            compute_warps=_w8_batched_warps(prefill_rows))
+        self.rope = GlmQueryRope(heads=n, qk_nope=g.qk_nope_dim, qk_head=g.qk_head_dim,
+                                 latent=g.latent_dim)
+
+    def key(self) -> tuple:
+        return ("w8", self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
+
+    def scratch_bytes(self, rows: int) -> int:
+        return producer_scratch_bytes(self.g, rows) + self.qkv_a.prefill_scratch_bytes(rows)
+
+    @cute.jit
+    def body(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
+             w_qkv_a_fp8: cute.Pointer, w_qkv_a_scale: cute.Pointer, q_a_norm: cute.Pointer,
+             kv_a_norm: cute.Pointer, w_q_b_fp8: cute.Pointer, w_q_b_scale: cute.Pointer,
+             w_uk_fp8: cute.Pointer, w_uk_scale: cute.Pointer, kv_cache: cute.Pointer, query: cute.Pointer,
+             q_resid: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        g = self.g
+        base = Int64(scratch.toint())
+        qkv = cute.make_ptr(cutlass.BFloat16, base, cute.AddressSpace.gmem, assumed_align=16)
+        q_off = base + _align_i64(Int64(rows) * Int64(g.qkv_a_width * 2))
+        q = cute.make_ptr(cutlass.BFloat16, q_off, cute.AddressSpace.gmem, assumed_align=16)
+        qscratch = q_off + _align_i64(Int64(rows) * Int64(g.heads * g.qk_head_dim * 2))
+        self.qkv_a(x, w_qkv_a_fp8, w_qkv_a_scale, qkv, rows, fp8_rows, qscratch, stream)
+        self.pack(qkv, q_a_norm, kv_a_norm, positions, kv_slots, cos_sin, q_resid, kv_cache, rows, stream)
+        self.q_b(q_resid, w_q_b_fp8, w_q_b_scale, q, rows, fp8_rows, qscratch, stream)
+        self.absorb(q, w_uk_fp8, w_uk_scale, query, rows, stream)
+        self.rope(q, positions, cos_sin, query, rows, stream)
+
+
+class _ProducerW8Decode(_ProducerW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
+                 w_qkv_a_fp8: cute.Pointer, w_qkv_a_scale: cute.Pointer, q_a_norm: cute.Pointer,
+                 kv_a_norm: cute.Pointer, w_q_b_fp8: cute.Pointer, w_q_b_scale: cute.Pointer,
+                 w_uk_fp8: cute.Pointer, w_uk_scale: cute.Pointer, kv_cache: cute.Pointer, query: cute.Pointer,
+                 q_resid: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.body(x, positions, kv_slots, cos_sin, w_qkv_a_fp8, w_qkv_a_scale, q_a_norm, kv_a_norm, w_q_b_fp8,
+                  w_q_b_scale, w_uk_fp8, w_uk_scale, kv_cache, query, q_resid, scratch, rows,
+                  Int32(FP8_GEMV_ROWS), stream)
+
+
+class _ProducerW8Prefill(_ProducerW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
+                 w_qkv_a_fp8: cute.Pointer, w_qkv_a_kscale: cute.Pointer, q_a_norm: cute.Pointer,
+                 kv_a_norm: cute.Pointer, w_q_b_fp8: cute.Pointer, w_q_b_scale: cute.Pointer,
+                 w_uk_fp8: cute.Pointer, w_uk_scale: cute.Pointer, kv_cache: cute.Pointer, query: cute.Pointer,
+                 q_resid: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
+                 stream: cuda.CUstream):
+        self.body(x, positions, kv_slots, cos_sin, w_qkv_a_fp8, w_qkv_a_kscale, q_a_norm, kv_a_norm, w_q_b_fp8,
+                  w_q_b_scale, w_uk_fp8, w_uk_scale, kv_cache, query, q_resid, scratch, rows, fp8_rows, stream)
+
+
+class _IndexProducerW8:
+    def __init__(self, g: GLMGeometry, prefill_rows: int | None):
+        self.g = g
+        i = g.index_heads
+        self.wq = _w8_projection(i * 128, g.q_lora_rank, prefill_rows)
+        self.wk = glm_projection(128 + i, g.hidden)
+        self.post = GlmIndexPost(heads=i, eps=g.index_norm_eps,
+                                 weight_scale=float(i) ** -0.5 * 128.0 ** -0.5, page_rows=g.page_rows)
+
+    def key(self) -> tuple:
+        return ("w8", self.wq.key(), self.wk.key(), self.g)
+
+    def scratch_bytes(self, rows: int) -> int:
+        return index_producer_scratch_bytes(self.g, rows) + self.wq.prefill_scratch_bytes(rows)
+
+    @cute.jit
+    def body(self, x: cute.Pointer, q_resid: cute.Pointer, positions: cute.Pointer, index_slots: cute.Pointer,
+             cos_sin: cute.Pointer, w_iq_fp8: cute.Pointer, w_iq_scale: cute.Pointer, w_ik: cute.Pointer,
+             k_norm_w: cute.Pointer, k_norm_b: cute.Pointer, index_cache: cute.Pointer, q_fp8: cute.Pointer,
+             head_weights: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
+             stream: cuda.CUstream):
+        g = self.g
+        base = Int64(scratch.toint())
+        iq = cute.make_ptr(cutlass.BFloat16, base, cute.AddressSpace.gmem, assumed_align=16)
+        kw_off = base + _align_i64(Int64(rows) * Int64(g.index_heads * 128 * 2))
+        kw = cute.make_ptr(cutlass.BFloat16, kw_off, cute.AddressSpace.gmem, assumed_align=16)
+        qscratch = kw_off + _align_i64(Int64(rows) * Int64((128 + g.index_heads) * 2))
+        self.wq(q_resid, w_iq_fp8, w_iq_scale, iq, rows, fp8_rows, qscratch, stream)
+        self.wk(x, w_ik, kw, rows, stream)
+        self.post(iq, kw, positions, index_slots, cos_sin, k_norm_w, k_norm_b, q_fp8, head_weights,
+                  index_cache, rows, stream)
+
+
+class _IndexProducerW8Decode(_IndexProducerW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, q_resid: cute.Pointer, positions: cute.Pointer, index_slots: cute.Pointer,
+                 cos_sin: cute.Pointer, w_iq_fp8: cute.Pointer, w_iq_scale: cute.Pointer, w_ik: cute.Pointer,
+                 k_norm_w: cute.Pointer, k_norm_b: cute.Pointer, index_cache: cute.Pointer, q_fp8: cute.Pointer,
+                 head_weights: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.body(x, q_resid, positions, index_slots, cos_sin, w_iq_fp8, w_iq_scale, w_ik, k_norm_w, k_norm_b,
+                  index_cache, q_fp8, head_weights, scratch, rows, Int32(FP8_GEMV_ROWS), stream)
+
+
+class _IndexProducerW8Prefill(_IndexProducerW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, q_resid: cute.Pointer, positions: cute.Pointer, index_slots: cute.Pointer,
+                 cos_sin: cute.Pointer, w_iq_fp8: cute.Pointer, w_iq_scale: cute.Pointer, w_ik: cute.Pointer,
+                 k_norm_w: cute.Pointer, k_norm_b: cute.Pointer, index_cache: cute.Pointer, q_fp8: cute.Pointer,
+                 head_weights: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
+                 stream: cuda.CUstream):
+        self.body(x, q_resid, positions, index_slots, cos_sin, w_iq_fp8, w_iq_scale, w_ik, k_norm_w, k_norm_b,
+                  index_cache, q_fp8, head_weights, scratch, rows, fp8_rows, stream)
+
+
+class _OutputW8:
+    def __init__(self, g: GLMGeometry, prefill_rows: int | None):
+        self.g = g
+        n, v = g.heads, g.v_head_dim
+        self.uv = BatchedFp8Gemm(n=v, k=g.kv_lora_rank, batch=n, a_row=n * g.kv_lora_rank,
+                                 a_batch=g.kv_lora_rank, o_row=n * v, o_batch=v,
+                                 compute_warps=_w8_batched_warps(prefill_rows))
+        self.o = _w8_projection(g.hidden, n * v, prefill_rows)
+
+    def key(self) -> tuple:
+        return ("w8", self.uv.key(), self.o.key(), self.g)
+
+    def scratch_bytes(self, rows: int) -> int:
+        return o_scratch_bytes(self.g, rows) + self.o.prefill_scratch_bytes(rows)
+
+    @cute.jit
+    def body(self, attn: cute.Pointer, w_uv_fp8: cute.Pointer, w_uv_scale: cute.Pointer, w_o_fp8: cute.Pointer,
+             w_o_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
+             stream: cuda.CUstream):
+        values = cute.make_ptr(cutlass.BFloat16, Int64(scratch.toint()), cute.AddressSpace.gmem,
+                               assumed_align=16)
+        qscratch = Int64(scratch.toint()) + _align_i64(Int64(rows) * Int64(self.g.heads * self.g.v_head_dim * 2))
+        self.uv(attn, w_uv_fp8, w_uv_scale, values, rows, stream)
+        self.o(values, w_o_fp8, w_o_scale, out, rows, fp8_rows, qscratch, stream)
+
+
+class _OutputW8Decode(_OutputW8):
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, w_uv_fp8: cute.Pointer, w_uv_scale: cute.Pointer, w_o_fp8: cute.Pointer,
+                 w_o_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        self.body(attn, w_uv_fp8, w_uv_scale, w_o_fp8, w_o_scale, out, scratch, rows, Int32(FP8_GEMV_ROWS), stream)
+
+
+class _OutputW8Prefill(_OutputW8):
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, w_uv_fp8: cute.Pointer, w_uv_scale: cute.Pointer, w_o_fp8: cute.Pointer,
+                 w_o_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
+                 stream: cuda.CUstream):
+        self.body(attn, w_uv_fp8, w_uv_scale, w_o_fp8, w_o_scale, out, scratch, rows, fp8_rows, stream)
+
+
+def _compile_w8(kind: str, g: GLMGeometry, max_rows: int, mode: str):
+    prefill = check_w8_mode(mode) == "prefill"
+    rows_cap = int(max_rows) if prefill else None
+    h, q, n, i = g.hidden, g.q_lora_rank, g.heads, g.index_heads
+    w8 = lambda name, n_, k_, row=False: fp8_only_operands(name, n_, k_, row_scales=row and prefill,  # noqa: E731
+                                                         prefill=prefill)
+    if kind == "producer":
+        launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, rows_cap)
+        operands = (
+            Operand("x", torch.bfloat16, f"[rows,{h}]"),
+            Operand("positions", torch.int64, "[rows]", align=8),
+            Operand("kv_slots", torch.int64, "[rows]", align=8),
+            Operand("cos_sin", torch.float32, "[P,64]", align=4),
+            *w8("w_qkv_a", g.qkv_a_width, h, row=True),
+            Operand("q_a_norm", torch.bfloat16, f"[{q}]"),
+            Operand("kv_a_norm", torch.bfloat16, "[512]"),
+            *w8("w_q_b", n * g.qk_head_dim, q),
+            *kv_b_fp8_operands("w_uk", g),
+            Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]", "inout"),
+            Operand("query", torch.bfloat16, f"[rows,{n},{g.latent_dim}]", "out"),
+            Operand("q_resid", torch.bfloat16, f"[rows,{q}]", "out"),
+            Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"),
+        )
+        name, geometry = "glm_producer", {"hidden": h, "q_lora_rank": q, "heads": n, "record_bytes": g.record_bytes,
+                                          "page_rows": g.page_rows, "eps": g.norm_eps}
+    elif kind == "index_producer":
+        launch = (_IndexProducerW8Prefill if prefill else _IndexProducerW8Decode)(g, rows_cap)
+        operands = (
+            Operand("x", torch.bfloat16, f"[rows,{h}]"),
+            Operand("q_resid", torch.bfloat16, f"[rows,{q}]"),
+            Operand("positions", torch.int64, "[rows]", align=8),
+            Operand("index_slots", torch.int64, "[rows]", align=8),
+            Operand("cos_sin", torch.float32, "[P,64]", align=4),
+            *w8("w_iq", i * 128, q),
+            Operand("w_ik", torch.bfloat16, f"[{128 + i},{h}]", note="cat(wk, weights_proj): BF16 (mixed in the release)"),
+            Operand("k_norm_w", torch.bfloat16, "[128]"),
+            Operand("k_norm_b", torch.bfloat16, "[128]"),
+            Operand("index_cache", torch.uint8, f"[pages,{g.index_page_bytes}]", "inout"),
+            Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{i},128]", "out"),
+            Operand("head_weights", torch.float32, f"[rows,{i}]", "out"),
+            Operand("scratch", torch.uint8, "[index_producer_scratch_bytes]", "scratch"),
+        )
+        name, geometry = "glm_index_producer", {"hidden": h, "q_lora_rank": q, "index_heads": i,
+                                                "eps": g.index_norm_eps}
+    else:
+        launch = (_OutputW8Prefill if prefill else _OutputW8Decode)(g, rows_cap)
+        operands = (
+            Operand("attn", torch.bfloat16, f"[rows,{n},512]"),
+            *kv_b_fp8_operands("w_uv", g),
+            *w8("w_o", h, n * g.v_head_dim),
+            Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+            Operand("scratch", torch.uint8, "[o_scratch_bytes]", "scratch"),
+        )
+        name, geometry = "glm_o", {"hidden": h, "heads": n, "v_head_dim": g.v_head_dim}
+    geometry.update(max_rows=int(max_rows), fp8_weights="only", mode=mode)
+    return compile_program(
+        launch, name=name, operands=operands, scalars=w8_scalars(prefill), key=(int(max_rows), mode, launch.key()),
+        geometry=geometry, scratch={"scratch": launch.scratch_bytes}, doc=__doc__,
+    )
+
+
+def compile_glm_producer_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool = False,
+                             fp8_only: str | None = None):
     """MLA producer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds the decode FP8 weight operands."""
+    if fp8_only is not None:
+        return _compile_w8("producer", g, max_rows, fp8_only)
     max_rows = _check_rows(max_rows)
     launch = (_ProducerFp8 if fp8 else _Producer)(g, fp8)
     h, q, n = g.hidden, g.q_lora_rank, g.heads
@@ -292,9 +562,12 @@ def compile_glm_producer_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool
     )
 
 
-def compile_glm_index_producer_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool = False):
+def compile_glm_index_producer_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool = False,
+                                   fp8_only: str | None = None):
     """DSA index query/key producer for ``rows <= max_rows``; see the module
     docstring. ``fp8`` adds the decode FP8 ``w_iq`` operands."""
+    if fp8_only is not None:
+        return _compile_w8("index_producer", g, max_rows, fp8_only)
     max_rows = _check_rows(max_rows)
     launch = (_IndexProducerFp8 if fp8 else _IndexProducer)(g, fp8)
     h, q, i = g.hidden, g.q_lora_rank, g.index_heads
@@ -324,9 +597,12 @@ def compile_glm_index_producer_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8
     )
 
 
-def compile_glm_o_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool = False):
+def compile_glm_o_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool = False,
+                      fp8_only: str | None = None):
     """W_UV per head then o_proj for ``rows <= max_rows``; see the module
     docstring. ``fp8`` adds the decode FP8 ``w_o`` operands."""
+    if fp8_only is not None:
+        return _compile_w8("o", g, max_rows, fp8_only)
     max_rows = _check_rows(max_rows)
     launch = (_OutputFp8 if fp8 else _Output)(g, fp8)
     h, n, v = g.hidden, g.heads, g.v_head_dim

@@ -35,11 +35,16 @@ from b12x._lib.intrinsics import (
     fmax_f32,
     fmin_f32,
     ld_global_v4_u32,
+    ld_shared_v2_u32,
     pack_f32x2_to_bfloat2,
+    shared_ptr_to_u32,
     st_global_u32,
     st_global_v4_u32,
+    st_shared_v4_u32,
 )
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo, _ld_cached
+
+from ._fp8_weights import _e4m3x8_scaled_bf16, _ld_f32
 
 FP8_MAX = 448.0
 ROPE_PAIRS = 32
@@ -729,10 +734,172 @@ class BatchedBf16Gemm:
             load_pipeline.producer_tail(producer_state)
 
 
+class BatchedFp8Gemm(BatchedBf16Gemm):
+    """``BatchedBf16Gemm`` over E4M3 weights ``w [batch, N, K]`` with one FP32 scale per weight
+    row and 64-wide K tile (``scale [batch, N, K/64]``): each stage's weight tile lands as
+    E4M3 (half the bytes), the compute warps widen it to ``bf16(w * s)`` in a swizzled BF16
+    tile, then run the same MMAs in the same K order, so results equal ``BatchedBf16Gemm``
+    over the dequantized weights bitwise. Per-row scales carry block grids whose 128-row
+    blocks do not align with the batch slices (GLM ``kv_b_proj``: 448 rows per head)."""
+
+    def key(self) -> tuple:
+        return ("fp8",) + super().key()
+
+    def _fp8_layouts(self):
+        s_a, _ = self._smem_layouts()
+        atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, cutlass.BFloat16, self.tile_k),
+            cutlass.BFloat16)
+        s_b = cute.tile_to_shape(atom, (self.tile_n, self.tile_k), order=(0, 1))
+        s_w = cute.make_layout((self.tile_n, self.tile_k, self.num_stages),
+                               stride=(self.tile_k, 1, self.tile_n * self.tile_k))
+        return s_a, s_b, s_w
+
+    def _fp8_storage(self, s_a, s_b, s_w):
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "mbar_ptr": cute.struct.MemRange[cutlass.Int64, self.num_stages * 2],
+            "sA": cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, cute.cosize(s_a)], self.buffer_align_bytes],
+            "sB": cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, cute.cosize(s_b)], self.buffer_align_bytes],
+            "sW": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, cute.cosize(s_w)], self.buffer_align_bytes],
+        }
+        return cute.struct(SharedStorage)
+
+    @cute.jit
+    def __call__(self, a: cute.Pointer, w: cute.Pointer, scale: cute.Pointer, out: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        a_t = cute.make_tensor(a, cute.make_layout((rows, self.k, self.batch),
+                                                    stride=(self.a_row, 1, self.a_batch)))
+        w8 = cute.make_ptr(cutlass.Uint8, Int64(w.toint()), cute.AddressSpace.gmem, assumed_align=16)
+        w_t = cute.make_tensor(w8, cute.make_layout((self.n, self.k, self.batch),
+                                                     stride=(self.k, 1, self.n * self.k)))
+        o_t = cute.make_tensor(out, cute.make_layout((rows, self.n, self.batch),
+                                                      stride=(self.o_row, 1, self.o_batch)))
+        s_a, s_b, s_w = self._fp8_layouts()
+        storage = self._fp8_storage(s_a, s_b, s_w)
+        tma_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), a_t, cute.slice_(s_a, (None, None, 0)),
+            (self.tile_m, self.tile_k), num_multicast=1)
+        tma_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), w_t, cute.slice_(s_w, (None, None, 0)),
+            (self.tile_n, self.tile_k), num_multicast=1)
+        grid_m = (rows + Int32(self.tile_m - 1)) // Int32(self.tile_m)
+        self.fp8_kernel(tma_tensor_a, tma_tensor_w, o_t, scale, tma_a, tma_w, s_a, s_b, s_w, self._tiled_mma(),
+                        storage, rows).launch(grid=(grid_m, self.n_tiles, self.batch),
+                                              block=[self.num_threads, 1, 1], stream=stream, min_blocks_per_mp=1)
+
+    @cute.kernel
+    def fp8_kernel(self, source: cute.Tensor, weight: cute.Tensor, output: cute.Tensor, scale: cute.Pointer,
+                   tma_atom_a: cute.CopyAtom, tma_atom_w: cute.CopyAtom, s_a_layout: cute.ComposedLayout,
+                   s_b_layout: cute.ComposedLayout, s_w_layout: cute.Layout, tiled_mma: cute.TiledMma,
+                   SharedStorage: cutlass.Constexpr, num_tokens: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        m_tile, n_tile, batch = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_w)
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        s_a = storage.sA.get_tensor(s_a_layout.outer, swizzle=s_a_layout.inner)
+        s_b = storage.sB.get_tensor(s_b_layout.outer, swizzle=s_b_layout.inner)
+        s_w = storage.sW.get_tensor(s_w_layout)
+        compute_threads = 32 * self.num_compute_warps
+        chunks = self.tile_n * self.tile_k // 8 // compute_threads
+        tma_bytes = (self.tile_m * 2 + self.tile_n) * self.tile_k
+        load_pipeline = pipeline.PipelineTmaAsync.create(
+            num_stages=self.num_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_compute_warps),
+            tx_count=tma_bytes,
+            barrier_storage=storage.mbar_ptr.data_ptr(),
+            cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
+        )
+        cute.arch.sync_threads()
+        g_a = cute.local_tile(source, (self.tile_m, self.tile_k), (None, None, None))
+        g_w = cute.local_tile(weight, (self.tile_n, self.tile_k), (None, None, None))
+        cta_layout = cute.make_layout(1)
+        t_as, t_ag = cpasync.tma_partition(tma_atom_a, 0, cta_layout, cute.group_modes(s_a, 0, 2),
+                                           cute.group_modes(g_a, 0, 2))
+        t_ws, t_wg = cpasync.tma_partition(tma_atom_w, 0, cta_layout, cute.group_modes(s_w, 0, 2),
+                                           cute.group_modes(g_w, 0, 2))
+        if warp_idx < Int32(self.num_compute_warps):
+            consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_stages)
+            thr_mma = tiled_mma.get_slice(tidx)
+            t_csa = thr_mma.partition_A(s_a)
+            t_csb = thr_mma.partition_B(s_b)
+            t_cra = thr_mma.make_fragment_A(t_csa[None, None, None, 0])
+            t_crb = thr_mma.make_fragment_B(t_csb)
+            acc = cute.make_rmem_tensor(thr_mma.partition_shape_C((self.tile_m, self.tile_n)), Float32)
+            acc.fill(0.0)
+            copy_a = cute.make_tiled_copy_A(
+                cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.BFloat16),
+                tiled_mma).get_slice(tidx)
+            copy_b = cute.make_tiled_copy_B(
+                cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.BFloat16),
+                tiled_mma).get_slice(tidx)
+            t_ssa = copy_a.partition_S(s_a)
+            t_ssb = copy_b.partition_S(s_b)
+            w_base = shared_ptr_to_u32(storage.sW.data_ptr())
+            b_base = shared_ptr_to_u32(storage.sB.data_ptr())
+            # Scales of this CTA's weight rows: [batch, N, K/64].
+            s_rows = Int64(scale.toint()) + (Int64(batch) * Int64(self.n) + Int64(n_tile) * Int64(self.tile_n)) \
+                * Int64(self.k_tiles * 4)
+            for k_tile in cutlass.range(self.k_tiles, unroll_full=False):
+                load_pipeline.consumer_wait(consumer_state)
+                stage = w_base + Int32(consumer_state.index) * Int32(self.tile_n * self.tile_k)
+                for i in cutlass.range_constexpr(chunks):
+                    chunk = Int32(i * compute_threads) + Int32(tidx)
+                    n = chunk // Int32(self.tile_k // 8)
+                    c = chunk % Int32(self.tile_k // 8)
+                    s = _ld_f32(s_rows + (Int64(n) * Int64(self.k_tiles) + Int64(k_tile)) * Int64(4))
+                    lo, hi = ld_shared_v2_u32(stage + n * Int32(self.tile_k) + c * Int32(8))
+                    v0, v1, v2, v3 = _e4m3x8_scaled_bf16(lo, hi, s)
+                    # 128-byte swizzle: 16-byte chunk c of row n sits at chunk c ^ (n % 8).
+                    st_shared_v4_u32(b_base + n * Int32(128) + ((c ^ (n % Int32(8))) * Int32(16)), v0, v1, v2, v3)
+                cute.arch.barrier(barrier_id=1, number_of_threads=compute_threads)
+                shared_a = t_ssa[None, None, None, consumer_state.index]
+                target_a = copy_a.retile(t_cra)
+                target_b = copy_b.retile(t_crb)
+                cute.copy(copy_a, shared_a[None, None, 0], target_a[None, None, 0])
+                cute.copy(copy_b, t_ssb[None, None, 0], target_b[None, None, 0])
+                for kk in cutlass.range_constexpr(cute.size(shared_a.shape[2])):
+                    if kk < cute.size(shared_a.shape[2]) - 1:
+                        cute.copy(copy_a, shared_a[None, None, kk + 1], target_a[None, None, kk + 1])
+                        cute.copy(copy_b, t_ssb[None, None, kk + 1], target_b[None, None, kk + 1])
+                    cute.gemm(thr_mma, acc, t_cra[None, None, kk], t_crb[None, None, kk], acc)
+                load_pipeline.consumer_release(consumer_state)
+                consumer_state.advance()
+                cute.arch.barrier(barrier_id=1, number_of_threads=compute_threads)
+            coordinates = thr_mma.partition_C(cute.make_identity_tensor((self.tile_m, self.tile_n)))
+            base = Int64(output.iterator.toint())
+            for pair in cutlass.range_constexpr(cute.size(acc) // 2):
+                coord = coordinates[2 * pair]
+                token = m_tile * Int32(self.tile_m) + coord[0]
+                column = n_tile * Int32(self.tile_n) + coord[1]
+                if token < num_tokens:
+                    at = (Int64(token) * Int64(self.o_row) + Int64(batch) * Int64(self.o_batch) + Int64(column)) * Int64(2)
+                    st_global_u32(base + at, pack_f32x2_to_bfloat2(acc[2 * pair], acc[2 * pair + 1]))
+        elif warp_idx == Int32(self.producer_warp):
+            producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_stages)
+            for k_tile in cutlass.range(self.k_tiles, unroll_full=False):
+                load_pipeline.producer_acquire(producer_state)
+                cute.copy(tma_atom_a, t_ag[(None, m_tile, k_tile, batch)], t_as[(None, producer_state.index)],
+                          tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state))
+                cute.copy(tma_atom_w, t_wg[(None, n_tile, k_tile, batch)], t_ws[(None, producer_state.index)],
+                          tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state))
+                load_pipeline.producer_commit(producer_state)
+                producer_state.advance()
+            load_pipeline.producer_tail(producer_state)
+
+
 __all__ = [
     "WIDE_SKINNY_MAX_ROWS",
     "glm_projection",
     "BatchedBf16Gemm",
+    "BatchedFp8Gemm",
     "GlmAddRmsNorm",
     "GlmIndexPost",
     "GlmQueryRope",
