@@ -15,6 +15,18 @@ RoPE is NeoX style on the first 64 dims of every 192-wide query/key head
 KV record (one per token, BF16): every KV head's 192-wide key (RoPE applied)
 then every KV head's 128-wide value times ``v_scale`` (``record_elems =
 kv_heads * 320``).
+
+8-bit KV record (``kv8``, :func:`fp8_record_bytes`): the same keys and values
+rounded to BF16 as above, then quantized with one FP32 scale per ``kv_group``
+dims of each head's key and value (64 or 32; 0: one per key, one per value):
+``"s8"`` signed bytes ``clamp(rne(x / s), -127, 127)`` with ``s = amax / 127``,
+``"e4m3"`` E4M3 ``rn(x / s)`` with ``s = amax / 448`` (``s = 1`` for an all-zero
+group). Layout: ``[G, 192]`` keys, ``[G, 128]`` values, ``[G, 192 / kv_group]``
+FP32 key scales, ``[G, 128 / kv_group]`` FP32 value scales, zero padding to 16
+bytes. Attention widens each key/value to ``bf16(q * s)`` in shared memory and
+runs the BF16 MMAs unchanged. On the MiMo goldens E4M3 keys are too coarse
+(3-bit mantissa: KL(golden||engine) +0.235 on V2 Flash, +0.012 on V2.6 Pro over
+BF16 records) while int8 per 32 dims stays within noise (-0.0002, +0.0015).
 """
 
 from __future__ import annotations
@@ -23,15 +35,24 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-from cutlass import BFloat16, Float32, Int32, Int64, const_expr
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32, const_expr
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import warp, warpgroup
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 
-from b12x._lib.intrinsics import ld_global_v4_u32, shared_ptr_to_u32, st_global_v4_u32
+from b12x._lib.intrinsics import (
+    div_rn_f32, fabs_f32, fmax_f32, ld_global_nc_v2_u32, ld_global_nc_v4_u32, ld_global_v4_u32, shared_ptr_to_u32,
+    st_global_v4_u32,
+    st_shared_v4_u32,
+)
 from b12x.attention._shared.contiguous import layout_utils
 from b12x.attention._shared.contiguous.forward import warp_mma_gemm
 from b12x.attention._shared.contiguous.softmax import Softmax
 from b12x.attention.paged._selected_forward import _cp_async_load_128b_zfill
+
+from ._fp8_weights import _e4m3x8_scaled_bf16, _ld_f32
+from ._glm_kernels import _bf16, _warp_max
 
 ROPE_HALF = 32
 LOG2_E = 1.4426950408889634
@@ -40,6 +61,95 @@ MAX_SPLITS = 64
 
 def _ceil(a: int, b: int) -> int:
     return (int(a) + int(b) - 1) // int(b)
+
+
+KV8_FORMATS = ("e4m3", "s8")
+KV8_MAX = {"e4m3": 448.0, "s8": 127.0}
+
+
+def fp8_scale_counts(kv_group: int, head: int = 192, v_head: int = 128) -> tuple[int, int]:
+    """FP32 scales per KV head of an 8-bit record: (key, value)."""
+    if int(kv_group) == 0:
+        return 1, 1
+    if int(kv_group) not in (32, 64):
+        raise ValueError("kv_group is 32, 64 or 0 (per head)")
+    return head // int(kv_group), v_head // int(kv_group)
+
+
+@dsl_user_op
+def _s8x8_scaled_bf16(lo, hi, s, *, loc=None, ip=None):
+    """bf16(int8 * s) for eight packed signed bytes, as four bf16x2 words. Each byte, biased by
+    128, becomes the low mantissa byte of 2^23 (``prmt``), so ``float - (2^23 + 128)`` is the
+    integer exactly without an I2F conversion."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Uint32(lo).ir_value(loc=loc, ip=ip), Uint32(hi).ir_value(loc=loc, ip=ip),
+         Float32(s).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 x0, x1, m, u0, u1, u2, u3, u4, u5, u6, u7;
+            .reg .f32 f0, f1, f2, f3, f4, f5, f6, f7;
+            xor.b32 x0, $4, 0x80808080;
+            xor.b32 x1, $5, 0x80808080;
+            mov.b32 m, 0x4B000000;
+            prmt.b32 u0, x0, m, 0x7440;
+            prmt.b32 u1, x0, m, 0x7441;
+            prmt.b32 u2, x0, m, 0x7442;
+            prmt.b32 u3, x0, m, 0x7443;
+            prmt.b32 u4, x1, m, 0x7440;
+            prmt.b32 u5, x1, m, 0x7441;
+            prmt.b32 u6, x1, m, 0x7442;
+            prmt.b32 u7, x1, m, 0x7443;
+            mov.b32 f0, u0;
+            mov.b32 f1, u1;
+            mov.b32 f2, u2;
+            mov.b32 f3, u3;
+            mov.b32 f4, u4;
+            mov.b32 f5, u5;
+            mov.b32 f6, u6;
+            mov.b32 f7, u7;
+            sub.f32 f0, f0, 0f4B000080;
+            sub.f32 f1, f1, 0f4B000080;
+            sub.f32 f2, f2, 0f4B000080;
+            sub.f32 f3, f3, 0f4B000080;
+            sub.f32 f4, f4, 0f4B000080;
+            sub.f32 f5, f5, 0f4B000080;
+            sub.f32 f6, f6, 0f4B000080;
+            sub.f32 f7, f7, 0f4B000080;
+            mul.rn.f32 f0, f0, $6;
+            mul.rn.f32 f1, f1, $6;
+            mul.rn.f32 f2, f2, $6;
+            mul.rn.f32 f3, f3, $6;
+            mul.rn.f32 f4, f4, $6;
+            mul.rn.f32 f5, f5, $6;
+            mul.rn.f32 f6, f6, $6;
+            mul.rn.f32 f7, f7, $6;
+            cvt.rn.bf16x2.f32 $0, f1, f0;
+            cvt.rn.bf16x2.f32 $1, f3, f2;
+            cvt.rn.bf16x2.f32 $2, f5, f4;
+            cvt.rn.bf16x2.f32 $3, f7, f6;
+        }
+        """,
+        "=r,=r,=r,=r,r,r,f",
+        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _f32_to_s8(x, *, loc=None, ip=None):
+    """``x`` rounded to the nearest integer (ties to even), clamped to [-127, 127]."""
+    return Int32(llvm.inline_asm(
+        T.i32(), [Float32(x).ir_value(loc=loc, ip=ip)],
+        "{ .reg .s32 t; cvt.rni.s32.f32 t, $1; max.s32 t, t, -127; min.s32 $0, t, 127; }", "=r,f",
+        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+def fp8_record_bytes(kv_heads: int, kv_group: int = 64, head: int = 192, v_head: int = 128) -> int:
+    """Bytes of one token's FP8 KV record (E4M3 keys, values, FP32 scales, padded to 16)."""
+    sk, sv = fp8_scale_counts(kv_group, head, v_head)
+    raw = int(kv_heads) * (head + v_head) + 4 * int(kv_heads) * (sk + sv)
+    return (raw + 15) // 16 * 16
 
 
 # ---------------------------------------------------------------------------
@@ -56,9 +166,15 @@ class MimoQkvRope:
     threads = 256
 
     def __init__(self, *, heads: int, kv_heads: int, v_scale: float, head: int = 192, v_head: int = 128,
-                 k_stride: int | None = None):
+                 k_stride: int | None = None, kv8: str | None = None, kv_group: int = 64):
         self.heads, self.kv_heads = int(heads), int(kv_heads)
         self.head, self.v_head = int(head), int(v_head)
+        if kv8 is not None and kv8 not in KV8_FORMATS:
+            raise ValueError(f"kv8 is one of {KV8_FORMATS}")
+        self.kv8, self.kv_fp8, self.kv_group = kv8, kv8 is not None, int(kv_group)
+        self.k_scales, self.v_scales = fp8_scale_counts(self.kv_group, self.head, self.v_head)
+        self.record_bytes = fp8_record_bytes(self.kv_heads, self.kv_group, self.head, self.v_head) if self.kv_fp8 \
+            else self.kv_heads * (self.head + self.v_head) * 2
         # Key heads are k_stride apart in qkv (zero padding past each 192-wide key).
         self.k_stride = self.head if k_stride is None else int(k_stride)
         self.v_scale = float(v_scale)
@@ -114,7 +230,10 @@ class MimoQkvRope:
                 d = Int64(2 * ROPE_HALF) + Int64(idx % Int32(pass_width))
                 query[token, h * Int64(self.head) + d] = qkv[token, h * Int64(self.head) + d]
         slot = Int64(slots[token])
-        if slot >= Int64(0):
+        if const_expr(self.kv_fp8):
+            if slot >= Int64(0):
+                self._record_fp8(qkv, token, Int64(cache.toint()) + slot * Int64(self.record_bytes), cs, tidx)
+        elif slot >= Int64(0):
             record = cute.make_tensor(
                 cute.make_ptr(BFloat16, Int64(cache.toint()) + slot * Int64(self.record * 2),
                               cute.AddressSpace.gmem, assumed_align=16),
@@ -144,6 +263,74 @@ class MimoQkvRope:
                     record[Int64(0), v0 + Int64(idx)] = (value * Float32(self.v_scale)).to(BFloat16)
 
 
+    @cute.jit
+    def _record_fp8(self, qkv: cute.Tensor, token: Int64, record: Int64, cs: cute.Pointer, tidx: Int32):
+        """The token's FP8 record: one warp per (KV head, key | value); lane ``l`` holds dims
+        ``l + 32 j`` (RoPE pairs stay in one lane), BF16-rounded, then E4M3 per scale group."""
+        warp_id = tidx // Int32(32)
+        lane = tidx % Int32(32)
+        k0 = Int64(self.q_width)
+        v_src = k0 + Int64(self.kv_heads * self.k_stride)
+        k_scales = record + Int64(self.kv_heads * (self.head + self.v_head))
+        v_scales = k_scales + Int64(4 * self.kv_heads * self.k_scales)
+        k_per = self.head // 32
+        v_per = self.v_head // 32
+        cos_v = Float32(cs[lane])
+        sin_v = Float32(cs[Int32(ROPE_HALF) + lane])
+        units = 2 * self.kv_heads
+        for it in cutlass.range_constexpr(_ceil(units, self.threads // 32)):
+            unit = Int32(it * (self.threads // 32)) + warp_id
+            if unit < Int32(self.kv_heads):
+                # Key of KV head `unit`: RoPE on dims 0:64 (lane, 32 + lane), the rest passed through.
+                h = Int64(unit)
+                src = k0 + h * Int64(self.k_stride)
+                vals = cute.make_rmem_tensor(cute.make_layout((k_per,)), Float32)
+                x1 = Float32(qkv[token, src + Int64(lane)])
+                x2 = Float32(qkv[token, src + Int64(ROPE_HALF) + Int64(lane)])
+                vals[0] = _bf16(x1 * cos_v - x2 * sin_v)
+                vals[1] = _bf16(x2 * cos_v + x1 * sin_v)
+                for j in cutlass.range_constexpr(2, k_per):
+                    vals[j] = Float32(qkv[token, src + Int64(32 * j) + Int64(lane)])
+                self._store_fp8(vals, k_per, record + h * Int64(self.head), k_scales + h * Int64(4 * self.k_scales),
+                                lane)
+            elif unit < Int32(units):
+                h = Int64(unit - Int32(self.kv_heads))
+                vals = cute.make_rmem_tensor(cute.make_layout((v_per,)), Float32)
+                for j in cutlass.range_constexpr(v_per):
+                    vals[j] = _bf16(Float32(qkv[token, v_src + h * Int64(self.v_head) + Int64(32 * j) + Int64(lane)])
+                                    * Float32(self.v_scale))
+                self._store_fp8(vals, v_per, record + Int64(self.kv_heads * self.head) + h * Int64(self.v_head),
+                                v_scales + h * Int64(4 * self.v_scales), lane)
+
+    @cute.jit
+    def _store_fp8(self, vals: cute.Tensor, per: cutlass.Constexpr, dst: Int64, scale_dst: Int64, lane: Int32):
+        """8-bit ``vals`` (lane's dims ``l + 32 j``) at ``dst`` with one scale ``amax / max`` per
+        ``kv_group`` dims (E4M3: RN to E4M3; s8: round to nearest even, clamped to +-127)."""
+        scales = cute.make_tensor(cute.make_ptr(Float32, scale_dst, cute.AddressSpace.gmem, assumed_align=4),
+                                  cute.make_layout((per,)))
+        group = per if self.kv_group == 0 else self.kv_group // 32
+        for g0 in cutlass.range_constexpr(per // group):
+            local = Float32(0.0)
+            for j in cutlass.range_constexpr(group):
+                local = fmax_f32(local, fabs_f32(vals[g0 * group + j]))
+            amax = _warp_max(local)
+            scale = Float32(1.0)
+            if amax > Float32(0.0):
+                scale = div_rn_f32(amax, Float32(KV8_MAX[self.kv8]))
+            for j in cutlass.range_constexpr(group):
+                q = div_rn_f32(vals[g0 * group + j], scale)
+                if const_expr(self.kv8 == "e4m3"):
+                    out = cute.make_tensor(cute.make_ptr(cutlass.Float8E4M3FN, dst, cute.AddressSpace.gmem,
+                                                         assumed_align=1), cute.make_layout((per * 32,)))
+                    out[Int32(32 * (g0 * group + j)) + lane] = q.to(cutlass.Float8E4M3FN)
+                else:
+                    out = cute.make_tensor(cute.make_ptr(cutlass.Int8, dst, cute.AddressSpace.gmem, assumed_align=1),
+                                           cute.make_layout((per * 32,)))
+                    out[Int32(32 * (g0 * group + j)) + lane] = _f32_to_s8(q).to(cutlass.Int8)
+            if lane == Int32(0):
+                scales[g0] = scale
+
+
 # ---------------------------------------------------------------------------
 # GQA attention over KV records
 # ---------------------------------------------------------------------------
@@ -162,7 +349,8 @@ class MimoGqaAttention:
     to ``k <= p`` (and ``k > p - window``).
 
     ``paged``: keys live in a paged cache (``cache + (page_table[row *
-    table_stride + k / page_rows] * page_rows + k % page_rows) * R``).
+    table_stride + k / page_rows] * page_rows + k % page_rows) * R``), or with
+    ``contiguous`` at ``cache + k * R`` (a :class:`MimoKvWiden` copy).
     Otherwise (SWA): keys at or past the row's sequence start ``s =
     positions[seq_first[row]]`` come from this step's records (``kv_step``
     row ``seq_first[row] + k - s``), older keys from the sequence's ring
@@ -180,8 +368,13 @@ class MimoGqaAttention:
 
     def __init__(self, *, heads: int, kv_heads: int, tokens: int, window: int, paged: bool, sink: bool,
                  direct: bool, softmax_scale: float, page_rows: int = 64, ring_rows: int = 256,
-                 head: int = 192, v_head: int = 128, kv_warps: int = 4):
+                 head: int = 192, v_head: int = 128, kv_warps: int = 4, kv8: str | None = None,
+                 kv_group: int = 64, contiguous: bool = False):
         self.heads, self.kv_heads = int(heads), int(kv_heads)
+        self.contiguous = bool(contiguous)
+        if kv8 is not None and kv8 not in KV8_FORMATS:
+            raise ValueError(f"kv8 is one of {KV8_FORMATS}")
+        self.kv8, self.kv_fp8, self.kv_group = kv8, kv8 is not None, int(kv_group)
         self.group = self.heads // self.kv_heads
         self.tokens = int(tokens)
         self.window = int(window)
@@ -190,11 +383,21 @@ class MimoGqaAttention:
         self.page_rows, self.ring_rows = int(page_rows), int(ring_rows)
         self.head, self.v_head = int(head), int(v_head)
         self.record = self.kv_heads * (self.head + self.v_head)
+        self.k_scales, self.v_scales = fp8_scale_counts(self.kv_group, self.head, self.v_head)
+        self.record_bytes = fp8_record_bytes(self.kv_heads, self.kv_group, self.head, self.v_head) if self.kv_fp8 \
+            else self.record * 2
         self.tile_n = 16 * int(kv_warps)
         self.qk_warps = _ceil(self.tokens * self.group, 16)
         self.tile_m = 16 * self.qk_warps
         self.pv_warps = 4 * self.qk_warps
         self.threads = 32 * self.pv_warps
+        # 8-bit records: each thread loads whole 16-byte pieces (8-byte when 16 do not divide
+        # across the CTA) of the next tile into registers while the current one computes.
+        self.chunk = 16
+        if (self.tile_n * self.head // 16) % self.threads or (self.tile_n * self.v_head // 16) % self.threads:
+            self.chunk = 8
+        self.k_iters = self.tile_n * self.head // self.chunk // self.threads
+        self.v_iters = self.tile_n * self.v_head // self.chunk // self.threads
         if self.head % 64 or self.v_head % 64:
             raise ValueError("head dims must be multiples of 64")
         if (self.tile_n * self.head // 8) % self.threads or (self.tile_n * self.v_head // 8) % self.threads:
@@ -204,7 +407,8 @@ class MimoGqaAttention:
 
     def key(self) -> tuple:
         return (self.heads, self.kv_heads, self.tokens, self.window, self.paged, self.sink, self.direct,
-                self.softmax_scale, self.page_rows, self.ring_rows, self.head, self.v_head, self.tile_n)
+                self.softmax_scale, self.page_rows, self.ring_rows, self.head, self.v_head, self.tile_n,
+                self.kv8, self.kv_group, self.contiguous)
 
     def _tiled_mma_qk(self):
         return cute.make_tiled_mma(warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)), (self.qk_warps, 1, 1),
@@ -237,21 +441,18 @@ class MimoGqaAttention:
             block=(self.threads, 1, 1), stream=stream)
 
     @cute.jit
-    def _tile(self, tile: Int32, lo: Int64, hi: Int64, row0: Int64, kv_head: Int32, cache: cute.Pointer,
-              kv_step: cute.Pointer, page_table: cute.Pointer, table_base: Int64, seq_start: Int64,
-              step_first: Int64, ring_base: Int64, token_pos: cute.Tensor, key_addr: cute.Tensor,
-              key_pos: cute.Tensor, s_k: cute.Tensor, s_v: cute.Tensor, s_p: cute.Tensor, s_scale: cute.Tensor,
-              thread: Int32, tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma, r_q: cute.Tensor,
-              r_k: cute.Tensor, r_p: cute.Tensor, r_v: cute.Tensor, c_q: cute.TiledCopy, c_k: cute.TiledCopy,
-              c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor, cs_k: cute.Tensor, cs_p: cute.Tensor,
-              cs_v: cute.Tensor, acc_o: cute.Tensor, softmax: Softmax, is_first: cutlass.Constexpr):
-        # Resolve this tile's keys: absolute record address (or -1) and position.
+    def _resolve(self, tile: Int32, buf: Int32, lo: Int64, hi: Int64, cache: cute.Pointer, kv_step: cute.Pointer,
+                 page_table: cute.Pointer, table_base: Int64, seq_start: Int64, step_first: Int64, ring_base: Int64,
+                 key_addr: cute.Tensor, key_pos: cute.Tensor, thread: Int32):
+        """Tile ``tile``'s keys into slot ``buf``: absolute record address (or -1) and position."""
         if thread < Int32(self.tile_n):
             k = lo + Int64(tile) * Int64(self.tile_n) + Int64(thread)
             address = Int64(-1)
             if k <= hi:
-                record_bytes = Int64(self.record * 2)
-                if const_expr(self.paged):
+                record_bytes = Int64(self.record_bytes)
+                if const_expr(self.paged and self.contiguous):
+                    address = Int64(cache.toint()) + k * record_bytes
+                elif const_expr(self.paged):
                     page = Int64(cute.make_ptr(Int32, Int64(page_table.toint()) + (table_base + k // Int64(
                         self.page_rows)) * Int64(4), cute.AddressSpace.gmem, assumed_align=4)[0])
                     address = Int64(cache.toint()) + (page * Int64(self.page_rows) + k % Int64(self.page_rows)) \
@@ -261,37 +462,35 @@ class MimoGqaAttention:
                         address = Int64(kv_step.toint()) + (step_first + k - seq_start) * record_bytes
                     else:
                         address = Int64(cache.toint()) + (ring_base + k % Int64(self.ring_rows)) * record_bytes
-            key_addr[thread] = address
-            key_pos[thread] = cutlass.select_(address >= Int64(0), k, Int64(-1))
-        cute.arch.sync_threads()
+            key_addr[buf, thread] = address
+            key_pos[buf, thread] = cutlass.select_(address >= Int64(0), k, Int64(-1))
 
-        k_vectors = self.head // 8
-        for it in cutlass.range_constexpr(self.tile_n * k_vectors // self.threads):
-            linear = thread + Int32(it * self.threads)
-            token = linear // Int32(k_vectors)
-            dim = (linear % Int32(k_vectors)) * Int32(8)
-            base = Int64(key_addr[token])
-            valid = base >= Int64(0)
-            source = cutlass.select_(valid, base + (Int64(kv_head) * Int64(self.head) + Int64(dim)) * Int64(2),
-                                     Int64(cache.toint()))
-            _cp_async_load_128b_zfill(shared_ptr_to_u32(s_k.iterator + cute.crd2idx((token, dim), s_k.layout)),
-                                      source, cutlass.select_(valid, Int32(16), Int32(0)))
-        v_vectors = self.v_head // 8
-        v0 = self.kv_heads * self.head
-        for it in cutlass.range_constexpr(self.tile_n * v_vectors // self.threads):
-            linear = thread + Int32(it * self.threads)
-            token = linear // Int32(v_vectors)
-            dim = (linear % Int32(v_vectors)) * Int32(8)
-            base = Int64(key_addr[token])
-            valid = base >= Int64(0)
-            source = cutlass.select_(
-                valid, base + (Int64(v0) + Int64(kv_head) * Int64(self.v_head) + Int64(dim)) * Int64(2),
-                Int64(cache.toint()))
-            _cp_async_load_128b_zfill(shared_ptr_to_u32(s_v.iterator + cute.crd2idx((token, dim), s_v.layout)),
-                                      source, cutlass.select_(valid, Int32(16), Int32(0)))
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
+    @cute.jit
+    def _tile(self, tile: Int32, next_tile: Int32, has_next, buf: Int32, lo: Int64, hi: Int64, row0: Int64,
+              kv_head: Int32, cache: cute.Pointer,
+              kv_step: cute.Pointer, page_table: cute.Pointer, table_base: Int64, seq_start: Int64,
+              step_first: Int64, ring_base: Int64, token_pos: cute.Tensor, key_addr: cute.Tensor,
+              key_pos: cute.Tensor, s_k: cute.Tensor, s_v: cute.Tensor, s_p: cute.Tensor, s_scale: cute.Tensor,
+              thread: Int32, tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma, r_q: cute.Tensor,
+              r_k: cute.Tensor, r_p: cute.Tensor, r_v: cute.Tensor, c_q: cute.TiledCopy, c_k: cute.TiledCopy,
+              c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor, cs_k: cute.Tensor, cs_p: cute.Tensor,
+              cs_v: cute.Tensor, acc_o: cute.Tensor, softmax: Softmax, raw: cute.Tensor, raw_s: cute.Tensor,
+              is_first: cutlass.Constexpr):
+        if const_expr(self.kv_fp8):
+            # `raw` holds this tile's bytes (slot `buf`); widen them, then start the next tile's loads.
+            self._widen(raw, raw_s, s_k, s_v, thread)
+            if has_next:
+                self._resolve(next_tile, Int32(1) - buf, lo, hi, cache, kv_step, page_table, table_base, seq_start,
+                              step_first, ring_base, key_addr, key_pos, thread)
+            cute.arch.sync_threads()
+            if has_next:
+                self._load_raw(key_addr, Int32(1) - buf, kv_head, cache, raw, raw_s, thread)
+        else:
+            self._resolve(tile, buf, lo, hi, cache, kv_step, page_table, table_base, seq_start, step_first,
+                          ring_base, key_addr, key_pos, thread)
+            cute.arch.sync_threads()
+            self._load_bf16(key_addr, kv_head, cache, s_k, s_v)
+            cute.arch.sync_threads()
 
         if thread < Int32(self.qk_warps * 32):
             acc_s = cute.make_rmem_tensor(
@@ -307,7 +506,7 @@ class MimoGqaAttention:
                 if t_local < Int32(self.tokens):
                     p = Int64(token_pos[t_local])
                 for n in cutlass.range_constexpr(cute.size(s_mn.shape[1])):
-                    kp = Int64(key_pos[coords[m, n][1]])
+                    kp = Int64(key_pos[buf, coords[m, n][1]])
                     masked = (p < Int64(0)) | (kp < Int64(0)) | (kp > p)
                     if const_expr(self.window > 0):
                         masked = masked | (kp <= p - Int64(self.window))
@@ -332,6 +531,100 @@ class MimoGqaAttention:
         warp_mma_gemm(tiled_mma_pv, acc_o, r_p, r_v, cs_p, cs_v, c_p, c_v)
         cute.arch.sync_threads()
 
+    @cute.jit
+    def _load_bf16(self, key_addr: cute.Tensor, kv_head: Int32, cache: cute.Pointer, s_k: cute.Tensor,
+                   s_v: cute.Tensor):
+        """BF16 records: each key's and value's 16-byte vectors by cp.async."""
+        thread = Int32(cute.arch.thread_idx()[0])
+        k_vectors = self.head // 8
+        for it in cutlass.range_constexpr(self.tile_n * k_vectors // self.threads):
+            linear = thread + Int32(it * self.threads)
+            token = linear // Int32(k_vectors)
+            dim = (linear % Int32(k_vectors)) * Int32(8)
+            base = Int64(key_addr[0, token])
+            valid = base >= Int64(0)
+            source = cutlass.select_(valid, base + (Int64(kv_head) * Int64(self.head) + Int64(dim)) * Int64(2),
+                                     Int64(cache.toint()))
+            _cp_async_load_128b_zfill(shared_ptr_to_u32(s_k.iterator + cute.crd2idx((token, dim), s_k.layout)),
+                                      source, cutlass.select_(valid, Int32(16), Int32(0)))
+        v_vectors = self.v_head // 8
+        v0 = self.kv_heads * self.head
+        for it in cutlass.range_constexpr(self.tile_n * v_vectors // self.threads):
+            linear = thread + Int32(it * self.threads)
+            token = linear // Int32(v_vectors)
+            dim = (linear % Int32(v_vectors)) * Int32(8)
+            base = Int64(key_addr[0, token])
+            valid = base >= Int64(0)
+            source = cutlass.select_(
+                valid, base + (Int64(v0) + Int64(kv_head) * Int64(self.v_head) + Int64(dim)) * Int64(2),
+                Int64(cache.toint()))
+            _cp_async_load_128b_zfill(shared_ptr_to_u32(s_v.iterator + cute.crd2idx((token, dim), s_v.layout)),
+                                      source, cutlass.select_(valid, Int32(16), Int32(0)))
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+
+    @cute.jit
+    def _load_raw(self, key_addr: cute.Tensor, buf: Int32, kv_head: Int32, cache: cute.Pointer, raw: cute.Tensor,
+                  raw_s: cute.Tensor, thread: Int32):
+        """8-bit records of slot ``buf``'s keys: this thread's ``chunk``-byte pieces of every key and
+        value and their scales into registers (missing keys: zeros), all loads in flight together."""
+        k_vectors = self.head // self.chunk
+        v_vectors = self.v_head // self.chunk
+        words = self.chunk // 4
+        k_scale_off = self.kv_heads * (self.head + self.v_head)
+        v_scale_off = k_scale_off + 4 * self.kv_heads * self.k_scales
+        k_group = self.head if self.kv_group == 0 else self.kv_group
+        v_group = self.v_head if self.kv_group == 0 else self.kv_group
+        fallback = Int64(cache.toint())
+        for it in cutlass.range_constexpr(self.k_iters + self.v_iters):
+            is_k = it < self.k_iters
+            vectors = k_vectors if is_k else v_vectors
+            linear = thread + Int32((it if is_k else it - self.k_iters) * self.threads)
+            token = linear // Int32(vectors)
+            dim = (linear % Int32(vectors)) * Int32(self.chunk)
+            base = Int64(key_addr[buf, token])
+            valid = base >= Int64(0)
+            if const_expr(is_k):
+                offset = Int64(kv_head) * Int64(self.head) + Int64(dim)
+                scale_off = Int64(k_scale_off) + Int64(4) * (Int64(kv_head) * Int64(self.k_scales)
+                                                             + Int64(dim // Int32(k_group)))
+            else:
+                offset = Int64(self.kv_heads * self.head) + Int64(kv_head) * Int64(self.v_head) + Int64(dim)
+                scale_off = Int64(v_scale_off) + Int64(4) * (Int64(kv_head) * Int64(self.v_scales)
+                                                             + Int64(dim // Int32(v_group)))
+            src = cutlass.select_(valid, base + offset, fallback)
+            if const_expr(words == 4):
+                w0, w1, w2, w3 = ld_global_nc_v4_u32(src)
+                raw[it * 4 + 0] = cutlass.select_(valid, w0, Uint32(0))
+                raw[it * 4 + 1] = cutlass.select_(valid, w1, Uint32(0))
+                raw[it * 4 + 2] = cutlass.select_(valid, w2, Uint32(0))
+                raw[it * 4 + 3] = cutlass.select_(valid, w3, Uint32(0))
+            else:
+                w0, w1 = ld_global_nc_v2_u32(src)
+                raw[it * 2 + 0] = cutlass.select_(valid, w0, Uint32(0))
+                raw[it * 2 + 1] = cutlass.select_(valid, w1, Uint32(0))
+            raw_s[it] = cutlass.select_(valid, _ld_f32(cutlass.select_(valid, base + scale_off, fallback)),
+                                        Float32(0.0))
+
+    @cute.jit
+    def _widen(self, raw: cute.Tensor, raw_s: cute.Tensor, s_k: cute.Tensor, s_v: cute.Tensor, thread: Int32):
+        """The registers of :meth:`_load_raw` as ``bf16(q * scale)`` into the swizzled BF16 tiles."""
+        k_vectors = self.head // self.chunk
+        v_vectors = self.v_head // self.chunk
+        words = self.chunk // 4
+        widen = _e4m3x8_scaled_bf16 if self.kv8 == "e4m3" else _s8x8_scaled_bf16
+        for it in cutlass.range_constexpr(self.k_iters + self.v_iters):
+            is_k = it < self.k_iters
+            vectors = k_vectors if is_k else v_vectors
+            linear = thread + Int32((it if is_k else it - self.k_iters) * self.threads)
+            token = linear // Int32(vectors)
+            dim = (linear % Int32(vectors)) * Int32(self.chunk)
+            for half in cutlass.range_constexpr(words // 2):
+                w0, w1, w2, w3 = widen(raw[it * words + 2 * half], raw[it * words + 2 * half + 1], raw_s[it])
+                tile = s_k if is_k else s_v
+                st_shared_v4_u32(shared_ptr_to_u32(tile.iterator + cute.crd2idx((token, dim + Int32(8 * half)),
+                                                                                tile.layout)), w0, w1, w2, w3)
+
     @cute.kernel
     def kernel(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
                page_table: cute.Pointer, ring_slots: cute.Pointer, seq_first: cute.Pointer, sinks: cute.Pointer,
@@ -355,10 +648,11 @@ class MimoGqaAttention:
         s_p = allocator.allocate_tensor(element_type=BFloat16, layout=p_layout, byte_alignment=1024)
         s_scale = allocator.allocate_tensor(element_type=Float32, layout=cute.make_layout((self.tile_m,)),
                                             byte_alignment=16)
-        key_addr = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout((self.tile_n,)),
-                                             byte_alignment=16)
-        key_pos = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout((self.tile_n,)),
-                                            byte_alignment=16)
+        # Two slots: an 8-bit-record CTA resolves the next tile's keys while this one computes.
+        key_addr = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout(
+            (2, self.tile_n), stride=(self.tile_n, 1)), byte_alignment=16)
+        key_pos = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout(
+            (2, self.tile_n), stride=(self.tile_n, 1)), byte_alignment=16)
         token_pos = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout((self.tokens,)),
                                               byte_alignment=16)
 
@@ -440,17 +734,30 @@ class MimoGqaAttention:
         if live <= Int32(0):
             tile_count = Int32(0)
         my_tiles = (tile_count - split + splits - Int32(1)) // splits
+        raw_words = max((self.k_iters + self.v_iters) * self.chunk // 4, 1) if self.kv_fp8 else 1
+        raw = cute.make_rmem_tensor(cute.make_layout((raw_words,)), Uint32)
+        raw_s = cute.make_rmem_tensor(cute.make_layout((max(self.k_iters + self.v_iters, 1),)), Float32)
         if my_tiles > Int32(0):
-            self._tile(split, lo, hi, row0, kv_head, cache, kv_step, page_table, table_base, seq_start,
+            if const_expr(self.kv_fp8):
+                self._resolve(split, Int32(0), lo, hi, cache, kv_step, page_table, table_base, seq_start,
+                              step_first, ring_base, key_addr, key_pos, thread)
+                cute.arch.sync_threads()
+                self._load_raw(key_addr, Int32(0), kv_head, cache, raw, raw_s, thread)
+            self._tile(split, split + splits, my_tiles > Int32(1), Int32(0), lo, hi, row0, kv_head, cache, kv_step,
+                       page_table, table_base, seq_start,
                        step_first, ring_base, token_pos, key_addr, key_pos, s_k, s_v, s_p, s_scale, thread,
                        tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p,
-                       cs_v, acc_o, softmax, is_first=True)
+                       cs_v, acc_o, softmax, raw, raw_s, is_first=True)
             for local in cutlass.range(my_tiles - Int32(1), unroll=1):
                 tile = split + (Int32(local) + Int32(1)) * splits
-                self._tile(tile, lo, hi, row0, kv_head, cache, kv_step, page_table, table_base, seq_start,
+                buf = (Int32(local) + Int32(1)) % Int32(2)
+                if const_expr(not self.kv_fp8):
+                    buf = Int32(0)
+                self._tile(tile, tile + splits, Int32(local) + Int32(2) < my_tiles, buf, lo, hi, row0, kv_head,
+                           cache, kv_step, page_table, table_base, seq_start,
                            step_first, ring_base, token_pos, key_addr, key_pos, s_k, s_v, s_p, s_scale, thread,
                            tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k,
-                           cs_p, cs_v, acc_o, softmax, is_first=False)
+                           cs_p, cs_v, acc_o, softmax, raw, raw_s, is_first=False)
 
         # Final scale per M row (and LSE for split partials).
         if thread < Int32(self.qk_warps * 32):
@@ -503,6 +810,90 @@ class MimoGqaAttention:
                             MAX_SPLITS * self.heads * self.v_head),)))
                         po[((row * Int64(splits) + Int64(split)) * Int64(self.heads) + o_head) * Int64(self.v_head)
                            + dim] = value
+
+
+class MimoKvWiden:
+    """BF16 copy of one sequence's 8-bit full-attention records: key ``k < keys`` (paged at
+    ``page_table[k / page_rows] * page_rows + k % page_rows``) to ``wide + k * R`` as
+    ``bf16(q * scale)``, the values :class:`MimoGqaAttention` widens in shared memory. A
+    prefill CTA re-reads every earlier key, so widening once per step and running the BF16
+    attention over the copy costs one pass instead of one per CTA. ``keys_per_cta`` keys per
+    CTA; each thread loads all its 8-byte pieces before widening any."""
+
+    threads = 256
+
+    def __init__(self, *, kv_heads: int, kv8: str, kv_group: int, page_rows: int = 64, head: int = 192,
+                 v_head: int = 128, keys_per_cta: int = 8):
+        if kv8 not in KV8_FORMATS:
+            raise ValueError(f"kv8 is one of {KV8_FORMATS}")
+        self.kv_heads, self.kv8, self.kv_group = int(kv_heads), kv8, int(kv_group)
+        self.page_rows, self.head, self.v_head = int(page_rows), int(head), int(v_head)
+        self.k_scales, self.v_scales = fp8_scale_counts(self.kv_group, self.head, self.v_head)
+        self.record_bytes = fp8_record_bytes(self.kv_heads, self.kv_group, self.head, self.v_head)
+        self.k_chunks = self.kv_heads * self.head // 8
+        self.chunks = self.kv_heads * (self.head + self.v_head) // 8
+        self.keys_per_cta = int(keys_per_cta)
+        if page_rows % self.keys_per_cta:
+            raise ValueError("keys_per_cta must divide page_rows")
+        self.iters = _ceil(self.chunks * self.keys_per_cta, self.threads)
+
+    @cute.jit
+    def __call__(self, cache: cute.Pointer, page_table: cute.Pointer, wide: cute.Pointer, keys: Int32,
+                 stream: cuda.CUstream):
+        self.kernel(cache, page_table, wide, keys).launch(
+            grid=((keys + Int32(self.keys_per_cta - 1)) // Int32(self.keys_per_cta), 1, 1),
+            block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, cache: cute.Pointer, page_table: cute.Pointer, wide: cute.Pointer, keys: Int32):
+        k0 = Int64(cute.arch.block_idx()[0]) * Int64(self.keys_per_cta)
+        tidx = Int32(cute.arch.thread_idx()[0])
+        # The CTA's keys share one page (keys_per_cta divides page_rows).
+        page = Int64(cute.make_ptr(Int32, Int64(page_table.toint()) + (k0 // Int64(self.page_rows)) * Int64(4),
+                                   cute.AddressSpace.gmem, assumed_align=4)[0])
+        base = Int64(cache.toint()) + (page * Int64(self.page_rows) + k0 % Int64(self.page_rows)) \
+            * Int64(self.record_bytes)
+        wide_row = Int64(self.kv_heads * (self.head + self.v_head) * 2)
+        k_group = self.head if self.kv_group == 0 else self.kv_group
+        v_group = self.v_head if self.kv_group == 0 else self.kv_group
+        widen = _e4m3x8_scaled_bf16 if self.kv8 == "e4m3" else _s8x8_scaled_bf16
+        lo = cute.make_rmem_tensor(cute.make_layout((self.iters,)), Uint32)
+        hi = cute.make_rmem_tensor(cute.make_layout((self.iters,)), Uint32)
+        sc = cute.make_rmem_tensor(cute.make_layout((self.iters,)), Float32)
+        for it in cutlass.range_constexpr(self.iters):
+            linear = Int32(it * self.threads) + tidx
+            key = linear // Int32(self.chunks)
+            c = linear % Int32(self.chunks)
+            live = (key < Int32(self.keys_per_cta)) & (k0 + Int64(key) < Int64(keys))
+            src = base + Int64(key) * Int64(self.record_bytes)
+            k_scales = src + Int64(self.kv_heads * (self.head + self.v_head))
+            v_scales = k_scales + Int64(4 * self.kv_heads * self.k_scales)
+            scale_at = Int64(0)
+            if c < Int32(self.k_chunks):
+                h = c // Int32(self.head // 8)
+                d = (c % Int32(self.head // 8)) * Int32(8)
+                scale_at = k_scales + Int64(4) * Int64(h * Int32(self.k_scales) + d // Int32(k_group))
+            else:
+                v = c - Int32(self.k_chunks)
+                h = v // Int32(self.v_head // 8)
+                d = (v % Int32(self.v_head // 8)) * Int32(8)
+                scale_at = v_scales + Int64(4) * Int64(h * Int32(self.v_scales) + d // Int32(v_group))
+            lo[it] = Uint32(0)
+            hi[it] = Uint32(0)
+            sc[it] = Float32(0.0)
+            if live:
+                a, b = ld_global_nc_v2_u32(src + Int64(c) * Int64(8))
+                lo[it] = a
+                hi[it] = b
+                sc[it] = _ld_f32(scale_at)
+        for it in cutlass.range_constexpr(self.iters):
+            linear = Int32(it * self.threads) + tidx
+            key = linear // Int32(self.chunks)
+            c = linear % Int32(self.chunks)
+            if (key < Int32(self.keys_per_cta)) & (k0 + Int64(key) < Int64(keys)):
+                w0, w1, w2, w3 = widen(lo[it], hi[it], sc[it])
+                st_global_v4_u32(Int64(wide.toint()) + (k0 + Int64(key)) * wide_row + Int64(c) * Int64(16),
+                                 w0, w1, w2, w3)
 
 
 class MimoSplitMerge:
@@ -558,11 +949,12 @@ class MimoRingCommit:
 
     threads = 128
 
-    def __init__(self, *, record: int, ring_rows: int):
+    def __init__(self, *, record: int, ring_rows: int, record_bytes: int | None = None):
         self.record, self.ring_rows = int(record), int(ring_rows)
-        if (self.record * 2) % 16:
+        self.record_bytes = self.record * 2 if record_bytes is None else int(record_bytes)
+        if self.record_bytes % 16:
             raise ValueError("records must be whole 16-byte vectors")
-        self.vectors = self.record * 2 // 16
+        self.vectors = self.record_bytes // 16
 
     @cute.jit
     def __call__(self, kv_step: cute.Pointer, ring: cute.Pointer, ring_slots: cute.Pointer,
@@ -583,8 +975,8 @@ class MimoRingCommit:
             later_first = Int64(first[later])
         slot = Int64(slots[row])
         if (later_first != Int64(first[row])) & (slot >= Int64(0)):
-            src = Int64(kv_step.toint()) + row * Int64(self.record * 2)
-            dst = Int64(ring.toint()) + slot * Int64(self.record * 2)
+            src = Int64(kv_step.toint()) + row * Int64(self.record_bytes)
+            dst = Int64(ring.toint()) + slot * Int64(self.record_bytes)
             for it in cutlass.range_constexpr(_ceil(self.vectors, self.threads)):
                 v = Int64(it * self.threads) + tidx
                 if v < Int64(self.vectors):

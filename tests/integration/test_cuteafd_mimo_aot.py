@@ -6,7 +6,9 @@ mounted. Decode programs (m64) at 1/16/64 live rows, prefill programs (m4096)
 up to 4096 rows. Every output is compared with the module it replaces at
 cosine >= 0.9999; attention runs as the engine chains it (producer ->
 attention -> o_proj) over prefill chunks and decode steps against the
-reference module over the whole sequence.
+reference module over the whole sequence. FP8 KV records (``kv="fp8"``): the
+producer's bytes against a torch quantization of the BF16 records, the chain
+at cosine >= 0.998 (the E4M3 rounding of keys and values).
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ from ._mimo import (
 DECODE, PREFILL = 64, 4096
 ROWS = [(DECODE, 1), (DECODE, 16), (DECODE, 64), (PREFILL, 4096)]
 COS = 0.9999
+COS_FP8 = 0.9998
+KVS = ["bf16", "fp8", "int8"]
 
 
 @pytest.fixture(scope="module")
@@ -181,22 +185,83 @@ def test_mimo_producer(g, layer, capacity, rows):
     assert min(cq, ck, cv) >= COS
 
 
+def _records(g, kind, kv, rows):
+    from b12x.integration.cuteafd.mimo_attention import record_bytes
+
+    if kv != "bf16":
+        return torch.zeros((rows, record_bytes(g, kind, kv)), dtype=torch.uint8, device="cuda")
+    return torch.zeros((rows, g.record_elems(kind)), dtype=torch.bfloat16, device="cuda")
+
+
+def _quantize_records(g, kind, records, kv):
+    """Torch 8-bit records of BF16 ``records`` (``_mimo_kernels``: per ``KV_GROUPS[kv]`` dims of each
+    head's key and value, FP32 ``amax / 448`` E4M3 or ``amax / 127`` int8)."""
+    from b12x.integration.cuteafd.mimo_attention import KV_GROUPS, record_bytes
+
+    rows, G, group = records.shape[0], g.kv_heads(kind), KV_GROUPS[kv]
+    k = records[:, :G * 192].float().view(rows, G, 192 // group, group)
+    v = records[:, G * 192:].float().view(rows, G, 128 // group, group)
+    out = torch.zeros((rows, record_bytes(g, kind, kv)), dtype=torch.uint8, device=records.device)
+    top = 448.0 if kv == "fp8" else 127.0
+
+    def q(x):
+        amax = x.abs().amax(-1, keepdim=True)
+        # Tensor / tensor: a CUDA division by a Python scalar multiplies by its reciprocal.
+        scale = torch.where(amax > 0, amax / torch.full_like(amax, top), torch.ones_like(amax))
+        if kv == "fp8":
+            return (x / scale).to(torch.float8_e4m3fn).view(torch.uint8), scale[..., 0]
+        return torch.round(x / scale).clamp(-127, 127).to(torch.int8).view(torch.uint8), scale[..., 0]
+
+    kq, ks = q(k)
+    vq, vs = q(v)
+    out[:, :G * 192] = kq.reshape(rows, -1)
+    out[:, G * 192:G * 320] = vq.reshape(rows, -1)
+    scales = torch.cat([ks.reshape(rows, -1), vs.reshape(rows, -1)], 1).contiguous()
+    out[:, G * 320:G * 320 + scales.shape[1] * 4] = scales.view(torch.uint8)
+    return out
+
+
+@pytest.mark.parametrize("layer", [0, 1])
+@pytest.mark.parametrize("capacity,rows", [(DECODE, 16), (PREFILL, 1571)])
+def test_mimo_producer_kv8_records(g, layer, capacity, rows):
+    """FP8 records against a torch quantization of the BF16 program's records (same inputs)."""
+    kind = layer_kind(layer)
+    attn = _attention_module(layer)
+    x = _layer_input(layer, rows)
+    positions = torch.arange(rows, device="cuda") + 7
+    slots = torch.randperm(rows + 8, device="cuda")[:rows]
+    table = cos_sin(int(positions.max()) + 1, kind)
+    caches = {}
+    for kv in KVS:
+        program = _program("producer", kind=kind, max_rows=capacity, kv=kv)
+        caches[kv] = _records(g, kind, kv, rows + 8)
+        query = torch.empty((rows, 64, 192), dtype=torch.bfloat16, device="cuda")
+        program.launch(x, positions, slots, table, _qkv(attn), caches[kv], query, _scratch(program, rows),
+                       scalars=(rows,))
+    torch.cuda.synchronize()
+    for kv in KVS[1:]:
+        want = _quantize_records(g, kind, caches["bf16"][slots], kv)
+        got = caches[kv][slots]
+        same = float((want == got).float().mean())
+        unwritten = int(caches[kv][torch.ones(rows + 8, dtype=torch.bool, device="cuda").index_fill_(0, slots, False)]
+                        .count_nonzero())
+        print(f"mimo_{kind}_producer {kv} m{capacity} rows={rows}: bytes equal {same:.6f}")
+        assert same == 1.0 and unwritten == 0
+
+
 class _Sequence:
     """One sequence's engine state: paged records (full) or its ring (swa)."""
 
     def __init__(self, g, kind, capacity_tokens, ring_id=0, rings=1, pages_total=None, pages=None, cache=None,
-                 ring=None):
-        self.kind, self.len = kind, 0
-        r = g.record_elems(kind)
+                 ring=None, kv="bf16"):
+        self.kind, self.len, self.kv = kind, 0, kv
         if kind == "full":
             count = -(-capacity_tokens // 64)
             self.pages = pages if pages is not None else torch.randperm(count, device="cuda").int()
-            self.cache = cache if cache is not None else torch.zeros(((pages_total or count) * 64, r),
-                                                                     dtype=torch.bfloat16, device="cuda")
+            self.cache = cache if cache is not None else _records(g, kind, kv, (pages_total or count) * 64)
         else:
             self.ring_id = ring_id
-            self.cache = ring if ring is not None else torch.zeros((rings * g.ring_rows, r), dtype=torch.bfloat16,
-                                                                   device="cuda")
+            self.cache = ring if ring is not None else _records(g, kind, kv, rings * g.ring_rows)
 
     def slots(self, positions):
         if self.kind == "full":
@@ -208,9 +273,10 @@ def _step(g, kind, route, sequences, x_rows, attn_weights, splits=8):
     """One engine step: rows of each (sequence, n) in order; returns o_proj rows."""
     capacity = DECODE if route == "decode" else PREFILL
     rows = sum(n for _, n in sequences)
+    kv = sequences[0][0].kv
     positions = torch.cat([torch.arange(s.len, s.len + n, device="cuda") for s, n in sequences])
-    producer = _program("producer", kind=kind, max_rows=capacity)
-    attention = _program("attention", kind=kind, route=route, max_rows=capacity)
+    producer = _program("producer", kind=kind, max_rows=capacity, kv=kv)
+    attention = _program("attention", kind=kind, route=route, max_rows=capacity, kv=kv)
     o = _program("o", max_rows=capacity)
     table = cos_sin(int(positions.max()) + 1, kind)
     query = torch.empty((rows, 64, 192), dtype=torch.bfloat16, device="cuda")
@@ -231,9 +297,16 @@ def _step(g, kind, route, sequences, x_rows, attn_weights, splits=8):
                 r0 += n
             table_stride = stride
         scalars = (rows, table_stride) + ((splits,) if route == "decode" else ())
-        attention.launch(query, cache, positions, page_table, out, _scratch(attention, rows), scalars=scalars)
+        if route == "prefill" and kv != "bf16":
+            # 8-bit prefill: the sequence's keys widened once into a BF16 copy.
+            keys = int(positions[-1]) + 1
+            wide = torch.empty((keys, g.record_elems(kind)), dtype=torch.bfloat16, device="cuda")
+            attention.launch(query, cache, positions, page_table, wide, out, _scratch(attention, rows),
+                             scalars=scalars + (keys,))
+        else:
+            attention.launch(query, cache, positions, page_table, out, _scratch(attention, rows), scalars=scalars)
     else:
-        kv_step = torch.empty((rows, g.record_elems(kind)), dtype=torch.bfloat16, device="cuda")
+        kv_step = _records(g, kind, kv, rows)
         producer.launch(x_rows, positions, torch.arange(rows, device="cuda"), table, attn_weights["qkv"], kv_step,
                         query, _scratch(producer, rows), scalars=(rows,))
         ring_slots = torch.cat([s.slots(torch.arange(s.len, s.len + n, device="cuda")) for s, n in sequences])
@@ -277,16 +350,18 @@ SCHEDULES = {
 }
 
 
+@pytest.mark.parametrize("kv", KVS)
 @pytest.mark.parametrize("layer", [0, 1])
 @pytest.mark.parametrize("schedule", list(SCHEDULES))
-def test_mimo_attention_chain(g, layer, schedule):
+def test_mimo_attention_chain(g, layer, schedule, kv):
     kind = layer_kind(layer)
     steps = SCHEDULES[schedule]
     total = sum(n for _, n in steps)
     x = _layer_input(layer, total)
     expected = _reference(layer, x)
     weights = _weights(layer)
-    seq = _Sequence(g, kind, total)
+    seq = _Sequence(g, kind, total, kv=kv)
+    bound = COS_FP8 if kv != "bf16" else COS
     worst = 1.0
     for route, n in steps:
         while n > 0:
@@ -296,15 +371,16 @@ def test_mimo_attention_chain(g, layer, schedule):
             torch.cuda.synchronize()
             c = cosine(got, expected[start:start + take])
             worst = min(worst, c)
-            if c < COS:
+            if c < bound:
                 print(f"  step {route} rows {start}..{start + take}: cosine {c:.7f}")
             n -= take
-    print(f"mimo_{kind}_attention chain {schedule} ({total} rows): worst step cosine {worst:.7f}")
-    assert worst >= COS
+    print(f"mimo_{kind}_attention {kv} chain {schedule} ({total} rows): worst step cosine {worst:.7f}")
+    assert worst >= bound
 
 
+@pytest.mark.parametrize("kv", KVS)
 @pytest.mark.parametrize("layer", [0, 1])
-def test_mimo_attention_two_sequences(g, layer):
+def test_mimo_attention_two_sequences(g, layer, kv):
     """One decode step mixing two sequences of different lengths."""
     kind = layer_kind(layer)
     a_len, b_len, a_new, b_new = 900, 300, 3, 5
@@ -314,15 +390,15 @@ def test_mimo_attention_two_sequences(g, layer):
     weights = _weights(layer)
     if kind == "full":
         pages = torch.randperm(32, device="cuda").int()
-        a = _Sequence(g, kind, a_len + a_new, pages=pages[:15], pages_total=32)
-        b = _Sequence(g, kind, b_len + b_new, pages=pages[15:21], cache=a.cache)
+        a = _Sequence(g, kind, a_len + a_new, pages=pages[:15], pages_total=32, kv=kv)
+        b = _Sequence(g, kind, b_len + b_new, pages=pages[15:21], cache=a.cache, kv=kv)
     else:
-        a = _Sequence(g, kind, 0, ring_id=1, rings=3)
-        b = _Sequence(g, kind, 0, ring_id=2, ring=a.cache)
+        a = _Sequence(g, kind, 0, ring_id=1, rings=3, kv=kv)
+        b = _Sequence(g, kind, 0, ring_id=2, ring=a.cache, kv=kv)
     _step(g, kind, "prefill", [(a, a_len)], xa[:a_len], weights)
     _step(g, kind, "prefill", [(b, b_len)], xb[:b_len], weights)
     got = _step(g, kind, "decode", [(a, a_new), (b, b_new)], torch.cat([xa[a_len:], xb[b_len:]]), weights)
     torch.cuda.synchronize()
     ca, cb = cosine(got[:a_new], ea[a_len:]), cosine(got[a_new:], eb[b_len:])
-    print(f"mimo_{kind}_attention two sequences: a {ca:.7f} b {cb:.7f}")
-    assert min(ca, cb) >= COS
+    print(f"mimo_{kind}_attention {kv} two sequences: a {ca:.7f} b {cb:.7f}")
+    assert min(ca, cb) >= (COS_FP8 if kv != "bf16" else COS)

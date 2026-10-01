@@ -64,6 +64,16 @@ row's key range over ``splits`` CTAs (FP32 partials + LSE, then a merge);
 scratch holds ``partials f32 [rows, S, N, 128]`` then (1024-aligned)
 ``lse f32 [rows, S, N]`` for ``S = max_splits``.
 
+KV records (``kv``): ``"bf16"`` as above; ``"int8"`` / ``"fp8"`` 8-bit records
+(signed bytes with an FP32 scale per 32 dims of each head's key and value, or
+E4M3 with one per 64 dims; ``record_bytes``, layout in ``_mimo_kernels``): the
+producer quantizes the record it writes, attention widens keys and values to
+BF16 in shared memory, the SWA commit copies whole records. ``kv_cache``,
+``kv_step`` and ``ring`` are then ``u8 [.., record_bytes]``. The 8-bit full
+prefill program takes ``kv_wide bf16 [keys, R]`` and the scalar ``keys`` (last
+row position + 1) after ``table_stride``: it widens the sequence's keys there
+once, then runs the BF16 prefill attention over that copy.
+
 Softmax: ``softmax(q.k * 192^-0.5 [; sink]) . v`` (the sink is a raw extra
 logit that takes probability mass but no value), FP32 scores, BF16
 probabilities, FP32 PV accumulation.
@@ -106,7 +116,15 @@ from cutlass import Int32, Int64
 from ._common import MIMO_V2_FLASH, MiMoGeometry, Operand, Scalar, compile_program
 from ._glm_kernels import glm_projection
 from .glmf import FP8_GEMV_CONFIG, FP8_ROWS, _Fp8Switch, _HeadFp8, fp8_ops
-from ._mimo_kernels import MAX_SPLITS, MimoGqaAttention, MimoQkvRope, MimoRingCommit, MimoSplitMerge
+from ._mimo_kernels import (
+    MAX_SPLITS, MimoGqaAttention, MimoKvWiden, MimoQkvRope, MimoRingCommit, MimoSplitMerge, fp8_record_bytes, fp8_scale_counts,
+)
+
+# 8-bit KV records (``kv="fp8"``: E4M3, ``kv="int8"``: signed bytes): one FP32 scale per this
+# many dims of each head's key and value (0: one per key, one per value). See ``_mimo_kernels``.
+KV_FP8_GROUP = 64
+KV_GROUPS = {"fp8": 64, "int8": 32}
+_KV8 = {"bf16": None, "fp8": "e4m3", "int8": "s8"}
 
 # Most rows a MiMo decode program reads the E4M3 copies for (qkv, o, dense FFN): DFlash
 # verify steps of 17-32 rows stay on FP8 (V2.6 Pro coordinator alone, 1 RTX PRO 6000:
@@ -114,6 +132,7 @@ from ._mimo_kernels import MAX_SPLITS, MimoGqaAttention, MimoQkvRope, MimoRingCo
 MIMO_FP8_ROWS = 32
 
 __all__ = [
+    "KV_FP8_GROUP",
     "attention_scratch_bytes",
     "compile_mimo_attention_aot",
     "compile_mimo_head_fp8_aot",
@@ -121,6 +140,7 @@ __all__ = [
     "compile_mimo_producer_aot",
     "producer_scratch_bytes",
     "prefill_tokens",
+    "record_bytes",
 ]
 
 _ALIGN = 1024
@@ -156,16 +176,52 @@ def prefill_tokens(g: MiMoGeometry, kind: str) -> int:
     return 64 // (g.heads // g.kv_heads(kind))
 
 
+def _check_kv(kv: str) -> str:
+    if kv not in _KV8:
+        raise ValueError(f"kv is one of {tuple(_KV8)}")
+    return kv
+
+
+def _group(kv: str, kv_group: int | None) -> int:
+    return KV_GROUPS.get(kv, KV_FP8_GROUP) if kv_group is None else int(kv_group)
+
+
+def record_bytes(g: MiMoGeometry, kind: str, kv: str = "bf16", kv_group: int | None = None) -> int:
+    """Bytes of one token's KV record of ``kind`` (``kv`` "bf16", "fp8" or "int8", see ``_mimo_kernels``)."""
+    if _check_kv(kv) != "bf16":
+        return fp8_record_bytes(g.kv_heads(kind), _group(kv, kv_group), g.qk_head_dim, g.v_head_dim)
+    return g.record_elems(kind) * 2
+
+
+def _kv_operand(name: str, g: MiMoGeometry, kind: str, kv: str, rows: str, mode: str = "in",
+                kv_group: int | None = None):
+    if kv != "bf16":
+        return Operand(name, torch.uint8, f"[{rows},{record_bytes(g, kind, kv, kv_group)}]", mode)
+    return Operand(name, torch.bfloat16, f"[{rows},{g.record_elems(kind)}]", mode)
+
+
+def _kv_geometry(g: MiMoGeometry, kind: str, kv: str, kv_group: int | None) -> dict:
+    kv_group = _group(kv, kv_group)
+    out = {"kv": kv, "record_bytes": record_bytes(g, kind, kv, kv_group)}
+    if kv != "bf16":
+        sk, sv = fp8_scale_counts(kv_group, g.qk_head_dim, g.v_head_dim)
+        out.update({"kv_group": kv_group, "key_scales": sk, "value_scales": sv})
+    return out
+
+
 class _Producer:
-    def __init__(self, g: MiMoGeometry, kind: str, fp8: bool = False):
+    def __init__(self, g: MiMoGeometry, kind: str, fp8: bool = False, kv: str = "bf16", kv_group: int | None = None):
         self.g, self.kind, self.fp8 = g, kind, bool(fp8)
+        self.kv = _check_kv(kv)
+        self.kv_group = _group(kv, kv_group)
         self.qkv = _Fp8Switch(g.qkv_width(kind), g.hidden, fp8=True, row_scales=True, wide_rows=MIMO_FP8_ROWS) if fp8 \
             else glm_projection(g.qkv_width(kind), g.hidden)
         self.post = MimoQkvRope(heads=g.heads, kv_heads=g.kv_heads(kind), v_scale=g.v_scale,
-                                head=g.qk_head_dim, v_head=g.v_head_dim, k_stride=g.qkv_k_stride)
+                                head=g.qk_head_dim, v_head=g.v_head_dim, k_stride=g.qkv_k_stride,
+                                kv8=_KV8[self.kv], kv_group=self.kv_group)
 
     def key(self) -> tuple:
-        return (self.qkv.key(), self.kind, self.g, self.fp8)
+        return (self.qkv.key(), self.kind, self.g, self.fp8, self.kv, self.kv_group)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
@@ -177,8 +233,8 @@ class _Producer:
 
 
 class _ProducerFp8(_Producer):
-    def __init__(self, g: MiMoGeometry, kind: str):
-        super().__init__(g, kind, fp8=True)
+    def __init__(self, g: MiMoGeometry, kind: str, kv: str = "bf16", kv_group: int | None = None):
+        super().__init__(g, kind, fp8=True, kv=kv, kv_group=kv_group)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, cos_sin: cute.Pointer,
@@ -213,8 +269,9 @@ def mimo_w8_scratch_bytes(k: int, rows: int, prefill: bool) -> int:
 class _ProducerW8(_Producer):
     """The QKV producer over the FP8-only ``w_qkv`` (no BF16 copy)."""
 
-    def __init__(self, g: MiMoGeometry, kind: str, max_rows: int, prefill: bool):
-        super().__init__(g, kind, fp8=False)
+    def __init__(self, g: MiMoGeometry, kind: str, max_rows: int, prefill: bool, kv: str = "bf16",
+                 kv_group: int | None = None):
+        super().__init__(g, kind, fp8=False, kv=kv, kv_group=kv_group)
         self.fp8 = "only"
         self.qkv = mimo_w8(g.qkv_width(kind), g.hidden, int(max_rows) if prefill else None)
 
@@ -248,11 +305,11 @@ class _ProducerW8Prefill(_ProducerW8):
                   stream)
 
 
-def _compile_mimo_producer_w8(g: MiMoGeometry, kind: str, max_rows: int, mode: str):
+def _compile_mimo_producer_w8(g: MiMoGeometry, kind: str, max_rows: int, mode: str, kv: str, kv_group: int):
     from ._fp8_weights import check_w8_mode, fp8_only_operands
 
     prefill = check_w8_mode(mode) == "prefill"
-    launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, kind, max_rows, prefill)
+    launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, kind, max_rows, prefill, kv, kv_group)
     h, n, r, w = g.hidden, g.heads, g.record_elems(kind), g.qkv_width(kind)
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
@@ -260,7 +317,7 @@ def _compile_mimo_producer_w8(g: MiMoGeometry, kind: str, max_rows: int, mode: s
         Operand("kv_slots", torch.int64, "[rows]", align=8),
         Operand("cos_sin", torch.float32, "[P,64]", align=4),
         *fp8_only_operands("w_qkv", w, h, row_scales=True, prefill=prefill),
-        Operand("kv_cache", torch.bfloat16, f"[slots,{r}]", "inout"),
+        _kv_operand("kv_cache", g, kind, kv, "slots", "inout", kv_group),
         Operand("query", torch.bfloat16, f"[rows,{n},{g.qk_head_dim}]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"),
     )
@@ -271,21 +328,23 @@ def _compile_mimo_producer_w8(g: MiMoGeometry, kind: str, max_rows: int, mode: s
         key=(max_rows, mode, launch.key()),
         geometry={"kind": kind, "hidden": h, "heads": n, "kv_heads": g.kv_heads(kind), "record_elems": r,
                   "max_rows": max_rows, "v_scale": g.v_scale, "rope_theta": g.rope_theta(kind), "fp8_weights": "only",
-                  "mode": mode, "qkv_width": w, "k_stride": g.qkv_k_stride},
+                  "mode": mode, "qkv_width": w, "k_stride": g.qkv_k_stride, **_kv_geometry(g, kind, kv, kv_group)},
         scratch={"scratch": lambda rows: producer_scratch_bytes(g, kind, rows) + mimo_w8_scratch_bytes(h, rows, prefill)},
         doc=__doc__,
     )
 
 
 def compile_mimo_producer_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, max_rows: int, fp8: bool = False,
-                              fp8_only: str | None = None):
+                              fp8_only: str | None = None, kv: str = "bf16", kv_group: int | None = None):
     """QKV projection, partial RoPE and the KV record write; see the module docstring
     (``fp8``: the E4M3 ``w_qkv`` copy for decode rows; ``fp8_only`` ``"decode"`` /
-    ``"prefill"``: ``w_qkv`` as E4M3 + per-row scales only, see ``mimo_w8``)."""
+    ``"prefill"``: ``w_qkv`` as E4M3 + per-row scales only, see ``mimo_w8``; ``kv``:
+    ``"int8"`` / ``"fp8"`` write 8-bit records, see ``_mimo_kernels``)."""
     max_rows = _check(kind, max_rows)
+    _check_kv(kv)
     if fp8_only is not None:
-        return _compile_mimo_producer_w8(g, kind, max_rows, fp8_only)
-    launch = (_ProducerFp8(g, kind) if fp8 else _Producer(g, kind))
+        return _compile_mimo_producer_w8(g, kind, max_rows, fp8_only, kv, kv_group)
+    launch = (_ProducerFp8(g, kind, kv, kv_group) if fp8 else _Producer(g, kind, kv=kv, kv_group=kv_group))
     h, n, r = g.hidden, g.heads, g.record_elems(kind)
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
@@ -294,7 +353,7 @@ def compile_mimo_producer_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, max
         Operand("cos_sin", torch.float32, "[P,64]", align=4),
         Operand("w_qkv", torch.bfloat16, f"[{g.qkv_width(kind)},{h}]"),
         *(fp8_ops("w_qkv", g.qkv_width(kind), h, True) if fp8 else ()),
-        Operand("kv_cache", torch.bfloat16, f"[slots,{r}]", "inout"),
+        _kv_operand("kv_cache", g, kind, kv, "slots", "inout", kv_group),
         Operand("query", torch.bfloat16, f"[rows,{n},{g.qk_head_dim}]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"),
     )
@@ -304,20 +363,21 @@ def compile_mimo_producer_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, max
         key=(max_rows, launch.key()),
         geometry={"kind": kind, "hidden": h, "heads": n, "kv_heads": g.kv_heads(kind), "record_elems": r,
                   "max_rows": max_rows, "v_scale": g.v_scale, "rope_theta": g.rope_theta(kind), "fp8_weights": fp8,
-                  "qkv_width": g.qkv_width(kind), "k_stride": g.qkv_k_stride},
+                  "qkv_width": g.qkv_width(kind), "k_stride": g.qkv_k_stride, **_kv_geometry(g, kind, kv, kv_group)},
         scratch={"scratch": lambda rows: producer_scratch_bytes(g, kind, rows)},
         doc=__doc__,
     )
 
 
 class _FullAttention:
-    def __init__(self, g: MiMoGeometry, route: str, max_splits: int):
+    def __init__(self, g: MiMoGeometry, route: str, max_splits: int, kv: str = "bf16", kv_group: int | None = None):
         self.g, self.route = g, route
         decode = route == "decode"
         self.attn = MimoGqaAttention(
             heads=g.heads, kv_heads=g.full_kv_heads, tokens=1 if decode else prefill_tokens(g, "full"),
             window=0, paged=True, sink=False, direct=not decode, softmax_scale=g.softmax_scale,
-            page_rows=g.page_rows, ring_rows=g.ring_rows, head=g.qk_head_dim, v_head=g.v_head_dim)
+            page_rows=g.page_rows, ring_rows=g.ring_rows, head=g.qk_head_dim, v_head=g.v_head_dim,
+            kv8=_KV8[_check_kv(kv)], kv_group=_group(kv, kv_group))
         self.merge = MimoSplitMerge(heads=g.heads, v_head=g.v_head_dim, sink=False) if decode else None
         self.max_splits = int(max_splits)
 
@@ -362,13 +422,15 @@ class _FullAttentionPrefill(_FullAttention):
 
 
 class _SwaAttention:
-    def __init__(self, g: MiMoGeometry, route: str):
+    def __init__(self, g: MiMoGeometry, route: str, kv: str = "bf16", kv_group: int | None = None):
         self.g, self.route = g, route
         self.attn = MimoGqaAttention(
             heads=g.heads, kv_heads=g.swa_kv_heads, tokens=1 if route == "decode" else prefill_tokens(g, "swa"),
             window=g.window, paged=False, sink=True, direct=True, softmax_scale=g.softmax_scale,
-            page_rows=g.page_rows, ring_rows=g.ring_rows, head=g.qk_head_dim, v_head=g.v_head_dim)
-        self.commit = MimoRingCommit(record=g.record_elems("swa"), ring_rows=g.ring_rows)
+            page_rows=g.page_rows, ring_rows=g.ring_rows, head=g.qk_head_dim, v_head=g.v_head_dim,
+            kv8=_KV8[_check_kv(kv)], kv_group=_group(kv, kv_group))
+        self.commit = MimoRingCommit(record=g.record_elems("swa"), ring_rows=g.ring_rows,
+                                     record_bytes=record_bytes(g, "swa", kv, kv_group))
 
     def key(self) -> tuple:
         return (self.attn.key(), self.route)
@@ -384,10 +446,37 @@ class _SwaAttention:
         self.commit(kv_step, ring, ring_slots, seq_first, rows, stream)
 
 
+class _FullAttentionPrefillWide(_FullAttention):
+    """Prefill over 8-bit records: :class:`MimoKvWiden` copies the sequence's keys ``< keys`` to
+    BF16 ``kv_wide`` once, then the BF16 prefill attention reads that copy (``contiguous``)."""
+
+    def __init__(self, g: MiMoGeometry, route: str, max_splits: int, kv: str, kv_group: int | None):
+        super().__init__(g, route, max_splits)
+        self.kv, self.kv_group = kv, _group(kv, kv_group)
+        self.attn = MimoGqaAttention(
+            heads=g.heads, kv_heads=g.full_kv_heads, tokens=prefill_tokens(g, "full"), window=0, paged=True,
+            sink=False, direct=True, softmax_scale=g.softmax_scale, page_rows=g.page_rows, ring_rows=g.ring_rows,
+            head=g.qk_head_dim, v_head=g.v_head_dim, contiguous=True)
+        self.widen = MimoKvWiden(kv_heads=g.full_kv_heads, kv8=_KV8[kv], kv_group=self.kv_group,
+                                 page_rows=g.page_rows, head=g.qk_head_dim, v_head=g.v_head_dim)
+
+    def key(self) -> tuple:
+        return (self.attn.key(), self.route, self.kv, self.kv_group, "wide")
+
+    @cute.jit
+    def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
+                 kv_wide: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32, table_stride: Int32,
+                 keys: Int32, stream: cuda.CUstream):
+        self.widen(kv_cache, page_table, kv_wide, keys, stream)
+        self.run(q, kv_wide, positions, page_table, out, scratch, rows, table_stride, Int32(1), stream)
+
+
 def compile_mimo_attention_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, route: str, max_rows: int,
-                               max_splits: int = DEFAULT_MAX_SPLITS):
-    """GQA attention of ``kind`` for ``rows <= max_rows``; see the module docstring."""
+                               max_splits: int = DEFAULT_MAX_SPLITS, kv: str = "bf16", kv_group: int | None = None):
+    """GQA attention of ``kind`` for ``rows <= max_rows``; see the module docstring (``kv``
+    ``"int8"`` / ``"fp8"``: 8-bit records, see ``_mimo_kernels``)."""
     max_rows = _check(kind, max_rows)
+    _check_kv(kv)
     if route not in ("decode", "prefill"):
         raise ValueError("route is 'decode' or 'prefill'")
     if not 1 <= int(max_splits) <= MAX_SPLITS:
@@ -397,17 +486,24 @@ def compile_mimo_attention_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, ro
     out = Operand("out", torch.bfloat16, f"[rows,{n},{g.v_head_dim}]", "out")
     scratch = Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch")
     if kind == "full":
-        launch = (_FullAttentionDecode if route == "decode" else _FullAttentionPrefill)(g, route, max_splits)
-        operands = (q, Operand("kv_cache", torch.bfloat16, f"[pages*{g.page_rows},{r}]"),
+        wide = route == "prefill" and kv != "bf16"
+        cls = _FullAttentionDecode if route == "decode" else _FullAttentionPrefillWide if wide else _FullAttentionPrefill
+        launch = cls(g, route, max_splits, kv, kv_group)
+        operands = (q, _kv_operand("kv_cache", g, kind, kv, f"pages*{g.page_rows}", "in", kv_group),
                     Operand("positions", torch.int64, "[rows]", align=8),
-                    Operand("page_table", torch.int32, "[rows|1,table_stride]", align=4), out, scratch)
+                    Operand("page_table", torch.int32, "[rows|1,table_stride]", align=4))
+        if wide:
+            operands += (Operand("kv_wide", torch.bfloat16, f"[keys,{r}]", "out"),)
+        operands += (out, scratch)
         scalars = (Scalar("rows"), Scalar("table_stride"))
         if route == "decode":
             scalars += (Scalar("splits"),)
+        if wide:
+            scalars += (Scalar("keys", note="the sequence's last row position + 1 (keys widened into kv_wide)"),)
     else:
-        launch = _SwaAttention(g, route)
-        operands = (q, Operand("kv_step", torch.bfloat16, f"[rows,{r}]"),
-                    Operand("ring", torch.bfloat16, f"[rings*{g.ring_rows},{r}]", "inout"),
+        launch = _SwaAttention(g, route, kv, kv_group)
+        operands = (q, _kv_operand("kv_step", g, kind, kv, "rows", "in", kv_group),
+                    _kv_operand("ring", g, kind, kv, f"rings*{g.ring_rows}", "inout", kv_group),
                     Operand("positions", torch.int64, "[rows]", align=8),
                     Operand("ring_slots", torch.int64, "[rows]", align=8),
                     Operand("seq_first", torch.int32, "[rows]", align=4),
@@ -419,7 +515,7 @@ def compile_mimo_attention_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, ro
         geometry={"kind": kind, "route": route, "heads": n, "kv_heads": g.kv_heads(kind), "record_elems": r,
                   "max_rows": max_rows, "window": g.window if kind == "swa" else 0, "ring_rows": g.ring_rows,
                   "page_rows": g.page_rows, "max_splits": int(max_splits) if kind == "full" and route == "decode"
-                  else 1, "rows_per_cta": launch.attn.tokens},
+                  else 1, "rows_per_cta": launch.attn.tokens, **_kv_geometry(g, kind, kv, kv_group)},
         scratch={"scratch": lambda rows: attention_scratch_bytes(g, kind, route, rows, max_splits)},
         doc=__doc__,
     )
