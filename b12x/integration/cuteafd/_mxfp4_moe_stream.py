@@ -41,11 +41,14 @@ from b12x._lib.intrinsics import (
     ld_shared_u32,
     ld_shared_v4_u32,
     ldmatrix_m8n8x4_b16,
+    max_abs_32,
     mxfp8_mma_m16n8k32_f32_e2m1,
     pack_f32x2_to_bfloat2,
+    quantize_block_fp8_mx,
     shared_ptr_to_u32,
     st_global_u32,
     st_global_v4_u32,
+    st_global_u8,
     st_shared_u32,
     st_shared_v4_u32,
 )
@@ -54,6 +57,8 @@ from ._fp8_moe_kernels import _i32_at, _u32_as_f32
 from ._fp8_moe_stream import STREAM_TILE_M, StreamFp8Down, StreamFp8GateUp, _chunk, _swiglu, _u8_weight
 from ._fp8_weights import _e4m3x4_scaled_bf16x2x2
 from ._mxfp4_moe_kernels import e2m1x8_scaled_bf16, ue8m0_bf16x2
+from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes
+from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 
 __all__ = ["StreamMxfp4Down", "StreamMxfp4GateUp"]
 
@@ -94,11 +99,17 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     w_ring = 3
     w_k = 256
 
-    def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False):
+    def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False,
+                 act_mxfp8: bool = False):
         super().__init__(inter=inter, hidden=hidden, experts=experts, limit=limit)
         # qmma: block-scaled E4M3 x E2M1 MMAs (m16n8k32, UE8M0 per 32 on both
         # operands) read the wire rows and the packed weights as they are.
         self.qmma = bool(qmma)
+        self.act_mxfp8 = bool(act_mxfp8)
+        self.act_row_bytes = mxfp8_down_row_bytes(self.inter) if self.act_mxfp8 else 2 * self.inter
+        # Once its async reads drain, reuse A shared memory for exact BF16
+        # SwiGLU rounding before the row-local K32 quantization.
+        self.act_stride = self.cols * 2 + 16
         if self.hidden % 512:
             raise ValueError("MXFP4 stream gate/up needs H % 512 == 0 (16-byte scale rows)")
         self.w_blocks = self.hidden // self.w_k
@@ -109,8 +120,9 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
             raise ValueError("MXFP4 stream gate/up needs at least as many weight blocks as ring slots")
 
     def key(self) -> tuple:
-        return ("stream_gate_up_mxfp4", 1, self.inter, self.hidden, self.experts, self.limit, self.a_ring,
-                self.w_ring, self.qmma)
+        key = ("stream_gate_up_mxfp4", 1, self.inter, self.hidden, self.experts, self.limit, self.a_ring,
+               self.w_ring, self.qmma)
+        return key + (("act_mxfp8", self.act_row_bytes),) if self.act_mxfp8 else key
 
     def _storage(self, w_layout):
         class Storage:
@@ -362,6 +374,8 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                                         acc[f + 2] = d2
                                         acc[f + 3] = d3
             cute.arch.cp_async_wait_group(0)
+            if cutlass.const_expr(self.act_mxfp8):
+                cute.arch.sync_threads()
             if active:
                 for mt in cutlass.range_constexpr(2):
                     for half in cutlass.range_constexpr(2):
@@ -373,9 +387,32 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                                 col = n0 + warp_n * Int32(16) + Int32(8 * nt) + Int32(2) * j
                                 v0 = _swiglu(acc[fg], acc[fu], self.limit)
                                 v1 = _swiglu(acc[fg + 1], acc[fu + 1], self.limit)
-                                st_global_u32(Int64(act.toint()) + (Int64(tile * Int32(STREAM_TILE_M) + row)
-                                                                    * Int64(i) + Int64(col)) * Int64(2),
-                                              pack_f32x2_to_bfloat2(v0, v1))
+                                if cutlass.const_expr(self.act_mxfp8):
+                                    st_shared_u32(sa + row * Int32(self.act_stride) + (col - n0) * Int32(2),
+                                                  pack_f32x2_to_bfloat2(v0, v1))
+                                else:
+                                    st_global_u32(Int64(act.toint()) + (Int64(tile * Int32(STREAM_TILE_M) + row)
+                                                                        * Int64(i) + Int64(col)) * Int64(2),
+                                                  pack_f32x2_to_bfloat2(v0, v1))
+            if cutlass.const_expr(self.act_mxfp8):
+                cute.arch.sync_threads()
+                if tidx < live:
+                    # A CTA owns exactly 32 intermediate columns, including
+                    # the TP6 slice's whole K32 zero-padding blocks.
+                    values = cute.make_rmem_tensor(cute.make_layout((32,), stride=(1,)), Float32)
+                    for q in cutlass.range_constexpr(4):
+                        words = ld_shared_v4_u32(sa + tidx * Int32(self.act_stride) + Int32(16 * q))
+                        for word in cutlass.range_constexpr(4):
+                            values[8 * q + 2 * word] = _bf16_lo(words[word])
+                            values[8 * q + 2 * word + 1] = _bf16_hi(words[word])
+                    payload, scale = quantize_block_fp8_mx(values, max_abs_32(values))
+                    at = Int64(act.toint()) + (Int64(tile) * Int64(STREAM_TILE_M) + Int64(tidx)) \
+                        * Int64(self.act_row_bytes)
+                    for half in cutlass.range_constexpr(2):
+                        st_global_v4_u32(at + Int64(n0) + Int64(16 * half),
+                                         payload[4 * half], payload[4 * half + 1],
+                                         payload[4 * half + 2], payload[4 * half + 3])
+                    st_global_u8(at + Int64(i) + Int64(n0 // Int32(32)), cutlass.Uint8(scale))
 
 
 class StreamMxfp4Down(StreamFp8Down):

@@ -55,6 +55,10 @@ Scratch (1024-aligned regions, live row layout): metadata, ``pair_row`` / ``pair
 for the down projection's output), ``gate|up`` BF16, SwiGLU BF16; ``stream``:
 metadata, ``pair_row`` / ``pair_pos``, SwiGLU BF16 ``[max_tiles * 128, I]``
 (chunk-padded rows), down output BF16 ``[pairs, H]``, (BF16 input) wire rows.
+``mxfp4_down_a8=True`` is opt-in for MXFP4 wire-input stream programs: round
+SwiGLU to the same BF16 values, then quantize each row's K32 blocks to E4M3
+with UE8M0 scales and use direct block-scaled down MMAs. Decode and the default
+BF16 down path stay unchanged; scratch must be sized with the same option.
 """
 
 from __future__ import annotations
@@ -77,6 +81,8 @@ from ._fp8_moe_kernels import (
 from ._fp8_moe_stream import STREAM_TILE_M, StreamFp8Down, StreamFp8GateUp, stream_max_tiles
 from ._mxfp4_moe_kernels import GroupedMxfp4Gemv
 from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
+from ._mxfp4_moe_a8 import StreamMxfp4DownA8
+from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes
 from ._nvfp4_moe_kernels import GroupedNvfp4Gemv, nvfp4_alpha_offset
 from ._nvfp4_moe_stream import ChunkRows, ChunkSwiGLU, StreamNvfp4Linear
 from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, StreamNvfp4LinearA4
@@ -319,7 +325,8 @@ def _grouped_rows(g: Fp8MoeGeometry, route: str, rows: int) -> int:
     return TILE_M * (-(-pairs // TILE_M) + min(g.experts, pairs))
 
 
-def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True) -> list[int]:
+def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
+             mxfp4_down_a8: bool = False) -> list[int]:
     rows = max(int(rows), 1)
     if route == "stream" and g.activations == "a4":
         pairs = rows * g.top_k
@@ -351,11 +358,12 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True) -> lis
         ]
     if route == "stream":
         pairs = rows * g.top_k
+        act_bytes = mxfp8_down_row_bytes(g.slice) if mxfp4_down_a8 else 2 * g.slice
         return [
             meta_words(g.experts, stream_max_tiles(g.experts, pairs)) * 4,
             pairs * 4,                                 # pair_row
             pairs * 4,                                 # pair_pos
-            stream_max_tiles(g.experts, pairs) * STREAM_TILE_M * g.slice * 2,  # SwiGLU, chunk-padded rows
+            stream_max_tiles(g.experts, pairs) * STREAM_TILE_M * act_bytes,  # SwiGLU, chunk-padded rows
             pairs * g.hidden * 2,                      # down output
         ] + ([] if wire else [rows * (g.hidden + g.hidden // 32)])  # BF16 input: its wire rows
     grouped = _grouped_rows(g, route, rows)
@@ -396,12 +404,14 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8",
 
 
 def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
-                          prefill: str = "auto") -> int:
+                          prefill: str = "auto", mxfp4_down_a8: bool = False) -> int:
+    if mxfp4_down_a8 and (g.weights != "mxfp4" or not wire):
+        raise ValueError("MXFP4 A8 down requires MXFP4 weights and wire input")
     route = _resolve(route, rows, wire, g.kind, prefill)
     if route == "auto":
-        return max(fp8_moe_scratch_bytes(g, "decode", rows, wire, prefill),
-                   fp8_moe_scratch_bytes(g, _large_route(wire, g.kind, prefill), rows, wire, prefill))
-    return sum(_align(b) for b in _regions(g, route, rows, wire))
+        return max(fp8_moe_scratch_bytes(g, "decode", rows, wire, prefill, mxfp4_down_a8),
+                   fp8_moe_scratch_bytes(g, _large_route(wire, g.kind, prefill), rows, wire, prefill, mxfp4_down_a8))
+    return sum(_align(b) for b in _regions(g, route, rows, wire, mxfp4_down_a8))
 
 
 @cute.jit
@@ -494,10 +504,13 @@ class _StreamRoute:
     """The ``stream`` route: compact expert groups in 128-row chunks, streaming
     gate/up (FP8 wire rows, SwiGLU fused) and down GEMMs, route combine."""
 
-    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool, prefill: str = "auto"):
+    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool, prefill: str = "auto",
+                 mxfp4_down_a8: bool = False):
         if not wire and g.weights != "fp8":
             raise ValueError("the MXFP4 stream route takes FP8 K32 wire rows")
         self.g, self.wire = g, bool(wire)
+        self.mxfp4_down_a8 = bool(mxfp4_down_a8)
+        self.act_bytes = mxfp8_down_row_bytes(g.slice) if self.mxfp4_down_a8 else 2 * g.slice
         # BF16 input: the rows are first quantized to FP8 K32 wire rows (the
         # coordinator's expert-input rule: UE8M0 per 32, amax floor 1e-4).
         self.quant = None if wire else _MXFP8RowsQuantLaunch(
@@ -508,8 +521,8 @@ class _StreamRoute:
                             chunked=True)
         if g.weights == "mxfp4":
             self.gate_up = StreamMxfp4GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
-                                             qmma=MXFP4_STREAM_QMMA)
-            self.down = StreamMxfp4Down(hidden=h, inter=i, experts=e)
+                                             qmma=MXFP4_STREAM_QMMA, act_mxfp8=self.mxfp4_down_a8)
+            self.down = (StreamMxfp4DownA8 if self.mxfp4_down_a8 else StreamMxfp4Down)(hidden=h, inter=i, experts=e)
         else:
             self.gate_up = StreamFp8GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
                                            qmma=FP8_STREAM_QMMA and prefill != "w8a16")
@@ -533,7 +546,7 @@ class _StreamRoute:
         pair_row_at = base + _al(Int64(4 * meta_words(g.experts, self.max_tiles)))
         pair_pos_at = pair_row_at + _al(Int64(pairs) * Int64(4))
         act_at = pair_pos_at + _al(Int64(pairs) * Int64(4))
-        y_at = act_at + _al(Int64(max_tiles) * Int64(STREAM_TILE_M * 2 * g.slice))
+        y_at = act_at + _al(Int64(max_tiles) * Int64(STREAM_TILE_M * self.act_bytes))
         ptr = lambda dtype, at: cute.make_ptr(dtype, at, cute.AddressSpace.gmem, assumed_align=16)  # noqa: E731
         rows_x = x
         if cutlass.const_expr(not self.wire):
@@ -550,7 +563,7 @@ class _StreamRoute:
         meta = ptr(cutlass.Int32, base)
         pair_row = ptr(cutlass.Int32, pair_row_at)
         pair_pos = ptr(cutlass.Int32, pair_pos_at)
-        act = ptr(cutlass.BFloat16, act_at)
+        act = ptr(cutlass.Uint8 if self.mxfp4_down_a8 else cutlass.BFloat16, act_at)
         y = ptr(cutlass.BFloat16, y_at)
         ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
         self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
@@ -687,23 +700,25 @@ class _StreamNvfp4A4Route:
         self.combine(y, pair_pos, weights, out, rows, stream)
 
 
-def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto"):
+def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
+                mxfp4_down_a8: bool = False):
     if route == "stream" and g.activations == "a4":
         return _StreamNvfp4A4Route(g, max_rows, wire)
     if route == "stream" and g.weights == "nvfp4":
         return _StreamNvfp4Route(g, max_rows, wire)
     if route == "stream":
-        return _StreamRoute(g, max_rows, wire, prefill)
+        return _StreamRoute(g, max_rows, wire, prefill, mxfp4_down_a8)
     return _Route(g, route, max_rows, wire)
 
 
 class _Fp8Moe:
-    def __init__(self, g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto"):
+    def __init__(self, g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
+                 mxfp4_down_a8: bool = False):
         self.route = route
         self.threshold = auto_large_rows(wire, g.kind, prefill)
         self.decode = _Route(g, "decode", max_rows, wire) if route in ("decode", "auto") else None
         large = _large_route(wire, g.kind, prefill) if route == "auto" else route
-        self.prefill = (_make_route(g, large, max_rows, wire, prefill)
+        self.prefill = (_make_route(g, large, max_rows, wire, prefill, mxfp4_down_a8)
                         if route in ("prefill", "stream", "auto") else None)
 
     def key(self) -> tuple:
@@ -726,15 +741,17 @@ class _Fp8Moe:
 
 
 def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: bool = True,
-                        prefill: str = "auto") -> AotProgram:
+                        prefill: str = "auto", mxfp4_down_a8: bool = False) -> AotProgram:
     """Routed FP8 experts of ``g`` for ``rows <= max_rows``; see the module docstring
     (``prefill``: the large-row form of FP8 programs, "auto", "w8a8" or "w8a16")."""
     if route not in ("decode", "prefill", "stream", "auto"):
         raise ValueError("route is 'decode', 'prefill', 'stream' or 'auto'")
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
+    if mxfp4_down_a8 and (g.weights != "mxfp4" or not wire):
+        raise ValueError("MXFP4 A8 down requires MXFP4 weights and wire input")
     requested, route = route, _resolve(route, max_rows, wire, g.kind, prefill)
-    launch = _Fp8Moe(g, route, max_rows, wire, prefill)
+    launch = _Fp8Moe(g, route, max_rows, wire, prefill, mxfp4_down_a8)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
     x = (Operand("x", torch.uint8, f"[rows,{h + h // 32}]", note="FP8 K32 wire rows") if wire
          else Operand("x", torch.bfloat16, f"[rows,{h}]"))
@@ -783,7 +800,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         geometry={"requested_route": requested, "hidden": h, "experts": e, "top_k": k, "intermediate": g.intermediate, "tp": g.tp,
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
                   "wire": bool(wire), "weights": g.weights, "activations": g.activations,
-                  "prefill": prefill},
-        scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire, prefill)},
+                  "prefill": prefill, "mxfp4_down_a8": bool(mxfp4_down_a8)},
+        scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire, prefill, mxfp4_down_a8)},
         doc=__doc__,
     )

@@ -61,13 +61,17 @@ def _weights(g, real: int):
     return _WEIGHTS[key]
 
 
-def reference(x, ids, weights, w1, s1, w3, s3, w2, s2):
+def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, mxfp4_down_a8=False):
     out = torch.zeros(x.shape, device=x.device)
     for expert in ids.unique().tolist():
         rows, slots = torch.where(ids == expert)
         gate = x[rows] @ dequant(w1[expert], s1[expert]).T
         up = x[rows] @ dequant(w3[expert], s3[expert]).T
-        y = (torch.nn.functional.silu(gate) * up) @ dequant(w2[expert], s2[expert]).T
+        act = torch.nn.functional.silu(gate) * up
+        if mxfp4_down_a8:
+            from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
+            act = quant_dequant_mxfp8_torch(act).bfloat16()
+        y = act @ dequant(w2[expert], s2[expert]).T
         out.index_add_(0, rows, y.float() * weights[rows, slots][:, None])
     return out.bfloat16()
 
