@@ -44,7 +44,7 @@ from cutlass import Float32, Int32, Int64
 
 from b12x.attention._shared.cute.ops import LOG2_E
 
-from ._common import GLM53, GLMGeometry, Operand, Scalar, compile_program
+from ._common import GLM53, GLMFGeometry, GLMGeometry, Operand, Scalar, compile_program
 
 __all__ = ["compile_glm_sparse_mla_aot", "decode_buckets"]
 
@@ -94,12 +94,12 @@ def decode_buckets(g: GLMGeometry, max_rows: int) -> tuple[tuple[int, int, int],
     return tuple(out)
 
 
-def sparse_mla_scratch_bytes(g: GLMGeometry, *, route: str, rows: int, buckets=()) -> int:
+def sparse_mla_scratch_bytes(g: GLMGeometry, *, route: str, rows: int, buckets=(), fp32_partials=False) -> int:
     rows = max(int(rows), 1)
     if route == "prefill":
         return rows * g.heads * 4
     units = max(min(rows, cap) * splits for cap, splits, _ in buckets)
-    return _align(units * g.heads * _DV * 2) + units * g.heads * 4
+    return _align(units * g.heads * _DV * (4 if fp32_partials else 2)) + units * g.heads * 4
 
 
 class _Prefill:
@@ -157,12 +157,14 @@ class _Prefill:
 
 
 class _Decode:
-    def __init__(self, g: GLMGeometry, max_rows: int):
+    def __init__(self, g: GLMGeometry, max_rows: int, fp32_partials=False):
         from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel
         from b12x.attention._shared.mla.merge import SparseMLASplitDecodeMergeKernel
         from b12x.attention._shared.mla.smem import make_smem_layout
 
         self.g = g
+        self.partial_type = Float32 if fp32_partials else cutlass.BFloat16
+        self.partial_bytes = 4 if fp32_partials else 2
         self.heads, self.topk, self.qk = g.heads, _topk(g), _qk(g)
         traits = _traits(g)
         layout = make_smem_layout(traits)
@@ -184,7 +186,7 @@ class _Decode:
                 native_dsv4_h8=False, native_dsv4_h16=False, native_dsv41_fp8=False, vector_q=True,
             ))
             self.merges.append(SparseMLASplitDecodeMergeKernel(static_num_chunks=splits))
-        self.key = ("decode", self.buckets)
+        self.key = ("decode", self.buckets, "fp32") if fp32_partials else ("decode", self.buckets)
 
     @cute.jit
     def _run(self, b: cutlass.Constexpr, q: cute.Pointer, kv_cache: cute.Pointer,
@@ -194,9 +196,9 @@ class _Decode:
         n = self.heads
         s = self.buckets[b][1]
         partials = cute.make_tensor(
-            cute.make_ptr(cutlass.BFloat16, base, cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_ptr(self.partial_type, base, cute.AddressSpace.gmem, assumed_align=16),
             cute.make_layout((m, n, s, _DV), stride=(n * s * _DV, s * _DV, _DV, 1)))
-        lse_off = (m * Int64(n * s * _DV * 2) + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
+        lse_off = (m * Int64(n * s * _DV * self.partial_bytes) + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
         partial_lse = cute.make_tensor(
             cute.make_ptr(Float32, base + lse_off, cute.AddressSpace.gmem, assumed_align=16),
             cute.make_layout((m, n, s), stride=(n * s, s, 1)))
@@ -234,15 +236,20 @@ class _Decode:
 
 
 def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill", max_rows: int = 1,
-                               name: str = "glm_sparse_mla"):
+                               name: str = "glm_sparse_mla", fp32_partials: bool = False):
     """GLM latent sparse MLA; see the module docstring for the ABI. A GLM 5.3
     Flash geometry (``GLMFGeometry``) selects the 512-wide query, 528-byte
-    records (``ModelType.GLM_NEXT``) and its 2112-slot index rows."""
+    records (``ModelType.GLM_NEXT``) and its 2112-slot index rows. The opt-in
+    ``fp32_partials`` retains GLM Flash decode's normalized split outputs in
+    FP32 until the merge; the final output and the pointer/scalar ABI stay
+    BF16 and unchanged. Other families keep their existing BF16 path."""
+    if fp32_partials and (route != "decode" or not isinstance(g, GLMFGeometry)):
+        raise ValueError("fp32_partials is supported only for GLM Flash decode")
     if route == "prefill":
         launch = _Prefill(g)
         buckets = ()
     elif route == "decode":
-        launch = _Decode(g, int(max_rows))
+        launch = _Decode(g, int(max_rows), fp32_partials)
         buckets = launch.buckets
     else:
         raise ValueError("route must be 'prefill' or 'decode'")
@@ -259,7 +266,9 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         launch, name=f"{name}_{route}", operands=operands, scalars=(Scalar("rows"),),
         key=(n, k, int(max_rows), launch.key),
         geometry={"heads": n, "route": route, "max_rows": int(max_rows), "topk": k,
-                  "softmax_scale": g.softmax_scale, "decode_buckets": [list(b) for b in buckets]},
-        scratch={"scratch": lambda rows: sparse_mla_scratch_bytes(g, route=route, rows=rows, buckets=buckets)},
+                  "softmax_scale": g.softmax_scale, "decode_buckets": [list(b) for b in buckets],
+                  **({"partial_dtype": "float32"} if fp32_partials else {})},
+        scratch={"scratch": lambda rows: sparse_mla_scratch_bytes(g, route=route, rows=rows, buckets=buckets,
+                                                               fp32_partials=fp32_partials)},
         doc=__doc__,
     )

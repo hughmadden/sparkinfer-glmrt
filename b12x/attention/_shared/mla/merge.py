@@ -10,7 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 import torch
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.intrinsics import (
@@ -306,19 +306,30 @@ def _merge_accumulate_pass(
                 tmp_output,
                 cute.crd2idx((q_idx, head_idx, slot, dim0), tmp_output.layout),
             )
-            loaded.append(ld_global_v4_u32(src))
+            if cutlass.const_expr(tmp_output.element_type == Float32):
+                lo = ld_global_v4_u32(src)
+                hi = ld_global_v4_u32(src + Int64(16))
+                loaded.append((lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]))
+            else:
+                loaded.append(ld_global_v4_u32(src))
         for k in cutlass.range_constexpr(slots_per_lane):
             w = ld_shared_f32(
                 weights_addr
                 + (slot_base + slot_lane + Int32(k * _MERGE_SLOT_LANES)) * Int32(4)
             )
             if w != Float32(0.0):
-                x0, x1, x2, x3 = loaded[k]
-                i = 0
-                for x in (x0, x1, x2, x3):
-                    acc[i] = acc[i] + w * _u32_to_f32(x << Uint32(16))
-                    acc[i + 1] = acc[i + 1] + w * _u32_to_f32(x & Uint32(0xFFFF0000))
-                    i += 2
+                if cutlass.const_expr(tmp_output.element_type == Float32):
+                    i = 0
+                    for x in loaded[k]:
+                        acc[i] = acc[i] + w * _u32_to_f32(x)
+                        i += 1
+                else:
+                    x0, x1, x2, x3 = loaded[k]
+                    i = 0
+                    for x in (x0, x1, x2, x3):
+                        acc[i] = acc[i] + w * _u32_to_f32(x << Uint32(16))
+                        acc[i + 1] = acc[i + 1] + w * _u32_to_f32(x & Uint32(0xFFFF0000))
+                        i += 2
     else:
         for k in cutlass.range_constexpr(slots_per_lane):
             slot = slot_base + slot_lane + Int32(k * _MERGE_SLOT_LANES)
