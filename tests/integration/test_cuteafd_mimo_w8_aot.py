@@ -1,4 +1,4 @@
-"""MiMo V2 qkv producer and dense FFN programs over FP8-only weights (``fp8_only``)
+"""MiMo V2 qkv producer, output projection and FFN over FP8-only weights (``fp8_only``)
 against the BF16 (+ FP8) programs fed the dequantized weights: decode bitwise at
 every row count (16-row GEMV, two-tile GEMV to 32, W8A16 TMA above), prefill W8A16
 (``fp8_rows`` 0) bitwise above the BF16 skinny GEMV rows, W8A8 close."""
@@ -20,9 +20,11 @@ def _b12x():
 
 
 def _geometry(geo):
+    from dataclasses import replace
     from b12x.integration.cuteafd import MIMO_V2_FLASH, MIMO_V26_PRO
 
-    return {"flash": MIMO_V2_FLASH, "pro": MIMO_V26_PRO}[geo]
+    return {"flash": MIMO_V2_FLASH, "pro": MIMO_V26_PRO,
+            "pro_tp2": replace(MIMO_V26_PRO, heads=MIMO_V26_PRO.heads // 2)}[geo]
 
 
 def P(program, geo, **kw):
@@ -30,7 +32,8 @@ def P(program, geo, **kw):
     if key not in _PROGRAMS:
         from b12x.integration.cuteafd import mimo_attention, mimo_ffn
 
-        fn = {"producer": mimo_attention.compile_mimo_producer_aot, "ffn": mimo_ffn.compile_mimo_ffn_aot}[program]
+        fn = {"producer": mimo_attention.compile_mimo_producer_aot, "ffn": mimo_ffn.compile_mimo_ffn_aot,
+              "o": mimo_attention.compile_mimo_o_aot}[program]
         _PROGRAMS[key] = fn(_geometry(geo), **kw)
     return _PROGRAMS[key]
 
@@ -86,6 +89,77 @@ def test_mimo_producer_w8(geo, kind, mode, cap, rows, fp8_rows):
         new = run(P("producer", geo, kind=kind, max_rows=cap, fp8_only="prefill"), w8, s.t().contiguous(),
                   scalars=(rows, fp8_rows))
     _cmp(new, old, mode, fp8_rows)
+
+
+@pytest.mark.parametrize("geo", ["flash", "pro", "pro_tp2"])
+@pytest.mark.parametrize("mode,cap,rows,fp8_rows", CASES)
+def test_mimo_output_w8(geo, mode, cap, rows, fp8_rows):
+    g = _geometry(geo)
+    h, w = g.hidden, g.heads * g.v_head_dim
+    w8, scale, wd = _w(h, w, rows)
+    x = torch.randn((rows, w), device="cuda").bfloat16()
+    old = torch.empty((rows, h), device="cuda", dtype=torch.bfloat16)
+    new = torch.empty_like(old)
+    op = P("o", geo, max_rows=cap, fp8=mode == "decode")
+    np_ = P("o", geo, max_rows=cap, fp8_only=mode)
+    assert "w_o" not in [operand.name for operand in np_.operands]
+    if mode == "decode":
+        op.launch(x, wd, w8, scale, old, scalars=(rows, fp8_rows))
+    else:
+        op.launch(x, wd, old, scalars=(rows,))
+    np_.launch(x, w8, scale if mode == "decode" else scale.t().contiguous(), new,
+               _scratch(np_, cap), scalars=(rows, fp8_rows))
+    torch.cuda.synchronize()
+    assert torch.isfinite(new).all() and torch.count_nonzero(new) > 0
+    _cmp(new, old, mode, fp8_rows)
+
+
+@pytest.mark.parametrize("geo", ["pro", "pro_tp2"])
+@pytest.mark.parametrize("mode,cap,counts", [("decode", 64, (1, 16, 17, 32, 33, 64)),
+                                          ("prefill", 4096, (64, 65, 1024, 4096))])
+def test_mimo_output_w8_frozen_graph(geo, mode, cap, counts):
+    """One compiled capacity handles live tails and replay with changed inputs.
+
+    This checks the FP8 kernel against dequantized weights; it does not qualify
+    quantizing the checkpoint's original BF16 output projections.
+    """
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    g = _geometry(geo)
+    h, w = g.hidden, g.heads * g.v_head_dim
+    w8, scale, wd = _w(h, w, 927)
+    scales = scale if mode == "decode" else scale.t().contiguous()
+    x = torch.empty((cap, w), device="cuda", dtype=torch.bfloat16)
+    new = torch.empty((cap + 1, h), device="cuda", dtype=torch.bfloat16)
+    old = torch.empty_like(new)
+    np_ = P("o", geo, max_rows=cap, fp8_only=mode)
+    op = P("o", geo, max_rows=cap, fp8=mode == "decode")
+    scratch = _scratch(np_, cap)
+    fp8_rows = 32 if mode == "decode" else 0
+    ptrs = tuple(t.data_ptr() for t in (x, w8, scales, new, scratch))
+    with kernel_resolution_guard("MiMo output projection live rows reuse one FP8-only capacity"):
+        for rows in counts:
+            x.normal_()
+            x[rows:].fill_(float("nan"))
+            new.fill_(123)
+            np_.launch(x, w8, scales, new, scratch, scalars=(rows, fp8_rows))
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                np_.launch(x, w8, scales, new, scratch, scalars=(rows, fp8_rows))
+            for _ in range(2):
+                x[:rows].normal_()
+                new.fill_(123)
+                graph.replay()
+                if mode == "decode":
+                    op.launch(x, wd, w8, scale, old, scalars=(rows, fp8_rows))
+                else:
+                    op.launch(x, wd, old, scalars=(rows,))
+                torch.cuda.synchronize()
+                assert torch.isfinite(new[:rows]).all() and torch.count_nonzero(new[:rows]) > 0
+                assert torch.equal(new[:rows], old[:rows])
+                assert torch.all(new[rows:] == 123)
+                assert ptrs == tuple(t.data_ptr() for t in (x, w8, scales, new, scratch))
 
 
 @pytest.mark.parametrize("geo", ["flash", "pro"])

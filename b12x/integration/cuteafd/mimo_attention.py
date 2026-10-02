@@ -5,13 +5,18 @@ a paged cache, no sink, RoPE theta 5e6) and ``swa`` (64 / 8 heads, 128-token
 window, learned per-head sink, theta 1e4). ``H`` hidden 4096, ``N`` 64 query
 heads, ``G`` KV heads of the kind, ``R = G * 320`` BF16 elements per KV record
 (keys ``[G, 192]`` then values ``[G, 128]``, see ``_mimo_kernels``). Weights
-are BF16 (the checkpoint's FP8 blocks times their FP32 scales, dequantized at
-load; ``o_proj`` is stored BF16). Projections are ``RoutedBf16Projection``
-(skinny GEMV for few rows, TMA tensor-core GEMM above; FP32 accumulation).
+in the legacy ABI are BF16 (FP8 source blocks dequantized with their FP32
+scales; ``o_proj`` is stored BF16 in the supported checkpoints). Legacy
+projections are ``RoutedBf16Projection`` (skinny GEMV for few rows, TMA
+tensor-core GEMM above; FP32 accumulation).
 With ``fp8_only`` (the exported producers) ``w_qkv`` is ``w_qkv_fp8`` E4M3 +
 FP32 per-row x 128-K scales only (``w_qkv_scale [W, K/128]`` in decode programs,
 ``w_qkv_kscale [K/128, W]`` in prefill programs; ``mimo_w8``: decode GEMVs to 32
 rows then W8A16; prefill W8A8 or W8A16 on the ``fp8_rows`` switch).
+The optional FP8-only output projection uses the same layouts and dispatch
+with ``w_o_fp8`` and ``w_o_scale`` / ``w_o_kscale``, and no BF16 operand.
+Quantizing a BF16 checkpoint output weight requires model quality validation
+separate from validating the FP8 projection against its dequantized weights.
 Scratch is laid out from the live row count (size it with ``rows =
 max_rows``); regions start 1024-byte aligned.
 
@@ -546,10 +551,59 @@ class _OutputFp8(_Output):
         self.o(attn, w_o, w_o_fp8, w_o_scale, out, rows, fp8_rows, stream)
 
 
-def compile_mimo_o_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, max_rows: int, fp8: bool = False):
+class _OutputW8:
+    def __init__(self, g: MiMoGeometry, max_rows: int, prefill: bool):
+        self.o = mimo_w8(g.hidden, g.heads * g.v_head_dim, int(max_rows) if prefill else None)
+
+    def key(self) -> tuple:
+        return self.o.key()
+
+    @cute.jit
+    def body(self, attn: cute.Pointer, w_o_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+             scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.o(attn, w_o_fp8, scale, out, rows, fp8_rows, Int64(scratch.toint()), stream)
+
+
+class _OutputW8Decode(_OutputW8):
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, w_o_fp8: cute.Pointer, w_o_scale: cute.Pointer, out: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.body(attn, w_o_fp8, w_o_scale, out, scratch, rows, fp8_rows, stream)
+
+
+class _OutputW8Prefill(_OutputW8):
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, w_o_fp8: cute.Pointer, w_o_kscale: cute.Pointer, out: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.body(attn, w_o_fp8, w_o_kscale, out, scratch, rows, fp8_rows, stream)
+
+
+def compile_mimo_o_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, max_rows: int, fp8: bool = False,
+                       fp8_only: str | None = None):
     """o_proj for ``rows <= max_rows``; see the module docstring (``fp8``: the
-    E4M3 per-row-scaled copy for decode rows)."""
+    E4M3 per-row-scaled copy for decode rows; ``fp8_only``: ``"decode"`` or
+    ``"prefill"`` over one E4M3 weight, with no BF16 weight operand).
+
+    FP8-only prefill uses W8A16 when ``fp8_rows=0``. A nonzero value enables
+    activation quantization, which requires its own model quality gate.
+    """
     max_rows = _check("full", max_rows)
+    if fp8_only is not None:
+        from ._fp8_weights import check_w8_mode, fp8_only_operands
+
+        prefill = check_w8_mode(fp8_only) == "prefill"
+        launch = (_OutputW8Prefill if prefill else _OutputW8Decode)(g, max_rows, prefill)
+        h, w = g.hidden, g.heads * g.v_head_dim
+        return compile_program(
+            launch, name="mimo_o",
+            operands=(Operand("attn", torch.bfloat16, f"[rows,{w}]"),
+                      *fp8_only_operands("w_o", h, w, row_scales=True, prefill=prefill),
+                      Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+                      Operand("scratch", torch.uint8, "[o_scratch_bytes]", "scratch")),
+            scalars=(Scalar("rows"), Scalar("fp8_rows")), key=(max_rows, fp8_only, launch.key()),
+            geometry={"hidden": h, "width": w, "max_rows": max_rows, "fp8_weights": "only", "mode": fp8_only},
+            scratch={"scratch": lambda rows: mimo_w8_scratch_bytes(w, rows, prefill)}, doc=__doc__,
+        )
     launch = _OutputFp8(g) if fp8 else _Output(g)
     h, w = g.hidden, g.heads * g.v_head_dim
     return compile_program(
