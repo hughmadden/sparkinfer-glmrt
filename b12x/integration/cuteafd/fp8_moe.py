@@ -55,10 +55,12 @@ Scratch (1024-aligned regions, live row layout): metadata, ``pair_row`` / ``pair
 for the down projection's output), ``gate|up`` BF16, SwiGLU BF16; ``stream``:
 metadata, ``pair_row`` / ``pair_pos``, SwiGLU BF16 ``[max_tiles * 128, I]``
 (chunk-padded rows), down output BF16 ``[pairs, H]``, (BF16 input) wire rows.
-``mxfp4_down_a8=True`` is opt-in for MXFP4 wire-input stream programs: round
-SwiGLU to the same BF16 values, then quantize each row's K32 blocks to E4M3
-with UE8M0 scales and use direct block-scaled down MMAs. Decode and the default
-BF16 down path stay unchanged; scratch must be sized with the same option.
+MXFP4 wire-input stream programs run the down projection A8 by default
+(``MXFP4_STREAM_DOWN_A8``): SwiGLU is rounded to the same BF16 values, then
+each row's K32 blocks are quantized to E4M3 with UE8M0 scales and the down
+GEMM uses direct block-scaled E4M3 x E2M1 MMAs. ``prefill="w8a16"`` keeps the
+former BF16 down projection (``mxfp4_down_a8=False`` forces it too); decode
+is unchanged. Scratch must be sized with the same form.
 """
 
 from __future__ import annotations
@@ -126,6 +128,12 @@ AUTO_MXFP4_STREAM_ROWS_SM121 = 640
 # (us, widen / block-scaled): 4096 rows 7175 / 5833, 1024 5012 / 4794; the
 # layer outputs match the widening kernel's in all but ~1e-4 of BF16 values.
 MXFP4_STREAM_QMMA = True
+# The MXFP4 stream down projection over MXFP8 rows (the SwiGLU output's K32
+# blocks as E4M3 with UE8M0 scales, block-scaled MMAs) instead of widening the
+# E2M1 weights for BF16 MMAs over BF16 rows. GB10 TP6, 4096 rows, per layer
+# (us, BF16 / A8 down): 13379 / 12531; MiMo V2.6 Pro golden prefill NLL
+# 2.4190 -> 2.4119, KL to the reference 0.0446 -> 0.0457.
+MXFP4_STREAM_DOWN_A8 = True
 # The FP8 stream gate/up of W8A8 programs: block-scaled E4M3 x E4M3 MMAs
 # (False: the W8A16 widening kernel everywhere, as ``prefill="w8a16"``).
 FP8_STREAM_QMMA = True
@@ -180,6 +188,18 @@ def _w8a8(wire: bool, weights: str, prefill: str) -> bool:
     return bool(wire) or prefill == "w8a8"
 
 
+def _mxfp4_down_a8(wire: bool, weights: str, prefill: str, explicit: "bool | None" = None) -> bool:
+    """Whether an MXFP4 wire-input stream runs its down projection A8: the
+    default unless ``prefill="w8a16"`` (the former BF16 down), or ``explicit``."""
+    if prefill not in PREFILL_FORMS:
+        raise ValueError(f"prefill is one of {PREFILL_FORMS}")
+    if explicit is not None:
+        if explicit and (weights != "mxfp4" or not wire):
+            raise ValueError("MXFP4 A8 down requires MXFP4 weights and wire input")
+        return bool(explicit)
+    return weights == "mxfp4" and bool(wire) and MXFP4_STREAM_DOWN_A8 and prefill != "w8a16"
+
+
 def _streams(wire: bool, weights: str = "fp8", prefill: str = "auto") -> bool:
     """Whether ``auto``'s large route is ``stream``: MXFP4 weights (wire
     input; their only large route), NVFP4 (BF16 or wire input), W8A8 FP8
@@ -216,7 +236,8 @@ def prefill_forms(g: "Fp8MoeGeometry", max_rows: int, wire: bool = True) -> list
     """The ``prefill`` forms besides "auto" whose program of ``g`` at capacity
     ``max_rows`` differs from the "auto" one (packages carry those too)."""
     def policy(prefill):
-        return _large_route(wire, g.kind, prefill), auto_large_rows(wire, g.kind, prefill), _w8a8(wire, g.kind, prefill)
+        return (_large_route(wire, g.kind, prefill), auto_large_rows(wire, g.kind, prefill),
+                _w8a8(wire, g.kind, prefill), _mxfp4_down_a8(wire, g.kind, prefill))
 
     base = policy("auto")
     return [form for form in PREFILL_FORMS[1:] if policy(form) != base
@@ -404,9 +425,8 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8",
 
 
 def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
-                          prefill: str = "auto", mxfp4_down_a8: bool = False) -> int:
-    if mxfp4_down_a8 and (g.weights != "mxfp4" or not wire):
-        raise ValueError("MXFP4 A8 down requires MXFP4 weights and wire input")
+                          prefill: str = "auto", mxfp4_down_a8: "bool | None" = None) -> int:
+    mxfp4_down_a8 = _mxfp4_down_a8(wire, g.kind, prefill, mxfp4_down_a8)
     route = _resolve(route, rows, wire, g.kind, prefill)
     if route == "auto":
         return max(fp8_moe_scratch_bytes(g, "decode", rows, wire, prefill, mxfp4_down_a8),
@@ -741,15 +761,14 @@ class _Fp8Moe:
 
 
 def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: bool = True,
-                        prefill: str = "auto", mxfp4_down_a8: bool = False) -> AotProgram:
+                        prefill: str = "auto", mxfp4_down_a8: "bool | None" = None) -> AotProgram:
     """Routed FP8 experts of ``g`` for ``rows <= max_rows``; see the module docstring
     (``prefill``: the large-row form of FP8 programs, "auto", "w8a8" or "w8a16")."""
     if route not in ("decode", "prefill", "stream", "auto"):
         raise ValueError("route is 'decode', 'prefill', 'stream' or 'auto'")
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
-    if mxfp4_down_a8 and (g.weights != "mxfp4" or not wire):
-        raise ValueError("MXFP4 A8 down requires MXFP4 weights and wire input")
+    mxfp4_down_a8 = _mxfp4_down_a8(wire, g.kind, prefill, mxfp4_down_a8)
     requested, route = route, _resolve(route, max_rows, wire, g.kind, prefill)
     launch = _Fp8Moe(g, route, max_rows, wire, prefill, mxfp4_down_a8)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
