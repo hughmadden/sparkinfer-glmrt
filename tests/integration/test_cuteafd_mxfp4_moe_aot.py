@@ -61,13 +61,18 @@ def _weights(g, real: int):
     return _WEIGHTS[key]
 
 
-def reference(x, ids, weights, w1, s1, w3, s3, w2, s2):
+def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, mxfp4_down_a8=False):
     out = torch.zeros(x.shape, device=x.device)
     for expert in ids.unique().tolist():
         rows, slots = torch.where(ids == expert)
         gate = x[rows] @ dequant(w1[expert], s1[expert]).T
         up = x[rows] @ dequant(w3[expert], s3[expert]).T
-        y = (torch.nn.functional.silu(gate) * up) @ dequant(w2[expert], s2[expert]).T
+        act = torch.nn.functional.silu(gate) * up
+        if mxfp4_down_a8:
+            from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
+            # The kernel rounds SwiGLU to BF16 before its K32 quantization.
+            act = quant_dequant_mxfp8_torch(act.bfloat16().float()).bfloat16()
+        y = act @ dequant(w2[expert], s2[expert]).T
         out.index_add_(0, rows, y.float() * weights[rows, slots][:, None])
     return out.bfloat16()
 
@@ -91,7 +96,11 @@ def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, route="auto"):
     scratch = torch.empty(fp8_moe_scratch_bytes(g, route, capacity, wire), dtype=torch.uint8, device="cuda")
     _PROGRAMS[key].launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
     torch.cuda.synchronize()
-    expected = reference(x_exact, ids, weights, *w)
+    # Wire-input streams run the down projection A8 by default (MXFP4_STREAM_DOWN_A8).
+    from b12x.integration.cuteafd.fp8_moe import MXFP4_STREAM_DOWN_A8, auto_large_rows
+    streamed = wire and (route == "stream" or (route == "auto" and capacity > auto_large_rows(True, "mxfp4")
+                                                and rows > auto_large_rows(True, "mxfp4")))
+    expected = reference(x_exact, ids, weights, *w, mxfp4_down_a8=streamed and MXFP4_STREAM_DOWN_A8)
     a, b = out.float(), expected.float()
     c = float((a * b).sum() / (a.norm() * b.norm()))
     worst = float(torch.nn.functional.cosine_similarity(a, b, dim=1).min())
@@ -136,7 +145,10 @@ def test_mxfp4_moe_stream(tp, real, capacity, rows, hot, route):
     c, worst = _run(g, real, capacity, rows, wire=True, hot=hot, route=route)
     print(f"mxfp4_moe mimop tp{tp} (slice {g.slice}, {real} real) {route} m{capacity} rows={rows}: "
           f"cosine {c:.7f} worst row {worst:.6f}")
-    assert c >= 0.99999 and worst >= 0.9999
+    from b12x.integration.cuteafd.fp8_moe import MXFP4_STREAM_DOWN_A8
+    # A8 down: E4M3 SwiGLU rows (K32 UE8M0 scales) against the FP32 reference
+    # of the same quantization; the GPU sums in a different order.
+    assert c >= (0.9998 if MXFP4_STREAM_DOWN_A8 else 0.99999) and worst >= (0.999 if MXFP4_STREAM_DOWN_A8 else 0.9999)
 
 
 def test_mxfp4_geometry():

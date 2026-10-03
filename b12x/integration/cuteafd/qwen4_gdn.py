@@ -30,6 +30,16 @@ projection rows ``C + V + 2 * 48`` = 16480. ``rows`` is the live row count
                                               replay inputs (``gdn_replay_layout``) for
                                               ``qwen4_gdn_commit``
 
+``compile_qwen4_gdn_aot(g, max_rows=R, fp8_only="decode" | "prefill")`` takes the two
+projections as E4M3 only (no BF16 copy): ``w_in_fp8 [P,H]`` / ``w_in_scale`` and
+``w_out_fp8 [H,V]`` / ``w_out_scale`` (FP32 128x128 block scales ``[ceil(N/128), K/128]``,
+one layout for decode and prefill programs) in place of ``w_in`` / ``w_out``
+(``Fp8Projection``: decode programs run the 16-row tensor-core GEMV, bitwise the
+``fp8`` programs' E4M3 route, then the W8A16 TMA GEMM; prefill programs add the
+scalar ``fp8_rows``: 0 runs W8A16, bitwise the BF16 program over ``bf16(w * s)``
+weights, nonzero W8A8 with E4M3 activations per row and 128-K block for ``w_out``;
+``w_in`` (16480 rows, not whole 128-row scale blocks) stays W8A16).
+
 ``compile_qwen4_gdn_commit_aot(g)`` (``qwen4_gdn_commit``) applies each
 sequence's accepted rows of a speculative step to every GDN layer's recurrent
 and conv state in one launch; the state is bit-identical to serial steps over
@@ -53,7 +63,8 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
 
-from ._fp8_weights import fp8_operands, projection
+from ._fp8_weights import FP8_GEMV_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
+    w8_scalars
 from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
 from ._glm_kernels import glm_projection
 from ._glmf_kernels import GlmfKdaConvState
@@ -164,6 +175,29 @@ class _GdnChunked:
                                 Int64(self.heads * 128 * 128), Int64(1), Int32(w), stream)
 
 
+class _PrefillW8A16:
+    """``Fp8Projection``'s prefill call with W8A16 at every ``fp8_rows`` (the TMA GEMM over
+    E4M3 tiles widened to ``bf16(w * s)``, its prefill configuration): for outputs that are not
+    whole 128-row blocks of the 128x128 scale grid, which the block-FP8 GEMM cannot take."""
+
+    def __init__(self, n: int, k: int):
+        from ._fp8_weights import TmaFp8Gemm
+
+        self.n, self.k = int(n), int(k)
+        self.w8a16 = TmaFp8Gemm(self.n, self.k, scales="block", compute_warps=8, num_stages=3)
+
+    def key(self) -> tuple:
+        return ("w8a16", self.w8a16.key())
+
+    def prefill_scratch_bytes(self, rows: int) -> int:
+        return 0
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, fp8_rows: Int32, qscratch: Int64, stream: cuda.CUstream):
+        self.w8a16(x, w_fp8, scale, out, rows, stream)
+
+
 def gdn_scratch_bytes(g: Qwen4Geometry, rows: int, chunked: int = 0) -> int:
     """proj [rows,P], conv q|k|v [rows,C], o [rows,V], y [rows,V] (BF16), then the chunked
     recurrence's workspace (``chunked`` bytes, prefill capacities)."""
@@ -173,25 +207,45 @@ def gdn_scratch_bytes(g: Qwen4Geometry, rows: int, chunked: int = 0) -> int:
 
 
 class _Gdn:
-    def __init__(self, g: Qwen4Geometry, max_rows: int = 64, fp8: bool = False):
+    def __init__(self, g: Qwen4Geometry, max_rows: int = 64, fp8: bool = False, w8: str | None = None):
         self.g = g
         self.chunked = _GdnChunked(g, max_rows) if int(max_rows) > CHUNKED_MIN_ROWS else None
         c, v, p = g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width
         self.c, self.v, self.p = c, v, p
         self.fp8 = bool(fp8)
-        self.in_proj = projection(p, g.hidden, self.fp8)
+        # w8 ("decode" / "prefill"): FP8-only projections (no BF16 weight operands).
+        self.w8 = w8
+        if w8 is None:
+            self.in_proj = projection(p, g.hidden, self.fp8)
+            self.o_proj = projection(g.hidden, v, self.fp8)
+        else:
+            rows = int(max_rows) if check_w8_mode(w8) == "prefill" else None
+            # The block-FP8 (W8A8) GEMM wants whole 128-row blocks; P = 16480 is not.
+            self.in_proj = (Fp8Projection(p, g.hidden, prefill_rows=rows) if rows is None or p % 128 == 0
+                            else _PrefillW8A16(p, g.hidden))
+            self.o_proj = Fp8Projection(g.hidden, v, prefill_rows=rows)
         self.conv = Qwen4GdnConv(channels=c, proj_width=p)
         self.conv_state = GlmfKdaConvState(channels=c, proj_width=p)
         self.recurrent = Qwen4GdnRecurrent(heads=g.gdn_value_heads, key_heads=g.gdn_key_heads, ab_stride=p)
         self.norm = Qwen4GdnGatedNorm(heads=g.gdn_value_heads, eps=g.norm_eps, gate_stride=p)
-        self.o_proj = projection(g.hidden, v, self.fp8)
         self.replay = gdn_replay_layout(g.gdn_key_heads, g.gdn_value_heads, c)
         # Speculative steps (replay records) are decode-capacity programs only.
         self.spec = self.chunked is None
 
     def key(self) -> tuple:
-        return (self.in_proj.key(), self.o_proj.key(), self.g, self.fp8,
-                None if self.chunked is None else self.chunked.key())
+        key = (self.in_proj.key(), self.o_proj.key(), self.g, self.fp8,
+               None if self.chunked is None else self.chunked.key())
+        return key if self.w8 is None else (*key, "w8", self.w8)
+
+    def chunked_bytes(self) -> int:
+        return 0 if self.chunked is None else self.chunked.nbytes
+
+    def scratch_bytes(self, rows: int) -> int:
+        """``gdn_scratch_bytes``, then (FP8-only prefill programs) the W8A8 quantized rows."""
+        extra = 0
+        if self.w8 is not None:
+            extra = max(self.in_proj.prefill_scratch_bytes(rows), self.o_proj.prefill_scratch_bytes(rows))
+        return gdn_scratch_bytes(self.g, rows, self.chunked_bytes()) + extra
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, conv_w: cute.Pointer, a_log: cute.Pointer,
@@ -216,6 +270,23 @@ class _Gdn:
         bf16 = cutlass.BFloat16
         proj = _ptr(bf16, base)
         self.in_proj(x, w_in, w_in_fp8, w_in_scale, proj, rows, stream)
+        self.core(conv_w, a_log, dt_bias, norm_w, conv_state, state, slots, seq_first, replay, scratch, rows, spec,
+                  stream)
+        self.o_proj(_ptr(bf16, y_off), w_out, w_out_fp8, w_out_scale, out, rows, stream)
+
+    @cute.jit
+    def core(self, conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer, norm_w: cute.Pointer,
+             conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
+             replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, spec: Int32, stream: cuda.CUstream):
+        """In-projection rows (scratch) -> conv, recurrence, gated norm -> y (scratch)."""
+        c, v, p = self.c, self.v, self.p
+        m = Int64(rows)
+        base = Int64(scratch.toint())
+        qkv_off = base + _align_i64(m * Int64(p * 2))
+        o_off = qkv_off + _align_i64(m * Int64(c * 2))
+        y_off = o_off + _align_i64(m * Int64(v * 2))
+        bf16 = cutlass.BFloat16
+        proj = _ptr(bf16, base)
         self.conv(proj, conv_w, conv_state, slots, seq_first, _ptr(bf16, qkv_off), rows, stream)
         # spec 0: the conv window advances in place; otherwise the rows go to the replay record.
         self.conv_state(proj, conv_state, slots, seq_first,
@@ -234,7 +305,6 @@ class _Gdn:
                 self.recurrent(_ptr(bf16, qkv_off), a_raw, b_raw, a_log, dt_bias, state, slots,
                                _ptr(bf16, o_off), replay, spec, rows, stream)
         self.norm(_ptr(bf16, o_off), z, norm_w, _ptr(bf16, y_off), rows, stream)
-        self.o_proj(_ptr(bf16, y_off), w_out, w_out_fp8, w_out_scale, out, rows, stream)
 
 
 class _GdnSpec(_Gdn):
@@ -269,13 +339,106 @@ class _GdnFp8(_Gdn):
                   conv_state, state, slots, seq_first, out, replay, scratch, rows, spec, stream)
 
 
-def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int, fp8: bool = False) -> AotProgram:
+class _GdnW8(_Gdn):
+    """The GDN layer over FP8-only in/out projections (``Fp8Projection``, no BF16 copies)."""
+
+    @cute.jit
+    def body_w8(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, conv_w: cute.Pointer,
+                a_log: cute.Pointer, dt_bias: cute.Pointer, norm_w: cute.Pointer, w_out_fp8: cute.Pointer,
+                w_out_scale: cute.Pointer, conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer,
+                seq_first: cute.Pointer, out: cute.Pointer, replay: cute.Pointer, scratch: cute.Pointer,
+                rows: Int32, spec: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        c, v, p = self.c, self.v, self.p
+        m = Int64(rows)
+        base = Int64(scratch.toint())
+        y_off = base + _align_i64(m * Int64(p * 2)) + _align_i64(m * Int64(c * 2)) + _align_i64(m * Int64(v * 2))
+        # W8A8 quantized rows (prefill programs) after the chunked recurrence's workspace.
+        qscratch = y_off + _align_i64(m * Int64(v * 2)) + Int64(_align(self.chunked_bytes()))
+        self.in_proj(x, w_in_fp8, w_in_scale, _ptr(cutlass.BFloat16, base), rows, fp8_rows, qscratch, stream)
+        self.core(conv_w, a_log, dt_bias, norm_w, conv_state, state, slots, seq_first, replay, scratch, rows, spec,
+                  stream)
+        self.o_proj(_ptr(cutlass.BFloat16, y_off), w_out_fp8, w_out_scale, out, rows, fp8_rows, qscratch, stream)
+
+
+class _GdnW8Decode(_GdnW8):
+    """Decode capacities (speculative replay record; GEMV to 16 rows, W8A16 TMA above)."""
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, conv_w: cute.Pointer,
+                 a_log: cute.Pointer, dt_bias: cute.Pointer, norm_w: cute.Pointer, w_out_fp8: cute.Pointer,
+                 w_out_scale: cute.Pointer, conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer,
+                 seq_first: cute.Pointer, out: cute.Pointer, replay: cute.Pointer, scratch: cute.Pointer,
+                 rows: Int32, spec: Int32, stream: cuda.CUstream):
+        self.body_w8(x, w_in_fp8, w_in_scale, conv_w, a_log, dt_bias, norm_w, w_out_fp8, w_out_scale, conv_state,
+                     state, slots, seq_first, out, replay, scratch, rows, spec, Int32(FP8_GEMV_ROWS), stream)
+
+
+class _GdnW8Prefill(_GdnW8):
+    """Prefill capacities (chunked recurrence above 64 rows; W8A16, or W8A8 on ``fp8_rows``)."""
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, conv_w: cute.Pointer,
+                 a_log: cute.Pointer, dt_bias: cute.Pointer, norm_w: cute.Pointer, w_out_fp8: cute.Pointer,
+                 w_out_scale: cute.Pointer, conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer,
+                 seq_first: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32,
+                 stream: cuda.CUstream):
+        self.body_w8(x, w_in_fp8, w_in_scale, conv_w, a_log, dt_bias, norm_w, w_out_fp8, w_out_scale, conv_state,
+                     state, slots, seq_first, out, state, scratch, rows, Int32(0), fp8_rows, stream)
+
+
+def _compile_gdn_w8(g: Qwen4Geometry, max_rows: int, mode: str) -> AotProgram:
+    prefill = check_w8_mode(mode) == "prefill"
+    spec = max_rows <= CHUNKED_MIN_ROWS
+    if prefill == spec:
+        raise ValueError("FP8-only GDN programs: decode mode for capacities <= CHUNKED_MIN_ROWS (speculative "
+                         "replay), prefill mode above")
+    launch = (_GdnW8Prefill if prefill else _GdnW8Decode)(g, max_rows, w8=mode)
+    record = launch.replay["bytes"]
+    h, c, v, p, heads = g.hidden, g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width, g.gdn_value_heads
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{h}]"),
+        *fp8_only_operands("w_in", p, h, prefill=prefill),
+        Operand("conv_w", torch.float32, f"[{c},4]", align=4),
+        Operand("a_log", torch.float32, f"[{heads}]", align=4),
+        Operand("dt_bias", torch.float32, f"[{heads}]", align=4),
+        Operand("norm_w", torch.bfloat16, f"[{g.gdn_head_dim}]"),
+        *fp8_only_operands("w_out", h, v, prefill=prefill),
+        Operand("conv_state", torch.bfloat16, f"[slots,3,{c}]", "inout", align=2),
+        Operand("state", torch.float32, f"[slots,{heads},128,128]", "inout"),
+        Operand("slots", torch.int32, "[rows]", align=4),
+        Operand("seq_first", torch.int32, "[rows]", align=4),
+        Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+        *((Operand("replay", torch.float32, f"[{record // 4}]", "out",
+                   note="speculative replay record (gdn_replay_layout)"),) if spec else ()),
+        Operand("scratch", torch.uint8, "[qwen4_gdn_scratch_bytes]", "scratch"),
+    )
+    scalars = (Scalar("rows"), Scalar("spec")) if spec else w8_scalars(True)
+    return compile_program(
+        launch, name="qwen4_gdn", operands=operands, scalars=scalars, key=(max_rows, mode, launch.key()),
+        geometry={"hidden": h, "key_heads": g.gdn_key_heads, "value_heads": heads, "head_dim": g.gdn_head_dim,
+                  "max_rows": max_rows, "in_width": p, "eps": g.norm_eps, "fp8_weights": "only", "mode": mode,
+                  "fp8_gemv_rows": FP8_GEMV_ROWS if not prefill else 0,
+                  "chunked_min_rows": CHUNKED_MIN_ROWS if launch.chunked is not None else None,
+                  "replay_rows": REPLAY_ROWS if spec else None, "replay_bytes": record if spec else None},
+        scratch={"scratch": launch.scratch_bytes},
+        doc=__doc__,
+    )
+
+
+def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int, fp8: bool = False,
+                          fp8_only: str | None = None) -> AotProgram:
     """One GDN layer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds ``w_in_fp8``/``w_in_scale`` and ``w_out_fp8``/``w_out_scale`` (E4M3 with
-    FP32 128x128 block scales) after each BF16 weight for rows <= 16."""
+    FP32 128x128 block scales) after each BF16 weight for rows <= 16. ``fp8_only``
+    (``"decode"`` for capacities <= 64, ``"prefill"`` above) takes those E4M3
+    weights and scales in place of the BF16 ones (no BF16 weight operand)."""
     max_rows = int(max_rows)
     if max_rows <= 0:
         raise ValueError("max_rows must be positive")
+    if fp8_only is not None:
+        if fp8:
+            raise ValueError("fp8 and fp8_only are exclusive")
+        return _compile_gdn_w8(g, max_rows, fp8_only)
     spec = max_rows <= CHUNKED_MIN_ROWS
     launch = (_GdnFp8 if fp8 else _GdnSpec if spec else _Gdn)(g, max_rows)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
