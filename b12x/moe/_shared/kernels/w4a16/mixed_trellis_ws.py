@@ -58,6 +58,8 @@ from b12x._lib.intrinsics import (
     cvt_bf16x2_to_f16x2,
     f16_mma_m16n8k16_f32,
     f16x2_to_f32x2,
+    fabs_f32,
+    fmax_f32,
     get_ptr_as_int64,
     half2_mul,
     ld_global_nc_v4_u32,
@@ -77,6 +79,16 @@ from b12x._lib.intrinsics import (
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 
 from .kernel import _SQG_XOR_CHEB_T12_LUT_ENTRIES
+from .ws_a8 import (
+    A8_MAGIC_BITS,
+    A8_W_SCALE,
+    a8_rescale,
+    f16x2_pair_to_s8x4,
+    f32x4_to_s8x4,
+    imma_m16n8k32_s8,
+    prmt_b32,
+    st_shared_v2_u32_a8,
+)
 from .mixed_trellis import (
     W4A16MixedTrellisKernel,
     _TIER_DESCRIPTOR_BITS,
@@ -248,12 +260,17 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         self.ws_a_slot = block * 256
         self.ws_bc_slot = 4 * self.ws_n16 * 32 * self.ws_max_bits
         self.ws_tile_slot = 4 * (_TILE_HEADER_WORDS + block)
+        # A8 prototype (B12X_WS_A8=int8): int8 activations per (row, K128) with
+        # fp32 row scales in a side array per A stage, int8 weights round(32 w),
+        # m16n8k32 IMMA. Not for merge: the switch is an environment knob.
+        self.ws_a8 = os.environ.get("B12X_WS_A8", "") == "int8"
+        self.ws_s_slot = 4 * block if self.ws_a8 else 0
         fixed = _TILE_STAGES * (self.ws_tile_slot + 2 * _BARRIER_BYTES)
         budget = int(max_shared_mem) - 1024 - fixed
         a_stages = 2
         bc_stages = 0
         for candidate_a in (3, 2):
-            rest = budget - candidate_a * (self.ws_a_slot + 3 * _BARRIER_BYTES)
+            rest = budget - candidate_a * (self.ws_a_slot + self.ws_s_slot + 3 * _BARRIER_BYTES)
             candidate_bc = (
                 min(_MAX_BC_STAGES, rest // (self.ws_bc_slot + 2 * _BARRIER_BYTES))
                 if rest > 0
@@ -271,7 +288,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         self.ws_bc_stages = bc_stages
         self.ws_a_off = 0
         self.ws_bc_off = self.ws_a_off + a_stages * self.ws_a_slot
-        self.ws_tile_off = self.ws_bc_off + bc_stages * self.ws_bc_slot
+        self.ws_s_off = self.ws_bc_off + bc_stages * self.ws_bc_slot
+        self.ws_tile_off = self.ws_s_off + a_stages * self.ws_s_slot
         bar = self.ws_tile_off + _TILE_STAGES * self.ws_tile_slot
         self.ws_bar_a_raw = bar
         self.ws_bar_a_full = self.ws_bar_a_raw + a_stages * _BARRIER_BYTES
@@ -286,7 +304,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         self.blocks_per_sm = 1
         self.shared_words = (self.ws_smem_bytes + 3) // 4
         self.ws_act_ctas_per_sm = 8
-        # Timing probes only (wrong numerics): nodecode, nomma, norot.
+        # Timing probes only (wrong numerics): nodecode, nomma, norot, noquant (A8 FC2).
         self.ws_exp = frozenset(filter(None, os.environ.get("B12X_WS_EXP", "").split(",")))
 
     @property
@@ -299,6 +317,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             self.ws_bc_stages,
             self.ws_threads,
             tuple(sorted(self.ws_exp)),
+            self.ws_a8,
         )
 
     # ------------------------------------------------------------------
@@ -1019,13 +1038,86 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             p = cute.arch.shuffle_sync_bfly(v[e], offset=st)
                             v[e] = p + sign * v[e]
                     rs = cutlass.Float32(0.088388347648)
-                    st_shared_v4_u32(
-                        addrs[j],
-                        pack_f32x2_to_f16x2(v[0] * rs, v[1] * rs),
-                        pack_f32x2_to_f16x2(v[2] * rs, v[3] * rs),
-                        pack_f32x2_to_f16x2(v[4] * rs, v[5] * rs),
-                        pack_f32x2_to_f16x2(v[6] * rs, v[7] * rs),
-                    )
+                    if cutlass.const_expr(self.ws_a8):
+                        row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
+                        self._ws_a8_store(
+                            a_slot, base + Int32(self.ws_s_off) + slot * Int32(self.ws_s_slot),
+                            row, l16, [v[e] * rs for e in range(8)],
+                        )
+                    else:
+                        st_shared_v4_u32(
+                            addrs[j],
+                            pack_f32x2_to_f16x2(v[0] * rs, v[1] * rs),
+                            pack_f32x2_to_f16x2(v[2] * rs, v[3] * rs),
+                            pack_f32x2_to_f16x2(v[4] * rs, v[5] * rs),
+                            pack_f32x2_to_f16x2(v[6] * rs, v[7] * rs),
+                        )
+            else:
+                if cutlass.const_expr(self.ws_a8):
+                    # Unrotated (padding) rows: zero scales, so their zero int8
+                    # rows rescale to zero instead of reading stale words.
+                    for j in cutlass.range_constexpr(group):
+                        row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
+                        if l16 == Int32(0):
+                            st_shared_f32(
+                                base + Int32(self.ws_s_off) + slot * Int32(self.ws_s_slot) + row * Int32(4),
+                                cutlass.Float32(0.0),
+                            )
+
+    @cute.jit
+    def _ws_a8_store(self, a_slot: Int32, s_slot: Int32, row: Int32, l16: Int32, v):
+        """Quantize one lane's eight consecutive K elements (8 l16 .. 8 l16 + 7
+        of a 128-wide row block held by a half-warp) to int8 with the row
+        block's absmax scale, and store them in the IMMA K order: the 16-byte
+        chunk of K16 c sits at (c ^ row) & 7 and holds physical k
+        (0,1,8,9, 2,3,10,11, 4,5,12,13, 6,7,14,15)."""
+        amax = cutlass.Float32(0.0)
+        for e in cutlass.range_constexpr(8):
+            amax = fmax_f32(amax, fabs_f32(v[e]))
+        for si in cutlass.range_constexpr(4):
+            amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, offset=1 << si))
+        inv = cutlass.Float32(0.0)
+        if amax > cutlass.Float32(0.0):
+            inv = cutlass.Float32(127.0) / amax
+        lo = f32x4_to_s8x4(v[0], v[1], v[2], v[3], inv)
+        hi = f32x4_to_s8x4(v[4], v[5], v[6], v[7], inv)
+        odd = l16 & Int32(1)
+        send = hi
+        if odd == Int32(1):
+            send = lo
+        recv = cute.arch.shuffle_sync_bfly(send, offset=1)
+        w0 = prmt_b32(lo, recv, 0x5410)
+        w1 = prmt_b32(lo, recv, 0x7632)
+        if odd == Int32(1):
+            w0 = prmt_b32(recv, hi, 0x5410)
+            w1 = prmt_b32(recv, hi, 0x7632)
+        chunk = l16 >> Int32(1)
+        pos = (chunk ^ row) & Int32(7)
+        st_shared_v2_u32_a8(
+            a_slot + row * Int32(256) + pos * Int32(16) + odd * Int32(8), w0, w1
+        )
+        if l16 == Int32(0):
+            st_shared_f32(s_slot + row * Int32(4), amax * cutlass.Float32(1.0 / 127.0))
+
+    @cute.jit
+    def _ws_quant_block(self, base: Int32, slot: Int32, ptid: Int32):
+        """FC2 A8: quantize every row of a landed FP16 A slot in place."""
+        lane = ptid & Int32(31)
+        l16 = lane & Int32(15)
+        half = lane >> Int32(4)
+        warp = ptid >> Int32(5)
+        a_slot = base + Int32(self.ws_a_off) + slot * Int32(self.ws_a_slot)
+        s_slot = base + Int32(self.ws_s_off) + slot * Int32(self.ws_s_slot)
+        for i in cutlass.range_constexpr(self.ws_m // (2 * _PRODUCER_WARPS)):
+            row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * i)) + half
+            addr = a_slot + row * Int32(256) + ((l16 & Int32(8)) | ((l16 & Int32(7)) ^ (row & Int32(7)))) * Int32(16)
+            words = ld_shared_v4_u32(addr)
+            v = []
+            for w in cutlass.range_constexpr(4):
+                lo, hi = f16x2_to_f32x2(words[w])
+                v.append(lo)
+                v.append(hi)
+            self._ws_a8_store(a_slot, s_slot, row, l16, v)
 
     @cute.jit
     def _ws_publish_tile(
@@ -1121,7 +1213,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             tier1_hi_experts,
         )
         a_bar_base = Int32(self.ws_bar_a_full)
-        if cutlass.const_expr(is_fc1):
+        if cutlass.const_expr(is_fc1 or self.ws_a8):
             a_bar_base = Int32(self.ws_bar_a_raw)
 
         # Weight cursor and prologue.
@@ -1230,6 +1322,15 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     )
                     if cutlass.const_expr("norot" not in self.ws_exp):
                         self._ws_rotate_block(base, a_slot, dvalid, suh_w, ptid)
+                    _mbar_arrive(base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES))
+                elif cutlass.const_expr(self.ws_a8):
+                    a_slot = blk % Int32(na)
+                    _mbar_wait(
+                        base + Int32(self.ws_bar_a_raw) + a_slot * Int32(_BARRIER_BYTES),
+                        (blk // Int32(na)) & Int32(1),
+                    )
+                    if cutlass.const_expr("noquant" not in self.ws_exp):
+                        self._ws_quant_block(base, a_slot, ptid)
                     _mbar_arrive(base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES))
                 if blk >= Int32(1):
                     # Consumers finished block blk - 1: its A slot and its two
@@ -1442,6 +1543,166 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         return step, blk
 
     @cute.jit
+    def _ws_kloop_a8(
+        self,
+        is_fc1: cutlass.Constexpr,
+        tier_idx: cutlass.Constexpr,
+        active: cutlass.Constexpr,
+        k_size: cutlass.Constexpr,
+        facc,
+        iacc,
+        base: Int32,
+        lut_addr: Int64,
+        tid: Int32,
+        step: Int32,
+        blk: Int32,
+    ):
+        """A8 K loop: per 128-wide block, four K32 steps of (decode two K16
+        records per N16 pair -> int8, one ldmatrix.x4 per occupied M16, IMMA
+        into magic-initialised int32 block sums), then one fp32 rescale by the
+        rows' block scales."""
+        bits = self.ws_bits[tier_idx]
+        lane = tid & Int32(31)
+        cw = tid >> Int32(5)
+        na = self.ws_a_stages
+        nc = self.ws_bc_stages
+        blocks = Int32(k_size // 128)
+        row_bytes = self.ws_n16 * 32 * bits
+        lrow = (lane & Int32(7)) | (((lane >> Int32(3)) & Int32(1)) << Int32(3))
+        lchunk = lane >> Int32(4)
+        magic = Uint32(A8_MAGIC_BITS)
+        b = Int32(0)
+        while b < blocks:
+            a_slot = blk % Int32(na)
+            unit0 = step >> Int32(2)
+            slot0 = unit0 % Int32(nc)
+            slot1 = (unit0 + Int32(1)) % Int32(nc)
+            _mbar_wait(
+                base + Int32(self.ws_bar_bc_full) + slot0 * Int32(_BARRIER_BYTES),
+                (unit0 // Int32(nc)) & Int32(1),
+            )
+            _mbar_wait(
+                base + Int32(self.ws_bar_bc_full) + slot1 * Int32(_BARRIER_BYTES),
+                ((unit0 + Int32(1)) // Int32(nc)) & Int32(1),
+            )
+            _mbar_wait(
+                base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES),
+                (blk // Int32(na)) & Int32(1),
+            )
+            a_base = base + Int32(self.ws_a_off) + a_slot * Int32(self.ws_a_slot)
+            s_base = base + Int32(self.ws_s_off) + a_slot * Int32(self.ws_s_slot)
+            bc0 = base + Int32(self.ws_bc_off) + slot0 * Int32(self.ws_bc_slot)
+            bc1 = base + Int32(self.ws_bc_off) + slot1 * Int32(self.ws_bc_slot)
+            for ks in cutlass.range_constexpr(4):
+                b8 = [[[None, None], [None, None]], [[None, None], [None, None]]]
+                for qq in cutlass.range_constexpr(2):
+                    q = 2 * ks + qq
+                    row_addr = bc0 + Int32((q % 4) * row_bytes)
+                    if cutlass.const_expr(q >= 4):
+                        row_addr = bc1 + Int32((q % 4) * row_bytes)
+                    gemm = (self.tier0, self.tier1)[tier_idx].fc2
+                    if cutlass.const_expr(is_fc1):
+                        gemm = (self.tier0, self.tier1)[tier_idx].fc1
+                    for jj in cutlass.range_constexpr(2):
+                        wa, wb = self._ws_windows(
+                            gemm, row_addr, cw * Int32(2) + Int32(jj), lane, bits
+                        )
+                        frag = cute.make_rmem_tensor((2, 2), Uint32)
+                        if cutlass.const_expr("nodecode" in self.ws_exp):
+                            frag[0, 0] = wa
+                            frag[0, 1] = wb
+                            frag[1, 0] = wa
+                            frag[1, 1] = wb
+                        else:
+                            gemm._scaled_dequant_b_fragment_trellis256_bits(
+                                frag, wa, wb, lut_addr, bits
+                            )
+                        b8[jj][0][qq] = f16x2_pair_to_s8x4(frag[0, 0], frag[0, 1])
+                        b8[jj][1][qq] = f16x2_pair_to_s8x4(frag[1, 0], frag[1, 1])
+                a_regs = []
+                for mb in cutlass.range_constexpr(active):
+                    row = Int32(16 * mb) + lrow
+                    c = Int32(2 * ks) + lchunk
+                    pos = (c ^ row) & Int32(7)
+                    a_regs.append(ldmatrix_m8n8x4_b16(a_base + row * Int32(256) + pos * Int32(16)))
+                for jj in cutlass.range_constexpr(0 if "nomma" in self.ws_exp else 2):
+                    for mb in cutlass.range_constexpr(active):
+                        for h in cutlass.range_constexpr(2):
+                            o = ((mb * 2 + jj) * 2 + h) * 4
+                            if cutlass.const_expr(ks == 0):
+                                c0 = magic
+                                c1 = magic
+                                c2 = magic
+                                c3 = magic
+                            else:
+                                c0 = iacc[o][0]
+                                c1 = iacc[o + 1][0]
+                                c2 = iacc[o + 2][0]
+                                c3 = iacc[o + 3][0]
+                            d0, d1, d2, d3 = imma_m16n8k32_s8(
+                                c0, c1, c2, c3,
+                                a_regs[mb][0], a_regs[mb][1], a_regs[mb][2], a_regs[mb][3],
+                                b8[jj][h][0], b8[jj][h][1],
+                            )
+                            iacc[o][0] = d0
+                            iacc[o + 1][0] = d1
+                            iacc[o + 2][0] = d2
+                            iacc[o + 3][0] = d3
+            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
+            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
+            if cutlass.const_expr("nomma" not in self.ws_exp):
+                for mb in cutlass.range_constexpr(active):
+                    r0 = Int32(16 * mb) + (lane >> Int32(2))
+                    s0 = ld_shared_f32(s_base + r0 * Int32(4))
+                    s1 = ld_shared_f32(s_base + (r0 + Int32(8)) * Int32(4))
+                    for jj in cutlass.range_constexpr(2):
+                        for h in cutlass.range_constexpr(2):
+                            o = ((mb * 2 + jj) * 2 + h) * 4
+                            facc[o][0] = a8_rescale(facc[o][0], iacc[o][0], s0)
+                            facc[o + 1][0] = a8_rescale(facc[o + 1][0], iacc[o + 1][0], s0)
+                            facc[o + 2][0] = a8_rescale(facc[o + 2][0], iacc[o + 2][0], s1)
+                            facc[o + 3][0] = a8_rescale(facc[o + 3][0], iacc[o + 3][0], s1)
+            _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
+            step += Int32(8)
+            blk += Int32(1)
+            b += Int32(1)
+        return step, blk
+
+    @cute.jit
+    def _ws_store_a8(
+        self,
+        active: cutlass.Constexpr,
+        n_total: cutlass.Constexpr,
+        facc,
+        tid: Int32,
+        hdr: Int32,
+        nt: Int32,
+        valid: Int32,
+        scale: cutlass.Float32,
+        c_out: cute.Tensor,
+    ):
+        lane = tid & Int32(31)
+        cw = tid >> Int32(5)
+        col_base = nt * Int32(self.ws_n) + cw * Int32(32) + Int32(2) * (lane & Int32(3))
+        scale = scale * cutlass.Float32(1.0 / A8_W_SCALE)
+        for mb in cutlass.range_constexpr(active):
+            for rh in cutlass.range_constexpr(2):
+                row = Int32(16 * mb + 8 * rh) + (lane >> Int32(2))
+                if row < valid:
+                    route = ld_shared_i32_relaxed(
+                        hdr + Int32(4 * _TILE_HEADER_WORDS) + row * Int32(4)
+                    )
+                    row_base = Int64(route) * Int64(n_total)
+                    for jj in cutlass.range_constexpr(2):
+                        for h in cutlass.range_constexpr(2):
+                            o = ((mb * 2 + jj) * 2 + h) * 4 + 2 * rh
+                            col = col_base + Int32(jj * 16 + h * 8)
+                            st_global_u32(
+                                get_ptr_as_int64(c_out, row_base + Int64(col)),
+                                pack_f32x2_to_f16x2(facc[o][0] * scale, facc[o + 1][0] * scale),
+                            )
+
+    @cute.jit
     def _ws_store(
         self,
         active: cutlass.Constexpr,
@@ -1493,6 +1754,10 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         c_out: cute.Tensor,
     ):
         n_acc = 2 * self.ws_mb * 2 * 2 * 4
+        iacc = []
+        if cutlass.const_expr(self.ws_a8):
+            n_acc = self.ws_mb * 2 * 2 * 4
+            iacc = [cute.make_rmem_tensor((1,), Uint32) for _ in range(n_acc)]
         acc = [cute.make_rmem_tensor((1,), cutlass.Float32) for _ in range(n_acc)]
         step = Int32(0)
         blk = Int32(0)
@@ -1521,16 +1786,31 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     occupied = Int32(self.ws_mb)
                 for active in cutlass.range_constexpr(1, self.ws_mb + 1):
                     if occupied == Int32(active):
-                        if tier == Int32(0):
-                            step, blk = self._ws_kloop(
-                                is_fc1, 0, active, k_size, acc, base, lut_addr, tid, step, blk
+                        if cutlass.const_expr(self.ws_a8):
+                            if tier == Int32(0):
+                                step, blk = self._ws_kloop_a8(
+                                    is_fc1, 0, active, k_size, acc, iacc, base, lut_addr, tid,
+                                    step, blk,
+                                )
+                            else:
+                                step, blk = self._ws_kloop_a8(
+                                    is_fc1, 1, active, k_size, acc, iacc, base, lut_addr, tid,
+                                    step, blk,
+                                )
+                            self._ws_store_a8(
+                                active, n_total, acc, tid, hdr, nt, valid, scale, c_out
                             )
                         else:
-                            step, blk = self._ws_kloop(
-                                is_fc1, 1, active, k_size, acc, base, lut_addr, tid, step, blk
+                            if tier == Int32(0):
+                                step, blk = self._ws_kloop(
+                                    is_fc1, 0, active, k_size, acc, base, lut_addr, tid, step, blk
+                                )
+                            else:
+                                step, blk = self._ws_kloop(
+                                    is_fc1, 1, active, k_size, acc, base, lut_addr, tid, step, blk
+                                )
+                            self._ws_store(
+                                active, n_total, acc, tid, hdr, nt, valid, scale, c_out
                             )
-                        self._ws_store(
-                            active, n_total, acc, tid, hdr, nt, valid, scale, c_out
-                        )
                 _mbar_arrive(base + Int32(self.ws_bar_t_empty) + slot * Int32(_BARRIER_BYTES))
                 ti += Int32(1)
