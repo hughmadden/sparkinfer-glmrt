@@ -87,6 +87,15 @@ FP32 scores and online softmax, BF16 probabilities, FP32 PV); rows <= 64 split
 every row's selection over 64/32/16 CTAs (1 / <=4 / <=64 rows) and merge the
 FP32 partials, more rows write BF16 directly.
 
+``fp8_only="decode" | "prefill"`` (producer and attn_o): ``w_in`` / ``w_o`` are
+taken as E4M3 only, ``w_in_fp8``/``w_in_scale`` and ``w_o_fp8``/``w_o_scale``
+(FP32 128x128 block scales ``[ceil(N/128), K/128]``, one layout for decode and
+prefill), no BF16 weight operand: decode programs run the 16-row tensor-core
+GEMV (bitwise the ``fp8`` programs' E4M3 route) then W8A16 TMA; prefill
+programs take ``fp8_rows`` (0: W8A16, bitwise the BF16 program over
+``bf16(w * s)``; nonzero: W8A8, E4M3 activations per row and 128-K block).
+Their scratch appends the W8A8 rows (prefill) after the regions below.
+
 ``compile_qwen4_attn_o_aot(g, max_rows=R)``::
 
     attn        bf16 [rows,N*256]        in   sparse_gqa out
@@ -105,7 +114,8 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
 
-from ._fp8_weights import fp8_operands, projection
+from ._fp8_weights import FP8_GEMV_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
+    w8_scalars
 from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
 from ._glm_kernels import glm_projection
 from ._qwen4_attention_kernels import (
@@ -137,6 +147,11 @@ TOPK_CHUNK_ROWS = 256
 
 def _align(value: int) -> int:
     return (int(value) + _ALIGN - 1) // _ALIGN * _ALIGN
+
+
+@cute.jit
+def _align_i64(value: Int64) -> Int64:
+    return (value + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
 
 
 def _ptr(dtype, address, align: int = 16):
@@ -210,17 +225,79 @@ class _ProducerFp8(_Producer):
                   kv_cache, token_keys, index_cache, query, gate, index_q, scratch, rows, stream)
 
 
+class _ProducerW8:
+    """The producer over an FP8-only in-projection (``Fp8Projection``, no BF16 copy)."""
+
+    def __init__(self, g: Qwen4Geometry, max_rows: int, prefill: bool):
+        self.g = g
+        self.proj = Fp8Projection(g.attn_in_width, g.hidden, prefill_rows=int(max_rows) if prefill else None)
+        self.post = Qwen4AttnPost(g)
+        self.pool = Qwen4PoolKeys(g)
+
+    def key(self) -> tuple:
+        return ("w8", self.proj.key(), self.g)
+
+    def scratch_bytes(self, rows: int) -> int:
+        return attn_producer_scratch_bytes(self.g, rows) + self.proj.prefill_scratch_bytes(rows)
+
+    @cute.jit
+    def body(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, q_norm: cute.Pointer,
+             k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer, positions: cute.Pointer,
+             kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer, token_keys: cute.Pointer,
+             index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer,
+             scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        base = Int64(scratch.toint())
+        proj = _ptr(cutlass.BFloat16, base)
+        qscratch = base + _align_i64(Int64(rows) * Int64(self.g.attn_in_width * 2))
+        self.proj(x, w_in_fp8, w_in_scale, proj, rows, fp8_rows, qscratch, stream)
+        self.post(proj, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, kv_cache, token_keys, query, gate,
+                  index_q, rows, stream)
+        self.pool(positions, kv_slots, pool_slots, ik_norm, token_keys, index_cache, rows, stream)
+
+
+class _ProducerW8Decode(_ProducerW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, q_norm: cute.Pointer,
+                 k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer, positions: cute.Pointer,
+                 kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer, token_keys: cute.Pointer,
+                 index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, pool_slots,
+                  kv_cache, token_keys, index_cache, query, gate, index_q, scratch, rows, Int32(FP8_GEMV_ROWS),
+                  stream)
+
+
+class _ProducerW8Prefill(_ProducerW8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, q_norm: cute.Pointer,
+                 k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer, positions: cute.Pointer,
+                 kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer, token_keys: cute.Pointer,
+                 index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, pool_slots,
+                  kv_cache, token_keys, index_cache, query, gate, index_q, scratch, rows, fp8_rows, stream)
+
+
 def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
-                                    fp8: bool = False) -> AotProgram:
+                                    fp8: bool = False, fp8_only: str | None = None) -> AotProgram:
     """Full-attention producer for ``rows <= max_rows``; see the module docstring.
-    ``fp8`` adds ``w_in_fp8``/``w_in_scale`` (E4M3, FP32 128x128 block scales) for rows <= 16."""
+    ``fp8`` adds ``w_in_fp8``/``w_in_scale`` (E4M3, FP32 128x128 block scales) for rows <= 16;
+    ``fp8_only`` (``"decode"`` / ``"prefill"``) takes them in place of ``w_in``."""
     max_rows = _check_rows(max_rows)
-    launch = (_ProducerFp8 if fp8 else _Producer)(g)
+    if fp8_only is not None and fp8:
+        raise ValueError("fp8 and fp8_only are exclusive")
+    prefill = fp8_only is not None and check_w8_mode(fp8_only) == "prefill"
+    if fp8_only is not None:
+        launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, max_rows, prefill)
+    else:
+        launch = (_ProducerFp8 if fp8 else _Producer)(g)
     h, n, d, ih = g.hidden, g.heads, g.head_dim, g.index_heads
+    weights = (fp8_only_operands("w_in", g.attn_in_width, h, prefill=prefill) if fp8_only is not None else
+               (Operand("w_in", torch.bfloat16, f"[{g.attn_in_width},{h}]"),
+                *(fp8_operands("w_in", g.attn_in_width, h) if fp8 else ())))
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
-        Operand("w_in", torch.bfloat16, f"[{g.attn_in_width},{h}]"),
-        *(fp8_operands("w_in", g.attn_in_width, h) if fp8 else ()),
+        *weights,
         Operand("q_norm", torch.bfloat16, f"[{d}]"),
         Operand("k_norm", torch.bfloat16, f"[{d}]"),
         Operand("iq_norm", torch.bfloat16, f"[{g.index_head_dim}]"),
@@ -236,6 +313,17 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
         Operand("index_q", torch.bfloat16, f"[rows,{ih},{g.index_head_dim}]", "out"),
         Operand("scratch", torch.uint8, "[attn_producer_scratch_bytes]", "scratch"),
     )
+    if fp8_only is not None:
+        return compile_program(
+            launch, name="qwen4_attn_producer", operands=operands, scalars=w8_scalars(prefill),
+            key=(max_rows, fp8_only, launch.key()),
+            geometry={"hidden": h, "heads": n, "kv_heads": g.kv_heads, "head_dim": d, "index_heads": ih,
+                      "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "record_bytes": g.record_bytes,
+                      "page_rows": g.page_rows, "eps": g.norm_eps, "max_rows": max_rows, "fp8_weights": "only",
+                      "mode": fp8_only},
+            scratch={"scratch": launch.scratch_bytes},
+            doc=__doc__,
+        )
     return compile_program(
         launch, name="qwen4_attn_producer", operands=operands, scalars=(Scalar("rows"),),
         key=(max_rows, launch.key()),
@@ -521,11 +609,68 @@ class _AttnOFp8(_AttnO):
         self.body(attn, gate, w_o, w_o_fp8, w_o_scale, out, scratch, rows, stream)
 
 
+class _AttnOW8:
+    """``o_proj(attn * sigmoid(gate))`` over an FP8-only ``w_o`` (``Fp8Projection``)."""
+
+    def __init__(self, g: Qwen4Geometry, max_rows: int, prefill: bool):
+        self.g = g
+        self.gate = Qwen4GateMul(g.heads * g.head_dim)
+        self.o_proj = Fp8Projection(g.hidden, g.heads * g.head_dim, prefill_rows=int(max_rows) if prefill else None)
+
+    def key(self) -> tuple:
+        return ("w8", self.o_proj.key(), self.g)
+
+    def scratch_bytes(self, rows: int) -> int:
+        return attn_o_scratch_bytes(self.g, rows) + self.o_proj.prefill_scratch_bytes(rows)
+
+    @cute.jit
+    def body(self, attn: cute.Pointer, gate: cute.Pointer, w_o_fp8: cute.Pointer, w_o_scale: cute.Pointer,
+             out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        base = Int64(scratch.toint())
+        gated = _ptr(cutlass.BFloat16, base)
+        qscratch = base + _align_i64(Int64(rows) * Int64(self.g.heads * self.g.head_dim * 2))
+        self.gate(attn, gate, gated, rows, stream)
+        self.o_proj(gated, w_o_fp8, w_o_scale, out, rows, fp8_rows, qscratch, stream)
+
+
+class _AttnOW8Decode(_AttnOW8):
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, gate: cute.Pointer, w_o_fp8: cute.Pointer, w_o_scale: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.body(attn, gate, w_o_fp8, w_o_scale, out, scratch, rows, Int32(FP8_GEMV_ROWS), stream)
+
+
+class _AttnOW8Prefill(_AttnOW8):
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, gate: cute.Pointer, w_o_fp8: cute.Pointer, w_o_scale: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.body(attn, gate, w_o_fp8, w_o_scale, out, scratch, rows, fp8_rows, stream)
+
+
 def compile_qwen4_attn_o_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
-                             fp8: bool = False) -> AotProgram:
+                             fp8: bool = False, fp8_only: str | None = None) -> AotProgram:
     """``o_proj(attn * sigmoid(gate))``; see the module docstring. ``fp8`` adds
-    ``w_o_fp8``/``w_o_scale`` for rows <= 16."""
+    ``w_o_fp8``/``w_o_scale`` for rows <= 16; ``fp8_only`` (``"decode"`` /
+    ``"prefill"``) takes them in place of ``w_o``."""
     max_rows = _check_rows(max_rows)
+    if fp8_only is not None:
+        if fp8:
+            raise ValueError("fp8 and fp8_only are exclusive")
+        prefill = check_w8_mode(fp8_only) == "prefill"
+        launch = (_AttnOW8Prefill if prefill else _AttnOW8Decode)(g, max_rows, prefill)
+        h, w = g.hidden, g.heads * g.head_dim
+        return compile_program(
+            launch, name="qwen4_attn_o",
+            operands=(Operand("attn", torch.bfloat16, f"[rows,{w}]"),
+                      Operand("gate", torch.bfloat16, f"[rows,{w}]"),
+                      *fp8_only_operands("w_o", h, w, prefill=prefill),
+                      Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+                      Operand("scratch", torch.uint8, "[attn_o_scratch_bytes]", "scratch")),
+            scalars=w8_scalars(prefill), key=(max_rows, fp8_only, launch.key()),
+            geometry={"hidden": h, "width": w, "max_rows": max_rows, "fp8_weights": "only", "mode": fp8_only},
+            scratch={"scratch": launch.scratch_bytes},
+            doc=__doc__,
+        )
     launch = (_AttnOFp8 if fp8 else _AttnO)(g)
     h, w = g.hidden, g.heads * g.head_dim
     operands = (
