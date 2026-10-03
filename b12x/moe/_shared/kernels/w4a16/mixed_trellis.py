@@ -108,6 +108,12 @@ class MixedTrellisCompileResult:
     # Warp-specialized prefill (mixed_trellis_ws): FC1, SwiGLU and FC2 as three
     # launches of producer/consumer CTAs; FC1 rotates its input rows itself.
     warp_specialized: bool = field(default=False, kw_only=True)
+    # FC1 input rows: "bf16" [M, H], or "e4m3_k32" wire rows [M, H + H/32]
+    # bytes (E4M3 values, then one UE8M0 scale per 32) that the
+    # warp-specialized producers widen in shared memory.
+    input_format: str = field(default="bf16", kw_only=True)
+    # Warp-specialized input-row ring depth (None: the kernel's default).
+    ws_input_stages: int | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -2087,7 +2093,19 @@ def compile_mixed_trellis(
     token_major_rotation: bool = False,
     fused_input_rotation: bool = False,
     warp_specialized: bool = False,
+    input_format: str = "bf16",
+    ws_input_stages: int | None = None,
+    ws_dynamic_tiles: bool = False,
 ) -> MixedTrellisCompileResult:
+    if input_format not in ("bf16", "e4m3_k32"):
+        raise ValueError(f"unsupported mixed Trellis input format {input_format!r}")
+    if input_format == "e4m3_k32" and (
+        not warp_specialized or rotation_input_dtype != "bf16" or int(hidden_size) % 512
+    ):
+        raise ValueError(
+            "E4M3 K32 wire input requires the warp-specialized kernel and "
+            "16-byte wire rows (hidden % 512 == 0)"
+        )
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
     if int(size_m) * int(top_k) > torch.iinfo(torch.int32).max:
@@ -2100,6 +2118,14 @@ def compile_mixed_trellis(
         (tier0_bits, tier1_bits),
     )
     tier0_bits, tier1_bits = bits
+    # 192-wide and unequal FC1/FC2 N tiles exist only in the warp-specialized
+    # kernel; its cooperative sub-kernels (decode helpers, activation) keep 128.
+    ws_tile_n = None
+    if fc1_tile_n != fc2_tile_n or 192 in (fc1_tile_n, fc2_tile_n):
+        if not warp_specialized:
+            raise ValueError("192-wide or unequal N tiles require the warp-specialized kernel")
+        ws_tile_n = (fc1_tile_n, fc2_tile_n)
+        fc1_tile_n = fc2_tile_n = 128
     direct_topk_routes = bool(direct_topk_routes)
     # Mixed Trellis uses the whole-tile scheduler below: one CTA owns the
     # complete K reduction for an MN tile.  The retired split-K scheduler lost
@@ -2170,6 +2196,10 @@ def compile_mixed_trellis(
                 tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
                 tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
                 max_shared_mem=int(max_shared_mem),
+                input_format=input_format,
+                ws_tile_n=ws_tile_n,
+                input_stages=ws_input_stages,
+                dynamic_tiles=ws_dynamic_tiles,
             )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
@@ -2242,7 +2272,11 @@ def compile_mixed_trellis(
     compile_rows = compile_m * top_k
     fc1_cols = 2 * intermediate_size
     cutlass_dtype = cutlass.Float16
-    rotation_dtype = _cutlass_element_dtype(rotation_input_dtype)
+    rotation_dtype = (
+        cutlass.Uint8
+        if input_format == "e4m3_k32"
+        else _cutlass_element_dtype(rotation_input_dtype)
+    )
 
     def tensor(dtype, elements: int, *, align: int = 16):
         return cute.runtime.make_fake_compact_tensor(
@@ -2338,9 +2372,9 @@ def compile_mixed_trellis(
         tier1_bits=int(tier1_bits),
         trellis_codebook=trellis_codebook,
         fc1_tile_k=fc1_tile_k,
-        fc1_tile_n=fc1_tile_n,
+        fc1_tile_n=ws_tile_n[0] if ws_tile_n else fc1_tile_n,
         fc2_tile_k=fc2_tile_k,
-        fc2_tile_n=fc2_tile_n,
+        fc2_tile_n=ws_tile_n[1] if ws_tile_n else fc2_tile_n,
         moe_block_size=int(moe_block_size),
         fc2_moe_block_size=int(kernel.driver.fc2.moe_block_size),
         fc2_schedule_route_block_factor=int(
@@ -2358,6 +2392,8 @@ def compile_mixed_trellis(
         paired_boundary=paired_boundary,
         fused_input_rotation=bool(fused_input_rotation) and not warp_specialized,
         warp_specialized=bool(warp_specialized),
+        input_format=str(input_format),
+        ws_input_stages=ws_input_stages,
     )
     _CACHE[cache_key] = result
     return result
@@ -3347,10 +3383,14 @@ def run_bound_mixed_trellis(
     """Run a graph-safe two-tier launch from a validated binding."""
 
     launch = binding.launch
-    if x.ndim != 2 or int(x.shape[1]) != int(launch.hidden_size):
+    wire_input = getattr(launch, "input_format", "bf16") == "e4m3_k32"
+    input_cols = int(launch.hidden_size) + (
+        int(launch.hidden_size) // 32 if wire_input else 0
+    )
+    if x.ndim != 2 or int(x.shape[1]) != input_cols:
         raise ValueError(
             "mixed Trellis input must have shape "
-            f"[M, {int(launch.hidden_size)}], got {tuple(x.shape)}"
+            f"[M, {input_cols}], got {tuple(x.shape)}"
         )
     m = int(x.shape[0])
     if m <= 0:
@@ -3365,7 +3405,9 @@ def run_bound_mixed_trellis(
                 f"got {tuple(tensor.shape)}"
             )
     expected_input_dtype = (
-        torch.bfloat16 if launch.rotation_input_dtype == "bf16" else torch.float16
+        torch.uint8
+        if wire_input
+        else torch.bfloat16 if launch.rotation_input_dtype == "bf16" else torch.float16
     )
     for name, tensor, expected_dtype in (
         ("input", x, expected_input_dtype),
@@ -3459,7 +3501,7 @@ def run_bound_mixed_trellis(
     stream = current_cuda_stream()
     launch.compiled(
         make_ptr(
-            _cutlass_element_dtype(launch.rotation_input_dtype),
+            cutlass.Uint8 if wire_input else _cutlass_element_dtype(launch.rotation_input_dtype),
             x.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,

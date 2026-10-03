@@ -9042,10 +9042,13 @@ class W4A16TopKSumKernel:
                     hs3 = cutlass.Float32(0.0)
                     if valid_route != Int32(0):
                         base = row * Int32(self.hidden_size) + col0
-                        v0 = fc2_flat[base + Int32(0)].to(cutlass.Float32)
-                        v1 = fc2_flat[base + Int32(1)].to(cutlass.Float32)
-                        v2 = fc2_flat[base + Int32(2)].to(cutlass.Float32)
-                        v3 = fc2_flat[base + Int32(3)].to(cutlass.Float32)
+                        # One 8-byte load of the lane's four FP16 route values
+                        # (exact widening, as the element loads it replaces).
+                        p01, p23 = ld_global_nc_v2_u32(
+                            get_ptr_as_int64(fc2_flat, Int64(base))
+                        )
+                        v0, v1 = f16x2_to_f32x2(p01)
+                        v2, v3 = f16x2_to_f32x2(p23)
                         h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
                         if cutlass.const_expr(self.broadcast_svh):
                             sbase = col0
