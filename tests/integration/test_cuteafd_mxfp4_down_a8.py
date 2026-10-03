@@ -32,7 +32,7 @@ def test_quantized_oracle_padding_poison_and_fixed_resolution(real):
     ids = torch.rand(capacity, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int().contiguous()
     weights = torch.rand(capacity, g.top_k, device="cuda", generator=gen).contiguous()
     program = compile_fp8_moe_aot(g, route="stream", max_rows=capacity, mxfp4_down_a8=True)
-    baseline = compile_fp8_moe_aot(g, route="stream", max_rows=capacity)
+    baseline = compile_fp8_moe_aot(g, route="stream", max_rows=capacity, mxfp4_down_a8=False)
     assert len(program.operands) == 11 and len(program.scalars) == 1
     size = fp8_moe_scratch_bytes(g, "stream", capacity, mxfp4_down_a8=True)
     assert size == program.scratch_bytes(capacity)["scratch"]
@@ -91,7 +91,7 @@ def test_auto_small_rows_are_byte_exact_and_graph_replay_keeps_storage():
     source, _ = wire_rows(x)
     ids = torch.rand(capacity, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int().contiguous()
     weights = torch.rand(capacity, g.top_k, device="cuda", generator=gen).contiguous()
-    base = compile_fp8_moe_aot(g, route="auto", max_rows=capacity)
+    base = compile_fp8_moe_aot(g, route="auto", max_rows=capacity, mxfp4_down_a8=False)
     candidate = compile_fp8_moe_aot(g, route="auto", max_rows=capacity, mxfp4_down_a8=True)
     out = torch.empty(capacity, g.hidden, dtype=torch.bfloat16, device="cuda")
     old = torch.empty_like(out)
