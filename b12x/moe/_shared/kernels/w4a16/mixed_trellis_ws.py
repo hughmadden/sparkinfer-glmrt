@@ -33,6 +33,22 @@ a shared ring) was measured first and lost on GB10: one decode warp per SMSP
 is latency bound, and even two leave the consumers idle while the decode
 instructions still issue on the same schedulers.
 
+Options for LPDDR-bound parts (GB10), all bit-identical:
+
+``input_format="e4m3_k32"``
+    FC1 reads the coordinator's E4M3 + UE8M0 K32 wire rows directly (staged
+    in each row's own FP16 slot, widened to the value the BF16 decode gives)
+    instead of a separately decoded BF16 copy.
+``input_stages``
+    Input-row ring depth (4 hides GB10's gather latency).
+``ws_tile_n``
+    Per-launch N tiles, including 192-wide (six consumer warps plus two idle
+    padding warps) for widths that are odd multiples of 128.
+``dynamic_tiles``
+    CTAs claim tiles from a workspace counter, so an expert's route blocks
+    start together and share its weight stream through L2 (the static
+    round-robin read most weights twice from DRAM).
+
 Arithmetic is bit-identical to the cooperative kernel with (64, 256, 64, 256)
 tiles: the same decoded fragments, rotated rows and MMA instructions, and each
 output element accumulates its K16 steps in the same two chains (K16 index
@@ -978,14 +994,14 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tier0_hi_experts: Int32,
         tier1_hi_experts: Int32,
     ):
-        """The CTA's j-th tile with weights (claims j, j+1, ... until one has
-        weights): static tile cta + j * grid, or the j-th dynamically claimed
-        tile. Every producer thread walks the same claim sequence (uniform
-        control flow); the first cursor to reach claim j makes it (thread 0
-        increments the global counter into a shared slot, then the producer
-        warps synchronize), later cursors read the slot. Returns (next j,
-        claims made, tile or total_tiles, route block, N tile, combined
-        expert, tier, tier-local expert)."""
+        """The CTA's next tile with weights from claim j: static tiles
+        cta + j * grid (skipping weightless ones), or the j-th dynamically
+        claimed tile. Every producer thread walks the same claim sequence
+        (uniform control flow); the first cursor to reach claim j makes it
+        (thread 0 takes counter values until one has weights, stores it in a
+        shared slot, then the producer warps synchronize); later cursors read
+        the slot. Returns (next j, claims made, tile or total_tiles, route
+        block, N tile, combined expert, tier, tier-local expert)."""
         found = Int32(0)
         t = total_tiles
         rb = Int32(0)
@@ -993,37 +1009,52 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         combined = Int32(0)
         tier = Int32(-1)
         local = Int32(0)
-        while found == Int32(0):
-            if cutlass.const_expr(self.ws_dynamic):
-                slot = claim_base + (j % Int32(_CLAIM_SLOTS)) * Int32(4)
-                if j >= nclaimed:
-                    if ptid == Int32(0):
-                        st_shared_i32(slot, _atom_add_relaxed_gpu(counter_addr, Int32(1)))
-                    _producer_bar_sync()
-                    nclaimed = j + Int32(1)
-                t = ld_shared_i32_relaxed(slot)
-            else:
-                t = cta + j * grid
+        meta = (
+            n_tiles,
+            block_expert_ids,
+            descriptor_map,
+            tier0_num_experts,
+            tier1_num_experts,
+            tier0_lo_experts,
+            tier1_lo_experts,
+            tier0_hi_experts,
+            tier1_hi_experts,
+        )
+        if cutlass.const_expr(self.ws_dynamic):
+            # A claim slot holds a tile with weights (thread 0 skips the rest),
+            # so cursors lag the claimer by at most their ring depths in slots.
+            slot = claim_base + (j % Int32(_CLAIM_SLOTS)) * Int32(4)
+            if j >= nclaimed:
+                if ptid == Int32(0):
+                    c = _atom_add_relaxed_gpu(counter_addr, Int32(1))
+                    while found == Int32(0):
+                        if c >= total_tiles:
+                            c = total_tiles
+                            found = Int32(1)
+                        else:
+                            _rb, _nt, _comb, c_tier, _local = self._ws_tile_meta(is_fc1, c, *meta)
+                            if c_tier >= Int32(0):
+                                found = Int32(1)
+                            else:
+                                c = _atom_add_relaxed_gpu(counter_addr, Int32(1))
+                    st_shared_i32(slot, c)
+                _producer_bar_sync()
+                nclaimed = j + Int32(1)
+            t = ld_shared_i32_relaxed(slot)
             j += Int32(1)
-            if t >= total_tiles:
-                t = total_tiles
-                found = Int32(1)
-            else:
-                rb, nt, combined, tier, local = self._ws_tile_meta(
-                    is_fc1,
-                    t,
-                    n_tiles,
-                    block_expert_ids,
-                    descriptor_map,
-                    tier0_num_experts,
-                    tier1_num_experts,
-                    tier0_lo_experts,
-                    tier1_lo_experts,
-                    tier0_hi_experts,
-                    tier1_hi_experts,
-                )
-                if tier >= Int32(0):
+            if t < total_tiles:
+                rb, nt, combined, tier, local = self._ws_tile_meta(is_fc1, t, *meta)
+        else:
+            while found == Int32(0):
+                t = cta + j * grid
+                j += Int32(1)
+                if t >= total_tiles:
+                    t = total_tiles
                     found = Int32(1)
+                else:
+                    rb, nt, combined, tier, local = self._ws_tile_meta(is_fc1, t, *meta)
+                    if tier >= Int32(0):
+                        found = Int32(1)
         return j, nclaimed, t, rb, nt, combined, tier, local
 
     @cute.jit
