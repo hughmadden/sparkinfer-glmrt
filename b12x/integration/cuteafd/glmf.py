@@ -585,7 +585,7 @@ class _KdaW8(_Kda):
         wide_rows = 32 if (g.hidden, g.kda_heads, g.kda_head_dim) == (4096, 32, 128) else 0
         self.in_proj = _W8Run(_w8(self.p, g.hidden, prefill_rows, row_scales=True,
                                   prefill_mask=1, wide_rows=wide_rows))
-        if self.output_norm and not prefill:
+        if wide_rows and not prefill:
             # Keep the full-head input GEMV's K reduction grouping after N slicing.
             from ._fp8_weights import Fp8Projection
             self.in_proj = _W8Run(Fp8Projection(self.p, g.hidden, row_scales=True, kmajor=True,

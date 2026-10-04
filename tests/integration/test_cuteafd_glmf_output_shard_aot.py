@@ -95,15 +95,10 @@ def test_norm_is_original_scratch_and_state(case, mode, rows, expanded):
             for actual, expected in zip([out, state, conv, replay], results[-1][:4]):
                 assert torch.equal(actual, expected)
         _guard(guard)
-    if rows != 1:
-        assert torch.equal(results[1][0], results[0][4])
+    assert torch.equal(results[1][0], results[0][4])
     assert torch.isfinite(results[1][0]).all() and results[1][0].abs().max() > 0
-    if rows != 1:
-        for a, b in zip(results[0][1:4], results[1][1:4]):
-            assert torch.equal(a, b)
-    else:
-        print('prefix1 old-half4/4 vs norm8/2 normalized differences:',
-              (results[1][0] != results[0][4]).sum().item(), flush=True)
+    for a, b in zip(results[0][1:4], results[1][1:4]):
+        assert torch.equal(a, b)
 
 
 @pytest.fixture(scope='module')
@@ -208,7 +203,8 @@ def test_prefix1_input_matches_full_k_grouping(case):
 
 
 @pytest.mark.parametrize('spec', [0, 1])
-def test_prefix1_norm_state_and_replay_match_full_heads(case, spec):
+@pytest.mark.parametrize('output_kind', ['projection', 'norm'])
+def test_prefix1_state_and_replay_match_full_heads(case, spec, output_kind):
     from b12x.integration.cuteafd import GLM53_FLASH, glmf
     from b12x.integration.cuteafd._glmf_kernels import kda_replay_layout
     g, iq, oq, common, _, _ = case
@@ -230,9 +226,10 @@ def test_prefix1_norm_state_and_replay_match_full_heads(case, spec):
         (GLM53_FLASH, iq[0][in_index].contiguous(), iq[2][:, in_index].contiguous(),
          full_common, oq[0].repeat(1, 2), oq[2].repeat(2, 1),
          state.repeat(1, 2, 1, 1), conv[:, :, qkv_index].contiguous())]:
-        p = glmf.compile_glmf_kda_aot(geometry, max_rows=64, fp8_only='decode', output_kind='norm')
+        p = glmf.compile_glmf_kda_aot(geometry, max_rows=64, fp8_only='decode', output_kind=output_kind)
         actual_state, actual_conv = initial_state.clone(), initial_conv.clone()
-        out = torch.empty(1, geometry.kda_width, device='cuda', dtype=torch.bfloat16)
+        out_width = geometry.kda_width if output_kind == 'norm' else geometry.hidden
+        out = torch.empty(1, out_width, device='cuda', dtype=torch.bfloat16)
         beta_at, proj_at, total = kda_replay_layout(geometry.kda_heads, 3 * geometry.kda_width)
         replay = torch.zeros(total, device='cuda', dtype=torch.uint8)
         scratch = torch.empty(p.scratch_bytes(1)['scratch'], device='cuda', dtype=torch.uint8)
@@ -248,5 +245,7 @@ def test_prefix1_norm_state_and_replay_match_full_heads(case, spec):
                               for start in [0, 2*d, 4*d]])
     expected = (full[0][:, :d], full[1][:, :32], full[2][:, :, selected_qkv],
                 full[3][:, :32], full[4][:, :32], full[5][:, selected_qkv])
-    for actual, reference in zip(half, expected):
+    if output_kind == 'norm':
+        assert torch.equal(half[0], expected[0])
+    for actual, reference in zip(half[1:], expected[1:]):
         assert torch.equal(actual, reference)
