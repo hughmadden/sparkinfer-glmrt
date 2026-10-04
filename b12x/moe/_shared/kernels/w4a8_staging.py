@@ -7,7 +7,7 @@ shared memory. Slice width is static geometry; position and strides are runtime.
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
-from b12x._lib.intrinsics import cp_async4_shared_global, get_ptr_as_int64
+from b12x._lib.intrinsics import cp_async4_shared_global, get_ptr_as_int64, st_shared_u32
 
 
 @cute.jit
@@ -143,4 +143,104 @@ def stage_repacked_sfb_k_slice(
                     word = source[expert_word_base + tile * Int64(256) + n % Int64(256)]
                     value = (cutlass.Uint32(word) >> cutlass.Uint32((k % Int64(4)) * Int64(8))) & cutlass.Uint32(255)
                     packed |= value << cutlass.Uint32(byte * 8)
+            destination[index] = packed.to(destination.element_type)
+
+
+@cute.jit
+def stage_v41_exact_b(source: cute.Tensor, shared_base: Int32,
+                      expert_word_base: Int64, n_start: Int32, k_start: Int32,
+                      thread: Int32, width: cutlass.Constexpr,
+                      intermediate: cutlass.Constexpr, hidden: cutlass.Constexpr,
+                      gated: cutlass.Constexpr):
+    """Exact TP4 payload: FC1 N128 tiles (last N64), FC2 K128 tiles (last K64).
+
+    Shared payload remains the existing compact MMA layout. Out-of-range tails
+    are zeroed only in shared MMA scratch, never in resident weights.
+    FC1 k_start is a K128 tile; FC2 k_start is a logical K row.
+    """
+    chunks = width // 32 if gated else 4
+    blocks = 4 if gated else width // 32
+    for iteration in cutlass.range_constexpr((blocks * chunks * 32 + 127) // 128):
+        index = thread + Int32(iteration * 128)
+        if index < Int32(blocks * chunks * 32):
+            lane = index % Int32(32)
+            chunk = (index // Int32(32)) % Int32(chunks)
+            kb = index // Int32(32 * chunks)
+            if cutlass.const_expr(gated):
+                projection = n_start // Int32(intermediate)
+                n = n_start % Int32(intermediate) + chunk * Int32(32)
+                tile = n // Int32(128)
+                rows = Int32(128)
+                if tile == Int32(intermediate // 128):
+                    rows = Int32(intermediate % 128)
+                word = (expert_word_base + Int64(projection * intermediate * (hidden // 8))
+                        + Int64(tile * 128 * (hidden // 8))
+                        + Int64((k_start * 4 + kb) * (rows // 32) * 128)
+                        + Int64((n % 128 // 32) * 128 + lane * 4))
+            else:
+                n = n_start + chunk * Int32(32)
+                k = k_start // Int32(32) + kb
+                word = (expert_word_base + Int64((n // 128) * 128 * (intermediate // 8))
+                        + Int64(k * 512 + (n % 128 // 32) * 128 + lane * 4))
+            valid = n < Int32(intermediate) if cutlass.const_expr(gated) else k < Int32(intermediate // 32)
+            address = shared_base + index * Int32(16)
+            if valid:
+                cp_async4_shared_global(address, get_ptr_as_int64(source, word))
+            else:
+                for element in cutlass.range_constexpr(4):
+                    st_shared_u32(address + Int32(element * 4), cutlass.Uint32(0))
+
+
+@cute.jit
+def stage_v41_exact_sfb(source: cute.Tensor, destination,
+                        expert_word_base: Int64, n_start: Int32, k_start: Int32,
+                        thread: Int32, width: cutlass.Constexpr,
+                        intermediate: cutlass.Constexpr, hidden: cutlass.Constexpr,
+                        gated: cutlass.Constexpr):
+    """Gather exact resident scales into the original shared MMA scale layout."""
+    if cutlass.const_expr(gated):
+        if thread < Int32(width // 4):
+            projection = n_start // Int32(intermediate)
+            n = n_start % Int32(intermediate) + thread * Int32(4)
+            tile = n // Int32(128)
+            count = Int32(128)
+            if tile == Int32(intermediate // 128):
+                count = Int32(intermediate % 128)
+            word = (expert_word_base + Int64(projection) * Int64(intermediate * hidden // 128)
+                    + Int64(tile) * Int64(hidden)
+                    + Int64(k_start * count + n % 128))
+            address = destination + thread * Int32(16)
+            if n < Int32(intermediate):
+                cp_async4_shared_global(address, get_ptr_as_int64(source, word))
+            else:
+                for element in cutlass.range_constexpr(4):
+                    st_shared_u32(address + Int32(element * 4), cutlass.Uint32(0))
+    else:
+        source_halves = cute.recast_tensor(source, cutlass.Uint16)
+        groups = (width + 127) // 128
+        for iteration in cutlass.range_constexpr(groups):
+            index = thread + Int32(iteration * 128)
+            row = index % Int32(128)
+            group = index // Int32(128)
+            packed = cutlass.Uint32(0)
+            for byte in cutlass.range_constexpr(4):
+                block = group * Int32(4) + Int32(byte)
+                if block < Int32(width // 32):
+                    n = n_start + row
+                    k = k_start // Int32(32) + block
+                    tile = k // Int32(4)
+                    cols = Int32(4)
+                    if tile == Int32(intermediate // 128):
+                        cols = Int32(intermediate % 128 // 32)
+                    offset = (expert_word_base * Int64(4)
+                              + Int64(n // 128) * Int64(128 * (intermediate // 32))
+                              + Int64(tile * 512 + (n % 128) * cols + k % 4))
+                    if k < Int32(intermediate // 32):
+                        word = cutlass.Uint32(0)
+                        if cols == Int32(2):
+                            word = cutlass.Uint32(source_halves[offset // Int64(2)])
+                        else:
+                            word = cutlass.Uint32(source[offset // Int64(4)])
+                        value = (word >> cutlass.Uint32((k % 4) * 8)) & cutlass.Uint32(255)
+                        packed |= value << cutlass.Uint32(byte * 8)
             destination[index] = packed.to(destination.element_type)

@@ -1,9 +1,10 @@
 """V4.1 M16 fused expert-slice kernel for intermediate tiling qualification.
 
-Consumes one expert's N256/K128 packed weights and prequantized MXFP8 rows.
+Consumes one expert's packed weights and prequantized MXFP8 rows. Legacy
+storage uses N256/K128 tiles; exact TP4 uses N128/K128 tiles with N64/K64 tails.
 Intermediate width is immutable model geometry: 576 for TP4 backbone experts
 and 2304 for local dSpark experts. Packed expert strides derive from its
-128-aligned storage width; live row/group counts remain runtime arguments.
+storage width (exact N128/K128 tail layout when requested); live row/group counts remain runtime arguments.
 The caller supplies 0..16 live rows in capacity-16 input/output storage. Width
 is static model tiling; row count remains a runtime launch argument. Partial
 FC2 output is FP32 and must be reduced across slices before BF16 conversion.
@@ -45,11 +46,13 @@ from b12x.moe._shared.kernels.w4a8_staging import (
     stage_repacked_sfb_slice,
     stage_repacked_b_k_slice,
     stage_repacked_sfb_k_slice,
+    stage_v41_exact_b,
+    stage_v41_exact_sfb,
 )
 
 
 class V41FusedSliceKernel:
-    def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576, hidden=5120):
+    def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576, hidden=5120, exact_storage=False):
         assert width in (64, 128, 192)
         assert hidden > 0 and hidden % 128 == 0
         self.hidden = hidden
@@ -60,9 +63,12 @@ class V41FusedSliceKernel:
         self.width = width
         assert intermediate > 0 and intermediate % 32 == 0
         self.intermediate = intermediate
-        self.kernel_intermediate = (intermediate + 127) // 128 * 128
+        self.exact_storage = bool(exact_storage)
+        if self.exact_storage:
+            assert intermediate == 576 and hidden == 5120, "exact tail layout is the V4.1 TP4 contract"
+        self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.slices = (intermediate + width - 1) // width
-        assert self.slices * width <= self.kernel_intermediate, (
+        assert self.slices * width <= (intermediate + 127) // 128 * 128, (
             "slice exceeds packed storage"
         )
 
@@ -154,50 +160,106 @@ class V41FusedSliceKernel:
             up = cute.make_rmem_tensor((self.width // 32, 4), Float32)
             up.fill(0)
             for kt in range(self.hidden_tiles):
-                stage_repacked_b_slice(
-                    w13,
-                    bb,
-                    expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                    Int32(self.hidden_tiles),
-                    kt,
-                    start,
-                    tid,
-                    128,
-                    self.width,
-                )
-                stage_repacked_b_slice(
-                    w13,
-                    bb + self.width * 64,
-                    expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                    Int32(self.hidden_tiles),
-                    kt,
-                    start + self.kernel_intermediate,
-                    tid,
-                    128,
-                    self.width,
-                )
-                stage_repacked_sfb_slice(
-                    s13,
-                    sb,
-                    expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                    Int32(self.hidden_tiles),
-                    kt,
-                    start,
-                    tid,
-                    128,
-                    self.width,
-                )
-                stage_repacked_sfb_slice(
-                    s13,
-                    sb + self.width * 4,
-                    expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                    Int32(self.hidden_tiles),
-                    kt,
-                    start + self.kernel_intermediate,
-                    tid,
-                    128,
-                    self.width,
-                )
+                if cutlass.const_expr(self.exact_storage):
+                    stage_v41_exact_b(
+                        w13,
+                        bb,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                        start,
+                        kt,
+                        tid,
+                        self.width,
+                        self.intermediate,
+                        self.hidden,
+                        True,
+                    )
+                else:
+                    stage_repacked_b_slice(
+                        w13,
+                        bb,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                        Int32(self.hidden_tiles),
+                        kt,
+                        start,
+                        tid,
+                        128,
+                        self.width,
+                    )
+                if cutlass.const_expr(self.exact_storage):
+                    stage_v41_exact_b(
+                        w13,
+                        bb + self.width * 64,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                        start + self.kernel_intermediate,
+                        kt,
+                        tid,
+                        self.width,
+                        self.intermediate,
+                        self.hidden,
+                        True,
+                    )
+                else:
+                    stage_repacked_b_slice(
+                        w13,
+                        bb + self.width * 64,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                        Int32(self.hidden_tiles),
+                        kt,
+                        start + self.kernel_intermediate,
+                        tid,
+                        128,
+                        self.width,
+                    )
+                if cutlass.const_expr(self.exact_storage):
+                    stage_v41_exact_sfb(
+                        s13,
+                        sb,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                        start,
+                        kt,
+                        tid,
+                        self.width,
+                        self.intermediate,
+                        self.hidden,
+                        True,
+                    )
+                else:
+                    stage_repacked_sfb_slice(
+                        s13,
+                        sb,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                        Int32(self.hidden_tiles),
+                        kt,
+                        start,
+                        tid,
+                        128,
+                        self.width,
+                    )
+                if cutlass.const_expr(self.exact_storage):
+                    stage_v41_exact_sfb(
+                        s13,
+                        sb + self.width * 4,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                        start + self.kernel_intermediate,
+                        kt,
+                        tid,
+                        self.width,
+                        self.intermediate,
+                        self.hidden,
+                        True,
+                    )
+                else:
+                    stage_repacked_sfb_slice(
+                        s13,
+                        sb + self.width * 4,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                        Int32(self.hidden_tiles),
+                        kt,
+                        start + self.kernel_intermediate,
+                        tid,
+                        128,
+                        self.width,
+                    )
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()
@@ -294,28 +356,56 @@ class V41FusedSliceKernel:
                 qs[row, block] = scale
             cute.arch.sync_threads()
             for ot in range(self.hidden_tiles):
-                stage_repacked_b_k_slice(
-                    w2,
-                    bb,
-                    expert * Int64(self.kernel_intermediate * self.hidden // 8),
-                    Int32(self.kernel_intermediate // 128),
-                    start,
-                    ot * 128,
-                    tid,
-                    128,
-                    self.width,
-                )
-                stage_repacked_sfb_k_slice(
-                    s2,
-                    sf,
-                    expert * Int64(self.kernel_intermediate * self.hidden // 128),
-                    Int32(self.kernel_intermediate // 128),
-                    start,
-                    ot * 128,
-                    tid,
-                    128,
-                    self.width,
-                )
+                if cutlass.const_expr(self.exact_storage):
+                    stage_v41_exact_b(
+                        w2,
+                        bb,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 8),
+                        ot * 128,
+                        start,
+                        tid,
+                        self.width,
+                        self.intermediate,
+                        self.hidden,
+                        False,
+                    )
+                else:
+                    stage_repacked_b_k_slice(
+                        w2,
+                        bb,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 8),
+                        Int32(self.kernel_intermediate // 128),
+                        start,
+                        ot * 128,
+                        tid,
+                        128,
+                        self.width,
+                    )
+                if cutlass.const_expr(self.exact_storage):
+                    stage_v41_exact_sfb(
+                        s2,
+                        sf,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 128),
+                        ot * 128,
+                        start,
+                        tid,
+                        self.width,
+                        self.intermediate,
+                        self.hidden,
+                        False,
+                    )
+                else:
+                    stage_repacked_sfb_k_slice(
+                        s2,
+                        sf,
+                        expert * Int64(self.kernel_intermediate * self.hidden // 128),
+                        Int32(self.kernel_intermediate // 128),
+                        start,
+                        ot * 128,
+                        tid,
+                        128,
+                        self.width,
+                    )
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()

@@ -47,14 +47,14 @@ class V41HybridPipeline:
     in the FP32 slice partial arena. Neither path retains state between calls.
     """
 
-    def __init__(self, capacity, width, sm_count, *, intermediate, cutoff):
+    def __init__(self, capacity, width, sm_count, *, intermediate, cutoff, exact_storage=False):
         from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
         if intermediate not in (576, 1152) or not 1 <= cutoff <= capacity:
             raise ValueError("invalid native hybrid geometry or cutoff")
         self.cutoff = int(cutoff)
         self.compact = V41CompactPipeline(capacity, sm_count,
-            kernel_intermediate=(intermediate + 127) // 128 * 128)
-        self.grouped = V41SlicePipeline(capacity, width, intermediate=intermediate)
+            kernel_intermediate=intermediate if exact_storage else (intermediate + 127) // 128 * 128)
+        self.grouped = V41SlicePipeline(capacity, width, intermediate=intermediate, exact_storage=exact_storage)
 
     @cute.jit
     def __call__(
