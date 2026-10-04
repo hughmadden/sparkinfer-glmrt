@@ -112,6 +112,9 @@ __all__ = [
     "compile_glmf_index_topk_aot",
     "compile_glmf_kda_aot",
     "compile_glmf_mla_producer_aot",
+    "compile_glmf_mla_values_aot",
+    "compile_glmf_mla_output_rows_aot",
+    "compile_glmf_join_mla_heads_aot",
     "compile_glmf_o_aot",
     "compile_glmf_router_scores_aot",
     "kda_scratch_bytes",
@@ -1459,3 +1462,22 @@ def compile_glmf_kda_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
     """Full KDA output for owned token rows; global rows determine math and scratch."""
     from ._glmf_output_rows import compile_glmf_kda_output_rows_aot as compile_rows
     return compile_rows(g_half, max_rows=max_rows, fp8_only=fp8_only, prefill_expanded=prefill_expanded)
+
+
+def compile_glmf_mla_values_aot(g_half: GLMFGeometry, *, max_rows: int) -> AotProgram:
+    """The original per-head BF16 W_UV expansion without o_proj or scratch."""
+    from ._glmf_mla_output_rows import compile_glmf_mla_values_aot as compile_values
+    return compile_values(g_half, max_rows=max_rows)
+
+
+def compile_glmf_mla_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
+                                   fp8_only: str = "decode") -> AotProgram:
+    """Full MLA output for owned token rows; global rows determine math and scratch."""
+    from ._glmf_mla_output_rows import compile_glmf_mla_output_rows_aot as compile_rows
+    return compile_rows(g_half, max_rows=max_rows, fp8_only=fp8_only)
+
+
+def compile_glmf_join_mla_heads_aot(g_half: GLMFGeometry) -> AotProgram:
+    """Bit-exact concatenation of the two BF16 MLA value-head halves."""
+    from ._glmf_mla_output_rows import compile_glmf_join_mla_heads_aot as compile_join
+    return compile_join(g_half)
