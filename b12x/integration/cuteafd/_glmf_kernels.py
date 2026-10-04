@@ -181,6 +181,28 @@ class GlmfAdd:
         self.row.store(Int64(out.toint()) + offset, x)
 
 
+class GlmfAddPartial:
+    """Add FP16 or FP32 head-split partials in FP32, then round to BF16."""
+
+    threads = 256
+
+    def __init__(self, width: int):
+        self.width = int(width)
+
+    @cute.jit
+    def __call__(self, a: cute.Pointer, b: cute.Pointer, out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.kernel(a, b, out, rows).launch(grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, a: cute.Pointer, b: cute.Pointer, out: cute.Pointer, rows: Int32):
+        layout = cute.make_layout((Int64(rows) * Int64(self.width),))
+        av, bv, ov = cute.make_tensor(a, layout), cute.make_tensor(b, layout), cute.make_tensor(out, layout)
+        base = Int64(cute.arch.block_idx()[0]) * Int64(self.width) + Int64(cute.arch.thread_idx()[0])
+        for i in cutlass.range_constexpr(self.width // self.threads):
+            at = base + Int64(i * self.threads)
+            ov[at] = (av[at].to(Float32) + bv[at].to(Float32)).to(cutlass.BFloat16)
+
+
 class GlmfKdaConv:
     """Causal short conv + SiLU over the q/k/v in-projection columns.
 

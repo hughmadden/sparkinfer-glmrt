@@ -119,7 +119,7 @@ class Fp8Projection:
 
     def __init__(self, n: int, k: int, *, prefill_rows: int | None = None, row_scales: bool = False,
                  kmajor: bool = False, gemv_rows: int = 16, wide_rows: int = 0, warps: int | None = None,
-                 groups: int = 4, prefill_mask: int = 0xFF):
+                 groups: int = 4, prefill_mask: int = 0xFF, out_dtype=cutlass.BFloat16):
         self.n, self.k = int(n), int(k)
         self.row_scales = bool(row_scales)
         # Per-row scales K-block major in decode programs too (one copy serves both).
@@ -130,25 +130,29 @@ class Fp8Projection:
         if self.prefill:
             from ._glmf_fp8 import BlockFp8Projection
 
-            self.w8a8 = BlockFp8Projection(self.n, self.k, int(prefill_rows), row_scales=self.row_scales)
+            if out_dtype != cutlass.BFloat16 and self.prefill_mask:
+                raise ValueError("non-BF16 prefill output requires W8A16 (prefill_mask=0)")
+            self.w8a8 = BlockFp8Projection(self.n, self.k, int(prefill_rows), row_scales=self.row_scales) \
+                if self.prefill_mask else None
             # 128-row tiles: the E4M3 tile is widened once per 128 rows (SM120 at 325 W, 4096 rows,
             # 6144x16384: 4 warps 3650 us, 8 warps 2779 us; BF16 TMA 128x128 tiles 2244 us).
             self.w8a16 = TmaFp8Gemm(self.n, self.k, scales="row_kmajor" if self.row_scales else "block",
-                                    compute_warps=8, num_stages=3)
+                                    compute_warps=8, num_stages=3, out_dtype=out_dtype)
             self.max_gemv_rows = 0
         else:
             warps = gemv_warps(self.k) if warps is None else int(warps)
             self.gemv = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows), warps=warps, groups=int(groups),
-                                   row_scales=self.row_scales, kmajor=self.kmajor)
+                                   row_scales=self.row_scales, kmajor=self.kmajor, out_dtype=out_dtype)
             if int(wide_rows) > int(gemv_rows):
                 self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=int(wide_rows), warps=warps,
-                                            groups=int(groups), row_scales=self.row_scales, kmajor=self.kmajor)
+                                            groups=int(groups), row_scales=self.row_scales, kmajor=self.kmajor,
+                                            out_dtype=out_dtype)
             self.gemv_rows = int(gemv_rows)
             self.max_gemv_rows = max(int(gemv_rows), int(wide_rows))
             tile_n = decode_tile_n(self.n)
             self.w8a16 = TmaFp8Gemm(self.n, self.k, scales=("row_kmajor" if self.kmajor else "row")
                                     if self.row_scales else "block", tile_n=tile_n,
-                                    num_stages=4 if tile_n == 128 else 6)
+                                    num_stages=4 if tile_n == 128 else 6, out_dtype=out_dtype)
 
     def key(self) -> tuple:
         return (self.n, self.k, self.row_scales, self.kmajor, self.prefill_mask, self.max_gemv_rows,
@@ -165,10 +169,13 @@ class Fp8Projection:
     def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
                  rows: Int32, fp8_rows: Int32, qscratch: Int64, stream: cuda.CUstream):
         if cutlass.const_expr(self.prefill):
-            if (fp8_rows & Int32(self.prefill_mask)) != Int32(0):
-                self.w8a8(x, w_fp8, scale, out, qscratch, rows, stream)
-            else:
+            if cutlass.const_expr(self.w8a8 is None):
                 self.w8a16(x, w_fp8, scale, out, rows, stream)
+            else:
+                if (fp8_rows & Int32(self.prefill_mask)) != Int32(0):
+                    self.w8a8(x, w_fp8, scale, out, qscratch, rows, stream)
+                else:
+                    self.w8a16(x, w_fp8, scale, out, rows, stream)
         else:
             limit = fp8_rows
             if limit > Int32(self.max_gemv_rows):
@@ -721,7 +728,7 @@ class MmaFp8Gemv:
         for i in cutlass.range_constexpr(self.frags):
             partial[(warp_id * Int32(self.frags) + Int32(i)) * Int32(32) + lane] = acc[i]
         cute.arch.sync_threads()
-        out_bytes = 2 if const_expr(self.out_dtype == cutlass.BFloat16) else 4
+        out_bytes = 2 if const_expr(self.out_dtype in (cutlass.BFloat16, cutlass.Float16)) else 4
         # Every warp stores a share of the fragments.
         for i in cutlass.range_constexpr(self.frags):
             if Int32(i % self.warps) == warp_id:
