@@ -210,8 +210,8 @@ class Bf16PrefillKernel:
             raise TypeError("source must be BFloat16")
         if const_expr(weight.element_type != cutlass.BFloat16):
             raise TypeError("weight must be BFloat16")
-        if const_expr(output.element_type not in (cutlass.Float32, cutlass.BFloat16, cutlass.Float16)):
-            raise TypeError("output must be Float32, BFloat16 or Float16")
+        if const_expr(output.element_type not in (cutlass.Float32, cutlass.BFloat16)):
+            raise TypeError("output must be Float32 or BFloat16")
 
         sA_layout, sB_layout = self._get_smem_layouts()
         tiled_mma = self._get_tiled_mma()

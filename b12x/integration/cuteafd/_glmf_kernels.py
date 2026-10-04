@@ -182,7 +182,7 @@ class GlmfAdd:
 
 
 class GlmfAddPartial:
-    """Add FP16 or FP32 head-split partials in FP32, then round to BF16."""
+    """Add FP32 head-split partials, then round to BF16."""
 
     threads = 256
 

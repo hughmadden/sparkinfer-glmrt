@@ -98,7 +98,6 @@ from ._glmf_kernels import (
 __all__ = [
     "compile_glmf_add_aot",
     "compile_glmf_add_fp32_aot",
-    "compile_glmf_add_fp16_aot",
     "compile_glmf_expert_input_quant_aot",
     "compile_glmf_ffn_aot",
     "compile_glmf_head_aot",
@@ -274,7 +273,7 @@ def _w8_mode(fp8_only) -> bool | None:
 
 
 def _w8(n: int, k: int, prefill_rows: int | None, *, row_scales: bool = False, prefill_mask: int = 0xFF,
-        out_dtype=cutlass.BFloat16):
+        out_dtype=cutlass.BFloat16, wide_rows: int = 0):
     """An ``Fp8Projection`` with this family's GEMV tuning: over the checkpoint's 128x128 grid, or
     (``row_scales``) over per-row x 128-K scales stored K-block major in decode and prefill
     programs alike, so one resident scale copy serves both."""
@@ -282,7 +281,8 @@ def _w8(n: int, k: int, prefill_rows: int | None, *, row_scales: bool = False, p
 
     warps, groups = FP8_GEMV_CONFIG.get((n, k), (gemv_warps(k), 4))
     return Fp8Projection(n, k, prefill_rows=prefill_rows, gemv_rows=FP8_ROWS, warps=warps, groups=groups,
-                         row_scales=row_scales, kmajor=row_scales, prefill_mask=prefill_mask, out_dtype=out_dtype)
+                         row_scales=row_scales, kmajor=row_scales, prefill_mask=prefill_mask, out_dtype=out_dtype,
+                         wide_rows=wide_rows, wide_warps=8, wide_groups=2)
 
 
 class _W8Run:
@@ -575,10 +575,12 @@ class _KdaW8(_Kda):
         super().__init__(g, max_rows, False)
         prefill_rows = int(max_rows) if prefill else None
         self.prefill = bool(prefill)
-        self.in_proj = _W8Run(_w8(self.p, g.hidden, prefill_rows, row_scales=True, prefill_mask=1))
+        wide_rows = 32 if (g.hidden, g.kda_heads, g.kda_head_dim) == (4096, 32, 128) else 0
+        self.in_proj = _W8Run(_w8(self.p, g.hidden, prefill_rows, row_scales=True,
+                                  prefill_mask=1, wide_rows=wide_rows))
         self.o_proj = _W8Run(_w8(g.hidden, self.d, prefill_rows, row_scales=True,
                                prefill_mask=2 if out_dtype == cutlass.BFloat16 else 0,
-                               out_dtype=out_dtype))
+                               out_dtype=out_dtype, wide_rows=wide_rows))
         if prefill_expanded:
             self.in_proj = _ExpandedW8Run(self.in_proj.proj, self.p, g.hidden)
             self.o_proj = _ExpandedW8Run(self.o_proj.proj, g.hidden, self.d, out_dtype)
@@ -612,9 +614,9 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
                        output_dtype: str = "bfloat16", prefill_expanded: bool = False) -> AotProgram:
     prefill = _w8_mode(fp8_only)
     types = {"bfloat16": (cutlass.BFloat16, torch.bfloat16),
-             "float16": (cutlass.Float16, torch.float16), "float32": (cutlass.Float32, torch.float32)}
+             "float32": (cutlass.Float32, torch.float32)}
     if output_dtype not in types:
-        raise ValueError("KDA output_dtype must be bfloat16, float16 or float32")
+        raise ValueError("KDA output_dtype must be bfloat16 or float32")
     if prefill_expanded and (not prefill or (g.hidden, g.kda_heads, g.kda_head_dim) != (4096, 32, 128)):
         raise ValueError("expanded W8A16 prefill requires GLM53 Flash half-head geometry")
     cute_dtype, torch_dtype = types[output_dtype]
@@ -653,6 +655,7 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
         geometry={"hidden": h, "heads": heads, "head_dim": g.kda_head_dim, "max_rows": max_rows,
                   "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps, "fp8_weights": "only",
                   "output_dtype": output_dtype, "prefill_expanded": prefill_expanded,
+                  "decode_gemv_rows": 32 if (h, heads, g.kda_head_dim) == (4096, 32, 128) else FP8_ROWS,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill, prefill_expanded)},
         doc=__doc__,
@@ -671,10 +674,11 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
     ``fp8_only`` (``"decode"`` / ``"prefill"``) takes ``w_in``/``w_o`` as E4M3 + per-row x
     128-K scales K-block major (``w_in_kscale [H/128, P]``, ``w_o_kscale [D/128, H]``) only,
     no BF16 copy: decode programs (``rows``, ``fp8_rows``, ``spec``; with ``replay``) run rows
-    up to ``fp8_rows`` (<= 16) on the FP8 GEMV and the W8A16 TMA GEMM above; prefill programs
+    up to ``fp8_rows`` (<= 32 for the GLM53 Flash half-head geometry, else <=16) on
+    the FP8 GEMV and the W8A16 TMA GEMM above; prefill programs
     (``rows``, ``fp8_rows``) run W8A8 on ``fp8_rows`` bit 0 (in-projection) / 1 (o_proj), else
     W8A16. One scale copy serves both. ``output_dtype`` optionally retains the final
-    dot product as float16 or float32 for a head-split peer sum, with W8A16-only
+    dot product as float32 for a head-split peer sum, with W8A16-only
     o-projection; prefill bit 1 must remain clear in these modes. Half-head
     ``prefill_expanded`` widens weights once in scratch for rows >=512, preserving
     their exact BF16 dequantization and requiring no persistent BF16 copy."""
@@ -1119,19 +1123,6 @@ def compile_glmf_add_fp32_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
         operands=(Operand("a", torch.float32, f"[rows,{h}]"), Operand("b", torch.float32, f"[rows,{h}]"),
                   Operand("out", torch.bfloat16, f"[rows,{h}]", "out")),
         scalars=(Scalar("rows"),), key=(h,), geometry={"hidden": h}, doc=compile_glmf_add_fp32_aot.__doc__,
-    )
-
-
-def compile_glmf_add_fp16_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
-    """``out = bf16(float(a) + float(b))`` for FP16 KDA output partials."""
-    from ._glmf_kernels import GlmfAddPartial
-
-    h = g.hidden
-    return compile_program(
-        GlmfAddPartial(h), name="glmf_add_fp16",
-        operands=(Operand("a", torch.float16, f"[rows,{h}]"), Operand("b", torch.float16, f"[rows,{h}]"),
-                  Operand("out", torch.bfloat16, f"[rows,{h}]", "out")),
-        scalars=(Scalar("rows"),), key=(h,), geometry={"hidden": h}, doc=compile_glmf_add_fp16_aot.__doc__,
     )
 
 

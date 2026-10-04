@@ -27,13 +27,13 @@ def case():
     programs = {(mode, dtype, expanded): glmf.compile_glmf_kda_aot(
         g, max_rows=64 if mode == "decode" else 4096, fp8_only=mode,
         output_dtype=dtype, prefill_expanded=expanded)
-        for mode in ("decode", "prefill") for dtype in ("bfloat16", "float16", "float32")
+        for mode in ("decode", "prefill") for dtype in ("bfloat16", "float32")
         for expanded in ((False, True) if mode == "prefill" else (False,))}
     replay_size = kda_replay_layout(32, 3 * g.kda_width)[2] // 4
     return g, iq, oq, common, programs, replay_size
 
 
-@pytest.mark.parametrize("mode,rows,bits", [("decode", 1, 16), ("decode", 24, 16),
+@pytest.mark.parametrize("mode,rows,bits", [("decode", 1, 16), ("decode", 24, 32),
                                            ("prefill", 64, 0), ("prefill", 512, 0),
                                            ("prefill", 64, 1)])
 def test_partial_dtype_keeps_dot_product_and_state(case, mode, rows, bits):
@@ -44,7 +44,7 @@ def test_partial_dtype_keeps_dot_product_and_state(case, mode, rows, bits):
     initial_state = torch.randn(1, 32, 128, 128, device="cuda") * .01
     initial_conv = (torch.randn(1, 3, 3 * g.kda_width, device="cuda") * .1).bfloat16()
     results = {}
-    for dtype in ("bfloat16", "float16", "float32"):
+    for dtype in ("bfloat16", "float32"):
         program = programs[mode, dtype, False]
         out = torch.full((rows, g.hidden), float("nan"), device="cuda",
                          dtype=getattr(torch, dtype))
@@ -60,19 +60,19 @@ def test_partial_dtype_keeps_dot_product_and_state(case, mode, rows, bits):
         torch.cuda.synchronize()
         assert torch.isfinite(out).all() and out.abs().max() > 0
         results[dtype] = (out, state, conv, replay)
-    for dtype in ("bfloat16", "float16"):
+    for dtype in ("bfloat16",):
         assert torch.equal(results[dtype][0], results['float32'][0].to(getattr(torch, dtype)))
         for old, new in zip(results[dtype][1:], results['float32'][1:]):
             assert torch.equal(old, new)
     assert (results['float32'][0] != results['float32'][0].bfloat16().float()).any()
 
 
-@pytest.mark.parametrize('dtype', ['float16', 'float32'])
+@pytest.mark.parametrize('dtype', ['float32'])
 def test_partial_sum_is_one_rounding_with_graph_replay(dtype):
     require_b12x()
     from b12x.integration.cuteafd import glmf
 
-    program = (glmf.compile_glmf_add_fp16_aot if dtype == 'float16' else glmf.compile_glmf_add_fp32_aot)()
+    program = glmf.compile_glmf_add_fp32_aot()
     for rows in (1, 4, 24, 64):
         a, b = [torch.randn(rows, 4096, device="cuda").to(getattr(torch, dtype)) for _ in range(2)]
         out = torch.full_like(a, float("nan"), dtype=torch.bfloat16)
@@ -89,7 +89,7 @@ def test_partial_sum_is_one_rounding_with_graph_replay(dtype):
         assert torch.equal(out, (a.float() + b.float()).bfloat16())
 
 
-@pytest.mark.parametrize('dtype', ['bfloat16', 'float16', 'float32'])
+@pytest.mark.parametrize('dtype', ['bfloat16', 'float32'])
 @pytest.mark.parametrize('rows,bits', [(64, 0), (512, 0), (512, 1)])
 def test_expanded_prefill_is_byte_exact_and_fits_full_workspace(case, dtype, rows, bits):
     g, iq, oq, common, programs, replay_size = case

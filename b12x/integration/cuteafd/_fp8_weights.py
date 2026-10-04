@@ -119,7 +119,8 @@ class Fp8Projection:
 
     def __init__(self, n: int, k: int, *, prefill_rows: int | None = None, row_scales: bool = False,
                  kmajor: bool = False, gemv_rows: int = 16, wide_rows: int = 0, warps: int | None = None,
-                 groups: int = 4, prefill_mask: int = 0xFF, out_dtype=cutlass.BFloat16):
+                 groups: int = 4, prefill_mask: int = 0xFF, out_dtype=cutlass.BFloat16,
+                 wide_warps: int | None = None, wide_groups: int | None = None):
         self.n, self.k = int(n), int(k)
         self.row_scales = bool(row_scales)
         # Per-row scales K-block major in decode programs too (one copy serves both).
@@ -144,8 +145,10 @@ class Fp8Projection:
             self.gemv = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows), warps=warps, groups=int(groups),
                                    row_scales=self.row_scales, kmajor=self.kmajor, out_dtype=out_dtype)
             if int(wide_rows) > int(gemv_rows):
-                self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=int(wide_rows), warps=warps,
-                                            groups=int(groups), row_scales=self.row_scales, kmajor=self.kmajor,
+                self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=int(wide_rows),
+                                            warps=warps if wide_warps is None else int(wide_warps),
+                                            groups=int(groups) if wide_groups is None else int(wide_groups),
+                                            row_scales=self.row_scales, kmajor=self.kmajor,
                                             out_dtype=out_dtype)
             self.gemv_rows = int(gemv_rows)
             self.max_gemv_rows = max(int(gemv_rows), int(wide_rows))
@@ -728,7 +731,7 @@ class MmaFp8Gemv:
         for i in cutlass.range_constexpr(self.frags):
             partial[(warp_id * Int32(self.frags) + Int32(i)) * Int32(32) + lane] = acc[i]
         cute.arch.sync_threads()
-        out_bytes = 2 if const_expr(self.out_dtype in (cutlass.BFloat16, cutlass.Float16)) else 4
+        out_bytes = 2 if const_expr(self.out_dtype == cutlass.BFloat16) else 4
         # Every warp stores a share of the fragments.
         for i in cutlass.range_constexpr(self.frags):
             if Int32(i % self.warps) == warp_id:
