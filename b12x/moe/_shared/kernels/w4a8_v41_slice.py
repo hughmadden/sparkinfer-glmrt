@@ -190,13 +190,14 @@ class V41FusedSliceKernel:
                         w13,
                         bb + self.width * 64,
                         expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                        start + self.kernel_intermediate,
+                        start,
                         kt,
                         tid,
                         self.width,
                         self.intermediate,
                         self.hidden,
                         True,
+                        1,
                     )
                 else:
                     stage_repacked_b_slice(
@@ -240,13 +241,14 @@ class V41FusedSliceKernel:
                         s13,
                         sb + self.width * 4,
                         expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                        start + self.kernel_intermediate,
+                        start,
                         kt,
                         tid,
                         self.width,
                         self.intermediate,
                         self.hidden,
                         True,
+                        1,
                     )
                 else:
                     stage_repacked_sfb_slice(
