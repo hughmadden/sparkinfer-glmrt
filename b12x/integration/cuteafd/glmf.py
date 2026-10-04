@@ -99,7 +99,9 @@ __all__ = [
     "compile_glmf_add_aot",
     "compile_glmf_add_fp32_aot",
     "compile_glmf_join_aot",
+    "compile_glmf_join_rows_aot",
     "compile_glmf_kda_output_shard_aot",
+    "compile_glmf_kda_output_rows_aot",
     "compile_glmf_expert_input_quant_aot",
     "compile_glmf_ffn_aot",
     "compile_glmf_head_aot",
@@ -1444,3 +1446,16 @@ def compile_glmf_kda_output_shard_aot(g_half: GLMFGeometry, *, max_rows: int,
     """Full K reduction for half the KDA output columns."""
     from ._glmf_output_shard import compile_glmf_kda_output_shard_aot as compile_shard
     return compile_shard(g_half, max_rows=max_rows, fp8_only=fp8_only, prefill_expanded=prefill_expanded)
+
+
+def compile_glmf_join_rows_aot(width: int) -> AotProgram:
+    """Bit-exact BF16 row concatenation with independent and possibly zero counts."""
+    from ._glmf_output_rows import compile_glmf_join_rows_aot as compile_join
+    return compile_join(width)
+
+
+def compile_glmf_kda_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
+                                   fp8_only: str = "decode", prefill_expanded: bool = False) -> AotProgram:
+    """Full KDA output for owned token rows; global rows determine math and scratch."""
+    from ._glmf_output_rows import compile_glmf_kda_output_rows_aot as compile_rows
+    return compile_rows(g_half, max_rows=max_rows, fp8_only=fp8_only, prefill_expanded=prefill_expanded)
