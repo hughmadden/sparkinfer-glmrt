@@ -4,10 +4,17 @@ from typing import ClassVar
 
 
 def mxfp8_down_row_bytes(inter: int) -> int:
-    if inter <= 0 or inter % 128:
-        raise ValueError("MXFP8 down rows need a positive 128-aligned intermediate slice")
+    if inter <= 0 or inter % 32:
+        raise ValueError("MXFP8 down rows need a positive 32-aligned intermediate slice")
     # TP6 I=384 has 12 scale bytes: pad 396 to 400 for 16-byte cp.async alignment.
     return (inter + inter // 32 + 15) // 16 * 16
+
+
+def mxfp4_scale_row_bytes(k: int) -> int:
+    """K32 weight scales, padded to whole u32 loads in every projection."""
+    if k <= 0 or k % 32:
+        raise ValueError("MXFP4 weight rows need a positive 32-aligned K")
+    return (k // 32 + 3) // 4 * 4
 
 
 @dataclass(frozen=True)

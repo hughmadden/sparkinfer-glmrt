@@ -3,10 +3,11 @@ route, ``weights="mxfp4"``, MiMo V2.6 Pro).
 
 The ``_fp8_moe_stream`` design with packed E2M1 weights (``[E, N, K/2]`` U8,
 the even element in the low nibble) and UE8M0 scales per 32 values along K
-(``[E, N, K/32]`` U8). Every weight byte is read from DRAM once per layer per
+(``[E, N, round_up(K/32, 4)]`` U8 in resident storage). Every weight byte is read from DRAM once per layer per
 128-row chunk group, by TMA in whole 128-byte lines per row (256 K values; a
 64-byte box when the down projection's K slice is not a multiple of 256, as
-TP6's 384). Each expert's scale rows for the CTA's columns are loaded once
+TP6's 352/320). TMA zero-fills the final partial block, and only live K32
+steps enter the down MMAs. Each expert's scale rows for the CTA's columns are loaded once
 into shared memory. Weights are widened exactly: ``cvt.rn.bf16x2.e2m1x2``
 then one ``mul.bf16x2`` by ``2^(s - 127)`` (every product is a BF16 number),
 the reference's dequantized weight, feeding m16n8k16 BF16 MMAs with FP32
@@ -57,7 +58,7 @@ from ._fp8_moe_kernels import _i32_at, _u32_as_f32
 from ._fp8_moe_stream import STREAM_TILE_M, StreamFp8Down, StreamFp8GateUp, _chunk, _swiglu, _u8_weight
 from ._fp8_weights import _e4m3x4_scaled_bf16x2x2
 from ._mxfp4_moe_kernels import e2m1x8_scaled_bf16, ue8m0_bf16x2
-from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes
+from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes, mxfp4_scale_row_bytes
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 
 __all__ = ["StreamMxfp4Down", "StreamMxfp4GateUp"]
@@ -95,6 +96,7 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     per two A steps."""
 
     # Shared memory: A 3 x 16 KiB, weights 3 x 8 KiB, scales 64 x (H/32 + 16) B.
+    inter_alignment = 32
     a_ring = 3
     w_ring = 3
     w_k = 256
@@ -421,19 +423,19 @@ class StreamMxfp4Down(StreamFp8Down):
     256 K (128-byte lines) when ``I % 256 == 0``, else 128 K (64 bytes: TP6's
     384); the CTA's 128 scale rows are loaded once."""
 
+    inter_alignment = 32
+
     def __init__(self, *, hidden: int, inter: int, experts: int):
         super().__init__(hidden=hidden, inter=inter, experts=experts)
         self.w_k = 256 if self.inter % 256 == 0 else 128
         self.w_row = self.w_k // 2
         self.w_bytes = self.tile_n * self.w_row
         self.per_block = self.w_k // self.k_step
-        self.scale_cols = self.inter // 32
-        if self.scale_cols % 4:
-            raise ValueError("MXFP4 stream down needs I % 128 == 0")
+        self.scale_cols = mxfp4_scale_row_bytes(self.inter)
         self.sc_stride = self.scale_cols + 4
 
     def key(self) -> tuple:
-        return ("stream_down_mxfp4", 1, self.hidden, self.inter, self.experts, self.ring, self.w_k)
+        return ("stream_down_mxfp4", 2, self.hidden, self.inter, self.experts, self.ring, self.w_k)
 
     def _layouts(self):
         atom = warpgroup.make_smem_layout_atom(
@@ -523,7 +525,7 @@ class StreamMxfp4Down(StreamFp8Down):
                         Int64(s2.toint()) + (Int64(e) * Int64(h) + Int64(n_blk * Int32(self.tile_n) + r))
                         * Int64(self.scale_cols) + Int64(c) * Int64(4))
             cute.arch.cp_async_commit_group()
-            blocks = self.k_steps // self.per_block
+            blocks = (self.k_steps + self.per_block - 1) // self.per_block
             if warp_id == Int32(0):
                 for p in cutlass.range_constexpr(min(2, blocks)):
                     self._load_w(p, tma_w, t_wg, t_ws, wbar, w_tile)

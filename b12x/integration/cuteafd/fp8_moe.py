@@ -84,7 +84,7 @@ from ._fp8_moe_stream import STREAM_TILE_M, StreamFp8Down, StreamFp8GateUp, stre
 from ._mxfp4_moe_kernels import GroupedMxfp4Gemv
 from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
 from ._mxfp4_moe_a8 import StreamMxfp4DownA8
-from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes
+from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes, mxfp4_scale_row_bytes
 from ._nvfp4_moe_kernels import GroupedNvfp4Gemv, nvfp4_alpha_offset
 from ._nvfp4_moe_stream import ChunkRows, ChunkSwiGLU, StreamNvfp4Linear
 from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, StreamNvfp4LinearA4
@@ -458,6 +458,8 @@ class _Route:
             # K split over warps in whole 128 blocks: 4 where they divide evenly,
             # else the largest divisor <= 8 of the blocks (Qwen's 640: 5 warps).
             warps_i = 4 if i % 512 == 0 else max(d for d in range(1, 9) if (i // 128) % d == 0)
+            if g.weights == "mxfp4" and i % 128:
+                warps_i = min(4, (i + 127) // 128)
             self.down = gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=warps_i)
         else:
             self.gate_up = GroupedFp8Gemm(n=i, k=h, experts=e, halves=2)
@@ -794,7 +796,8 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
             Operand("w3", torch.uint8, f"[{e},{i},{h // 2}]"),
             Operand("s3", torch.uint8, f"[{e},{i},{h // 32}]", align=4),
             Operand("w2", torch.uint8, f"[{e},{h},{i // 2}]"),
-            Operand("s2", torch.uint8, f"[{e},{h},{i // 32}]", align=4),
+            Operand("s2", torch.uint8, f"[{e},{h},{mxfp4_scale_row_bytes(i)}]", align=4,
+                    note="UE8M0 per 32, each row padded to four bytes"),
         )
     else:
         weights = (

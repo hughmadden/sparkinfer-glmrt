@@ -127,6 +127,7 @@ class StreamFp8GateUp:
 
     threads = 256
     cols = 32
+    inter_alignment = 128
     k_step = 128
     # GB10, MiMo TP4 slice, 4096 rows (us): a 3 / w 5: 5689; a 4 / w 3: 5447.
     a_ring = 4
@@ -137,8 +138,8 @@ class StreamFp8GateUp:
         # qmma: W8A8 block-scaled E4M3 x E4M3 MMAs (see the module docstring);
         # else both operands widen to BF16 (the reference's bf16(w * s)).
         self.qmma = bool(qmma)
-        if self.inter % 128 or self.hidden % 128:
-            raise ValueError("stream gate/up needs 128-aligned I and H")
+        if self.inter % self.inter_alignment or self.hidden % 128:
+            raise ValueError(f"stream gate/up needs {self.inter_alignment}-aligned I and 128-aligned H")
         self.row_bytes = self.hidden + self.hidden // 32
         self.k_steps = self.hidden // self.k_step
         self.a_bytes = STREAM_TILE_M * self.k_step
@@ -462,6 +463,7 @@ class StreamFp8Down:
 
     threads = 256
     tile_n = 128
+    inter_alignment = 128
     k_step = 32
     # GB10, MiMo TP4 slice, 4096 rows (us), act rows by cp.async: 4854-5068 at
     # best, and 4874 with neither MMAs nor widening (the per-thread 16-byte
@@ -473,8 +475,8 @@ class StreamFp8Down:
 
     def __init__(self, *, hidden: int, inter: int, experts: int):
         self.hidden, self.inter, self.experts = int(hidden), int(inter), int(experts)
-        if self.hidden % 128 or self.inter % 128:
-            raise ValueError("stream down needs 128-aligned H and I")
+        if self.hidden % 128 or self.inter % self.inter_alignment:
+            raise ValueError(f"stream down needs 128-aligned H and {self.inter_alignment}-aligned I")
         self.k_steps = self.inter // self.k_step
         self.a_bytes = STREAM_TILE_M * self.k_step * 2
         self.w_bytes = self.tile_n * self.w_block

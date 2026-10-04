@@ -10,8 +10,10 @@ FP32 accumulation, as the FP8 kernels do over ``bf16(w * s)``: results match
 ``F.linear(x, dequant(w))`` up to FP32 summation order. Nothing is
 re-quantized.
 
-``GroupedMxfp4Gemv``  decode (and, until an MXFP4 GEMM route exists, every row
-    count): ``GroupedFp8Gemv``'s grouped weight-streaming GEMV with each lane
+Resident scale rows pad ``K/32`` to four bytes; packed weights retain their
+exact K32 width. Invalid K32 lanes skip both weight and activation loads.
+
+``GroupedMxfp4Gemv``  decode: ``GroupedFp8Gemv``'s grouped weight-streaming GEMV with each lane
     reading 32 consecutive K values (16 bytes, one scale byte) per 128-wide
     K block.
 """
@@ -30,6 +32,7 @@ from b12x._lib.intrinsics import bf16_mma_m16n8k16_f32
 from b12x.gemm.bf16_gemv._skinny import _ld_cached, _ld_stream
 
 from ._fp8_moe_kernels import META_HEAD, _ceil, _i32_at, _ld_u8
+from ._mxfp4_down_a8_plan import mxfp4_scale_row_bytes
 
 __all__ = ["GroupedMxfp4Gemv", "e2m1x8_scaled_bf16", "ue8m0_bf16x2"]
 
@@ -100,17 +103,17 @@ class GroupedMxfp4Gemv:
         self.cols = 8 * self.groups
         self.m_tiles = _ceil(max_rows, 16)
         self.gather = bool(gather)
-        if self.n % self.cols or self.split % self.cols or self.k % (128 * self.warps):
+        if self.n % self.cols or self.split % self.cols or self.k % 32 or self.k <= 0 or self.warps <= 0:
             raise ValueError("grouped MXFP4 GEMV needs N and the gate/up split % (8*groups) == 0 and "
-                             "K % (128*warps) == 0")
-        self.k_per_warp = self.k // self.warps
+                             "positive K % 32 == 0 and positive warps")
+        self.k_per_warp = _ceil(_ceil(self.k, 128), self.warps) * 128
         self.blocks = self.k_per_warp // 128
         self.row_bytes = self.k // 2
-        self.scale_bytes = self.k // 32
+        self.scale_bytes = mxfp4_scale_row_bytes(self.k)
         self.frags = self.m_tiles * self.groups * 4
 
     def key(self) -> tuple:
-        return ("mxfp4", self.n, self.k, self.experts, self.split, self.warps, self.groups, self.m_tiles,
+        return ("mxfp4", 2, self.n, self.k, self.experts, self.split, self.warps, self.groups, self.m_tiles,
                 self.gather)
 
     def _storage(self):
@@ -132,10 +135,19 @@ class GroupedMxfp4Gemv:
     @cute.jit
     def _load_block(self, dest: cute.Tensor, factors: cute.Tensor, w_row: Int64, s_row: Int64, block):
         for gi in cutlass.range_constexpr(self.groups):
-            words = _ld_stream(w_row + Int64(gi * 8 * self.row_bytes) + Int64(block) * Int64(64))
             for t in cutlass.range_constexpr(4):
-                dest[gi * 4 + t] = words[t]
-            factors[gi] = _ld_u8(s_row + Int64(gi * 8 * self.scale_bytes) + Int64(block) * Int64(4))
+                dest[gi * 4 + t] = Uint32(0)
+            factors[gi] = Uint32(127)
+            live = Int32(1)
+            if const_expr(self.k % (128 * self.warps) != 0):
+                tidx = Int32(cute.arch.thread_idx()[0])
+                live = (tidx // Int32(32) * Int32(self.k_per_warp) + Int32(block) * Int32(128)
+                        + tidx % Int32(4) * Int32(32) < Int32(self.k)).to(Int32)
+            if live != Int32(0):
+                words = _ld_stream(w_row + Int64(gi * 8 * self.row_bytes) + Int64(block) * Int64(64))
+                for t in cutlass.range_constexpr(4):
+                    dest[gi * 4 + t] = words[t]
+                factors[gi] = _ld_u8(s_row + Int64(gi * 8 * self.scale_bytes) + Int64(block) * Int64(4))
 
     @cute.jit
     def _row_address(self, a: cute.Pointer, pair_row: cute.Pointer, grouped: Int32) -> Int64:
@@ -208,6 +220,9 @@ class GroupedMxfp4Gemv:
                             wide[16 * gi + 4 * t + 3] = v3
                     for chunk in cutlass.range_constexpr(2):
                         k_off = (Int64(block) * Int64(128) + Int64(chunk * 16)) * Int64(2)
+                        live_k = Int32(1)
+                        if const_expr(self.k % (128 * self.warps) != 0):
+                            live_k = (k_begin + Int64(block) * Int64(128) + Int64(32) * Int64(j) < Int64(self.k)).to(Int32)
                         for mt in cutlass.range_constexpr(self.m_tiles):
                             if Int32(mt) < live_tiles:
                                 r_lo = Int32(16 * mt) + g
@@ -215,14 +230,14 @@ class GroupedMxfp4Gemv:
                                 xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
                                 for i in cutlass.range_constexpr(16):
                                     xa[i] = Uint32(0)
-                                if r_lo < n_c:
+                                if (r_lo < n_c) & (live_k != Int32(0)):
                                     at = self._row_address(a, pair_row, row0 + r_lo) + x_off + k_off
                                     lo = _ld_cached(at)
                                     hi = _ld_cached(at + Int64(16))
                                     for i in cutlass.range_constexpr(4):
                                         xa[i] = lo[i]
                                         xa[4 + i] = hi[i]
-                                if r_hi < n_c:
+                                if (r_hi < n_c) & (live_k != Int32(0)):
                                     at = self._row_address(a, pair_row, row0 + r_hi) + x_off + k_off
                                     lo = _ld_cached(at)
                                     hi = _ld_cached(at + Int64(16))
