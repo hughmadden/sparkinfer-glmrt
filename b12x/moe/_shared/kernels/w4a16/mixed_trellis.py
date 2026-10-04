@@ -114,6 +114,8 @@ class MixedTrellisCompileResult:
     input_format: str = field(default="bf16", kw_only=True)
     # Warp-specialized input-row ring depth (None: the kernel's default).
     ws_input_stages: int | None = field(default=None, kw_only=True)
+    # Opt-in INT8 activations/decoded weights for warp-specialized prefill.
+    activations: str = field(default="a16", kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -2096,7 +2098,12 @@ def compile_mixed_trellis(
     input_format: str = "bf16",
     ws_input_stages: int | None = None,
     ws_dynamic_tiles: bool = False,
+    activations: str = "a16",
 ) -> MixedTrellisCompileResult:
+    if activations not in ("a16", "a8"):
+        raise ValueError(f"unsupported EXL3 activations {activations!r}")
+    if activations == "a8" and not warp_specialized:
+        raise ValueError("EXL3 A8 requires the warp-specialized prefill kernel")
     if input_format not in ("bf16", "e4m3_k32"):
         raise ValueError(f"unsupported mixed Trellis input format {input_format!r}")
     if input_format == "e4m3_k32" and (
@@ -2118,6 +2125,8 @@ def compile_mixed_trellis(
         (tier0_bits, tier1_bits),
     )
     tier0_bits, tier1_bits = bits
+    if activations == "a8" and trellis_codebook != "mcg":
+        raise ValueError("EXL3 A8 INT8 weight conversion requires the MCG codebook")
     # 192-wide and unequal FC1/FC2 N tiles exist only in the warp-specialized
     # kernel; its cooperative sub-kernels (decode helpers, activation) keep 128.
     ws_tile_n = None
@@ -2179,6 +2188,7 @@ def compile_mixed_trellis(
             direct_topk_routes=direct_topk_routes,
             schedule_whole_tiles=True,
             fused_input_rotation=fused_input_rotation and not warp_specialized,
+            activation_output_a8=activations == "a8",
         )
 
     def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellisKernel:
@@ -2200,6 +2210,7 @@ def compile_mixed_trellis(
                 ws_tile_n=ws_tile_n,
                 input_stages=ws_input_stages,
                 dynamic_tiles=ws_dynamic_tiles,
+                activations=activations,
             )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
@@ -2394,6 +2405,7 @@ def compile_mixed_trellis(
         warp_specialized=bool(warp_specialized),
         input_format=str(input_format),
         ws_input_stages=ws_input_stages,
+        activations=activations,
     )
     _CACHE[cache_key] = result
     return result

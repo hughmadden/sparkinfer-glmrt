@@ -61,6 +61,25 @@ def test_projection_tier_rate_family_validation() -> None:
             _projection_tier_bits(tiers(*bits))  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("activations,warp_specialized,codebook,message", [
+    ("fp8", True, "mcg", "unsupported EXL3 activations"),
+    ("a8", False, "mcg", "requires the warp-specialized"),
+    ("a8", True, "sqg_e4m3", "requires the MCG codebook"),
+])
+def test_mixed_a8_rejects_unsupported_plans_before_cuda(
+    activations, warp_specialized, codebook, message,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        compile_mixed_trellis(
+            size_m=64, hidden_size=512, intermediate_size=256,
+            tier0_num_experts=2, tier1_num_experts=2, top_k=2,
+            max_m_blocks=16, sms=1, max_shared_mem=101376,
+            force_tile_config=(64, 128, 64, 128), moe_block_size=16,
+            trellis_codebook=codebook, warp_specialized=warp_specialized,
+            activations=activations,
+        )
+
+
 def test_explicit_mixed_residency_limits_and_cache_identity() -> None:
     apply = mixed_trellis_module._apply_mixed_residency
     kernel = object.__new__(W4A16MixedTrellisKernel)
@@ -1976,3 +1995,87 @@ def test_mixed_three_tier_swiglu_limit_matches_clipped_serial(monkeypatch):
     test_mixed_k3_k4_k5_matches_serial_and_captures(
         5120, 640, 4, 6, 2, 6, monkeypatch, swiglu_limit=10.0,
     )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires SM120/SM121")
+@pytest.mark.parametrize("input_format,bits,tiles,intermediate", [
+    ("bf16", (3, 4), (64, 128, 64, 128), 256),
+    ("e4m3_k32", (4, 5), (64, 192, 64, 256), 384),
+])
+def test_mixed_a8_prefill_oracle_live_rows_and_graph(input_format, bits, tiles, intermediate) -> None:
+    """The fused INT8 row ABI must preserve K order, scales and replay storage."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    torch.manual_seed(20261004)
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    capacity, hidden, topk, experts = 64, 512, 2, 4
+    tiers = tuple(_prepared(
+        experts=2, hidden=hidden, intermediate=intermediate, bits=bits,
+        seed=bits, device=device, tile_config=tiles,
+    ) for bits in bits)
+    route_map, descriptor = build_tiered_maps(range(2), range(2, 4), device=device)
+    rotations = combine_trellis_rotations(*tiers)
+    launches, buffers, bindings = [], [], []
+    for activations in ("a16", "a8"):
+        launch = compile_mixed_trellis(
+            size_m=capacity, hidden_size=hidden, intermediate_size=intermediate,
+            tier0_num_experts=2, tier1_num_experts=2, top_k=topk,
+            max_m_blocks=16, sms=props.multi_processor_count,
+            max_shared_mem=props.shared_memory_per_block_optin,
+            force_tile_config=tiles, moe_block_size=16,
+            warp_specialized=True, activations=activations,
+            tier0_bits=bits[0], tier1_bits=bits[1], input_format=input_format,
+        )
+        launches.append(launch)
+        buffers.append(make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count))
+        bindings.append(bind_mixed_trellis(*tiers, route_map, descriptor, rotations, launch))
+        warmup_mixed_trellis_route_pack(launch, buffers[-1], expert_map=route_map)
+    assert launches[0].compiled is not launches[1].compiled
+    x = (torch.randn(capacity, hidden, device=device) * 0.01).to(torch.bfloat16)
+    def operand(rows):
+        if input_format == "bf16":
+            return x[:rows]
+        groups = x[:rows].float().reshape(rows, hidden // 32, 32)
+        exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(2.0**-100) / 448)).clamp(-127, 127)
+        values = (groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
+        return torch.cat((values.view(torch.uint8).reshape(rows, hidden), (exponent + 127).to(torch.uint8)), 1).contiguous()
+
+    # Keep graph operands alive and mutate their contents between replays.
+    inputs = {rows: operand(rows) for rows in (1, 17, capacity)}
+    ids = torch.randint(experts, (capacity, topk), device=device, dtype=torch.int32)
+    weights = torch.softmax(torch.randn(capacity, topk, device=device), dim=-1)
+    addresses = tuple(t.data_ptr() for b in buffers for t in (b.fc1, b.activated, b.fc2, b.output))
+
+    def run(arm, rows):
+        return run_bound_mixed_trellis(inputs[rows], weights[:rows], ids[:rows], bindings[arm], buffers[arm])
+
+    for rows in (1, 17, capacity):
+        with kernel_resolution_guard("EXL3 A8 live-row gate"):
+            reference = run(0, rows).clone()
+            actual = run(1, rows).clone()
+        torch.cuda.synchronize()
+        assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
+        relative = (actual - reference).float().norm() / reference.float().norm()
+        cosine = torch.nn.functional.cosine_similarity(actual.float().flatten(), reference.float().flatten(), dim=0)
+        assert relative.item() < 0.045, relative.item()
+        assert cosine.item() > 0.999, cosine.item()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with kernel_resolution_guard("EXL3 A8 graph gate"), torch.cuda.graph(graph):
+            run(1, 17)
+        x.mul_(-0.5)
+        inputs[17].copy_(operand(17))
+        graph.replay()
+        torch.cuda.synchronize()
+        captured = buffers[1].output[:17].clone()
+        expected = run(1, 17).clone()
+        assert torch.equal(captured, expected)
+        x.zero_()
+        inputs[17].copy_(operand(17))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(buffers[1].output[:17]).item() == 0
+        assert tuple(t.data_ptr() for b in buffers for t in (b.fc1, b.activated, b.fc2, b.output)) == addresses
+    finally:
+        graph.reset()

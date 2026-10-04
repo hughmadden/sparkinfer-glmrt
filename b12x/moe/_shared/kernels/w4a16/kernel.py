@@ -78,6 +78,8 @@ from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
     st_global_v4_u32,
     st_global_i32,
+    st_global_f32,
+    st_global_u32,
     st_global_v4_f32,
     st_shared_bf16_from_f32,
     st_shared_f16_from_f32,
@@ -133,6 +135,7 @@ from b12x.moe._shared.kernels.activations import (
 from b12x.moe._shared.kernels.micro import (
     MoEMicroKernelBackend,
 )
+from .ws_a8 import f32x4_to_s8x4, prmt_b32
 
 
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
@@ -6401,6 +6404,7 @@ class W4A16FusedMoeKernel:
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
         fused_input_rotation: bool = False,
+        activation_output_a8: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6570,6 +6574,14 @@ class W4A16FusedMoeKernel:
                     "intermediate_rotation requires intermediate_size % 128 == 0"
                 )
         self.full_rotation = bool(full_rotation)
+        # Internal WS A8 path only: retain the FP16-sized activated row ABI,
+        # storing an INT8 payload plus one FP32 scale per H128 block.
+        self.activation_output_a8 = bool(activation_output_a8)
+        if self.activation_output_a8 and (
+            not self.full_rotation or coupled_hadamard or self.collect_activation_amax
+            or element_dtype != "fp16" or self.trellis_codebook != MCG
+        ):
+            raise ValueError("A8 activation output requires MCG FP16 H128 full rotation")
         # FC1 rotates the staged token input itself (no rotation phase, no
         # materialized per-route copies). Requires BF16 input, per-expert SUH
         # and packed routes; the caller binds the SUH tables per FC1 tile.
@@ -6755,7 +6767,7 @@ class W4A16FusedMoeKernel:
             self.sms,
             self.shared_words,
             self.blocks_per_sm,
-        )
+        ) + (("activation_output_a8",) if self.activation_output_a8 else ())
 
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
@@ -8104,11 +8116,37 @@ class W4A16FusedMoeKernel:
                     a2 = self._silu_f32(ig2) * iu2 * sd2
                     a3 = self._silu_f32(ig3) * iu3 * sd3
                 o0, o1, o2, o3 = self._had128_quad(a0, a1, a2, a3, lane)
-                out_base = row * isz + col0
-                activated_bf16_flat[out_base + Int32(0)] = self._cast_elem(o0)
-                activated_bf16_flat[out_base + Int32(1)] = self._cast_elem(o1)
-                activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
-                activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
+                if cutlass.const_expr(self.activation_output_a8):
+                    # Quantize only after SVD/SwiGLU/SUD and H128. Each warp
+                    # owns a complete block, so amax needs no shared scratch.
+                    amax = fmax_f32(fmax_f32(fabs_f32(o0), fabs_f32(o1)),
+                                   fmax_f32(fabs_f32(o2), fabs_f32(o3)))
+                    amax = warp_reduce(amax, fmax_f32)
+                    inv = cutlass.Float32(0.0)
+                    if amax > cutlass.Float32(0.0):
+                        inv = cutlass.Float32(127.0) / amax
+                    natural = f32x4_to_s8x4(o0, o1, o2, o3, inv)
+                    source = (lane & Int32(-4)) | ((lane & Int32(3)) >> Int32(1))
+                    lo = cute.arch.shuffle_sync(natural, source)
+                    hi = cute.arch.shuffle_sync(natural, source + Int32(2))
+                    packed = prmt_b32(lo, hi, 0x5410)
+                    if (lane & Int32(1)) != Int32(0):
+                        packed = prmt_b32(lo, hi, 0x7632)
+                    # Same K permutation as m16n8k32 INT8 B fragments:
+                    # [0,1,8,9,2,3,10,11,...] within each physical K16.
+                    base = get_ptr_as_int64(activated_bf16_flat, Int64(0))
+                    row_base = base + Int64(row) * Int64(2 * self.intermediate_size)
+                    st_global_u32(row_base + Int64(blk) * Int64(128) + Int64(elem), packed)
+                    if lane == Int32(0):
+                        st_global_f32(row_base + Int64(self.intermediate_size)
+                                      + Int64(blk) * Int64(4),
+                                      amax * cutlass.Float32(1.0 / 127.0))
+                else:
+                    out_base = row * isz + col0
+                    activated_bf16_flat[out_base + Int32(0)] = self._cast_elem(o0)
+                    activated_bf16_flat[out_base + Int32(1)] = self._cast_elem(o1)
+                    activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
+                    activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
             unit += gw_stride
 
     @cute.jit
