@@ -313,6 +313,7 @@ GEOMETRIES = {
     "qwen4": Fp8MoeGeometry("qwen4", hidden=2560, experts=512, top_k=10, intermediate=640),
     # MiMo V2.6 Pro: MXFP4 experts, 384 of them, top-8, unclamped SiLU.
     "mimop": Fp8MoeGeometry("mimop", hidden=6144, experts=384, top_k=8, intermediate=2048, weights="mxfp4"),
+    "mimof": Fp8MoeGeometry("mimof", hidden=4096, experts=256, top_k=8, intermediate=2048, weights="mxfp4"),
     # NVIDIA ModelOpt NVFP4 releases of GLM 5.3, GLM 5.3 Flash and Qwen 3.8 Flash Next (W4A16).
     "glm_nvfp4": Fp8MoeGeometry("glm_nvfp4", hidden=6144, experts=256, top_k=8, intermediate=2048, weights="nvfp4"),
     "glmf_nvfp4": Fp8MoeGeometry("glmf_nvfp4", hidden=4096, experts=288, top_k=8, intermediate=2048,

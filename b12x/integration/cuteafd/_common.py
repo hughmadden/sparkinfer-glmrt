@@ -48,6 +48,7 @@ __all__ = [
     "GLMFGeometry",
     "GLMGeometry",
     "MIMO_V2_FLASH",
+    "MIMO_V26_FLASH",
     "MIMO_V26_PRO",
     "MiMoGeometry",
     "Operand",
@@ -263,6 +264,10 @@ class MiMoGeometry:
 
 
 MIMO_V2_FLASH = MiMoGeometry()
+# V2.6 Flash MOPD: TP4 fused QKV, two unpadded SWA KV heads per shard.
+MIMO_V26_FLASH = MiMoGeometry(
+    name="mimo_v26_flash", full_rope_theta=1.0e7, norm_eps=1.0e-6, router_fp32=False,
+)
 # MiMo V2.6 Pro (``mimo_v2``, MiMoV2ForCausalLM): 128 query / 8 KV heads on
 # both layer kinds, hidden 6144, 384 experts, BF16 router weight.
 MIMO_V26_PRO = MiMoGeometry(
