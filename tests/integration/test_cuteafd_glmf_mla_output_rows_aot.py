@@ -51,6 +51,19 @@ def case():
     return w, {"native": scales, "broad": broad}, uv, values, projections, oracles, join
 
 
+@pytest.mark.parametrize("max_rows", [64, 4096])
+def test_mla_values_exported_header_matches_abi(tmp_path, max_rows):
+    require_b12x()
+    from b12x.integration.cuteafd import GLM53_FLASH, exportable_compilation, glmf, validate_exported_header
+    with exportable_compilation():
+        program = glmf.compile_glmf_mla_values_aot(replace(GLM53_FLASH, heads=32), max_rows=max_rows)
+    stem = f"glmf2_mla_values_m{max_rows}"
+    program.export_to_c(str(tmp_path), stem, "cuteafd_" + stem)
+    checked = validate_exported_header(program, tmp_path / (stem + ".h"), "cuteafd_" + stem)
+    assert [operand.name for operand in program.operands] == ["a", "w", "out"]
+    assert checked["argument_count"] == 5
+
+
 CASES = [("decode", n, 16) for n in [1, 22, 63, 64]] + [
     ("prefill", n, a8) for n in [1, 22, 63, 64, 512, 513, 4096] for a8 in [0, 1]]
 

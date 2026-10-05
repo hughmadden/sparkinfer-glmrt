@@ -30,8 +30,8 @@ def compile_glmf_mla_values_aot(g_half: GLMFGeometry, *, max_rows: int):
     uv = BatchedBf16Gemm(n=v, k=latent, batch=heads, a_row=heads * latent,
         a_batch=latent, o_row=heads * v, o_batch=v, compute_warps=_batched_warps(max_rows))
     return compile_program(uv, name="glmf_mla_values",
-        operands=(Operand("attn", torch.bfloat16, f"[rows,{heads},{latent}]"),
-                  Operand("w_uv", torch.bfloat16, f"[{heads},{v},{latent}]"),
+        operands=(Operand("a", torch.bfloat16, f"[rows,{heads},{latent}]"),
+                  Operand("w", torch.bfloat16, f"[{heads},{v},{latent}]"),
                   Operand("out", torch.bfloat16, f"[rows,{heads * v}]", "out")),
         scalars=(Scalar("rows"),), key=(max_rows, uv.key()),
         geometry={"heads": heads, "v_head_dim": v, "kv_lora_rank": latent, "max_rows": max_rows},
