@@ -167,6 +167,8 @@ def _producer_case(rows, cap, fp8_rows):
     x = torch.randn((rows, h), generator=gen, device="cuda").bfloat16()
     norms = [(1 + 0.1 * torch.randn((dim,), generator=gen, device="cuda")).bfloat16() for dim in (d, d, 128, 128)]
     positions = torch.arange(rows, dtype=torch.int64, device="cuda") + 5
+    rope_positions = positions.to(torch.int32)[:, None].expand(-1, 3).contiguous()
+    block_rope_positions = (positions - positions % 4).to(torch.int32)[:, None].expand(-1, 3).contiguous()
     kv_slots = torch.arange(rows, dtype=torch.int64, device="cuda") + 3
     pool_slots = torch.where(positions % 4 == 3, positions // 4, torch.full_like(positions, -1))
     pages = -(-(rows + 3) // g.page_rows)
@@ -179,7 +181,8 @@ def _producer_case(rows, cap, fp8_rows):
         query = torch.empty((rows, n, d), dtype=torch.bfloat16, device="cuda")
         gate = torch.empty((rows, n * d), dtype=torch.bfloat16, device="cuda")
         index_q = torch.empty((rows, g.index_heads, 128), dtype=torch.bfloat16, device="cuda")
-        program.launch(x, *weights, *norms, positions, kv_slots, pool_slots, kv, keys, index, query, gate, index_q,
+        program.launch(x, *weights, *norms, positions, rope_positions, block_rope_positions,
+                       kv_slots, pool_slots, kv, keys, index, query, gate, index_q,
                        _scratch(program, cap), scalars=scalars)
         torch.cuda.synchronize()
         return torch.cat([query.view(rows, -1), gate, index_q.view(rows, -1)], 1), kv, keys, index

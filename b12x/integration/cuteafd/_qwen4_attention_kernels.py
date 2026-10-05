@@ -65,9 +65,16 @@ class _Rope:
         return _bf16(cute.math.cos(freq, fastmath=False)), _bf16(cute.math.sin(freq, fastmath=False))
 
     @cute.jit
-    def apply(self, y: Float32, partner: Float32, dim: Int32, position: Int64) -> Float32:
+    def apply(self, y: Float32, partner: Float32, dim: Int32, position: cute.Tensor) -> Float32:
         """RoPE of dim ``dim`` (``< 2 * half``) whose NeoX partner holds ``partner``."""
-        c, s = self.cos_sin(dim % Int32(self.half), position)
+        pair = dim % Int32(self.half)
+        axis = Int32(0)
+        # Qwen's recomposition_frequencies, mrope_section [11, 11, 10].
+        if pair % Int32(3) == Int32(1) and pair < Int32(33):
+            axis = Int32(1)
+        elif pair % Int32(3) == Int32(2) and pair < Int32(30):
+            axis = Int32(2)
+        c, s = self.cos_sin(pair, Int64(position[axis]))
         rotated = partner * s
         if dim < Int32(self.half):
             rotated = -rotated
@@ -104,10 +111,10 @@ class Qwen4AttnPost:
 
     @cute.jit
     def __call__(self, proj: cute.Pointer, q_norm: cute.Pointer, k_norm: cute.Pointer, iq_norm: cute.Pointer,
-                 ik_norm: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, kv_cache: cute.Pointer,
+                 ik_norm: cute.Pointer, rope_positions: cute.Pointer, kv_slots: cute.Pointer, kv_cache: cute.Pointer,
                  token_keys: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.kernel(proj, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, kv_cache, token_keys, query,
+        self.kernel(proj, q_norm, k_norm, iq_norm, ik_norm, rope_positions, kv_slots, kv_cache, token_keys, query,
                     gate, index_q).launch(grid=(rows, self.items, 1), block=(32, 1, 1), stream=stream)
 
     @cute.jit
@@ -125,7 +132,7 @@ class Qwen4AttnPost:
                          pack_f32x2_to_bfloat2(values[6], values[7]))
 
     @cute.jit
-    def _head256(self, src: Int64, weight: cute.Pointer, position: Int64, lane: Int32, out: Int64):
+    def _head256(self, src: Int64, weight: cute.Pointer, position: cute.Tensor, lane: Int32, out: Int64):
         """Norm (1 + w) + RoPE of one 256-wide head at ``src``; lane owns dims 8l..8l+7."""
         x = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
         self._load8(src + Int64(lane) * Int64(16), x)
@@ -144,7 +151,7 @@ class Qwen4AttnPost:
         self._store8(out + Int64(lane) * Int64(16), x)
 
     @cute.jit
-    def _head128(self, src: cute.Tensor, weight: cute.Pointer, position: Int64, lane: Int32, out: cute.Tensor,
+    def _head128(self, src: cute.Tensor, weight: cute.Pointer, position: cute.Tensor, lane: Int32, out: cute.Tensor,
                  rope: cutlass.Constexpr):
         """Norm (1 + w) (+ RoPE) of one 128-wide head; lane owns dims 4l..4l+3."""
         x = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
@@ -168,14 +175,14 @@ class Qwen4AttnPost:
 
     @cute.kernel
     def kernel(self, proj: cute.Pointer, q_norm: cute.Pointer, k_norm: cute.Pointer, iq_norm: cute.Pointer,
-               ik_norm: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer, kv_cache: cute.Pointer,
+               ik_norm: cute.Pointer, rope_positions: cute.Pointer, kv_slots: cute.Pointer, kv_cache: cute.Pointer,
                token_keys: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer):
         row = Int64(cute.arch.block_idx()[0])
         item = Int32(cute.arch.block_idx()[1])
         lane = Int32(cute.arch.thread_idx()[0])
-        pos = cute.make_tensor(positions, cute.make_layout((row + Int64(1),)))
+        pos = cute.make_tensor(rope_positions, cute.make_layout((row + Int64(1), 3), stride=(3, 1)))
         slots = cute.make_tensor(kv_slots, cute.make_layout((row + Int64(1),)))
-        position = Int64(pos[row])
+        position = pos[row, None]
         slot = Int64(slots[row])
         base = Int64(proj.toint()) + row * Int64(self.width * 2)
         if item < Int32(self.heads):
@@ -222,7 +229,7 @@ class Qwen4PoolKeys:
 
     Raw keys of the block's tokens sit at ``token_keys[kv_slots[row] - 3 ..
     kv_slots[row]]`` (a block never crosses a 64-row page). ``key =
-    rope(ik_norm(bf16(mean_fp32(raw))), position - 3)`` into
+    rope(ik_norm(bf16(mean_fp32(raw))), block_rope_positions[row])`` into
     ``index_cache[pool_slots[row]]``. One warp per row.
     """
 
@@ -233,21 +240,22 @@ class Qwen4PoolKeys:
         self.post = Qwen4AttnPost(g)
 
     @cute.jit
-    def __call__(self, positions: cute.Pointer, kv_slots: cute.Pointer, pool_slots: cute.Pointer,
+    def __call__(self, block_rope_positions: cute.Pointer, kv_slots: cute.Pointer, pool_slots: cute.Pointer,
                  ik_norm: cute.Pointer, token_keys: cute.Pointer, index_cache: cute.Pointer, rows: Int32,
                  stream: cuda.CUstream):
-        self.kernel(positions, kv_slots, pool_slots, ik_norm, token_keys, index_cache).launch(
+        self.kernel(block_rope_positions, kv_slots, pool_slots, ik_norm, token_keys, index_cache).launch(
             grid=(rows, 1, 1), block=(32, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, positions: cute.Pointer, kv_slots: cute.Pointer, pool_slots: cute.Pointer,
+    def kernel(self, block_rope_positions: cute.Pointer, kv_slots: cute.Pointer, pool_slots: cute.Pointer,
                ik_norm: cute.Pointer, token_keys: cute.Pointer, index_cache: cute.Pointer):
         row = Int64(cute.arch.block_idx()[0])
         lane = Int32(cute.arch.thread_idx()[0])
         pool = Int64(cute.make_tensor(pool_slots, cute.make_layout((row + Int64(1),)))[row])
         if pool >= Int64(0):
             slot = Int64(cute.make_tensor(kv_slots, cute.make_layout((row + Int64(1),)))[row])
-            position = Int64(cute.make_tensor(positions, cute.make_layout((row + Int64(1),)))[row])
+            position = cute.make_tensor(block_rope_positions,
+                                        cute.make_layout((row + Int64(1), 3), stride=(3, 1)))[row, None]
             keys = cute.make_tensor(
                 cute.make_ptr(BFloat16, Int64(token_keys.toint()) + (slot - Int64(3)) * Int64(256),
                               cute.AddressSpace.gmem, assumed_align=16), cute.make_layout((4, 128), stride=(128, 1)))
@@ -260,7 +268,7 @@ class Qwen4PoolKeys:
                 total = (Float32(keys[0, d]) + Float32(keys[1, d])) + (Float32(keys[2, d]) + Float32(keys[3, d]))
                 mean[d] = (total * Float32(0.25)).to(BFloat16)
             cute.arch.sync_warp()
-            self.post._head128(mean, ik_norm, position - Int64(3), lane, mean, True)
+            self.post._head128(mean, ik_norm, position, lane, mean, True)
 
 
 class Qwen4BlockTopK:

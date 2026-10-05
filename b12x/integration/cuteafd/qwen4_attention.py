@@ -29,7 +29,9 @@ so a 4-token block's slots are consecutive and block-aligned):
     k_norm      bf16 [256]               in   self_attn.k_norm.weight
     iq_norm     bf16 [128]               in   indexer.q_layernorm.weight
     ik_norm     bf16 [128]               in   indexer.k_layernorm.weight
-    positions   i64  [rows]              in   token position (RoPE; theta 1e7 on dims 0:64, NeoX halves)
+    positions   i64  [rows]              in   logical row (paging/causality, never a rotary coordinate)
+    rope_positions i32 [rows,3]         in   T/H/W coordinates (theta 1e7, 64 dims, NeoX halves)
+    block_rope_positions i32 [rows,3]   in   coordinates at logical row position - position % 4
     kv_slots    i64  [rows]              in   record slot (<0 skips every cache write of the row)
     pool_slots  i64  [rows]              in   index_cache slot of the block the row completes
                                               (position % 4 == 3), else -1
@@ -191,24 +193,27 @@ class _Producer:
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, q_norm: cute.Pointer, k_norm: cute.Pointer,
-                 iq_norm: cute.Pointer, ik_norm: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer,
+                 iq_norm: cute.Pointer, ik_norm: cute.Pointer, positions: cute.Pointer,
+                 rope_positions: cute.Pointer, block_rope_positions: cute.Pointer, kv_slots: cute.Pointer,
                  pool_slots: cute.Pointer, kv_cache: cute.Pointer, token_keys: cute.Pointer,
                  index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        self.body(x, w_in, w_in, w_in, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, pool_slots, kv_cache,
+        self.body(x, w_in, w_in, w_in, q_norm, k_norm, iq_norm, ik_norm, positions,
+                  rope_positions, block_rope_positions, kv_slots, pool_slots, kv_cache,
                   token_keys, index_cache, query, gate, index_q, scratch, rows, stream)
 
     @cute.jit
     def body(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
              q_norm: cute.Pointer, k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer,
-             positions: cute.Pointer, kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer,
+             positions: cute.Pointer, rope_positions: cute.Pointer, block_rope_positions: cute.Pointer,
+                 kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer,
              token_keys: cute.Pointer, index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer,
              index_q: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         proj = _ptr(cutlass.BFloat16, Int64(scratch.toint()))
         self.proj(x, w_in, w_in_fp8, w_in_scale, proj, rows, stream)
-        self.post(proj, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, kv_cache, token_keys, query, gate,
+        self.post(proj, q_norm, k_norm, iq_norm, ik_norm, rope_positions, kv_slots, kv_cache, token_keys, query, gate,
                   index_q, rows, stream)
-        self.pool(positions, kv_slots, pool_slots, ik_norm, token_keys, index_cache, rows, stream)
+        self.pool(block_rope_positions, kv_slots, pool_slots, ik_norm, token_keys, index_cache, rows, stream)
 
 
 class _ProducerFp8(_Producer):
@@ -218,10 +223,12 @@ class _ProducerFp8(_Producer):
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
                  q_norm: cute.Pointer, k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer,
-                 positions: cute.Pointer, kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer,
+                 positions: cute.Pointer, rope_positions: cute.Pointer, block_rope_positions: cute.Pointer,
+                 kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer,
                  token_keys: cute.Pointer, index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer,
                  index_q: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        self.body(x, w_in, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, pool_slots,
+        self.body(x, w_in, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions,
+                  rope_positions, block_rope_positions, kv_slots, pool_slots,
                   kv_cache, token_keys, index_cache, query, gate, index_q, scratch, rows, stream)
 
 
@@ -243,6 +250,7 @@ class _ProducerW8:
     @cute.jit
     def body(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, q_norm: cute.Pointer,
              k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer, positions: cute.Pointer,
+                 rope_positions: cute.Pointer, block_rope_positions: cute.Pointer,
              kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer, token_keys: cute.Pointer,
              index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer,
              scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
@@ -250,19 +258,21 @@ class _ProducerW8:
         proj = _ptr(cutlass.BFloat16, base)
         qscratch = base + _align_i64(Int64(rows) * Int64(self.g.attn_in_width * 2))
         self.proj(x, w_in_fp8, w_in_scale, proj, rows, fp8_rows, qscratch, stream)
-        self.post(proj, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, kv_cache, token_keys, query, gate,
+        self.post(proj, q_norm, k_norm, iq_norm, ik_norm, rope_positions, kv_slots, kv_cache, token_keys, query, gate,
                   index_q, rows, stream)
-        self.pool(positions, kv_slots, pool_slots, ik_norm, token_keys, index_cache, rows, stream)
+        self.pool(block_rope_positions, kv_slots, pool_slots, ik_norm, token_keys, index_cache, rows, stream)
 
 
 class _ProducerW8Decode(_ProducerW8):
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, q_norm: cute.Pointer,
                  k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer, positions: cute.Pointer,
+                 rope_positions: cute.Pointer, block_rope_positions: cute.Pointer,
                  kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer, token_keys: cute.Pointer,
                  index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        self.body(x, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, pool_slots,
+        self.body(x, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions,
+                  rope_positions, block_rope_positions, kv_slots, pool_slots,
                   kv_cache, token_keys, index_cache, query, gate, index_q, scratch, rows, Int32(FP8_GEMV_ROWS),
                   stream)
 
@@ -271,10 +281,12 @@ class _ProducerW8Prefill(_ProducerW8):
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, q_norm: cute.Pointer,
                  k_norm: cute.Pointer, iq_norm: cute.Pointer, ik_norm: cute.Pointer, positions: cute.Pointer,
+                 rope_positions: cute.Pointer, block_rope_positions: cute.Pointer,
                  kv_slots: cute.Pointer, pool_slots: cute.Pointer, kv_cache: cute.Pointer, token_keys: cute.Pointer,
                  index_cache: cute.Pointer, query: cute.Pointer, gate: cute.Pointer, index_q: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
-        self.body(x, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions, kv_slots, pool_slots,
+        self.body(x, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions,
+                  rope_positions, block_rope_positions, kv_slots, pool_slots,
                   kv_cache, token_keys, index_cache, query, gate, index_q, scratch, rows, fp8_rows, stream)
 
 
@@ -303,6 +315,8 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
         Operand("iq_norm", torch.bfloat16, f"[{g.index_head_dim}]"),
         Operand("ik_norm", torch.bfloat16, f"[{g.index_head_dim}]"),
         Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("rope_positions", torch.int32, "[rows,3]", align=4),
+        Operand("block_rope_positions", torch.int32, "[rows,3]", align=4),
         Operand("kv_slots", torch.int64, "[rows]", align=8),
         Operand("pool_slots", torch.int64, "[rows]", align=8),
         Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]", "inout"),
@@ -316,9 +330,9 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
     if fp8_only is not None:
         return compile_program(
             launch, name="qwen4_attn_producer", operands=operands, scalars=w8_scalars(prefill),
-            key=(max_rows, fp8_only, launch.key()),
+            key=("mrope-v1", max_rows, fp8_only, launch.key()),
             geometry={"hidden": h, "heads": n, "kv_heads": g.kv_heads, "head_dim": d, "index_heads": ih,
-                      "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "record_bytes": g.record_bytes,
+                      "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "mrope_section": [11, 11, 10], "record_bytes": g.record_bytes,
                       "page_rows": g.page_rows, "eps": g.norm_eps, "max_rows": max_rows, "fp8_weights": "only",
                       "mode": fp8_only},
             scratch={"scratch": launch.scratch_bytes},
@@ -326,9 +340,9 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
         )
     return compile_program(
         launch, name="qwen4_attn_producer", operands=operands, scalars=(Scalar("rows"),),
-        key=(max_rows, launch.key()),
+        key=("mrope-v1", max_rows, launch.key()),
         geometry={"hidden": h, "heads": n, "kv_heads": g.kv_heads, "head_dim": d, "index_heads": ih,
-                  "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "record_bytes": g.record_bytes,
+                  "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "mrope_section": [11, 11, 10], "record_bytes": g.record_bytes,
                   "page_rows": g.page_rows, "eps": g.norm_eps, "max_rows": max_rows, "fp8_weights": fp8},
         scratch={"scratch": lambda rows: attn_producer_scratch_bytes(g, rows)},
         doc=__doc__,

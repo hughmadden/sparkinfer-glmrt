@@ -256,7 +256,10 @@ def run_step(g, w: Weights, caches: Caches, rows_of: list[tuple[Sequence, int]],
     sp, ss, so, st = scratch(producer, cap), scratch(sparse, cap), scratch(o, cap), scratch(topk, cap)
     events = [torch.cuda.Event(enable_timing=True) for _ in range(6)]
     events[0].record()
-    producer.launch(x, w.w_in, w.q_norm, w.k_norm, w.iq_norm, w.ik_norm, pos, dev(kv_slots, torch.int64),
+    rope_pos = pos.to(torch.int32)[:, None].expand(-1, 3).contiguous()
+    block_rope_pos = (pos - pos % 4).to(torch.int32)[:, None].expand(-1, 3).contiguous()
+    producer.launch(x, w.w_in, w.q_norm, w.k_norm, w.iq_norm, w.ik_norm, pos, rope_pos, block_rope_pos,
+                    dev(kv_slots, torch.int64),
                     dev(pool_slots, torch.int64), caches.kv, caches.token_keys, caches.index, query, gate, index_q,
                     sp, scalars=[t])
     events[1].record()
