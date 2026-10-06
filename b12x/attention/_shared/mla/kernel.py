@@ -85,6 +85,10 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
+# The V part of a staged GLM (ARBITRARY_FP32) row: 512 E4M3 latent bytes, then
+# the four inline FP32 group scales S6 applies to them. GLM_NSA's RoPE follows
+# (QK only); GLM_NEXT has none.
+_GLM_V_STAGE_BYTES = 528
 # DSV4 H8 packs the contiguous 576-byte data record into a 592-byte smem row.
 # The 16-byte pad preserves KV_SMEM_STRIDE/4 % 32 == 20, matching the generic
 # 464-byte row's bank rotation while allowing one bulk copy per candidate.
@@ -405,6 +409,7 @@ class UnifiedDecodeKernel:
         native_dsv4_h16=False,
         native_dsv41_fp8=False,
         vector_q=False,
+        zero_masked_v=False,
     ):
         self.traits = traits
         self.layout = layout
@@ -491,6 +496,22 @@ class UnifiedDecodeKernel:
             and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
         )
         self.vector_q_hpb = 8 if self.native_h8 else int(traits.hpb)
+        # A masked candidate stages record slot 0 (the producer copies row 0
+        # for a negative index), and S6 multiplies its zero weight by that
+        # row's V. UE8M0 rows always get their V zeroed first (0 x NaN = NaN).
+        # ``zero_masked_v`` does the same for GLM's ARBITRARY_FP32 rows: their
+        # E4M3 V and the inline FP32 group scales S6 applies to it, so a NaN or
+        # an infinity in record slot 0 cannot reach a row. Off by default:
+        # every existing specialization keeps its trace and PTX.
+        self.zero_masked_v = bool(zero_masked_v)
+        if self.zero_masked_v and not (
+            int(traits.model_type) in (int(ModelType.GLM_NSA), int(ModelType.GLM_NEXT))
+            and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+        ):
+            raise ValueError(
+                "zero_masked_v applies to GLM ARBITRARY_FP32 records (UE8M0 "
+                "records always zero a masked candidate's V)"
+            )
         if self.native_dsv4_h8 or self.native_dsv4_h16:
             packed_span = int(layout.kv_bufs) * int(
                 traits.bi
@@ -1585,6 +1606,22 @@ class UnifiedDecodeKernel:
                                 offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
                                 st_shared_u32(
                                     kv_rope_b + entry * rope_stride + offset, Uint32(0)
+                                )
+                if cutlass.const_expr(self.zero_masked_v):
+                    # The same for GLM (opt-in): zero a masked candidate's E4M3 V
+                    # and its inline FP32 group scales, bytes [0, 528) of the
+                    # staged row. S3 replaces the masked score, so QK needs
+                    # nothing, and the RoPE that follows on GLM_NSA rows is QK's.
+                    for part in cutlass.range_constexpr(
+                        (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                    ):
+                        entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                        if entry < Int32(t.bi) and tok_buf_view[entry] < Int32(0):
+                            for chunk in cutlass.range_constexpr(_GLM_V_STAGE_BYTES // 16):
+                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                st_shared_u32(
+                                    kv_fp8_b + entry * Int32(staged_kv_stride) + offset,
+                                    Uint32(0),
                                 )
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
 
