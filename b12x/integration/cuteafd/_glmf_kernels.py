@@ -989,3 +989,358 @@ __all__ = [
     "GlmfKdaRecurrent",
     "GlmfMeanNorm",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Compact DSA index cache: pooled keys plus a BF16 tail of at most three rows
+# per sequence and DSA layer, instead of every token's key | gate row.
+#
+# Appended after the definitions above so that their source (and the objects
+# exported from it) stays byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+
+#: Bytes of one BF16 key | gate row (128 keys after k_norm, then 128 gates).
+KEY_ROW_BYTES = 512
+#: Bytes before a tail's rows: an i32 row count (0..3), then 12 reserved zero bytes.
+TAIL_HEADER = 16
+#: A sequence's index tail in one DSA layer: the header, then the key | gate rows of its open
+#: pool (positions ``4 * floor(len / 4) .. len``), zero past the count.
+TAIL_BYTES = TAIL_HEADER + 3 * KEY_ROW_BYTES
+#: Rows a fixed-step search for a sequence's last step row covers (2^13 = 8192 >= 4096).
+_LAST_ROW_STEPS = 13
+
+
+class GlmfIndexPostRows:
+    """``GlmfIndexPost`` storing each row's key | gate row by step row: at ``keys + row * 512``
+    (the producer's scratch), or at ``replay + row * 512`` (the DSA layer's replay record, which
+    ``GlmfIndexTailCommit`` reads after a speculative step) when ``spec`` != 0. The query, head
+    weights, key and gate values are ``GlmfIndexPost``'s (the same operations in the same order).
+    """
+
+    def __init__(self, *, heads: int, eps: float, weight_scale: float):
+        self.heads, self.eps, self.weight_scale = int(heads), float(eps), float(weight_scale)
+        self.width = 128 + self.heads + 128
+
+    @cute.jit
+    def __call__(self, iq: cute.Pointer, kw: cute.Pointer, k_weight: cute.Pointer, k_bias: cute.Pointer,
+                 q_fp8: cute.Pointer, head_weights: cute.Pointer, keys: cute.Pointer, replay: cute.Pointer,
+                 spec: Int32, rows: Int32, stream: cuda.CUstream):
+        m = Int64(rows)
+        h = self.heads
+        self.kernel(
+            cute.make_tensor(iq, cute.make_layout((m, h, 128), stride=(h * 128, 128, 1))),
+            cute.make_tensor(kw, cute.make_layout((m, self.width), stride=(self.width, 1))),
+            cute.make_tensor(k_weight, cute.make_layout((128,))),
+            cute.make_tensor(k_bias, cute.make_layout((128,))),
+            q_fp8,
+            cute.make_tensor(head_weights, cute.make_layout((m, h), stride=(h, 1))),
+            keys, replay, spec,
+        ).launch(grid=(rows, h + 1, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, iq: cute.Tensor, kw: cute.Tensor, k_weight: cute.Tensor, k_bias: cute.Tensor,
+               q_fp8: cute.Pointer, head_weights: cute.Tensor, keys: cute.Pointer, replay: cute.Pointer,
+               spec: Int32):
+        token = Int64(cute.arch.block_idx()[0])
+        head = Int32(cute.arch.block_idx()[1])
+        lane = Int32(cute.arch.thread_idx()[0])
+        out = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+        if head < Int32(self.heads):
+            h64 = Int64(head)
+            for e in cutlass.range_constexpr(4):
+                out[e] = Float32(iq[token, h64, Int64(4) * Int64(lane) + Int64(e)])
+            local = fmax_f32(fmax_f32(fabs_f32(out[0]), fabs_f32(out[1])),
+                             fmax_f32(fabs_f32(out[2]), fabs_f32(out[3])))
+            scale = _fp8_scale(_warp_max(local))
+            packed = cvt_f32x4_to_e4m3x4(div_rn_f32(out[0], scale), div_rn_f32(out[1], scale),
+                                         div_rn_f32(out[2], scale), div_rn_f32(out[3], scale))
+            words = cute.make_ptr(
+                Uint32, Int64(q_fp8.toint()) + (token * Int64(self.heads) + h64) * Int64(128)
+                + Int64(4) * Int64(lane), cute.AddressSpace.gmem, assumed_align=4)
+            words[0] = packed
+            if lane == Int32(0):
+                raw = Float32(kw[token, Int64(128) + h64])
+                head_weights[token, h64] = raw * Float32(self.weight_scale) * scale
+        else:
+            total = Float32(0.0)
+            for e in cutlass.range_constexpr(4):
+                out[e] = Float32(kw[token, Int64(4) * Int64(lane) + Int64(e)])
+                total = total + out[e]
+            mean = _warp_sum(total) / Float32(128.0)
+            var = Float32(0.0)
+            for e in cutlass.range_constexpr(4):
+                diff = out[e] - mean
+                var = var + diff * diff
+            rstd = _rsqrt(_warp_sum(var) / Float32(128.0) + Float32(self.eps))
+            base = Int64(keys.toint())
+            if spec != Int32(0):
+                base = Int64(replay.toint())
+            row = cute.make_tensor(
+                cute.make_ptr(BFloat16, base + token * Int64(KEY_ROW_BYTES), cute.AddressSpace.gmem,
+                              assumed_align=16), cute.make_layout((256,)))
+            for e in cutlass.range_constexpr(4):
+                d = Int32(4) * lane + Int32(e)
+                row[d] = ((out[e] - mean) * rstd * Float32(k_weight[d]) + Float32(k_bias[d])).to(BFloat16)
+                row[Int32(128) + d] = kw[token, Int64(128 + self.heads) + Int64(d)]
+
+
+class GlmfPoolKeysTail:
+    """``GlmfPoolKeys`` over the step's key | gate rows and the sequences' index tails, which
+    then advance (the compact index cache keeps no per-token keys).
+
+    A row completing a pool (``pool_slots[row] >= 0``, position ``p``) pools positions
+    ``p - 3 .. p``: the ones in this step from its key | gate rows (``keys``, or ``replay``
+    when ``spec`` != 0), the ones before it from the tail of its sequence's KDA slot
+    (``tails`` this layer's ``[slots, TAIL_BYTES]``, which holds the rows of the pool open
+    before the step: ``positions[seq_first[row]] % 4`` of them). The pooled key is
+    ``GlmfPoolKeys``'s (the same operations in the same order on the same BF16 inputs).
+
+    Outside speculative steps each sequence's tail then becomes the rows of the pool its
+    last row leaves open (zero past the count). One CTA writes it: the row completing the
+    open pool, after it has read the old rows (each thread reads and writes only its own
+    channel's key and gate), or else the sequence's last row. Speculative steps leave the
+    tails alone; ``GlmfIndexTailCommit`` advances them from the replay record.
+    One CTA of 128 threads (one per channel) per row.
+    """
+
+    threads = 128
+
+    def __init__(self, *, kpool: int = 4, page_rows: int = 64):
+        if kpool != 4:
+            raise ValueError("pool keys are built for 4-token pools")
+        self.kpool, self.page_rows = int(kpool), int(page_rows)
+        self.page_bytes = self.page_rows * (128 + 4)
+        self.warps = self.threads // 32
+
+    @cute.jit
+    def __call__(self, pool_slots: cute.Pointer, positions: cute.Pointer, kda_slots: cute.Pointer,
+                 seq_first: cute.Pointer, ape: cute.Pointer, keys: cute.Pointer, replay: cute.Pointer,
+                 tails: cute.Pointer, cache: cute.Pointer, spec: Int32, rows: Int32, stream: cuda.CUstream):
+        m = Int64(rows)
+        self.kernel(
+            cute.make_tensor(pool_slots, cute.make_layout((m,))),
+            cute.make_tensor(positions, cute.make_layout((m,))),
+            cute.make_tensor(kda_slots, cute.make_layout((m,))),
+            cute.make_tensor(seq_first, cute.make_layout((m,))),
+            cute.make_tensor(ape, cute.make_layout((self.kpool, 128), stride=(128, 1))),
+            keys, replay, tails, cache, spec, rows,
+        ).launch(grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.jit
+    def _last_row(self, seq_first: cute.Tensor, first: Int64, row: Int64, rows: Int32) -> Int64:
+        """The last step row of the sequence whose rows start at ``first`` (``row`` is one of
+        them). Rows of a sequence are contiguous and sequences are in order, so ``seq_first``
+        does not decrease; a prefill step holds one sequence (one load)."""
+        lo = row
+        hi = Int64(rows) - Int64(1)
+        if Int64(seq_first[hi]) == first:
+            lo = hi
+        else:
+            # seq_first[lo] == first != seq_first[hi]: halve until they are adjacent.
+            for _ in cutlass.range_constexpr(_LAST_ROW_STEPS):
+                if hi - lo > Int64(1):
+                    mid = (lo + hi) // Int64(2)
+                    if Int64(seq_first[mid]) == first:
+                        lo = mid
+                    else:
+                        hi = mid
+        return lo
+
+    @cute.kernel
+    def kernel(self, pool_slots: cute.Tensor, positions: cute.Tensor, kda_slots: cute.Tensor,
+               seq_first: cute.Tensor, ape: cute.Tensor, keys: cute.Pointer, replay: cute.Pointer,
+               tails: cute.Pointer, cache: cute.Pointer, spec: Int32, rows: Int32):
+        token = Int64(cute.arch.block_idx()[0])
+        c = Int32(cute.arch.thread_idx()[0])
+        lane = c % Int32(32)
+        warp_id = c // Int32(32)
+        pool = Int64(pool_slots[token])
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(_reduction_storage(1, self.warps))
+        maxes = storage.sums.get_tensor(cute.make_layout((1, self.warps), stride=(self.warps, 1)))
+        step = Int64(keys.toint())
+        if spec != Int32(0):
+            step = Int64(replay.toint())
+        first = Int64(seq_first[token])
+        start = Int64(positions[first])
+        held = start % Int64(self.kpool)
+        slot = Int64(kda_slots[token])
+        safe = slot
+        if safe < Int64(0):
+            safe = Int64(0)
+        tail = Int64(tails.toint()) + safe * Int64(TAIL_BYTES)
+        if pool >= Int64(0):
+            k = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+            gate = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+            for t in cutlass.range_constexpr(4):
+                at = token - Int64(self.kpool - 1 - t)
+                address = step + at * Int64(KEY_ROW_BYTES)
+                before = at < first
+                if before:
+                    # Rows of the pool before the step sit in the tail at their offset in the pool.
+                    address = tail + Int64(TAIL_HEADER + t * KEY_ROW_BYTES)
+                values = cute.make_tensor(cute.make_ptr(BFloat16, address, cute.AddressSpace.gmem, assumed_align=16),
+                                          cute.make_layout((256,)))
+                k[t] = Float32(values[c])
+                gate[t] = Float32(values[Int32(128) + c])
+                if before:
+                    if slot < Int64(0):
+                        k[t] = Float32(0.0)
+                        gate[t] = Float32(0.0)
+            logit = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+            top = Float32(-3.0e38)
+            for t in cutlass.range_constexpr(4):
+                logit[t] = gate[t] + Float32(ape[t, c])
+                top = fmax_f32(top, logit[t])
+            total = Float32(0.0)
+            for t in cutlass.range_constexpr(4):
+                logit[t] = cute.math.exp(logit[t] - top, fastmath=False)
+                total = total + logit[t]
+            key = Float32(0.0)
+            for t in cutlass.range_constexpr(4):
+                key = key + _bf16(_bf16(div_rn_f32(logit[t], total)) * k[t])
+            key = _bf16(key)
+            local = _warp_max(fabs_f32(key))
+            if lane == Int32(0):
+                maxes[0, warp_id] = local
+            cute.arch.sync_threads()
+            amax = Float32(0.0)
+            for w in cutlass.range_constexpr(self.warps):
+                amax = fmax_f32(amax, maxes[0, w])
+            scale = _fp8_scale(amax)
+            page = pool // Int64(self.page_rows)
+            prow = pool - page * Int64(self.page_rows)
+            page_base = Int64(cache.toint()) + page * Int64(self.page_bytes)
+            value = cute.make_tensor(cute.make_ptr(cutlass.Float8E4M3FN, page_base + prow * Int64(128),
+                                                   cute.AddressSpace.gmem, assumed_align=1), cute.make_layout((128,)))
+            value[c] = div_rn_f32(key, scale).to(cutlass.Float8E4M3FN)
+            if c == Int32(0):
+                scale_ptr = cute.make_ptr(Float32, page_base + Int64(self.page_rows * 128) + prow * Int64(4),
+                                          cute.AddressSpace.gmem, assumed_align=4)
+                scale_ptr[0] = scale
+        if spec == Int32(0):
+            if slot >= Int64(0):
+                last = token + Int64(1) == Int64(rows)
+                if not last:
+                    last = Int64(seq_first[token + Int64(1)]) != first
+                # The row completing the pool open before the step (it reads the old tail).
+                opener = first + Int64(self.kpool - 1) - held
+                writes = Int32(0)
+                if held > Int64(0):
+                    if token == opener:
+                        writes = Int32(1)
+                    else:
+                        if last:
+                            if opener > token:
+                                writes = Int32(1)
+                else:
+                    if last:
+                        writes = Int32(1)
+                if writes != Int32(0):
+                    end = token
+                    if not last:
+                        end = self._last_row(seq_first, first, token, rows)
+                    stop = Int64(positions[end]) + Int64(1)
+                    count = stop % Int64(self.kpool)
+                    opened = stop - count
+                    for e in cutlass.range_constexpr(self.kpool - 1):
+                        dst = cute.make_tensor(
+                            cute.make_ptr(BFloat16, tail + Int64(TAIL_HEADER + e * KEY_ROW_BYTES),
+                                          cute.AddressSpace.gmem, assumed_align=16), cute.make_layout((256,)))
+                        if Int64(e) < count:
+                            position = opened + Int64(e)
+                            # Rows before the step keep their place (the open pool did not complete).
+                            if position >= start:
+                                kept = cute.make_tensor(
+                                    cute.make_ptr(BFloat16, step + (first + position - start) * Int64(KEY_ROW_BYTES),
+                                                  cute.AddressSpace.gmem, assumed_align=16), cute.make_layout((256,)))
+                                dst[c] = kept[c]
+                                dst[Int32(128) + c] = kept[Int32(128) + c]
+                        else:
+                            dst[c] = Float32(0.0).to(BFloat16)
+                            dst[Int32(128) + c] = Float32(0.0).to(BFloat16)
+                    if c == Int32(0):
+                        header = cute.make_ptr(Int32, tail, cute.AddressSpace.gmem, assumed_align=16)
+                        header[0] = Int32(count)
+                        header[1] = Int32(0)
+                        header[2] = Int32(0)
+                        header[3] = Int32(0)
+
+
+class GlmfIndexTailCommit:
+    """After a speculative step: each sequence's index tail in every DSA layer from its old
+    tail and its kept rows, in one launch.
+
+    ``tails`` u8 ``[layers, slots, TAIL_BYTES]``, ``replay`` the layers' key | gate records
+    (BF16 ``[layers, REPLAY_ROWS, 256]``, written by the speculative step), ``tables`` i32
+    ``[3, sequences]`` as ``GlmfKdaCommit``'s: KDA slot (negative: skip), first step row and
+    kept rows. The tail becomes the rows of the pool left open after the kept rows, as the
+    non-speculative producer leaves it. Grid ``(sequences * layers)``, 128 threads (one per
+    channel).
+    """
+
+    threads = 128
+
+    def __init__(self, *, kpool: int = 4):
+        if kpool != 4:
+            raise ValueError("index tails are built for 4-token pools")
+        self.kpool = int(kpool)
+
+    @cute.jit
+    def __call__(self, tails: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,
+                 layers: Int32, slots: Int32, stream: cuda.CUstream):
+        self.kernel(tails, replay, cute.make_tensor(tables, cute.make_layout((3, sequences), stride=(sequences, 1))),
+                    sequences, slots).launch(
+            grid=(sequences * layers, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, tails: cute.Pointer, replay: cute.Pointer, tables: cute.Tensor, sequences: Int32,
+               slots: Int32):
+        z = Int32(cute.arch.block_idx()[0])
+        seq = z % sequences
+        layer = Int64(z // sequences)
+        c = Int32(cute.arch.thread_idx()[0])
+        slot = Int64(tables[0, seq])
+        first = Int64(tables[1, seq])
+        keep = Int64(tables[2, seq])
+        if slot >= Int64(0):
+            tail = Int64(tails.toint()) + (layer * Int64(slots) + slot) * Int64(TAIL_BYTES)
+            header = cute.make_ptr(Int32, tail, cute.AddressSpace.gmem, assumed_align=16)
+            held = Int64(header[0])
+            # Every thread holds the old count before thread 0 rewrites it.
+            cute.arch.sync_threads()
+            total = held + keep
+            count = total % Int64(self.kpool)
+            # Offset of the new tail's first row from the old tail's first row.
+            opened = total - count
+            record = Int64(replay.toint()) + layer * Int64(REPLAY_ROWS * KEY_ROW_BYTES)
+            for e in cutlass.range_constexpr(self.kpool - 1):
+                dst = cute.make_tensor(
+                    cute.make_ptr(BFloat16, tail + Int64(TAIL_HEADER + e * KEY_ROW_BYTES), cute.AddressSpace.gmem,
+                                  assumed_align=16), cute.make_layout((256,)))
+                if Int64(e) < count:
+                    offset = opened + Int64(e)
+                    # Old rows keep their place (the open pool did not complete).
+                    if offset >= held:
+                        src = cute.make_tensor(
+                            cute.make_ptr(BFloat16, record + (first + offset - held) * Int64(KEY_ROW_BYTES),
+                                          cute.AddressSpace.gmem, assumed_align=16), cute.make_layout((256,)))
+                        dst[c] = src[c]
+                        dst[Int32(128) + c] = src[Int32(128) + c]
+                else:
+                    dst[c] = Float32(0.0).to(BFloat16)
+                    dst[Int32(128) + c] = Float32(0.0).to(BFloat16)
+            if c == Int32(0):
+                header[0] = Int32(count)
+                header[1] = Int32(0)
+                header[2] = Int32(0)
+                header[3] = Int32(0)
+
+
+__all__ += [
+    "GlmfIndexPostRows",
+    "GlmfIndexTailCommit",
+    "GlmfPoolKeysTail",
+    "KEY_ROW_BYTES",
+    "TAIL_BYTES",
+]
