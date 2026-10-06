@@ -33,6 +33,8 @@ from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u64_shared_global,
     cp_async4_shared_global_pred,
+    cp_async4_shared_global_pred_l2hint,
+    create_l2_evict_first_policy,
     fabs_f32,
     fmax_f32,
     f16_mma_m16n8k16_f32,
@@ -72,6 +74,8 @@ from b12x._lib.intrinsics import (
     ld_global_nc_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
+    prefetch_bulk_global_l2,
+    prefetch_global_l2,
     red_add_global_bf16x2,
     red_add_global_release_i32,
     red_max_global_f32_nonnegative,
@@ -942,6 +946,8 @@ class W4A16GemmKernel:
         dynamic_num_experts: bool = False,
         schedule_route_block_factor: int = 1,
         fused_input_rotation: bool = False,
+        l2_evict_first_b: bool = False,
+        l2_prefetch_k_tiles: int = 0,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1307,6 +1313,36 @@ class W4A16GemmKernel:
         else:
             self.b_sh_chunks = self.b_sh_stage
             self.b_sh_wr_iters_var = self.b_sh_wr_iters
+        # Memory-schedule options for single-rate Trellis whole tiles (the GB10
+        # decode schedule). Neither changes what is computed or in which order:
+        # - l2_evict_first_b stages the weight words with an L2 evict-first
+        #   policy, so the one-pass weight stream gives way to the activation
+        #   rows and phase buffers that are read again;
+        # - l2_prefetch_k_tiles > 0 lets the tile emitter prefetch the first
+        #   K tiles of the CTA's next tile into L2 (_prefetch_tile_b_l2), so
+        #   its pipeline starts from L2 instead of a DRAM round trip.
+        self.l2_evict_first_b = bool(l2_evict_first_b)
+        self.l2_prefetch_k_tiles = int(l2_prefetch_k_tiles)
+        if self.l2_prefetch_k_tiles < 0:
+            raise ValueError("l2_prefetch_k_tiles must be non-negative")
+        if (self.l2_evict_first_b or self.l2_prefetch_k_tiles) and (
+            not self.weight_layout_trellis256
+            or self.weight_layout_trellis256_pair
+            or not self.schedule_whole_tiles
+            or self.direct_topk_routes
+            or self.dense_route_fast_path
+        ):
+            raise ValueError(
+                "L2 weight schedule options require packed whole-tile "
+                "single-rate trellis_t256 weights"
+            )
+        self.l2_prefetch_k_tiles = min(self.l2_prefetch_k_tiles, self.k_tiles)
+        # One bulk prefetch per K16 row of the tile: its cta_n_blocks Trellis
+        # tiles are contiguous in both the projection-major and packed layouts.
+        self.l2_prefetch_row_bytes = self.cta_n_blocks * 32 * self.trellis_bits
+        # Lane 0 of each warp issues the rows in turn (unrolled): bound it.
+        if self.l2_prefetch_k_tiles * self.cta_k_blocks > self.cta_threads:
+            raise ValueError("L2 prefetch rows exceed 32 per warp")
 
         self.s_sh_stride = 16 * self.cta_n_blocks // 16
         self.s_tb_groups = (
@@ -1395,7 +1431,16 @@ class W4A16GemmKernel:
             self.small_m_splitk,
             self.skip_empty_m_blocks,
             self.fused_input_rotation,
-        )
+        ) + self._memory_schedule_key()
+
+    def _memory_schedule_key(self) -> tuple[object, ...]:
+        """Present only when a memory-schedule option is on, so the keys of
+        every existing specialization stay as they were."""
+        evict_first = getattr(self, "l2_evict_first_b", False)
+        prefetch = getattr(self, "l2_prefetch_k_tiles", 0)
+        if not evict_first and not prefetch:
+            return ()
+        return (("l2_schedule", evict_first, prefetch),)
 
     @cute.jit
     def _activation_smem_permuted_offset(self, i: Int32) -> Int32:
@@ -1656,7 +1701,12 @@ class W4A16GemmKernel:
         grid_x: Int32,
         active_size_m: Int32,
         emit_tile: cutlass.Constexpr = None,
+        prefetch_tile: cutlass.Constexpr = None,
     ):
+        # prefetch_tile(route_block_idx, output_n_tile) (whole tiles only, as
+        # the L2 schedule options require): called before each tile is
+        # emitted, for the CTA's next tile (grid_x tiles on), so that tile's
+        # first weight K tiles wait in L2 when its pipeline starts.
         n_tiles = Int32(self.n_tiles)
         route_blocks = active_size_m * Int32(self.top_k)
         if cutlass.const_expr(self.dense_route_fast_path):
@@ -1801,6 +1851,15 @@ class W4A16GemmKernel:
                 and reduce_tile_count > Int32(0)
                 and route_block_idx < route_blocks
             ):
+                if cutlass.const_expr(prefetch_tile is not None):
+                    # Whole tiles: this CTA's next tile is grid_x tiles on.
+                    next_mn_tile = work_mn_tile + grid_x
+                    next_route_block_idx = next_mn_tile // n_tiles
+                    if next_route_block_idx < route_blocks:
+                        prefetch_tile(
+                            next_route_block_idx,
+                            next_mn_tile - next_route_block_idx * n_tiles,
+                        )
                 if cutlass.const_expr(emit_tile is not None):
                     # Trace-time tile emission hook: the caller owns expert
                     # resolution and the _run_tile dispatch (e.g. the hybrid
@@ -1858,6 +1917,85 @@ class W4A16GemmKernel:
                     if output_n_tile == n_tiles:
                         output_n_tile = Int32(0)
                         route_block_idx += Int32(1)
+
+    @cute.jit
+    def _prefetch_tile_b_l2(
+        self,
+        b_i32_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        tid: Int32,
+        route_block_idx: Int32,
+        expert_idx: Int32,
+        output_n_tile: Int32,
+    ):
+        """Prefetch one whole tile's start into L2: the first
+        l2_prefetch_k_tiles K tiles of its weight words (one bulk prefetch per
+        K16 row, the same words _stage_k_tile_async stages) and its packed
+        route indices. Only cache state changes, never the computed values."""
+        rows = self.l2_prefetch_k_tiles * self.cta_k_blocks
+        warps = self.cta_threads // 32
+        t256_tile_u32 = 8 * self.trellis_bits
+        t256_n16 = self.size_n // 16
+        # Lane 0 of every warp takes rows warp, warp + warps, ...: a bulk
+        # prefetch takes a uniform address, so one active lane per warp keeps
+        # it from looping over the lanes.
+        if (tid & Int32(31)) == Int32(0):
+            for i in cutlass.range_constexpr((rows + warps - 1) // warps):
+                row = (tid >> Int32(5)) + Int32(i * warps)
+                if row < Int32(rows):
+                    if cutlass.const_expr(self.weight_layout_trellis256_proj):
+                        t256_half_n16 = t256_n16 // 2
+                        t256_out_n16 = output_n_tile * Int32(self.cta_n_blocks)
+                        t256_proj = (t256_out_n16 >= Int32(t256_half_n16)).to(Int32)
+                        t256_local_n16 = t256_out_n16 - t256_proj * Int32(t256_half_n16)
+                        t256_proj_expert_u32 = (
+                            (self.size_k // 16) * t256_half_n16 * t256_tile_u32
+                        )
+                        # Projection-major W13 is physically [2, E, ...].
+                        t256_plane_u32 = Int64(cute.size(b_i32_flat)) // Int64(2)
+                        row_u32 = (
+                            Int64(t256_proj) * t256_plane_u32
+                            + Int64(expert_idx) * Int64(t256_proj_expert_u32)
+                            + Int64(row) * Int64(t256_half_n16 * t256_tile_u32)
+                            + Int64(t256_local_n16) * Int64(t256_tile_u32)
+                        )
+                    else:
+                        t256_expert_u32 = (self.size_k // 16) * t256_n16 * t256_tile_u32
+                        row_u32 = (
+                            Int64(t256_expert_u32) * Int64(expert_idx)
+                            + Int64(row) * Int64(t256_n16 * t256_tile_u32)
+                            + Int64(output_n_tile)
+                            * Int64(self.cta_n_blocks * t256_tile_u32)
+                        )
+                    prefetch_bulk_global_l2(
+                        get_ptr_as_int64(b_i32_flat, row_u32),
+                        Int32(self.l2_prefetch_row_bytes),
+                    )
+        if tid == Int32(self.cta_threads - 1):
+            prefetch_global_l2(
+                get_ptr_as_int64(
+                    packed_route_indices,
+                    route_block_idx * Int32(self.moe_block_size),
+                )
+            )
+
+    @cute.jit
+    def _prefetch_first_tile(
+        self,
+        prefetch_tile: cutlass.Constexpr,
+        packed_route_count: cute.Tensor,
+        cta: Int32,
+    ):
+        """Before a phase's grid barrier: prefetch this CTA's first tile of the
+        next whole-tile GEMM (tile `cta`; packed routes)."""
+        route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
+            self.moe_block_size * self.schedule_route_block_factor
+        )
+        route_block_idx = cta // Int32(self.n_tiles)
+        if route_block_idx < route_blocks:
+            prefetch_tile(
+                route_block_idx, cta - route_block_idx * Int32(self.n_tiles)
+            )
 
     @cute.jit
     def _read_moe_block_data(
@@ -5086,6 +5224,8 @@ class W4A16GemmKernel:
                 )
                 t256_chunks_per_kt = self.cta_n_blocks * (2 * self.trellis_bits)
                 t256_total_chunks = self.cta_k_blocks * t256_chunks_per_kt
+                if cutlass.const_expr(self.l2_evict_first_b):
+                    b_l2_policy = create_l2_evict_first_policy()
                 for i in cutlass.range_constexpr(self.b_sh_wr_iters_var):
                     t256_chunk = Int32(i * self.cta_threads) + tid
                     t256_kt = t256_chunk // Int32(t256_chunks_per_kt)
@@ -5137,11 +5277,19 @@ class W4A16GemmKernel:
                             * Int64(self.cta_n_blocks * t256_tile_u32)
                             + Int64(t256_in_kt) * Int64(4)
                         )
-                    cp_async4_shared_global_pred(
-                        b_dst,
-                        get_ptr_as_int64(b_i32_flat, b_src_i64),
-                        (t256_chunk < Int32(t256_total_chunks)).to(Int32),
-                    )
+                    if cutlass.const_expr(self.l2_evict_first_b):
+                        cp_async4_shared_global_pred_l2hint(
+                            b_dst,
+                            get_ptr_as_int64(b_i32_flat, b_src_i64),
+                            (t256_chunk < Int32(t256_total_chunks)).to(Int32),
+                            b_l2_policy,
+                        )
+                    else:
+                        cp_async4_shared_global_pred(
+                            b_dst,
+                            get_ptr_as_int64(b_i32_flat, b_src_i64),
+                            (t256_chunk < Int32(t256_total_chunks)).to(Int32),
+                        )
 
         for i in cutlass.range_constexpr(
             0 if self.b_region_variable else self.b_sh_wr_iters
@@ -6405,6 +6553,10 @@ class W4A16FusedMoeKernel:
         broadcast_suh: bool = False,
         fused_input_rotation: bool = False,
         activation_output_a8: bool = False,
+        l2_evict_first_b: bool = False,
+        fc1_l2_prefetch_k_tiles: int = 0,
+        fc2_l2_prefetch_k_tiles: int = 0,
+        phase_l2_prefetch: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6661,6 +6813,8 @@ class W4A16FusedMoeKernel:
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
             fused_input_rotation=self.fused_input_rotation,
+            l2_evict_first_b=l2_evict_first_b,
+            l2_prefetch_k_tiles=fc1_l2_prefetch_k_tiles,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -6694,7 +6848,17 @@ class W4A16FusedMoeKernel:
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
+            l2_evict_first_b=l2_evict_first_b,
+            l2_prefetch_k_tiles=fc2_l2_prefetch_k_tiles,
         )
+        # Prefetch each GEMM's first tile into L2 before the grid barrier that
+        # precedes it (the rotation phase's for FC1, FC1's own for FC2): the
+        # memory analogue of starting the down kernel while gate/up ends.
+        self.phase_l2_prefetch = bool(phase_l2_prefetch)
+        if self.phase_l2_prefetch and (
+            not self.fc1.l2_prefetch_k_tiles or not self.fc2.l2_prefetch_k_tiles
+        ):
+            raise ValueError("phase L2 prefetch requires FC1 and FC2 tile prefetch")
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
             raise ValueError(
@@ -6767,7 +6931,9 @@ class W4A16FusedMoeKernel:
             self.sms,
             self.shared_words,
             self.blocks_per_sm,
-        ) + (("activation_output_a8",) if self.activation_output_a8 else ())
+        ) + (("activation_output_a8",) if self.activation_output_a8 else ()) + (
+            ("phase_l2_prefetch",) if getattr(self, "phase_l2_prefetch", False) else ()
+        )
 
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
@@ -7278,12 +7444,15 @@ class W4A16FusedMoeKernel:
         fc1_emit_tile: cutlass.Constexpr = None,
         fc2_emit_tile: cutlass.Constexpr = None,
         input_rotated: cutlass.Constexpr = False,
+        fc1_prefetch_tile: cutlass.Constexpr = None,
+        fc2_prefetch_tile: cutlass.Constexpr = None,
     ):
         # Phase assembly shared by the single-tier fused kernel and the hybrid
         # multi-tier entry: zero prologue, FC1, grid barrier, activation, grid
         # barrier, FC2. The emit hooks delegate per-tile expert resolution and
         # dispatch (used by the hybrid route map); None keeps the single-tier
-        # resolution inside _run_persistent_gemm.
+        # resolution inside _run_persistent_gemm. The prefetch hooks (the L2
+        # weight schedule) prefetch a tile's first weight K tiles into L2.
         # The trellis LUT parameters carry the raw global address unless the
         # single-tier entry staged the T12 staircase in shared memory.
         fc1_phase_lut = fc1_trellis_lut_addr
@@ -7294,6 +7463,10 @@ class W4A16FusedMoeKernel:
             )
             fc1_phase_lut = table_addr
             fc2_phase_lut = table_addr
+        if cutlass.const_expr(self.phase_l2_prefetch and fc1_prefetch_tile is not None):
+            # The rotation phase moves little memory: stream this CTA's first
+            # FC1 tile meanwhile.
+            self.fc1._prefetch_first_tile(fc1_prefetch_tile, packed_route_count, cta)
         if cutlass.const_expr(
             self.full_rotation and not input_rotated and not self.fused_input_rotation
         ):
@@ -7382,7 +7555,13 @@ class W4A16FusedMoeKernel:
                 grid_x,
                 active_m,
                 fc1_emit_tile,
+                fc1_prefetch_tile,
             )
+            if cutlass.const_expr(self.phase_l2_prefetch and fc2_prefetch_tile is not None):
+                # A CTA done with FC1 waits at the barrier for the slowest one
+                # and then runs the activation: stream its first FC2 tile
+                # meanwhile (the down weights do not depend on FC1's output).
+                self.fc2._prefetch_first_tile(fc2_prefetch_tile, packed_route_count, cta)
             self._grid_barrier(locks_i32_flat, tid, grid_x)
             if cutlass.const_expr(self.full_rotation):
                 if cutlass.const_expr(self.coupled_hadamard):
@@ -7488,6 +7667,7 @@ class W4A16FusedMoeKernel:
             grid_x,
             active_m * Int32(self.top_k),
             fc2_emit_tile,
+            fc2_prefetch_tile,
         )
 
     @cute.jit
