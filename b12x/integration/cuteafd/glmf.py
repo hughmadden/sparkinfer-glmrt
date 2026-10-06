@@ -498,16 +498,31 @@ def _state_geometry(state_dtype: str, state_rounding: str) -> dict:
     return {} if state_dtype == "float32" else {"state_dtype": state_dtype, "state_rounding": state_rounding}
 
 
+def _replay_geometry(launch) -> dict:
+    """Manifest geometry of a wide decode KDA program's replay record (none at ``REPLAY_ROWS``
+    rows, whose programs' geometry is unchanged)."""
+    return {} if launch.replay_rows == REPLAY_ROWS else {"replay_rows": launch.replay_rows}
+
+
 class _Kda:
     def __init__(self, g: GLMFGeometry, max_rows: int = 64, fp8=False, state_dtype: str = "float32",
-                 state_rounding: str = "window"):
+                 state_rounding: str = "window", decode: bool | None = None):
         self.g = g
         self.output_norm = False
         fp8, prefill = _fp8_mode(fp8)
         state, _, round_tiles = _kda_state(state_dtype, state_rounding)
         # A BF16 state extends the key; the FP32 programs keep theirs.
         self.state_key = () if state_dtype == "float32" else (("state", state_dtype, state_rounding),)
-        self.chunked = _KdaChunked(g, max_rows, state, round_tiles) if int(max_rows) > CHUNKED_MIN_ROWS else None
+        # Decode programs (the FP8 GEMV route, or ``decode``) keep the decode structures at any
+        # capacity: past CHUNKED_MIN_ROWS rows a wide verify still runs the token-sequential
+        # recurrence (which records every row for the replay commit), the per-row conv and the
+        # 64-row batched tiles, and its replay record holds max_rows rows. Prefill and
+        # BF16-only programs take the prefill structures past CHUNKED_MIN_ROWS rows.
+        decode = (fp8 and not prefill) if decode is None else bool(decode)
+        structure = min(int(max_rows), CHUNKED_MIN_ROWS) if decode else int(max_rows)
+        self.replay_rows = max(int(max_rows), REPLAY_ROWS) if decode else REPLAY_ROWS
+        self.replay_key = () if self.replay_rows == REPLAY_ROWS else (("replay_rows", self.replay_rows),)
+        self.chunked = _KdaChunked(g, max_rows, state, round_tiles) if structure > CHUNKED_MIN_ROWS else None
         d, p = g.kda_width, g.kda_in_width
         self.d, self.p = d, p
         prefill_rows = int(max_rows) if prefill else None
@@ -516,20 +531,20 @@ class _Kda:
         self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=1)
         # f_b(f_a) and g_b(g_a): two 128 -> D products off the in-projection row.
         self.fg = BatchedBf16Gemm(n=d, k=g.kda_head_dim, batch=2, a_row=p, a_batch=g.kda_head_dim,
-                                  o_row=2 * d, o_batch=d, compute_warps=_batched_warps(max_rows))
+                                  o_row=2 * d, o_batch=d, compute_warps=_batched_warps(structure))
         # Prefill capacities: the row-blocked conv and the scanning conv-state update.
-        wide = int(max_rows) > CHUNKED_MIN_ROWS
+        wide = structure > CHUNKED_MIN_ROWS
         self.conv = (GlmfKdaConvRows if wide else GlmfKdaConv)(channels=3 * d, proj_width=p)
         self.conv_state = GlmfKdaConvState(channels=3 * d, proj_width=p, row_block=64 if wide else 0)
         self.recurrent = GlmfKdaRecurrent(heads=g.kda_heads, lower_bound=g.gate_lower_bound, qkv_width=3 * d,
-                                          g_stride=2 * d, b_stride=p, state_dtype=state)
+                                          g_stride=2 * d, b_stride=p, state_dtype=state, replay_rows=self.replay_rows)
         self.norm = GlmfKdaGatedNorm(heads=g.kda_heads, eps=g.norm_eps, gate_stride=2 * d)
         self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=2)
 
     def key(self) -> tuple:
         return (self.in_proj.key(), self.fg.key(), self.o_proj.key(), self.g,
                 None if self.chunked is None else self.chunked.key()) + (("norm",) if self.output_norm else ()) \
-            + self.state_key
+            + self.state_key + self.replay_key
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_fg: cute.Pointer, conv_w: cute.Pointer,
@@ -560,7 +575,7 @@ class _Kda:
         self.in_proj.run(x, w_in, w_in_fp8, w_in_scale, proj, rows, fp8_rows, qscratch, stream)
         self.fg(_ptr(bf16, base + Int64(3 * d * 2)), w_fg, _ptr(bf16, fg_off), rows, stream)
         self.conv(proj, conv_w, conv_state, slots, seq_first, _ptr(bf16, qkv_off), rows, stream)
-        _, proj_off, _ = kda_replay_layout(self.g.kda_heads, 3 * d)
+        _, proj_off, _ = kda_replay_layout(self.g.kda_heads, 3 * d, self.replay_rows)
         self.conv_state(proj, conv_state, slots, seq_first, _ptr(bf16, Int64(replay.toint()) + Int64(proj_off)), spec,
                         rows, stream)
         b_raw = _ptr(bf16, base + Int64((3 * d + 256) * 2), 2)
@@ -612,7 +627,7 @@ class _KdaW8(_Kda):
     def __init__(self, g: GLMFGeometry, max_rows: int, prefill: bool, out_dtype=cutlass.BFloat16,
                  prefill_expanded: bool = False, output_kind: str = "projection", state_dtype: str = "float32",
                  state_rounding: str = "window"):
-        super().__init__(g, max_rows, False, state_dtype, state_rounding)
+        super().__init__(g, max_rows, False, state_dtype, state_rounding, decode=not prefill)
         self.output_norm = output_kind == "norm"
         prefill_rows = int(max_rows) if prefill else None
         self.prefill = bool(prefill)
@@ -695,7 +710,8 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
         Operand("seq_first", torch.int32, "[rows]", align=4),
         Operand("out", torch_dtype, f"[rows,{d if output_kind == 'norm' else h}]", "out"),
         *(() if prefill else
-          (Operand("replay", torch.float32, f"[{kda_replay_layout(heads, 3 * d)[2] // 4}]", "inout"),)),
+          (Operand("replay", torch.float32, f"[{kda_replay_layout(heads, 3 * d, launch.replay_rows)[2] // 4}]",
+                   "inout"),)),
         Operand("scratch", torch.uint8, "[kda_scratch_bytes]", "scratch"),
     )
     scalars = ((Scalar("rows"), Scalar("fp8_rows", note="prefill: bit 0 runs the in-projection W8A8, bit 1 "
@@ -711,7 +727,7 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
                   "output_dtype": output_dtype, "output_kind": output_kind, "prefill_expanded": prefill_expanded,
                   "decode_gemv_rows": 32 if (h, heads, g.kda_head_dim) == (4096, 32, 128) else FP8_ROWS,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
-                  **_state_geometry(state_dtype, state_rounding)},
+                  **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch)},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill, prefill_expanded)},
         doc=__doc__,
     )
@@ -745,7 +761,12 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
     computed in FP32, rounded to nearest even after every row of the token-sequential
     recurrence (decode, verify, prefills up to ``CHUNKED_MIN_ROWS`` rows), and in the chunked
     prefill where each window of tiles stores it (``state_rounding="window"``) or after every
-    16-row tile (``"tile"``). Half the state bytes; the FP32 programs are unchanged."""
+    16-row tile (``"tile"``). Half the state bytes; the FP32 programs are unchanged.
+
+    Decode programs (``fp8=True``, ``fp8_only="decode"``) past ``CHUNKED_MIN_ROWS`` rows (a wide
+    verify, e.g. ``max_rows=128``) keep the decode structures, the token-sequential recurrence
+    included, and record every row: their ``replay`` is ``kda_replay_layout(..., max_rows)``,
+    for ``compile_glmf_kda_commit_aot(replay_rows=max_rows)``."""
     max_rows = _check_rows(max_rows)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
     if fp8_only is not None:
@@ -776,7 +797,8 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
         Operand("slots", torch.int32, "[rows]", align=4),
         Operand("seq_first", torch.int32, "[rows]", align=4),
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
-        *((Operand("replay", torch.float32, f"[{kda_replay_layout(heads, 3 * d)[2] // 4}]", "inout"),)
+        *((Operand("replay", torch.float32, f"[{kda_replay_layout(heads, 3 * d, launch.replay_rows)[2] // 4}]",
+                   "inout"),)
           if fp8_on and not prefill else ()),
         Operand("scratch", torch.uint8, "[kda_scratch_bytes]", "scratch"),
     )
@@ -788,18 +810,18 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
         geometry={"hidden": h, "heads": heads, "head_dim": g.kda_head_dim, "max_rows": max_rows,
                   "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
-                  **_state_geometry(state_dtype, state_rounding)},
+                  **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch)},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill)},
         doc=__doc__,
     )
 
 
 class _KdaCommit:
-    def __init__(self, g: GLMFGeometry, state_dtype: str = "float32"):
+    def __init__(self, g: GLMFGeometry, state_dtype: str = "float32", replay_rows: int = REPLAY_ROWS):
         self.g = g
         self.recurrent = GlmfKdaCommit(heads=g.kda_heads, channels=3 * g.kda_width,
-                                       state_dtype=_kda_state(state_dtype, "window")[0])
-        self.conv = GlmfKdaConvCommit(heads=g.kda_heads, channels=3 * g.kda_width)
+                                       state_dtype=_kda_state(state_dtype, "window")[0], replay_rows=replay_rows)
+        self.conv = GlmfKdaConvCommit(heads=g.kda_heads, channels=3 * g.kda_width, replay_rows=replay_rows)
 
     @cute.jit
     def __call__(self, state: cute.Pointer, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer,
@@ -808,7 +830,8 @@ class _KdaCommit:
         self.conv(conv_state, replay, tables, sequences, layers, slots, stream)
 
 
-def compile_glmf_kda_commit_aot(g: GLMFGeometry = GLM53_FLASH, *, state_dtype: str = "float32") -> AotProgram:
+def compile_glmf_kda_commit_aot(g: GLMFGeometry = GLM53_FLASH, *, state_dtype: str = "float32",
+                                replay_rows: int = REPLAY_ROWS) -> AotProgram:
     """Verify-by-replay for KDA: after a speculative decode step (``glmf_kda``
     with ``spec`` = 1, which records each row's replay inputs and leaves the
     state alone), apply each sequence's accepted rows to its recurrent and
@@ -822,11 +845,13 @@ def compile_glmf_kda_commit_aot(g: GLMFGeometry = GLM53_FLASH, *, state_dtype: s
     arithmetic, so the state is bit-identical to serial steps over those rows.
     ``state_dtype="bfloat16"``: the BF16 state of ``glmf_kda``'s BF16-state programs, rounded
     after every replayed row as those programs round it.
+    ``replay_rows``: the records' rows, the speculative step's decode program's
+    (``REPLAY_ROWS``, or a wide verify's ``max_rows``).
     """
     state_torch = _kda_state(state_dtype, "window")[1]
-    launch = _KdaCommit(g, state_dtype)
+    launch = _KdaCommit(g, state_dtype, replay_rows)
     heads, d = g.kda_heads, g.kda_width
-    record = kda_replay_layout(heads, 3 * d)[2]
+    record = kda_replay_layout(heads, 3 * d, replay_rows)[2]
     return compile_program(
         launch, name="glmf_kda_commit",
         operands=(Operand("state", state_torch, f"[layers,slots,{heads},128,128]", "inout"),
@@ -834,8 +859,8 @@ def compile_glmf_kda_commit_aot(g: GLMFGeometry = GLM53_FLASH, *, state_dtype: s
                   Operand("replay", torch.float32, f"[layers,{record // 4}]"),
                   Operand("tables", torch.int32, "[3,sequences]", align=4)),
         scalars=(Scalar("sequences"), Scalar("layers"), Scalar("slots")),
-        key=(heads, d, REPLAY_ROWS) + (() if state_dtype == "float32" else (state_dtype,)),
-        geometry={"heads": heads, "channels": 3 * d, "replay_rows": REPLAY_ROWS, "replay_bytes": record,
+        key=(heads, d, int(replay_rows)) + (() if state_dtype == "float32" else (state_dtype,)),
+        geometry={"heads": heads, "channels": 3 * d, "replay_rows": int(replay_rows), "replay_bytes": record,
                   **_state_geometry(state_dtype, "window")},
         doc=compile_glmf_kda_commit_aot.__doc__,
     )
@@ -1584,7 +1609,8 @@ class _IndexProducerCompact:
                   stream)
 
 
-def compile_glmf_index_producer_c_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int) -> AotProgram:
+def compile_glmf_index_producer_c_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int,
+                                      verify_rows: int | None = None) -> AotProgram:
     """DSA index query and completed pool keys over the compact index cache.
 
     ``glmf_index_producer`` (the same query, head weights and pooled keys, bit for bit) without
@@ -1601,8 +1627,13 @@ def compile_glmf_index_producer_c_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows
     for ``glmf_kda_commit_c``; ``spec`` needs rows <= 64), ``index_cache`` u8
     [pool_pages,8448] inout, ``q_fp8`` fp8 [rows,I,128] out, ``head_weights`` f32 [rows,I]
     out; scalars ``rows``, ``spec``.
+
+    ``verify_rows``: a wide decode program's record of that many rows (``[verify_rows,256]``;
+    ``spec`` then needs rows <= verify_rows) for ``glmf_kda_commit_c(replay_rows=verify_rows)``.
+    The code is the same at any record size (the caller passes the layer's record).
     """
     max_rows = _check_rows(max_rows)
+    replay_rows = REPLAY_ROWS if verify_rows is None else int(verify_rows)
     launch = _IndexProducerCompact(g, max_rows)
     h, q, i = g.hidden, g.q_lora_rank, g.index_heads
     operands = (
@@ -1618,7 +1649,7 @@ def compile_glmf_index_producer_c_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows
         Operand("k_norm_b", torch.bfloat16, "[128]"),
         Operand("ape", torch.bfloat16, f"[{g.index_kpool},128]"),
         Operand("tails", torch.uint8, f"[slots,{TAIL_BYTES}]", "inout"),
-        Operand("replay", torch.bfloat16, f"[{REPLAY_ROWS},256]", "out"),
+        Operand("replay", torch.bfloat16, f"[{replay_rows},256]", "out"),
         Operand("index_cache", torch.uint8, "[pool_pages,8448]", "inout"),
         Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{i},128]", "out"),
         Operand("head_weights", torch.float32, f"[rows,{i}]", "out"),
@@ -1626,21 +1657,21 @@ def compile_glmf_index_producer_c_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows
     )
     return compile_program(
         launch, name="glmf_index_producer_c", operands=operands, scalars=(Scalar("rows"), Scalar("spec")),
-        key=(max_rows, launch.key()),
+        key=(max_rows, launch.key()) + (() if replay_rows == REPLAY_ROWS else (("replay_rows", replay_rows),)),
         geometry={"hidden": h, "index_heads": i, "max_rows": max_rows, "kpool": g.index_kpool,
-                  "eps": g.index_norm_eps, "tail_bytes": TAIL_BYTES, "replay_rows": REPLAY_ROWS},
+                  "eps": g.index_norm_eps, "tail_bytes": TAIL_BYTES, "replay_rows": replay_rows},
         scratch={"scratch": lambda rows: index_producer_c_scratch_bytes(g, rows)},
         doc=compile_glmf_index_producer_c_aot.__doc__,
     )
 
 
 class _KdaCommitCompact:
-    def __init__(self, g: GLMFGeometry, state_dtype: str = "float32"):
+    def __init__(self, g: GLMFGeometry, state_dtype: str = "float32", replay_rows: int = REPLAY_ROWS):
         self.g = g
         self.recurrent = GlmfKdaCommit(heads=g.kda_heads, channels=3 * g.kda_width,
-                                       state_dtype=_kda_state(state_dtype, "window")[0])
-        self.conv = GlmfKdaConvCommit(heads=g.kda_heads, channels=3 * g.kda_width)
-        self.tail = GlmfIndexTailCommit(kpool=g.index_kpool)
+                                       state_dtype=_kda_state(state_dtype, "window")[0], replay_rows=replay_rows)
+        self.conv = GlmfKdaConvCommit(heads=g.kda_heads, channels=3 * g.kda_width, replay_rows=replay_rows)
+        self.tail = GlmfIndexTailCommit(kpool=g.index_kpool, replay_rows=replay_rows)
 
     @cute.jit
     def __call__(self, state: cute.Pointer, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer,
@@ -1651,7 +1682,8 @@ class _KdaCommitCompact:
         self.tail(tails, index_replay, tables, sequences, index_layers, slots, stream)
 
 
-def compile_glmf_kda_commit_c_aot(g: GLMFGeometry = GLM53_FLASH, *, state_dtype: str = "float32") -> AotProgram:
+def compile_glmf_kda_commit_c_aot(g: GLMFGeometry = GLM53_FLASH, *, state_dtype: str = "float32",
+                                  replay_rows: int = REPLAY_ROWS) -> AotProgram:
     """``glmf_kda_commit`` over the compact index cache: after a speculative decode step,
     apply each sequence's accepted rows to its recurrent and conv state in every KDA layer,
     and rebuild its index tail in every DSA layer from the old tail and the kept rows'
@@ -1666,11 +1698,15 @@ def compile_glmf_kda_commit_c_aot(g: GLMFGeometry = GLM53_FLASH, *, state_dtype:
     ``state_dtype="bfloat16"``: over the BF16 state of ``glmf_kda``'s BF16-state programs; the
     KDA half is ``compile_glmf_kda_commit_aot(state_dtype="bfloat16")``'s, the tails as with
     FP32. The FP32 program's operands, key and geometry are unchanged.
+
+    ``replay_rows``: both records' rows (``REPLAY_ROWS``, or a wide verify's: ``index_replay``
+    is then ``[index_layers, replay_rows, 256]``), as ``compile_glmf_kda_commit_aot``'s.
     """
     state_torch = _kda_state(state_dtype, "window")[1]
-    launch = _KdaCommitCompact(g, state_dtype)
+    replay_rows = int(replay_rows)
+    launch = _KdaCommitCompact(g, state_dtype, replay_rows)
     heads, d = g.kda_heads, g.kda_width
-    record = kda_replay_layout(heads, 3 * d)[2]
+    record = kda_replay_layout(heads, 3 * d, replay_rows)[2]
     return compile_program(
         launch, name="glmf_kda_commit_c",
         operands=(Operand("state", state_torch, f"[layers,slots,{heads},128,128]", "inout"),
@@ -1678,10 +1714,10 @@ def compile_glmf_kda_commit_c_aot(g: GLMFGeometry = GLM53_FLASH, *, state_dtype:
                   Operand("replay", torch.float32, f"[layers,{record // 4}]"),
                   Operand("tables", torch.int32, "[3,sequences]", align=4),
                   Operand("tails", torch.uint8, f"[index_layers,slots,{TAIL_BYTES}]", "inout"),
-                  Operand("index_replay", torch.bfloat16, f"[index_layers,{REPLAY_ROWS},256]")),
+                  Operand("index_replay", torch.bfloat16, f"[index_layers,{replay_rows},256]")),
         scalars=(Scalar("sequences"), Scalar("layers"), Scalar("slots"), Scalar("index_layers")),
-        key=(heads, d, REPLAY_ROWS, TAIL_BYTES) + (() if state_dtype == "float32" else (state_dtype,)),
-        geometry={"heads": heads, "channels": 3 * d, "replay_rows": REPLAY_ROWS, "replay_bytes": record,
+        key=(heads, d, replay_rows, TAIL_BYTES) + (() if state_dtype == "float32" else (state_dtype,)),
+        geometry={"heads": heads, "channels": 3 * d, "replay_rows": replay_rows, "replay_bytes": record,
                   "tail_bytes": TAIL_BYTES, **_state_geometry(state_dtype, "window")},
         doc=compile_glmf_kda_commit_c_aot.__doc__,
     )
