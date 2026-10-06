@@ -1503,6 +1503,57 @@ def cp_async4_shared_global_pred(
 
 
 @dsl_user_op
+def cp_async4_shared_global_pred_l2hint(
+    smem_addr: Int32,
+    gmem_addr: Int64,
+    pred: Int32,
+    cache_policy: Uint64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Predicated 16-byte `cp.async.cg.shared.global` copy with an L2 cache
+    policy (for example `create_l2_evict_first_policy` for one-pass weights)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(pred).ir_value(loc=loc, ip=ip),
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Uint64(cache_policy).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.ne.b32 p, $0, 0; "
+        "@p cp.async.cg.shared.global.L2::cache_hint [$1], [$2], 16, $3; }",
+        "r,r,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def prefetch_bulk_global_l2(gmem_addr: Int64, nbytes: Int32, *, loc=None, ip=None) -> None:
+    """Prefetch `nbytes` (a multiple of 16, 16-byte aligned) of global memory
+    into L2 with one `cp.async.bulk.prefetch.L2` (SM90 and later)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Int32(nbytes).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def cp_async4_ca_shared_global_pred(
     smem_addr: Int32, gmem_addr: Int64, pred: Int32, *, loc=None, ip=None
 ):
