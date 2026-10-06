@@ -7,7 +7,8 @@ and speculative steps committed at every kept count. After every step the pooled
 the index query and the head weights are bitwise equal, and every sequence's tail holds
 exactly the key | gate rows of its open pool (the per-token keys at those positions) with a
 zero past its count. The KDA half of ``glmf_kda_commit_c`` equals ``glmf_kda_commit``
-bitwise. With ``GLMF_SNAPSHOT`` (a GLM-5.3-Flash checkpoint directory) the same runs on
+bitwise, over an FP32 state and over the BF16 state of ``--kda-state bf16`` (both programs'
+``state_dtype="bfloat16"`` variants). With ``GLMF_SNAPSHOT`` (a GLM-5.3-Flash checkpoint directory) the same runs on
 layer 3's indexer weights with real embedding rows through its input norm.
 """
 
@@ -182,9 +183,10 @@ class World:
                 seq["len"] += n
             self.check_tails([seq for seq, _ in parts])
 
-    def commit(self, parts, keeps):
+    def commit(self, parts, keeps, state_dtype="float32"):
         """``glmf_kda_commit_c`` after a speculative step over ``parts``: sequence i keeps
-        ``keeps[i]`` rows. Its KDA half against ``glmf_kda_commit`` on the same random state."""
+        ``keeps[i]`` rows. Its KDA half against ``glmf_kda_commit`` on the same random state,
+        FP32 or (``state_dtype="bfloat16"``) BF16, both programs built for that state."""
         from b12x.integration.cuteafd import GLM53_FLASH as g
         from b12x.integration.cuteafd._glmf_kernels import kda_replay_layout
 
@@ -197,14 +199,20 @@ class World:
         d = g.kda_width
         record = kda_replay_layout(g.kda_heads, 3 * d)[2]
         state = torch.randn((1, self.slots, g.kda_heads, 128, 128), generator=self.gen, device="cuda")
+        bf16 = state_dtype == "bfloat16"
+        if bf16:
+            state = state.bfloat16()
         conv = torch.randn((1, self.slots, 3, 3 * d), generator=self.gen, device="cuda").bfloat16()
         replay = torch.rand((1, record // 4), generator=self.gen, device="cuda")
         state_c, conv_c = state.clone(), conv.clone()
-        P("commit").launch(state, conv, replay, tables, scalars=(len(parts), 1, self.slots))
-        P("commit_c").launch(state_c, conv_c, replay, tables, self.tails.view(1, self.slots, TAIL_BYTES),
-                             self.replay.view(1, 64, 256), scalars=(len(parts), 1, self.slots, 1))
+        # The FP32 programs are built without the keyword, as the exporter builds them.
+        kw = {"state_dtype": state_dtype} if bf16 else {}
+        P("commit", **kw).launch(state, conv, replay, tables, scalars=(len(parts), 1, self.slots))
+        P("commit_c", **kw).launch(state_c, conv_c, replay, tables, self.tails.view(1, self.slots, TAIL_BYTES),
+                                   self.replay.view(1, 64, 256), scalars=(len(parts), 1, self.slots, 1))
         torch.cuda.synchronize()
-        assert torch.equal(state.view(torch.int32), state_c.view(torch.int32))
+        word = torch.int16 if bf16 else torch.int32
+        assert torch.equal(state.view(word), state_c.view(word))
         assert torch.equal(conv.view(torch.int16), conv_c.view(torch.int16))
         for (seq, _), keep in zip(parts, keeps):
             seq["len"] += keep
@@ -275,6 +283,23 @@ def test_speculative_commit_at_every_kept_count(rows):
         # The next steps read the committed tails.
         world.step([(seq, 1 + (i % 3)) for i, seq in enumerate(seqs)], 64)
         world.step([(seq, 4) for seq in seqs], 64)
+
+
+@pytest.mark.parametrize("rows", [1, 6])
+def test_speculative_commit_over_a_bf16_kda_state(rows):
+    """The compact cache with ``--kda-state bf16`` commits with ``glmf_kda_commit_c``'s BF16-state
+    variant: its KDA half equals ``glmf_kda_commit``'s BF16-state program, its tails as with FP32."""
+    g = _g()
+    for keep in range(rows + 1):
+        world = World(g, _random_weights(g, 4), seed=30 + keep)
+        seqs = [world.admit(600) for _ in range(4)]
+        for r, seq in enumerate(seqs):
+            world.step([(seq, 300 + r)], 4096)
+        parts = [(seq, rows) for seq in seqs]
+        world.step(parts, 64, spec=True)
+        world.commit(parts, [keep] * len(seqs), state_dtype="bfloat16")
+        # The next step reads the committed tails.
+        world.step([(seq, 1 + (i % 3)) for i, seq in enumerate(seqs)], 64)
 
 
 def test_speculative_rounds_with_mixed_kept_counts():
