@@ -25,6 +25,11 @@ per layer: the normalized key, decay and value per head in FP32, beta, and
 the q/k/v in-projection row); ``GlmfKdaCommit`` / ``GlmfKdaConvCommit`` then
 apply a sequence's accepted rows with the recurrent step's own arithmetic, so
 the state equals that of serial steps over those rows.
+
+The recurrent state is FP32, or BF16 (``state_dtype=BFloat16``): computed in
+FP32 and rounded to nearest even after every row, after that row's read-out,
+so R rows in one launch give the bits of R single-row launches and a verify
+committed at k rows the state of k serial steps.
 """
 
 from __future__ import annotations
@@ -66,6 +71,26 @@ def kda_replay_layout(heads: int, channels: int) -> tuple[int, int, int]:
 @cute.jit
 def _sigmoid(x: Float32) -> Float32:
     return div_rn_f32(Float32(1.0), Float32(1.0) + cute.math.exp(-x, fastmath=False))
+
+
+def _state_type(state_dtype) -> tuple[type, int]:
+    """(element type, bytes) of a KDA recurrent state: FP32 or BF16."""
+    if state_dtype is Float32:
+        return Float32, 4
+    if state_dtype is BFloat16:
+        return BFloat16, 2
+    raise ValueError("the KDA recurrent state is Float32 or BFloat16")
+
+
+@cute.jit
+def _round_state_rows(s: cute.Tensor):
+    """Rounds the ``[4, 4]`` state fragment to BF16 (RNE) in place, through the packing
+    instruction (a truncf/extf pair may be folded away)."""
+    for j in cutlass.range_constexpr(4):
+        for i in cutlass.range_constexpr(2):
+            word = pack_f32x2_to_bfloat2(s[j, 2 * i], s[j, 2 * i + 1])
+            s[j, 2 * i] = _bf16_lo(word)
+            s[j, 2 * i + 1] = _bf16_hi(word)
 
 
 @cute.jit
@@ -469,27 +494,29 @@ class GlmfKdaRecurrent:
     ``qkv`` BF16 ``[rows, 3D]`` (conv outputs q | k | v), ``g_raw`` BF16 rows
     of stride ``g_stride`` (``f_b(f_a(x))``), ``b_raw`` BF16 rows of stride
     ``b_stride`` (``b_proj(x)``, one per head), ``a_log`` FP32 ``[H]``,
-    ``dt_bias`` FP32 ``[D]``, ``state`` FP32 ``[slots, H, 128 (v), 128 (k)]``
-    (the b12x ``gdn_decode`` layout), ``slots`` i32 ``[rows]`` (negative: zero
-    state, not stored), ``out`` BF16 ``[rows, D]``.
+    ``dt_bias`` FP32 ``[D]``, ``state`` FP32 (``state_dtype``: or BF16)
+    ``[slots, H, 128 (v), 128 (k)]`` (the b12x ``gdn_decode`` layout), ``slots``
+    i32 ``[rows]`` (negative: zero state, not stored), ``out`` BF16 ``[rows, D]``.
 
     Grid ``(H, 128 / 32)``: a CTA owns 32 value rows of one head, each of its 8
     warps 4 rows, each lane 4 key columns of those rows in registers. Rows run
     in order; a row whose slot differs from the previous row's stores the
-    previous sequence's state and loads its own.
+    previous sequence's state and loads its own. A BF16 state is rounded after
+    every row's read-out (stores are then exact).
     """
 
     threads = 256
     v_block = 32
 
     def __init__(self, *, heads: int, lower_bound: float, qkv_width: int, g_stride: int, b_stride: int,
-                 eps: float = 1.0e-6):
+                 eps: float = 1.0e-6, state_dtype=Float32):
         self.heads = int(heads)
         self.width = self.heads * KDA_HEAD
         self.lower_bound = float(lower_bound)
         self.qkv_width, self.g_stride, self.b_stride = int(qkv_width), int(g_stride), int(b_stride)
         self.eps = float(eps)
         self.scale = KDA_HEAD ** -0.5
+        self.state_dtype, self.state_bytes = _state_type(state_dtype)
 
     @cute.jit
     def __call__(self, qkv: cute.Pointer, g_raw: cute.Pointer, b_raw: cute.Pointer, a_log: cute.Pointer,
@@ -514,8 +541,9 @@ class GlmfKdaRecurrent:
 
     @cute.jit
     def _state_tensor(self, state: cute.Pointer, slot: Int64, head: Int64) -> cute.Tensor:
-        base = Int64(state.toint()) + ((slot * Int64(self.heads) + head) * Int64(KDA_HEAD * KDA_HEAD)) * Int64(4)
-        return cute.make_tensor(cute.make_ptr(Float32, base, cute.AddressSpace.gmem, assumed_align=16),
+        base = Int64(state.toint()) + ((slot * Int64(self.heads) + head) * Int64(KDA_HEAD * KDA_HEAD)) \
+            * Int64(self.state_bytes)
+        return cute.make_tensor(cute.make_ptr(self.state_dtype, base, cute.AddressSpace.gmem, assumed_align=16),
                                 cute.make_layout((KDA_HEAD, KDA_HEAD), stride=(KDA_HEAD, 1)))
 
     @cute.kernel
@@ -554,12 +582,18 @@ class GlmfKdaRecurrent:
                         old = self._state_tensor(state, current, head)
                         for j in cutlass.range_constexpr(4):
                             for i in cutlass.range_constexpr(4):
-                                old[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+                                if cutlass.const_expr(self.state_bytes == 4):
+                                    old[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+                                else:
+                                    old[v0 + Int64(j), k0 + Int64(i)] = s[j, i].to(BFloat16)
                 if slot >= Int64(0):
                     new = self._state_tensor(state, slot, head)
                     for j in cutlass.range_constexpr(4):
                         for i in cutlass.range_constexpr(4):
-                            s[j, i] = new[v0 + Int64(j), k0 + Int64(i)]
+                            if cutlass.const_expr(self.state_bytes == 4):
+                                s[j, i] = new[v0 + Int64(j), k0 + Int64(i)]
+                            else:
+                                s[j, i] = Float32(new[v0 + Int64(j), k0 + Int64(i)])
                 else:
                     for j in cutlass.range_constexpr(4):
                         for i in cutlass.range_constexpr(4):
@@ -605,12 +639,18 @@ class GlmfKdaRecurrent:
                 o = _warp_sum(o)
                 if lane == Int32(j):
                     out[row, col + v0 + Int64(j)] = o.to(BFloat16)
+            if cutlass.const_expr(self.state_bytes == 2):
+                # The row's read-out used the FP32 update; the next row starts from it rounded.
+                _round_state_rows(s)
         if current >= Int64(0):
             if spec == Int32(0):
                 old = self._state_tensor(state, current, head)
                 for j in cutlass.range_constexpr(4):
                     for i in cutlass.range_constexpr(4):
-                        old[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+                        if cutlass.const_expr(self.state_bytes == 4):
+                            old[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+                        else:
+                            old[v0 + Int64(j), k0 + Int64(i)] = s[j, i].to(BFloat16)
 
 
 @cute.jit
@@ -632,20 +672,22 @@ class GlmfKdaCommit:
     """Applies each sequence's accepted rows of a speculative step to its
     recurrent state, in every KDA layer at once.
 
-    ``state`` FP32 ``[layers, slots, H, 128, 128]``, ``replay`` the layers'
-    records (``replay_bytes`` apart, see ``kda_replay_layout``), ``tables``
-    i32 ``[3, sequences]``: state slot, first step row and accepted rows of
-    each sequence. Grid ``(H, 128 / 32, sequences * layers)`` with the
-    recurrent kernel's thread mapping and update arithmetic (decay, memory,
-    delta, rank-1 update per row), so the result is what serial steps store.
+    ``state`` FP32 (``state_dtype``: or BF16) ``[layers, slots, H, 128, 128]``,
+    ``replay`` the layers' records (``replay_bytes`` apart, see
+    ``kda_replay_layout``), ``tables`` i32 ``[3, sequences]``: state slot, first
+    step row and accepted rows of each sequence. Grid ``(H, 128 / 32,
+    sequences * layers)`` with the recurrent kernel's thread mapping and update
+    arithmetic (decay, memory, delta, rank-1 update per row, a BF16 state
+    rounded after each), so the result is what serial steps store.
     """
 
     threads = 256
     v_block = 32
 
-    def __init__(self, *, heads: int, channels: int):
+    def __init__(self, *, heads: int, channels: int, state_dtype=Float32):
         self.heads = int(heads)
         self.beta_off, _, self.replay_bytes = kda_replay_layout(self.heads, int(channels))
+        self.state_dtype, self.state_bytes = _state_type(state_dtype)
 
     @cute.jit
     def __call__(self, state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,
@@ -669,8 +711,8 @@ class GlmfKdaCommit:
         keep = Int32(tables[2, seq])
         if slot >= Int64(0):
             base = Int64(state.toint()) + (((layer * Int64(slots) + slot) * Int64(self.heads) + head)
-                                           * Int64(KDA_HEAD * KDA_HEAD)) * Int64(4)
-            st = cute.make_tensor(cute.make_ptr(Float32, base, cute.AddressSpace.gmem, assumed_align=16),
+                                           * Int64(KDA_HEAD * KDA_HEAD)) * Int64(self.state_bytes)
+            st = cute.make_tensor(cute.make_ptr(self.state_dtype, base, cute.AddressSpace.gmem, assumed_align=16),
                                   cute.make_layout((KDA_HEAD, KDA_HEAD), stride=(KDA_HEAD, 1)))
             record = Int64(replay.toint()) + layer * Int64(self.replay_bytes)
             rows = _replay_rows(record, self.heads)
@@ -680,7 +722,10 @@ class GlmfKdaCommit:
             decay = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
             for j in cutlass.range_constexpr(4):
                 for i in cutlass.range_constexpr(4):
-                    s[j, i] = st[v0 + Int64(j), k0 + Int64(i)]
+                    if cutlass.const_expr(self.state_bytes == 4):
+                        s[j, i] = st[v0 + Int64(j), k0 + Int64(i)]
+                    else:
+                        s[j, i] = Float32(st[v0 + Int64(j), k0 + Int64(i)])
             for t in cutlass.range(keep, unroll=1):
                 row = first + Int64(t)
                 for i in cutlass.range_constexpr(4):
@@ -696,9 +741,14 @@ class GlmfKdaCommit:
                     delta = (v - _warp_sum(memory)) * beta
                     for i in cutlass.range_constexpr(4):
                         s[j, i] = s[j, i] + k[i] * delta
+                if cutlass.const_expr(self.state_bytes == 2):
+                    _round_state_rows(s)
             for j in cutlass.range_constexpr(4):
                 for i in cutlass.range_constexpr(4):
-                    st[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+                    if cutlass.const_expr(self.state_bytes == 4):
+                        st[v0 + Int64(j), k0 + Int64(i)] = s[j, i]
+                    else:
+                        st[v0 + Int64(j), k0 + Int64(i)] = s[j, i].to(BFloat16)
 
 
 class GlmfKdaConvCommit:
