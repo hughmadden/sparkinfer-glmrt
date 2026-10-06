@@ -45,6 +45,8 @@ def test_decode_schedule_presets_parse_and_round_trip() -> None:
     assert gb10 is not None
     assert gb10.canonical() == DECODE_SCHEDULE_PRESETS["gb10"]
     assert parse_decode_schedule(gb10.canonical()) == gb10
+    # Measured on GB10: evict-first weights only.
+    assert gb10 == MixedTrellisDecodeSchedule(l2_evict_first_b=True)
     for default in (None, "", "default", "l2=1,pf1=0,pf2=0,pdl=1", "pf2=0"):
         assert parse_decode_schedule(default) is None
     custom = parse_decode_schedule("pf2=8,l2=2")
@@ -142,7 +144,7 @@ def test_phase_prefetch_needs_both_tile_prefetches() -> None:
     with pytest.raises(ValueError, match="phase L2 prefetch"):
         _fused(fc1_l2_prefetch_k_tiles=4, phase_l2_prefetch=True)
     default = _fused()
-    scheduled = _fused(**parse_decode_schedule("gb10").kernel_options())
+    scheduled = _fused(**parse_decode_schedule("l2=2,pf1=4,pf2=8,pdl=2").kernel_options())
     assert scheduled.phase_l2_prefetch and not default.phase_l2_prefetch
     assert scheduled.__cache_key__[-1] == "phase_l2_prefetch"
     assert "phase_l2_prefetch" not in default.__cache_key__
@@ -271,3 +273,18 @@ def test_glmf_decode_row_alone_in_8_and_in_64_has_one_result(glmf_layer, variant
     assert torch.equal(in_64, alone)
     # ...and the same bits as the default schedule's row alone.
     assert torch.equal(alone, _run(glmf_layer, slice(row, row + 1), 1))
+
+
+@requires_sm12x
+def test_glmf_gb10_package_shape_keeps_one_result_per_row(glmf_layer) -> None:
+    """The gb10 package's decode exports: m1 keeps the 64x256 tile, m80 runs 64x128 tiles at
+    two CTAs per SM, both evict-first. A row alone (m1), in 8 and in 64 (m80) still gets
+    the default schedule's bits."""
+    row = 5
+    alone = _run(glmf_layer, slice(row, row + 1), 1, "gb10", K64_N256, None)
+    in_8 = _run(glmf_layer, slice(0, 8), 80, "gb10", (64, 128, 64, 128), 2)[row : row + 1]
+    in_64 = _run(glmf_layer, slice(0, 64), 80, "gb10", (64, 128, 64, 128), 2)[row : row + 1]
+    default_alone = _run(glmf_layer, slice(row, row + 1), 1)
+    assert torch.equal(alone, default_alone)
+    assert torch.equal(in_8, default_alone)
+    assert torch.equal(in_64, default_alone)
