@@ -2235,10 +2235,14 @@ class MixedTrellisDecodeSchedule:
 
 
 # Named decode schedules. "gb10" is the DGX Spark (SM121, LPDDR5X) schedule
-# for the GLM 5.3 Flash Spark decode packages (FR-G.7(b)); its values are the
-# starting point of the GB10 sweep and move only with a measurement.
+# for the GLM 5.3 Flash Spark decode packages (FR-G.7(b)): evict-first weight
+# words only. Measured on GB10 (one TP4 rank slice, uniform top-8 routes,
+# benchmarks/benchmark_glmf_decode_schedule.py), evict-first alone shortened a
+# call by 1.6-7.3% at 1-80 rows; the next-tile and phase prefetches lost 4% on
+# their own and added nothing to evict-first from 4 rows up, so they stay
+# options for other devices and are off here.
 DECODE_SCHEDULE_PRESETS = {
-    "gb10": "l2=2,pf1=4,pf2=8,pdl=2",
+    "gb10": "l2=2,pf1=0,pf2=0,pdl=1",
 }
 
 
