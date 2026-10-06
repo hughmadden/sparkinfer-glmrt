@@ -157,7 +157,11 @@ def main() -> None:
                 calls()
             graph.replay()
             torch.cuda.synchronize()
+            # The graph replays these buffers and bindings: keep them alive until it is
+            # done (a freed workspace reused by the next variant corrupts the
+            # cooperative kernel's grid-barrier words, and its replays never finish).
             state[name] = {"graph": graph, "digest": digest, "times": [],
+                           "keep": (launch, buffers, bindings, calls),
                            "blocks": launch.blocks_per_sm, "tile": tile, "schedule": launch.decode_schedule}
         for _ in range(args.rounds):
             for name, *_ in variants:
