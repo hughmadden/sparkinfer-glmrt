@@ -14,6 +14,8 @@ Routes (both take the live row count as a launch scalar):
     then the split merge. The split count is planned per live-row bucket
     (``rows == 1``, ``rows <= 8``, ``rows <= max_rows``) with the prepared
     plan's wave-balanced planner, and the program branches on ``rows``.
+    ``full_launch_splits`` (opt-in) plans the buckets whose unsplit launch
+    already exceeds the planner's waves; see ``decode_buckets``.
 ``route="prefill"`` the single-pass multi-head-group (MG) kernel (FP8 QK),
     one CTA per (row, 32-head group); scratch holds the base-2 LSE.
 
@@ -78,18 +80,33 @@ def _traits(g=GLM53):
 _QK = 576
 
 
-def decode_buckets(g: GLMGeometry, max_rows: int) -> tuple[tuple[int, int, int], ...]:
-    """``(rows_cap, num_splits, chunks_per_split)`` per live-row bucket."""
-    from b12x.attention._shared.mla.kernel import plan_unified_decode_splits
+def decode_buckets(g: GLMGeometry, max_rows: int, *, full_launch_splits: int | None = None,
+                   sm_count: int | None = None) -> tuple[tuple[int, int, int], ...]:
+    """``(rows_cap, num_splits, chunks_per_split)`` per live-row bucket.
 
-    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    The wave-balanced planner keeps a launch of ``rows_cap`` rows x 16-head
+    blocks x splits within three waves of the GPU's SMs. When the unsplit
+    launch alone exceeds them (128 rows x 4 blocks = 512 CTAs on 170 SMs), no
+    split count qualifies and the planner splits maximally: one 64-slot chunk
+    per CTA, every row and head writing and re-reading 33 partials. A bucket in
+    that case takes ``full_launch_splits`` splits instead; ``None`` keeps the
+    planner's choice for every bucket, so the programs that do not pass it
+    keep their plans, keys and objects. ``sm_count`` defaults to the current
+    device's."""
+    from b12x.attention._shared.mla.kernel import _CEIL_WAVES_MAX, plan_unified_decode_splits
+
+    if sm_count is None:
+        sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    sms = int(sm_count)
     h_blocks = g.heads // 16
     max_chunks = -(-_topk(g) // _CAND)
     caps = sorted({c for c in (1, 8, int(max_rows)) if c <= int(max_rows)})
     out = []
     for cap in caps:
+        full = full_launch_splits is not None and cap * h_blocks > _CEIL_WAVES_MAX * sms
         _, splits, per_split = plan_unified_decode_splits(
-            topk=_topk(g), max_chunks=max_chunks, num_tokens=cap, h_blocks=h_blocks, sm_count=sms)
+            topk=_topk(g), max_chunks=max_chunks, num_tokens=cap, h_blocks=h_blocks, sm_count=sms,
+            preferred_num_splits=int(full_launch_splits) if full else None)
         out.append((cap, int(splits), int(per_split)))
     return tuple(out)
 
@@ -157,7 +174,7 @@ class _Prefill:
 
 
 class _Decode:
-    def __init__(self, g: GLMGeometry, max_rows: int, fp32_partials=False):
+    def __init__(self, g: GLMGeometry, max_rows: int, fp32_partials=False, full_launch_splits=None):
         from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel
         from b12x.attention._shared.mla.merge import SparseMLASplitDecodeMergeKernel
         from b12x.attention._shared.mla.smem import make_smem_layout
@@ -171,7 +188,7 @@ class _Decode:
         hpb = int(traits.hpb)
         if self.heads % hpb:
             raise ValueError("GLM decode needs heads divisible by 16")
-        self.buckets = decode_buckets(g, max_rows)
+        self.buckets = decode_buckets(g, max_rows, full_launch_splits=full_launch_splits)
         n = self.heads
         self.kernels, self.merges = [], []
         for _, splits, per_split in self.buckets:
@@ -236,20 +253,26 @@ class _Decode:
 
 
 def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill", max_rows: int = 1,
-                               name: str = "glm_sparse_mla", fp32_partials: bool = False):
+                               name: str = "glm_sparse_mla", fp32_partials: bool = False,
+                               full_launch_splits: int | None = None):
     """GLM latent sparse MLA; see the module docstring for the ABI. A GLM 5.3
     Flash geometry (``GLMFGeometry``) selects the 512-wide query, 528-byte
     records (``ModelType.GLM_NEXT``) and its 2112-slot index rows. The opt-in
     ``fp32_partials`` retains GLM Flash decode's normalized split outputs in
     FP32 until the merge; the final output and the pointer/scalar ABI stay
-    BF16 and unchanged. Other families keep their existing BF16 path."""
+    BF16 and unchanged. Other families keep their existing BF16 path. The
+    opt-in ``full_launch_splits`` gives the decode buckets whose unsplit
+    launch already exceeds the split planner's waves that many splits
+    (``decode_buckets``); the scratch follows the plan."""
     if fp32_partials and (route != "decode" or not isinstance(g, GLMFGeometry)):
         raise ValueError("fp32_partials is supported only for GLM Flash decode")
+    if full_launch_splits is not None and (route != "decode" or int(full_launch_splits) < 1):
+        raise ValueError("full_launch_splits plans decode buckets: a split count of at least 1")
     if route == "prefill":
         launch = _Prefill(g)
         buckets = ()
     elif route == "decode":
-        launch = _Decode(g, int(max_rows), fp32_partials)
+        launch = _Decode(g, int(max_rows), fp32_partials, full_launch_splits)
         buckets = launch.buckets
     else:
         raise ValueError("route must be 'prefill' or 'decode'")
