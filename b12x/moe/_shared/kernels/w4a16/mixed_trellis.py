@@ -116,6 +116,8 @@ class MixedTrellisCompileResult:
     ws_input_stages: int | None = field(default=None, kw_only=True)
     # Opt-in INT8 activations/decoded weights for warp-specialized prefill.
     activations: str = field(default="a16", kw_only=True)
+    # The L2 decode schedule's canonical spec (None: the default schedule).
+    decode_schedule: str | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -605,6 +607,88 @@ class W4A16MixedTrellisKernel:
                         lock_slot,
                         active_size_m,
                     )
+
+    @cute.jit
+    def _prefetch_tier_tile(
+        self,
+        is_fc1: cutlass.Constexpr,
+        t0_b_flat: cute.Tensor,
+        t1_b_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        tid: Int32,
+        tier0_num_experts: Int32,
+        tier1_num_experts: Int32,
+        tier0_fc2_experts: Int32,
+        tier1_fc2_experts: Int32,
+        tier0_gate_experts: Int32,
+        tier1_gate_experts: Int32,
+        tier0_up_experts: Int32,
+        tier1_up_experts: Int32,
+        route_block_idx: Int32,
+        output_n_tile: Int32,
+    ):
+        """L2 weight schedule: resolve a whole tile's expert exactly as
+        _emit_tier_tile does (packed routes, disjoint ownership) and prefetch
+        its first weight K tiles with the owning tier's GEMM geometry."""
+        metadata_block_idx = route_block_idx
+        if cutlass.const_expr(not is_fc1):
+            metadata_block_idx = route_block_idx // Int32(
+                self.driver.moe_block_size
+                // (
+                    self.driver.fc2.moe_block_size
+                    * self.driver.fc2.schedule_route_block_factor
+                )
+            )
+        combined_expert = block_expert_ids[metadata_block_idx].to(Int32)
+        total_experts = tier0_num_experts + tier1_num_experts
+        descriptor_row = Int32(2)
+        if cutlass.const_expr(is_fc1):
+            fc1_half_tiles = Int32(self.driver.fc1.n_tiles // 2)
+            descriptor_row = Int32(0)
+            if output_n_tile >= fc1_half_tiles:
+                descriptor_row = Int32(1)
+        if combined_expert >= Int32(0) and combined_expert < total_experts:
+            descriptor = descriptor_map[
+                descriptor_row * total_experts + combined_expert
+            ].to(Int32)
+            if descriptor >= Int32(0):
+                tier = descriptor >> Int32(_TIER_DESCRIPTOR_BITS)
+                local_expert = descriptor & Int32(_TIER_DESCRIPTOR_MASK)
+                if cutlass.const_expr(is_fc1):
+                    tier0_in_bounds = local_expert < tier0_gate_experts
+                    tier1_in_bounds = local_expert < tier1_gate_experts
+                    if output_n_tile >= fc1_half_tiles:
+                        tier0_in_bounds = local_expert < tier0_up_experts
+                        tier1_in_bounds = local_expert < tier1_up_experts
+                else:
+                    tier0_in_bounds = local_expert < tier0_fc2_experts
+                    tier1_in_bounds = local_expert < tier1_fc2_experts
+                # GEMMs are named inline: CuTe DSL cannot carry a Python
+                # object through a runtime branch.
+                if tier == Int32(0) and tier0_in_bounds:
+                    if cutlass.const_expr(is_fc1):
+                        self.tier0.fc1._prefetch_tile_b_l2(
+                            t0_b_flat, packed_route_indices, tid,
+                            route_block_idx, local_expert, output_n_tile,
+                        )
+                    else:
+                        self.tier0.fc2._prefetch_tile_b_l2(
+                            t0_b_flat, packed_route_indices, tid,
+                            route_block_idx, local_expert, output_n_tile,
+                        )
+                if tier == Int32(1) and tier1_in_bounds:
+                    if cutlass.const_expr(is_fc1):
+                        self.tier1.fc1._prefetch_tile_b_l2(
+                            t1_b_flat, packed_route_indices, tid,
+                            route_block_idx, local_expert, output_n_tile,
+                        )
+                    else:
+                        self.tier1.fc2._prefetch_tile_b_l2(
+                            t1_b_flat, packed_route_indices, tid,
+                            route_block_idx, local_expert, output_n_tile,
+                        )
 
     @cute.jit
     def __call__(
@@ -1144,6 +1228,47 @@ class W4A16MixedTrellisKernel:
             tier0_up_experts,
             tier1_up_experts,
         )
+        # L2 weight schedule hooks (None unless the decode schedule asks).
+        fc1_prefetch = None
+        fc2_prefetch = None
+        if cutlass.const_expr(self.driver.fc1.l2_prefetch_k_tiles > 0):
+            fc1_prefetch = partial(
+                self._prefetch_tier_tile,
+                True,
+                t0_w13,
+                t1_w13,
+                packed_route_indices,
+                block_expert_ids,
+                descriptor_map,
+                tid,
+                tier0_num_experts,
+                tier1_num_experts,
+                tier0_fc2_experts,
+                tier1_fc2_experts,
+                tier0_gate_experts,
+                tier1_gate_experts,
+                tier0_up_experts,
+                tier1_up_experts,
+            )
+        if cutlass.const_expr(self.driver.fc2.l2_prefetch_k_tiles > 0):
+            fc2_prefetch = partial(
+                self._prefetch_tier_tile,
+                False,
+                t0_w2,
+                t1_w2,
+                packed_route_indices,
+                block_expert_ids,
+                descriptor_map,
+                tid,
+                tier0_num_experts,
+                tier1_num_experts,
+                tier0_fc2_experts,
+                tier1_fc2_experts,
+                tier0_gate_experts,
+                tier1_gate_experts,
+                tier0_up_experts,
+                tier1_up_experts,
+            )
         total_experts = tier0_num_experts + tier1_num_experts
         if cutlass.const_expr(self.token_major_rotation):
             if active_m >= Int32(_TOKEN_MAJOR_ROTATION_MIN_ROWS):
@@ -1220,6 +1345,8 @@ class W4A16MixedTrellisKernel:
             fc1_emit,
             fc2_emit,
             input_rotated=self.token_major_rotation,
+            fc1_prefetch_tile=fc1_prefetch,
+            fc2_prefetch_tile=fc2_prefetch,
         )
 
 
@@ -1938,6 +2065,8 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
             fc1_emit,
             fc2_emit,
             input_rotated=False,
+            fc1_prefetch_tile=None,
+            fc2_prefetch_tile=None,
         )
 
 
@@ -2066,6 +2195,85 @@ def _apply_mixed_residency(kernel, requested: int | None, max_shared_mem: int) -
     kernel.blocks_per_sm = requested
 
 
+@dataclass(frozen=True)
+class MixedTrellisDecodeSchedule:
+    """When, and with which L2 policy, the cooperative kernel fetches weight
+    words. Every option is a memory schedule of the same loads, products and
+    sums, so a schedule never changes a bit of the output:
+
+    - ``l2=2``: weight words are staged with an L2 evict-first policy, so the
+      one-pass weight stream gives way to the activation rows, the phase
+      buffers and the prefetched tile starts that are read again;
+    - ``pf1=N`` / ``pf2=N``: before each FC1 / FC2 whole tile runs, the CTA
+      prefetches the first N weight K tiles (and route indices) of its next
+      tile into L2, so that tile's pipeline does not start with a DRAM round
+      trip;
+    - ``pdl=2``: each GEMM's first tile is prefetched before the grid barrier
+      that precedes it (FC1's during the input rotation, FC2's while a CTA
+      waits for the slowest FC1 tile and runs the activation), the memory
+      analogue of starting the down kernel while gate/up ends.
+    """
+
+    l2_evict_first_b: bool = False
+    fc1_prefetch_k_tiles: int = 0
+    fc2_prefetch_k_tiles: int = 0
+    phase_prefetch: bool = False
+
+    def canonical(self) -> str:
+        return (
+            f"l2={2 if self.l2_evict_first_b else 1},pf1={self.fc1_prefetch_k_tiles},"
+            f"pf2={self.fc2_prefetch_k_tiles},pdl={2 if self.phase_prefetch else 1}"
+        )
+
+    def kernel_options(self) -> dict[str, object]:
+        return {
+            "l2_evict_first_b": self.l2_evict_first_b,
+            "fc1_l2_prefetch_k_tiles": self.fc1_prefetch_k_tiles,
+            "fc2_l2_prefetch_k_tiles": self.fc2_prefetch_k_tiles,
+            "phase_l2_prefetch": self.phase_prefetch,
+        }
+
+
+# Named decode schedules. "gb10" is the DGX Spark (SM121, LPDDR5X) schedule
+# for the GLM 5.3 Flash Spark decode packages (FR-G.7(b)); its values are the
+# starting point of the GB10 sweep and move only with a measurement.
+DECODE_SCHEDULE_PRESETS = {
+    "gb10": "l2=2,pf1=4,pf2=8,pdl=2",
+}
+
+
+def parse_decode_schedule(spec: str | None) -> MixedTrellisDecodeSchedule | None:
+    """Parse a preset name or ``key=value`` list (l2, pf1, pf2, pdl); None,
+    "" and "default" are the default schedule (no option)."""
+    if spec is None or spec in ("", "default"):
+        return None
+    text = DECODE_SCHEDULE_PRESETS.get(str(spec), str(spec))
+    values = {"l2": 1, "pf1": 0, "pf2": 0, "pdl": 1}
+    seen = set()
+    for item in text.split(","):
+        key, sep, value = item.strip().partition("=")
+        if not sep or key not in values or key in seen:
+            raise ValueError(f"unknown or repeated decode schedule option {item!r} in {spec!r}")
+        seen.add(key)
+        try:
+            values[key] = int(value)
+        except ValueError:
+            raise ValueError(f"decode schedule option {key} needs an integer: {item!r}") from None
+    if values["l2"] not in (1, 2) or values["pdl"] not in (1, 2):
+        raise ValueError(f"decode schedule l2 and pdl are 1 or 2: {spec!r}")
+    if not 0 <= values["pf1"] <= 64 or not 0 <= values["pf2"] <= 64:
+        raise ValueError(f"decode schedule prefetch depths are 0..64 K tiles: {spec!r}")
+    if values["pdl"] == 2 and not (values["pf1"] and values["pf2"]):
+        raise ValueError(f"decode schedule pdl=2 needs pf1 and pf2: {spec!r}")
+    schedule = MixedTrellisDecodeSchedule(
+        l2_evict_first_b=values["l2"] == 2,
+        fc1_prefetch_k_tiles=values["pf1"],
+        fc2_prefetch_k_tiles=values["pf2"],
+        phase_prefetch=values["pdl"] == 2,
+    )
+    return None if schedule == MixedTrellisDecodeSchedule() else schedule
+
+
 def compile_mixed_trellis(
     *,
     size_m: int,
@@ -2099,11 +2307,20 @@ def compile_mixed_trellis(
     ws_input_stages: int | None = None,
     ws_dynamic_tiles: bool = False,
     activations: str = "a16",
+    decode_schedule: str | None = None,
 ) -> MixedTrellisCompileResult:
     if activations not in ("a16", "a8"):
         raise ValueError(f"unsupported EXL3 activations {activations!r}")
     if activations == "a8" and not warp_specialized:
         raise ValueError("EXL3 A8 requires the warp-specialized prefill kernel")
+    schedule = parse_decode_schedule(decode_schedule)
+    if schedule is not None and (
+        warp_specialized or paired_boundary is not None or direct_topk_routes
+    ):
+        raise ValueError(
+            "the L2 decode schedule applies to the cooperative packed-route "
+            "kernel with disjoint ownership"
+        )
     if input_format not in ("bf16", "e4m3_k32"):
         raise ValueError(f"unsupported mixed Trellis input format {input_format!r}")
     if input_format == "e4m3_k32" and (
@@ -2189,6 +2406,7 @@ def compile_mixed_trellis(
             schedule_whole_tiles=True,
             fused_input_rotation=fused_input_rotation and not warp_specialized,
             activation_output_a8=activations == "a8",
+            **({} if schedule is None else schedule.kernel_options()),
         )
 
     def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellisKernel:
@@ -2406,6 +2624,7 @@ def compile_mixed_trellis(
         input_format=str(input_format),
         ws_input_stages=ws_input_stages,
         activations=activations,
+        decode_schedule=None if schedule is None else schedule.canonical(),
     )
     _CACHE[cache_key] = result
     return result
