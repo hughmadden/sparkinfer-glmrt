@@ -1635,9 +1635,10 @@ def compile_glmf_index_producer_c_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows
 
 
 class _KdaCommitCompact:
-    def __init__(self, g: GLMFGeometry):
+    def __init__(self, g: GLMFGeometry, state_dtype: str = "float32"):
         self.g = g
-        self.recurrent = GlmfKdaCommit(heads=g.kda_heads, channels=3 * g.kda_width)
+        self.recurrent = GlmfKdaCommit(heads=g.kda_heads, channels=3 * g.kda_width,
+                                       state_dtype=_kda_state(state_dtype, "window")[0])
         self.conv = GlmfKdaConvCommit(heads=g.kda_heads, channels=3 * g.kda_width)
         self.tail = GlmfIndexTailCommit(kpool=g.index_kpool)
 
@@ -1650,7 +1651,7 @@ class _KdaCommitCompact:
         self.tail(tails, index_replay, tables, sequences, index_layers, slots, stream)
 
 
-def compile_glmf_kda_commit_c_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
+def compile_glmf_kda_commit_c_aot(g: GLMFGeometry = GLM53_FLASH, *, state_dtype: str = "float32") -> AotProgram:
     """``glmf_kda_commit`` over the compact index cache: after a speculative decode step,
     apply each sequence's accepted rows to its recurrent and conv state in every KDA layer,
     and rebuild its index tail in every DSA layer from the old tail and the kept rows'
@@ -1661,22 +1662,27 @@ def compile_glmf_kda_commit_c_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
     ``[index_layers, slots, 1552]`` (every DSA layer's tails back to back), ``index_replay``
     bf16 ``[index_layers, 64, 256]``. ``index_layers`` must be positive. The tail becomes
     what a plain step over the kept rows leaves.
+
+    ``state_dtype="bfloat16"``: over the BF16 state of ``glmf_kda``'s BF16-state programs; the
+    KDA half is ``compile_glmf_kda_commit_aot(state_dtype="bfloat16")``'s, the tails as with
+    FP32. The FP32 program's operands, key and geometry are unchanged.
     """
-    launch = _KdaCommitCompact(g)
+    state_torch = _kda_state(state_dtype, "window")[1]
+    launch = _KdaCommitCompact(g, state_dtype)
     heads, d = g.kda_heads, g.kda_width
     record = kda_replay_layout(heads, 3 * d)[2]
     return compile_program(
         launch, name="glmf_kda_commit_c",
-        operands=(Operand("state", torch.float32, f"[layers,slots,{heads},128,128]", "inout"),
+        operands=(Operand("state", state_torch, f"[layers,slots,{heads},128,128]", "inout"),
                   Operand("conv_state", torch.bfloat16, f"[layers,slots,3,{3 * d}]", "inout", align=2),
                   Operand("replay", torch.float32, f"[layers,{record // 4}]"),
                   Operand("tables", torch.int32, "[3,sequences]", align=4),
                   Operand("tails", torch.uint8, f"[index_layers,slots,{TAIL_BYTES}]", "inout"),
                   Operand("index_replay", torch.bfloat16, f"[index_layers,{REPLAY_ROWS},256]")),
         scalars=(Scalar("sequences"), Scalar("layers"), Scalar("slots"), Scalar("index_layers")),
-        key=(heads, d, REPLAY_ROWS, TAIL_BYTES),
+        key=(heads, d, REPLAY_ROWS, TAIL_BYTES) + (() if state_dtype == "float32" else (state_dtype,)),
         geometry={"heads": heads, "channels": 3 * d, "replay_rows": REPLAY_ROWS, "replay_bytes": record,
-                  "tail_bytes": TAIL_BYTES},
+                  "tail_bytes": TAIL_BYTES, **_state_geometry(state_dtype, "window")},
         doc=compile_glmf_kda_commit_c_aot.__doc__,
     )
 
