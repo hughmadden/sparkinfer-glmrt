@@ -1511,7 +1511,7 @@ class _IndexProducerCompact:
         self.wq = glm_projection(i * 128, g.q_lora_rank, wide=int(max_rows) > CHUNKED_MIN_ROWS)
         self.wk = glm_projection(256 + i, g.hidden)
         self.post = GlmfIndexPostRows(heads=i, eps=g.index_norm_eps, weight_scale=float(i) ** -0.5 * 128.0 ** -0.5)
-        self.pool = GlmfPoolKeysTail(kpool=g.index_kpool, page_rows=g.page_rows)
+        self.pool = GlmfPoolKeysTail(kpool=g.index_kpool, page_rows=g.page_rows, max_rows=max_rows)
 
     def key(self) -> tuple:
         return (self.wq.key(), self.wk.key(), self.g)

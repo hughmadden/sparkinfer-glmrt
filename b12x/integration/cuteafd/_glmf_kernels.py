@@ -1006,8 +1006,19 @@ TAIL_HEADER = 16
 #: A sequence's index tail in one DSA layer: the header, then the key | gate rows of its open
 #: pool (positions ``4 * floor(len / 4) .. len``), zero past the count.
 TAIL_BYTES = TAIL_HEADER + 3 * KEY_ROW_BYTES
-#: Rows a fixed-step search for a sequence's last step row covers (2^13 = 8192 >= 4096).
+#: The fewest halving steps of the search for a sequence's last step row. 13 cover any step of
+#: up to 8,193 rows; as the floor they keep the 64- and 4,096-row programs as qualified.
 _LAST_ROW_STEPS = 13
+
+
+def last_row_steps(max_rows: int) -> int:
+    """Halving steps ``GlmfPoolKeysTail._last_row`` unrolls for steps of up to ``max_rows`` rows.
+
+    The search starts with ``hi - lo <= max_rows - 1``, and each step leaves at most
+    ``ceil((hi - lo) / 2)``, so ``ceil(log2(max_rows - 1))`` steps, ``(max_rows - 2).bit_length()``,
+    always end on adjacent rows. Never fewer than ``_LAST_ROW_STEPS``.
+    """
+    return max(_LAST_ROW_STEPS, (int(max_rows) - 2).bit_length())
 
 
 class GlmfIndexPostRows:
@@ -1100,17 +1111,19 @@ class GlmfPoolKeysTail:
     open pool, after it has read the old rows (each thread reads and writes only its own
     channel's key and gate), or else the sequence's last row. Speculative steps leave the
     tails alone; ``GlmfIndexTailCommit`` advances them from the replay record.
-    One CTA of 128 threads (one per channel) per row.
+    One CTA of 128 threads (one per channel) per row. ``max_rows`` is the most rows a step
+    may have: the search for a sequence's last row is unrolled deep enough for it.
     """
 
     threads = 128
 
-    def __init__(self, *, kpool: int = 4, page_rows: int = 64):
+    def __init__(self, *, kpool: int = 4, page_rows: int = 64, max_rows: int):
         if kpool != 4:
             raise ValueError("pool keys are built for 4-token pools")
         self.kpool, self.page_rows = int(kpool), int(page_rows)
         self.page_bytes = self.page_rows * (128 + 4)
         self.warps = self.threads // 32
+        self.search_steps = last_row_steps(max_rows)
 
     @cute.jit
     def __call__(self, pool_slots: cute.Pointer, positions: cute.Pointer, kda_slots: cute.Pointer,
@@ -1130,14 +1143,15 @@ class GlmfPoolKeysTail:
     def _last_row(self, seq_first: cute.Tensor, first: Int64, row: Int64, rows: Int32) -> Int64:
         """The last step row of the sequence whose rows start at ``first`` (``row`` is one of
         them). Rows of a sequence are contiguous and sequences are in order, so ``seq_first``
-        does not decrease; a prefill step holds one sequence (one load)."""
+        does not decrease; a prefill step holds one sequence (one load). ``search_steps``
+        halvings reach adjacent rows in any step of up to ``max_rows`` rows."""
         lo = row
         hi = Int64(rows) - Int64(1)
         if Int64(seq_first[hi]) == first:
             lo = hi
         else:
             # seq_first[lo] == first != seq_first[hi]: halve until they are adjacent.
-            for _ in cutlass.range_constexpr(_LAST_ROW_STEPS):
+            for _ in cutlass.range_constexpr(self.search_steps):
                 if hi - lo > Int64(1):
                     mid = (lo + hi) // Int64(2)
                     if Int64(seq_first[mid]) == first:

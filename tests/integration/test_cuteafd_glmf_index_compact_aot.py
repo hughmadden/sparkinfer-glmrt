@@ -309,3 +309,69 @@ def test_real_layer_weights():
         world.step(parts, 64, spec=True)
         world.commit(parts, [rng.randint(1, n) for _, n in parts])
         world.step([(seq, rng.randint(1, 3)) for seq in seqs], 64)
+
+
+# Sequence boundaries in wide steps. The row completing a sequence's open pool writes its tail
+# and searches for the sequence's last row; a step of up to ``max_rows`` rows needs
+# ``last_row_steps(max_rows)`` halvings: 13 up to 8,193 rows, 15 at 32,768
+# (tpurtell/sparkinfer-glmrt#1 review). The host check of the depth rule is
+# ``test_glmf_index_tail_search_contract.py``.
+WIDE = 32768
+
+
+def _wide_world(seed, cap=WIDE, steps=1):
+    g = _g()
+    return World(g, _random_weights(g, seed), seed=seed, units=steps * cap // UNIT + 16)
+
+
+def _lengths(rng, rows, count):
+    cuts = sorted(rng.sample(range(1, rows), count - 1))
+    return [b - a for a, b in zip([0, *cuts], [*cuts, rows])]
+
+
+def test_review_case_two_sequences_in_a_32768_row_step():
+    # The review's SM120 reproduction: A holds 1 row, then one step carries 19,001 more rows
+    # of A and 13,767 of a new sequence B. A's tail counts 2 (19,002 rows); with 13 halvings
+    # its header read [1, 0, 0, 0] while the pooled keys, query and head weights stayed exact.
+    world = _wide_world(20)
+    a, b = world.admit(19002), world.admit(13767)
+    world.step([(a, 1)], WIDE)
+    world.step([(a, 19001), (b, 13767)], WIDE)
+
+
+@pytest.mark.parametrize("start", [1, 2, 3])
+def test_full_32768_row_steps_split_between_two_sequences(start):
+    # A holds ``start`` rows, part-way into a pool, so the row completing that pool searches
+    # for A's last row in the next step: a full step of A's rows then a new sequence B's,
+    # split anywhere from just past the pool to B's last row.
+    for n in (4, 5, 6, 4097, 8191, 8192, 8193, 16384, 16385, 19001, 24575, 32765, 32766, 32767):
+        world = _wide_world(20 + start)
+        a, b = world.admit(start + n), world.admit(WIDE - n)
+        world.step([(a, start)], 64)
+        world.step([(a, n), (b, WIDE - n)], WIDE)
+
+
+def test_random_sequence_layouts_in_full_32768_row_steps():
+    # Up to eight sequences at random positions mod 4 share two full steps; the second step
+    # reads the tails the first one left.
+    rng = random.Random(23)
+    for trial in range(3):
+        world = _wide_world(30 + trial, steps=2)
+        count = rng.randint(2, 8)
+        starts = [rng.randrange(KPOOL) for _ in range(count)]
+        layouts = [_lengths(rng, WIDE, count) for _ in range(2)]
+        seqs = [world.admit(starts[i] + layouts[0][i] + layouts[1][i]) for i in range(count)]
+        opening = [(seq, s) for seq, s in zip(seqs, starts) if s]
+        if opening:
+            world.step(opening, 64)
+        for lengths in layouts:
+            world.step(list(zip(seqs, lengths)), WIDE)
+
+
+def test_the_first_capacity_past_thirteen_halvings():
+    # 8,194 rows is the smallest step that 13 halvings cannot always search (14 here): A holds
+    # 3 rows, so its first row in the step completes the open pool and searches 8,193 rows on.
+    world = _wide_world(40, cap=8194)
+    a, b = world.admit(3 + 8193), world.admit(1)
+    world.step([(a, 3)], 64)
+    world.step([(a, 8193), (b, 1)], 8194)
