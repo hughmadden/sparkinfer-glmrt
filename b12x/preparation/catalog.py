@@ -69,6 +69,7 @@ TUNING_COMPONENTS = (
     KernelTuningRegistration(op_qualname='sequence.engram', contract_ref='b12x.sequence.engram._tuning:TUNING'),
     KernelTuningRegistration(op_qualname='attention.mla_compress', contract_ref='b12x.attention.mla_compress._tuning:TUNING'),
     KernelTuningRegistration(op_qualname='norm.vision', contract_ref='b12x.norm._vision_preparation:TUNING'),
+    KernelTuningRegistration(op_qualname='norm.audio', contract_ref='b12x.norm._audio_preparation:TUNING'),
     KernelTuningRegistration(op_qualname='moe.fused_moe', contract_ref='b12x.moe.fused_moe._tuning:ROUTE_TUNING', variant='route_topk'),
     KernelTuningRegistration(op_qualname='moe.fused_moe', contract_ref='b12x.moe.fused_moe._tuning:FC2_TUNING', variant='fc2'),
 )
