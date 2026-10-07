@@ -59,15 +59,14 @@ def launcher(operation, width, device, kernel=1, stride=1):
 
 def test_norm_live_counts_poison_and_graph_replay():
     device = require_b12x()
-    from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     x = torch.randn(7, 1024, device=device)
     weight, bias = torch.randn(2, 1024, device=device).unbind()
     out = torch.empty_like(x)
     run = launcher("layer_norm", 1024, device)
     run(x, out, 7, weight=weight, bias=bias, parameter=1e-5)
     graph = torch.cuda.CUDAGraph()
-    freeze_kernel_resolution("audio support live rows reuse one callable")
-    try:
+    with kernel_resolution_guard("audio support live rows reuse one callable"):
         for rows in (1, 3, 7):
             out.fill_(float("nan"))
             run(x, out, rows, weight=weight, bias=bias, parameter=1e-5)
@@ -78,8 +77,6 @@ def test_norm_live_counts_poison_and_graph_replay():
         x.mul_(2)
         graph.replay()
         torch.testing.assert_close(out[:3], F.layer_norm(x[:3], (1024,), weight, bias), atol=2e-6, rtol=3e-6)
-    finally:
-        unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("window", [-1, 0, 2])
