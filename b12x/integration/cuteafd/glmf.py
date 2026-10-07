@@ -1481,3 +1481,159 @@ def compile_glmf_join_mla_heads_aot(g_half: GLMFGeometry) -> AotProgram:
     """Bit-exact concatenation of the two BF16 MLA value-head halves."""
     from ._glmf_mla_output_rows import compile_glmf_join_mla_heads_aot as compile_join
     return compile_join(g_half)
+
+
+# ---------------------------------------------------------------------------
+# Compact DSA index cache: pooled keys plus a BF16 tail of at most three rows per sequence
+# and DSA layer (``glmf_index_producer_c_m*``, ``glmf_kda_commit_c``). Appended after the
+# programs above so that their source, and the objects exported from it, stay unchanged.
+# ---------------------------------------------------------------------------
+
+from ._glmf_kernels import (  # noqa: E402
+    KEY_ROW_BYTES,
+    TAIL_BYTES,
+    GlmfIndexPostRows,
+    GlmfIndexTailCommit,
+    GlmfPoolKeysTail,
+)
+
+
+def index_producer_c_scratch_bytes(g: GLMFGeometry, rows: int) -> int:
+    """``index_producer_scratch_bytes``, then the step's key | gate rows BF16 [rows, 256]."""
+    rows = max(int(rows), 1)
+    return index_producer_scratch_bytes(g, rows) + _align(rows * KEY_ROW_BYTES)
+
+
+class _IndexProducerCompact:
+    def __init__(self, g: GLMFGeometry, max_rows: int = 64):
+        self.g = g
+        i = g.index_heads
+        self.wq = glm_projection(i * 128, g.q_lora_rank, wide=int(max_rows) > CHUNKED_MIN_ROWS)
+        self.wk = glm_projection(256 + i, g.hidden)
+        self.post = GlmfIndexPostRows(heads=i, eps=g.index_norm_eps, weight_scale=float(i) ** -0.5 * 128.0 ** -0.5)
+        self.pool = GlmfPoolKeysTail(kpool=g.index_kpool, page_rows=g.page_rows, max_rows=max_rows)
+
+    def key(self) -> tuple:
+        return (self.wq.key(), self.wk.key(), self.g)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, q_resid: cute.Pointer, pool_slots: cute.Pointer, positions: cute.Pointer,
+                 kda_slots: cute.Pointer, seq_first: cute.Pointer, w_iq: cute.Pointer, w_ik: cute.Pointer,
+                 k_norm_w: cute.Pointer, k_norm_b: cute.Pointer, ape: cute.Pointer, tails: cute.Pointer,
+                 replay: cute.Pointer, index_cache: cute.Pointer, q_fp8: cute.Pointer, head_weights: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, spec: Int32, stream: cuda.CUstream):
+        g = self.g
+        base = Int64(scratch.toint())
+        iq = _ptr(cutlass.BFloat16, base)
+        kw_at = base + _align_i64(Int64(rows) * Int64(g.index_heads * 128 * 2))
+        kw = _ptr(cutlass.BFloat16, kw_at)
+        keys = _ptr(cutlass.BFloat16, kw_at + _align_i64(Int64(rows) * Int64((256 + g.index_heads) * 2)))
+        self.wq(q_resid, w_iq, iq, rows, stream)
+        self.wk(x, w_ik, kw, rows, stream)
+        self.post(iq, kw, k_norm_w, k_norm_b, q_fp8, head_weights, keys, replay, spec, rows, stream)
+        self.pool(pool_slots, positions, kda_slots, seq_first, ape, keys, replay, tails, index_cache, spec, rows,
+                  stream)
+
+
+def compile_glmf_index_producer_c_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int) -> AotProgram:
+    """DSA index query and completed pool keys over the compact index cache.
+
+    ``glmf_index_producer`` (the same query, head weights and pooled keys, bit for bit) without
+    per-token key storage: each row's BF16 key | gate row lives in the scratch for the step
+    only, and the rows of a sequence's open pool carry over in its index tail. ``x`` bf16
+    [rows,H], ``q_resid`` bf16 [rows,Q], ``pool_slots`` i64 [rows] (index-cache slot of the
+    pool a row completes, else -1), ``positions`` i64 [rows], ``kda_slots`` i32 [rows] (the
+    sequence's state slot, which also indexes its tail), ``seq_first`` i32 [rows] (first step
+    row of the row's sequence; rows of a sequence are contiguous and in position order),
+    ``w_iq``/``w_ik``/``k_norm_w``/``k_norm_b``/``ape`` as ``glmf_index_producer``, ``tails``
+    u8 [slots,1552] inout (this DSA layer's: i32 count, 12 zero bytes, then the open pool's
+    key | gate rows, zero past the count), ``replay`` bf16 [64,256] out (this layer's record:
+    with ``spec`` != 0 every row's key | gate row goes there and the tails stay as they were,
+    for ``glmf_kda_commit_c``; ``spec`` needs rows <= 64), ``index_cache`` u8
+    [pool_pages,8448] inout, ``q_fp8`` fp8 [rows,I,128] out, ``head_weights`` f32 [rows,I]
+    out; scalars ``rows``, ``spec``.
+    """
+    max_rows = _check_rows(max_rows)
+    launch = _IndexProducerCompact(g, max_rows)
+    h, q, i = g.hidden, g.q_lora_rank, g.index_heads
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{h}]"),
+        Operand("q_resid", torch.bfloat16, f"[rows,{q}]"),
+        Operand("pool_slots", torch.int64, "[rows]", align=8),
+        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("kda_slots", torch.int32, "[rows]", align=4),
+        Operand("seq_first", torch.int32, "[rows]", align=4),
+        Operand("w_iq", torch.bfloat16, f"[{i * 128},{q}]"),
+        Operand("w_ik", torch.bfloat16, f"[{256 + i},{h}]"),
+        Operand("k_norm_w", torch.bfloat16, "[128]"),
+        Operand("k_norm_b", torch.bfloat16, "[128]"),
+        Operand("ape", torch.bfloat16, f"[{g.index_kpool},128]"),
+        Operand("tails", torch.uint8, f"[slots,{TAIL_BYTES}]", "inout"),
+        Operand("replay", torch.bfloat16, f"[{REPLAY_ROWS},256]", "out"),
+        Operand("index_cache", torch.uint8, "[pool_pages,8448]", "inout"),
+        Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{i},128]", "out"),
+        Operand("head_weights", torch.float32, f"[rows,{i}]", "out"),
+        Operand("scratch", torch.uint8, "[index_producer_c_scratch_bytes]", "scratch"),
+    )
+    return compile_program(
+        launch, name="glmf_index_producer_c", operands=operands, scalars=(Scalar("rows"), Scalar("spec")),
+        key=(max_rows, launch.key()),
+        geometry={"hidden": h, "index_heads": i, "max_rows": max_rows, "kpool": g.index_kpool,
+                  "eps": g.index_norm_eps, "tail_bytes": TAIL_BYTES, "replay_rows": REPLAY_ROWS},
+        scratch={"scratch": lambda rows: index_producer_c_scratch_bytes(g, rows)},
+        doc=compile_glmf_index_producer_c_aot.__doc__,
+    )
+
+
+class _KdaCommitCompact:
+    def __init__(self, g: GLMFGeometry):
+        self.g = g
+        self.recurrent = GlmfKdaCommit(heads=g.kda_heads, channels=3 * g.kda_width)
+        self.conv = GlmfKdaConvCommit(heads=g.kda_heads, channels=3 * g.kda_width)
+        self.tail = GlmfIndexTailCommit(kpool=g.index_kpool)
+
+    @cute.jit
+    def __call__(self, state: cute.Pointer, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer,
+                 tails: cute.Pointer, index_replay: cute.Pointer, sequences: Int32, layers: Int32, slots: Int32,
+                 index_layers: Int32, stream: cuda.CUstream):
+        self.recurrent(state, replay, tables, sequences, layers, slots, stream)
+        self.conv(conv_state, replay, tables, sequences, layers, slots, stream)
+        self.tail(tails, index_replay, tables, sequences, index_layers, slots, stream)
+
+
+def compile_glmf_kda_commit_c_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
+    """``glmf_kda_commit`` over the compact index cache: after a speculative decode step,
+    apply each sequence's accepted rows to its recurrent and conv state in every KDA layer,
+    and rebuild its index tail in every DSA layer from the old tail and the kept rows'
+    key | gate rows (``index_replay``, recorded by ``glmf_index_producer_c`` with ``spec``),
+    in one launch.
+
+    ``state``, ``conv_state``, ``replay`` and ``tables`` as ``glmf_kda_commit``; ``tails`` u8
+    ``[index_layers, slots, 1552]`` (every DSA layer's tails back to back), ``index_replay``
+    bf16 ``[index_layers, 64, 256]``. ``index_layers`` must be positive. The tail becomes
+    what a plain step over the kept rows leaves.
+    """
+    launch = _KdaCommitCompact(g)
+    heads, d = g.kda_heads, g.kda_width
+    record = kda_replay_layout(heads, 3 * d)[2]
+    return compile_program(
+        launch, name="glmf_kda_commit_c",
+        operands=(Operand("state", torch.float32, f"[layers,slots,{heads},128,128]", "inout"),
+                  Operand("conv_state", torch.bfloat16, f"[layers,slots,3,{3 * d}]", "inout", align=2),
+                  Operand("replay", torch.float32, f"[layers,{record // 4}]"),
+                  Operand("tables", torch.int32, "[3,sequences]", align=4),
+                  Operand("tails", torch.uint8, f"[index_layers,slots,{TAIL_BYTES}]", "inout"),
+                  Operand("index_replay", torch.bfloat16, f"[index_layers,{REPLAY_ROWS},256]")),
+        scalars=(Scalar("sequences"), Scalar("layers"), Scalar("slots"), Scalar("index_layers")),
+        key=(heads, d, REPLAY_ROWS, TAIL_BYTES),
+        geometry={"heads": heads, "channels": 3 * d, "replay_rows": REPLAY_ROWS, "replay_bytes": record,
+                  "tail_bytes": TAIL_BYTES},
+        doc=compile_glmf_kda_commit_c_aot.__doc__,
+    )
+
+
+__all__ += [
+    "compile_glmf_index_producer_c_aot",
+    "compile_glmf_kda_commit_c_aot",
+    "index_producer_c_scratch_bytes",
+]
