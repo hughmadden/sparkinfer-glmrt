@@ -1007,6 +1007,11 @@ class _RecurrenceKernel:
     4: local state and output with a convergence checkpoint, and 5: output
     correction from the propagated incoming state. Mode 5 reuses a suffix
     only after every FP32 state bit in that value group matches mode 4.
+
+    ``state_dtype`` is the element type of ``recurrent_state`` (FP32, or BF16:
+    loaded into the FP32 registers and rounded to nearest even where it is
+    stored, at each window end). ``round_tiles`` also rounds the BF16 state
+    after every tile, so its bits do not depend on the window plan.
     """
 
     def __init__(
@@ -1025,6 +1030,8 @@ class _RecurrenceKernel:
         summary_mode: int = 0,
         max_sequence_tiles: int = 0,
         is_gdn: bool = False,
+        state_dtype: type[cutlass.Numeric] = Float32,
+        round_tiles: bool = False,
     ) -> None:
         self.heads = int(heads)
         self.tiles_capacity = int(tiles_capacity)
@@ -1055,6 +1062,14 @@ class _RecurrenceKernel:
         self.is_gdn = bool(is_gdn)
         self.record_skip = REC.K_TILDE if summary_mode in (1, 2, 3) else 0
         self.min_blocks = 3 if is_gdn and summary_mode in (0, 4, 5) and max_sequence_tiles and (v_split, k_split, stages) == (64, 1, 2) else 0
+        if state_dtype not in (Float32, BFloat16):
+            raise ValueError("the recurrent state is Float32 or BFloat16")
+        if state_dtype is BFloat16 and summary_mode:
+            raise ValueError("the parallel summary modes compare FP32 state bits; a BF16 state takes mode 0")
+        if round_tiles and state_dtype is not BFloat16:
+            raise ValueError("round_tiles rounds a BF16 state")
+        self.state_dtype = state_dtype
+        self.round_tiles = bool(round_tiles)
 
     @cute.jit
     def __call__(
@@ -1113,10 +1128,16 @@ class _RecurrenceKernel:
             kcol = col_base + Int32(nb * 8) + tid * Int32(2)
             offset0 = base + row0.to(Int64) * Int64(_HEAD_DIM) + kcol.to(Int64)
             offset1 = base + row1.to(Int64) * Int64(_HEAD_DIM) + kcol.to(Int64)
-            target[offset0] = acc[nb, 0]
-            target[offset0 + Int64(1)] = acc[nb, 1]
-            target[offset1] = acc[nb, 2]
-            target[offset1 + Int64(1)] = acc[nb, 3]
+            if cutlass.const_expr(self.state_dtype is Float32):
+                target[offset0] = acc[nb, 0]
+                target[offset0 + Int64(1)] = acc[nb, 1]
+                target[offset1] = acc[nb, 2]
+                target[offset1 + Int64(1)] = acc[nb, 3]
+            else:
+                target[offset0] = acc[nb, 0].to(self.state_dtype)
+                target[offset0 + Int64(1)] = acc[nb, 1].to(self.state_dtype)
+                target[offset1] = acc[nb, 2].to(self.state_dtype)
+                target[offset1 + Int64(1)] = acc[nb, 3].to(self.state_dtype)
 
     @cute.jit
     def _load_state(
@@ -1778,6 +1799,14 @@ class _RecurrenceKernel:
                                 shadow[done, 1] = pack_f32x2_to_bfloat2(acc[2 * done, 2], acc[2 * done, 3])
                                 shadow[done, 2] = pack_f32x2_to_bfloat2(acc[2 * done + 1, 0], acc[2 * done + 1, 1])
                                 shadow[done, 3] = pack_f32x2_to_bfloat2(acc[2 * done + 1, 2], acc[2 * done + 1, 3])
+                            if cutlass.const_expr(self.round_tiles):
+                                # The tile's state rounded as a store rounds it (RNE): the bits
+                                # then depend on the tiles alone, not on where windows end.
+                                for nb in cutlass.range_constexpr(self.nb_blocks):
+                                    acc[nb, 0], acc[nb, 1] = _bf16x2_to_f32x2(
+                                        pack_f32x2_to_bfloat2(acc[nb, 0], acc[nb, 1]))
+                                    acc[nb, 2], acc[nb, 3] = _bf16x2_to_f32x2(
+                                        pack_f32x2_to_bfloat2(acc[nb, 2], acc[nb, 3]))
                             if cutlass.const_expr(self.summary_mode in (2, 3) and self.k_split == 1):
                                 if (not summary_local) & ((step & Int32(1)) == Int32(1)):
                                     all_zero = cutlass.Boolean(True)
