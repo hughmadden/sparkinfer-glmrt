@@ -15,10 +15,13 @@ layer). Rows are timed variant by variant, interleaved --rounds times.
 
 Per line: the call's GPU time (minimum and median over every replay of every
 round), the weight bandwidth (the distinct experts' Trellis bytes over the
-minimum time) and a digest of the output, which must agree across variants:
-a decode schedule changes when weight words are fetched, never a bit.
+minimum time) and a digest of every layer's output as the timed graph's last
+replay left it (each layer writes its own output buffer; the scratch is
+shared). "same" certifies those replay results: each layer's equals its own
+eager run and the first variant's. A decode schedule changes when weight words
+are fetched, never a bit.
 
-Variants: NAME, or NAME:SCHEDULE:TILE:BLOCKS_PER_SM, for example
+Variants: NAME, or NAME:SCHEDULE:TILE:BLOCKS_PER_SM, each NAME once, for example
   --variant default --variant gb10
   --variant 'gb10-n128x2:gb10:64,128,64,128:2'
   --variant 'l2only:l2=2:64,256,64,256:'
@@ -27,6 +30,7 @@ Variants: NAME, or NAME:SCHEDULE:TILE:BLOCKS_PER_SM, for example
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import statistics
 
@@ -69,6 +73,31 @@ def parse_variant(text: str):
     return name, (None if schedule in ("", "default") else schedule), tile, blocks
 
 
+def parse_variants(texts: list[str]):
+    """Every --variant, parsed. A name keys its graph, timings and digests, so
+    each may appear once: a repeated name would time the later graph twice."""
+    variants = [parse_variant(text) for text in texts]
+    names = [name for name, *_ in variants]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise ValueError(f"variant names must be unique: {', '.join(repeated)} repeated")
+    return variants
+
+
+def output_digest(output: torch.Tensor) -> str:
+    """The first 16 hex digits of the sha256 of an output's bytes."""
+    return hashlib.sha256(output.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:16]
+
+
+def verdict(replay: list[str], eager: list[str], reference: list[str]) -> str:
+    """Whether a variant's timed replays certify: every layer's replay result
+    equals its eager run (REPLAY-DIFFERS otherwise) and the reference
+    variant's (DIFFERENT otherwise)."""
+    if replay != eager:
+        return "REPLAY-DIFFERS"
+    return "same" if replay == reference else "DIFFERENT"
+
+
 def make_layer(seed: int, device: torch.device):
     generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -101,7 +130,12 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20261006)
     args = parser.parse_args()
-    variants = [parse_variant(v) for v in (args.variant or ["default", "gb10"])]
+    try:
+        variants = parse_variants(args.variant or ["default", "gb10"])
+    except ValueError as error:
+        parser.error(str(error))
+    if args.calls_per_graph < args.layers:
+        parser.error("--calls-per-graph must be at least --layers: every layer runs in the timed graph")
     rows_list = [int(v) for v in args.rows.split(",")]
     if any(r < 1 or r > 80 for r in rows_list):
         raise ValueError("decode rows are 1..80")
@@ -141,13 +175,17 @@ def main() -> None:
         state = {}
         for name, schedule, tile, blocks in variants:
             launch, buffers, bindings = build(capacity, schedule, tile, blocks)
-            out = run_bound_mixed_trellis(xs, ws, ks, bindings[0], buffers)
-            torch.cuda.synchronize()
-            digest = hashlib.sha256(out.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:16]
+            # Each layer writes its own output (the scratch stays shared), so the timed graph
+            # leaves every layer's result to check, not only the last call's.
+            layer_buffers = [dataclasses.replace(buffers, output=torch.empty_like(buffers.output))
+                             for _ in bindings]
+            eager = [output_digest(run_bound_mixed_trellis(xs, ws, ks, binding, layer_buffer))
+                     for binding, layer_buffer in zip(bindings, layer_buffers)]
 
-            def calls(bindings=bindings, buffers=buffers):
+            def calls(bindings=bindings, layer_buffers=layer_buffers):
                 for call in range(args.calls_per_graph):
-                    run_bound_mixed_trellis(xs, ws, ks, bindings[call % len(bindings)], buffers)
+                    layer = call % len(bindings)
+                    run_bound_mixed_trellis(xs, ws, ks, bindings[layer], layer_buffers[layer])
 
             for _ in range(3):
                 calls()
@@ -155,13 +193,16 @@ def main() -> None:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 calls()
+            # Poison the outputs: what they hold after the timed rounds is the graph's work.
+            for layer_buffer in layer_buffers:
+                layer_buffer.output.fill_(float("nan"))
             graph.replay()
             torch.cuda.synchronize()
             # The graph replays these buffers and bindings: keep them alive until it is
             # done (a freed workspace reused by the next variant corrupts the
             # cooperative kernel's grid-barrier words, and its replays never finish).
-            state[name] = {"graph": graph, "digest": digest, "times": [],
-                           "keep": (launch, buffers, bindings, calls),
+            state[name] = {"graph": graph, "eager": eager, "times": [],
+                           "keep": (launch, buffers, layer_buffers, bindings, calls),
                            "blocks": launch.blocks_per_sm, "tile": tile, "schedule": launch.decode_schedule}
         for _ in range(args.rounds):
             for name, *_ in variants:
@@ -174,6 +215,10 @@ def main() -> None:
                     end.record()
                 torch.cuda.synchronize()
                 state[name]["times"] += [s.elapsed_time(e) / args.calls_per_graph for s, e in zip(starts, ends)]
+        # Every layer's result as each variant's last timed replay left it.
+        for name, *_ in variants:
+            state[name]["replay"] = [output_digest(layer_buffer.output[:rows])
+                                     for layer_buffer in state[name]["keep"][2]]
         reference = state[variants[0][0]]
         for name, *_ in variants:
             entry = state[name]
@@ -181,7 +226,7 @@ def main() -> None:
             print(f"rows={rows:2d} m{capacity:<2d} variant={name:<16s} experts={len(distinct):3d} "
                   f"min={fastest:.4f}ms med={statistics.median(entry['times']):.4f}ms "
                   f"GB/s={weight_bytes / fastest / 1e6:6.1f} vs_first={reference['times'] and min(reference['times']) / fastest:.3f}x "
-                  f"bits={entry['digest']} {'same' if entry['digest'] == reference['digest'] else 'DIFFERENT'} "
+                  f"bits={'/'.join(entry['replay'])} {verdict(entry['replay'], entry['eager'], reference['replay'])} "
                   f"tile={','.join(map(str, entry['tile']))} blocks/SM={entry['blocks']} schedule={entry['schedule']}",
                   flush=True)
         del state
