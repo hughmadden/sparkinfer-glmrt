@@ -55,17 +55,18 @@ from ._glm_kernels import _bf16, _block_sum, _fp8_scale, _reduction_storage, _rs
 
 KDA_HEAD = 128
 CONV_TAPS = 4
-#: Rows one speculative step records per layer (the decode programs' rows).
+#: Rows one speculative step records per layer (the decode programs' rows). A wide decode
+#: program (a verify of up to R > REPLAY_ROWS rows) records R rows per layer instead.
 REPLAY_ROWS = 64
 
 
-def kda_replay_layout(heads: int, channels: int) -> tuple[int, int, int]:
-    """Byte offsets of a layer's replay record: k | decay | v FP32 ``[REPLAY_ROWS, heads, 3, 128]``
-    at 0, beta FP32 ``[REPLAY_ROWS, heads]``, the in-projection q|k|v BF16 ``[REPLAY_ROWS, channels]``;
-    returns (beta offset, projection offset, total bytes)."""
-    beta = REPLAY_ROWS * heads * 3 * KDA_HEAD * 4
-    proj = beta + REPLAY_ROWS * heads * 4
-    return beta, proj, proj + REPLAY_ROWS * channels * 2
+def kda_replay_layout(heads: int, channels: int, rows: int = REPLAY_ROWS) -> tuple[int, int, int]:
+    """Byte offsets of a layer's replay record of ``rows`` rows: k | decay | v FP32
+    ``[rows, heads, 3, 128]`` at 0, beta FP32 ``[rows, heads]``, the in-projection q|k|v BF16
+    ``[rows, channels]``; returns (beta offset, projection offset, total bytes)."""
+    beta = rows * heads * 3 * KDA_HEAD * 4
+    proj = beta + rows * heads * 4
+    return beta, proj, proj + rows * channels * 2
 
 
 @cute.jit
@@ -367,7 +368,7 @@ class GlmfKdaConvState:
     def __call__(self, proj: cute.Pointer, conv_state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
                  replay: cute.Pointer, spec: Int32, rows: Int32, stream: cuda.CUstream):
         """With ``spec`` != 0 every row's q/k/v in-projection goes to ``replay``
-        (``[REPLAY_ROWS, channels]`` BF16) and the state stays as it was."""
+        (``[record rows, channels]`` BF16) and the state stays as it was."""
         m = Int64(rows)
         grid_rows = rows
         if cutlass.const_expr(self.row_block > 0):
@@ -502,14 +503,16 @@ class GlmfKdaRecurrent:
     warps 4 rows, each lane 4 key columns of those rows in registers. Rows run
     in order; a row whose slot differs from the previous row's stores the
     previous sequence's state and loads its own. A BF16 state is rounded after
-    every row's read-out (stores are then exact).
+    every row's read-out (stores are then exact). ``replay_rows``: the rows of
+    the replay record (``kda_replay_layout``), at least the rows of a speculative
+    step.
     """
 
     threads = 256
     v_block = 32
 
     def __init__(self, *, heads: int, lower_bound: float, qkv_width: int, g_stride: int, b_stride: int,
-                 eps: float = 1.0e-6, state_dtype=Float32):
+                 eps: float = 1.0e-6, state_dtype=Float32, replay_rows: int = REPLAY_ROWS):
         self.heads = int(heads)
         self.width = self.heads * KDA_HEAD
         self.lower_bound = float(lower_bound)
@@ -517,6 +520,7 @@ class GlmfKdaRecurrent:
         self.eps = float(eps)
         self.scale = KDA_HEAD ** -0.5
         self.state_dtype, self.state_bytes = _state_type(state_dtype)
+        self.replay_rows = int(replay_rows)
 
     @cute.jit
     def __call__(self, qkv: cute.Pointer, g_raw: cute.Pointer, b_raw: cute.Pointer, a_log: cute.Pointer,
@@ -552,9 +556,9 @@ class GlmfKdaRecurrent:
                replay_ptr: cute.Pointer, spec: Int32, rows: Int32):
         head = Int64(cute.arch.block_idx()[0])
         tidx = Int32(cute.arch.thread_idx()[0])
-        beta_off, _, _ = kda_replay_layout(self.heads, 3 * self.width)
-        replay = _replay_rows(Int64(replay_ptr.toint()), self.heads)
-        replay_beta = _replay_beta(Int64(replay_ptr.toint()) + Int64(beta_off), self.heads)
+        beta_off, _, _ = kda_replay_layout(self.heads, 3 * self.width, self.replay_rows)
+        replay = _replay_rows(Int64(replay_ptr.toint()), self.heads, self.replay_rows)
+        replay_beta = _replay_beta(Int64(replay_ptr.toint()) + Int64(beta_off), self.heads, self.replay_rows)
         # Warp 0 of the head's first CTA records the row's key, decay and beta.
         recorder = Int32(cute.arch.block_idx()[1]) * Int32(self.threads) + tidx < Int32(32)
         lane = tidx % Int32(32)
@@ -654,18 +658,19 @@ class GlmfKdaRecurrent:
 
 
 @cute.jit
-def _replay_rows(address: Int64, heads: cutlass.Constexpr) -> cute.Tensor:
-    """A layer's recorded k | decay | v at ``address``, FP32 ``[REPLAY_ROWS, heads, 3, 128]``."""
+def _replay_rows(address: Int64, heads: cutlass.Constexpr, rows: cutlass.Constexpr) -> cute.Tensor:
+    """A layer's recorded k | decay | v at ``address``, FP32 ``[rows, heads, 3, 128]`` (``rows`` the
+    record's, ``REPLAY_ROWS`` or a wide decode program's)."""
     return cute.make_tensor(cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=16),
-                            cute.make_layout((REPLAY_ROWS, heads, 3, KDA_HEAD),
+                            cute.make_layout((rows, heads, 3, KDA_HEAD),
                                              stride=(heads * 3 * KDA_HEAD, 3 * KDA_HEAD, KDA_HEAD, 1)))
 
 
 @cute.jit
-def _replay_beta(address: Int64, heads: cutlass.Constexpr) -> cute.Tensor:
-    """A layer's recorded beta at ``address``, FP32 ``[REPLAY_ROWS, heads]``."""
+def _replay_beta(address: Int64, heads: cutlass.Constexpr, rows: cutlass.Constexpr) -> cute.Tensor:
+    """A layer's recorded beta at ``address``, FP32 ``[rows, heads]``."""
     return cute.make_tensor(cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=16),
-                            cute.make_layout((REPLAY_ROWS, heads), stride=(heads, 1)))
+                            cute.make_layout((rows, heads), stride=(heads, 1)))
 
 
 class GlmfKdaCommit:
@@ -679,14 +684,16 @@ class GlmfKdaCommit:
     sequences * layers)`` with the recurrent kernel's thread mapping and update
     arithmetic (decay, memory, delta, rank-1 update per row, a BF16 state
     rounded after each), so the result is what serial steps store.
+    ``replay_rows``: the records' rows (the speculative step's program's).
     """
 
     threads = 256
     v_block = 32
 
-    def __init__(self, *, heads: int, channels: int, state_dtype=Float32):
+    def __init__(self, *, heads: int, channels: int, state_dtype=Float32, replay_rows: int = REPLAY_ROWS):
         self.heads = int(heads)
-        self.beta_off, _, self.replay_bytes = kda_replay_layout(self.heads, int(channels))
+        self.replay_rows = int(replay_rows)
+        self.beta_off, _, self.replay_bytes = kda_replay_layout(self.heads, int(channels), self.replay_rows)
         self.state_dtype, self.state_bytes = _state_type(state_dtype)
 
     @cute.jit
@@ -715,8 +722,8 @@ class GlmfKdaCommit:
             st = cute.make_tensor(cute.make_ptr(self.state_dtype, base, cute.AddressSpace.gmem, assumed_align=16),
                                   cute.make_layout((KDA_HEAD, KDA_HEAD), stride=(KDA_HEAD, 1)))
             record = Int64(replay.toint()) + layer * Int64(self.replay_bytes)
-            rows = _replay_rows(record, self.heads)
-            betas = _replay_beta(record + Int64(self.beta_off), self.heads)
+            rows = _replay_rows(record, self.heads, self.replay_rows)
+            betas = _replay_beta(record + Int64(self.beta_off), self.heads, self.replay_rows)
             s = cute.make_rmem_tensor(cute.make_layout((4, 4), stride=(4, 1)), Float32)
             k = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
             decay = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
@@ -754,14 +761,15 @@ class GlmfKdaCommit:
 class GlmfKdaConvCommit:
     """Shifts each sequence's accepted in-projection rows of a speculative step
     into its conv state, in every KDA layer at once: ``conv_state`` BF16
-    ``[layers, slots, 3, C]``, ``replay`` as ``GlmfKdaCommit``. Grid
-    ``(sequences * layers, C / 256)``."""
+    ``[layers, slots, 3, C]``, ``replay`` as ``GlmfKdaCommit`` (records of
+    ``replay_rows`` rows). Grid ``(sequences * layers, C / 256)``."""
 
     threads = 256
 
-    def __init__(self, *, heads: int, channels: int):
+    def __init__(self, *, heads: int, channels: int, replay_rows: int = REPLAY_ROWS):
         self.channels = int(channels)
-        _, self.proj_off, self.replay_bytes = kda_replay_layout(int(heads), self.channels)
+        self.replay_rows = int(replay_rows)
+        _, self.proj_off, self.replay_bytes = kda_replay_layout(int(heads), self.channels, self.replay_rows)
 
     @cute.jit
     def __call__(self, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,
@@ -788,7 +796,7 @@ class GlmfKdaConvCommit:
                                          cute.make_layout((CONV_TAPS - 1, c), stride=(c, 1)))
                 record = Int64(replay.toint()) + layer * Int64(self.replay_bytes) + Int64(self.proj_off)
                 proj = cute.make_tensor(cute.make_ptr(BFloat16, record, cute.AddressSpace.gmem, assumed_align=16),
-                                        cute.make_layout((REPLAY_ROWS, c), stride=(c, 1)))
+                                        cute.make_layout((self.replay_rows, c), stride=(c, 1)))
                 _shift_conv_state(state, proj, first, keep, ch)
 
 
@@ -1336,7 +1344,7 @@ class GlmfIndexTailCommit:
     tail and its kept rows, in one launch.
 
     ``tails`` u8 ``[layers, slots, TAIL_BYTES]``, ``replay`` the layers' key | gate records
-    (BF16 ``[layers, REPLAY_ROWS, 256]``, written by the speculative step), ``tables`` i32
+    (BF16 ``[layers, replay_rows, 256]``, written by the speculative step), ``tables`` i32
     ``[3, sequences]`` as ``GlmfKdaCommit``'s: KDA slot (negative: skip), first step row and
     kept rows. The tail becomes the rows of the pool left open after the kept rows, as the
     non-speculative producer leaves it. Grid ``(sequences * layers)``, 128 threads (one per
@@ -1345,10 +1353,11 @@ class GlmfIndexTailCommit:
 
     threads = 128
 
-    def __init__(self, *, kpool: int = 4):
+    def __init__(self, *, kpool: int = 4, replay_rows: int = REPLAY_ROWS):
         if kpool != 4:
             raise ValueError("index tails are built for 4-token pools")
         self.kpool = int(kpool)
+        self.replay_rows = int(replay_rows)
 
     @cute.jit
     def __call__(self, tails: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,
@@ -1377,7 +1386,7 @@ class GlmfIndexTailCommit:
             count = total % Int64(self.kpool)
             # Offset of the new tail's first row from the old tail's first row.
             opened = total - count
-            record = Int64(replay.toint()) + layer * Int64(REPLAY_ROWS * KEY_ROW_BYTES)
+            record = Int64(replay.toint()) + layer * Int64(self.replay_rows * KEY_ROW_BYTES)
             for e in cutlass.range_constexpr(self.kpool - 1):
                 dst = cute.make_tensor(
                     cute.make_ptr(BFloat16, tail + Int64(TAIL_HEADER + e * KEY_ROW_BYTES), cute.AddressSpace.gmem,
