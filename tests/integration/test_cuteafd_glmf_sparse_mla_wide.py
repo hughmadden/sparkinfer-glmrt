@@ -12,6 +12,8 @@ row, with the 64-row program wherever both run the same plan.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import torch
 
@@ -64,6 +66,32 @@ def test_the_wide_scratch_holds_the_unsplit_partials():
         partial_bytes = rows * G.heads * splits * 512 * 4
         used = (partial_bytes + 1023) // 1024 * 1024 + rows * G.heads * splits * 4
         assert used <= _scratch(one, rows) <= _scratch(one, 128)
+
+
+def test_the_split_count_override_wins_over_full_launch_splits_and_says_so(monkeypatch, caplog):
+    # B12X_MLA_SM120_NUM_SPLITS pins every bucket's split count, ahead of full_launch_splits: at
+    # 170 SMs 33 keeps the 128-row bucket's 33 splits and its 554,729,472-byte scratch.
+    logger = "b12x.integration.cuteafd.glm_sparse_mla"
+    monkeypatch.setenv("B12X_MLA_SM120_NUM_SPLITS", "33")
+    with caplog.at_level(logging.WARNING, logger=logger):
+        buckets = decode_buckets(G, 128, sm_count=170, full_launch_splits=1)
+    assert buckets == ((1, 33, 1), (8, 33, 1), (128, 33, 1))
+    assert _scratch(buckets, 128) == 554_729_472
+    messages = [record.getMessage() for record in caplog.records if record.name == logger]
+    assert len(messages) == 1, messages
+    assert "B12X_MLA_SM120_NUM_SPLITS=33 overrides full_launch_splits=1" in messages[0]
+    assert "the 128-row bucket takes 33 splits" in messages[0]
+    caplog.clear()
+    # No warning where nothing is overridden: the same count, a bucket within the waves (188 SMs),
+    # or no full_launch_splits; nor without the variable.
+    with caplog.at_level(logging.WARNING, logger=logger):
+        decode_buckets(G, 128, sm_count=188, full_launch_splits=1)
+        decode_buckets(G, 128, sm_count=170)
+        monkeypatch.setenv("B12X_MLA_SM120_NUM_SPLITS", "1")
+        assert decode_buckets(G, 128, sm_count=170, full_launch_splits=1)[-1] == (128, 1, 33)
+        monkeypatch.delenv("B12X_MLA_SM120_NUM_SPLITS")
+        assert decode_buckets(G, 128, sm_count=170, full_launch_splits=1) == ((1, 33, 1), (8, 5, 7), (128, 1, 33))
+    assert not [record for record in caplog.records if record.name == logger]
 
 
 def test_the_wide_benchmark_needs_every_selected_slot_in_its_context(monkeypatch, capsys):

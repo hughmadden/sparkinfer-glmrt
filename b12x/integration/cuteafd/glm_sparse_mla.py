@@ -15,7 +15,9 @@ Routes (both take the live row count as a launch scalar):
     (``rows == 1``, ``rows <= 8``, ``rows <= max_rows``) with the prepared
     plan's wave-balanced planner, and the program branches on ``rows``.
     ``full_launch_splits`` (opt-in) plans the buckets whose unsplit launch
-    already exceeds the planner's waves; see ``decode_buckets``.
+    already exceeds the planner's waves; see ``decode_buckets``. A set
+    ``B12X_MLA_SM120_NUM_SPLITS`` pins every bucket's split count and so
+    overrides it.
 ``route="prefill"`` the single-pass multi-head-group (MG) kernel (FP8 QK),
     one CTA per (row, 32-head group); scratch holds the base-2 LSE.
 
@@ -38,6 +40,8 @@ Scratch (size with ``rows = max_rows``):
 
 from __future__ import annotations
 
+import logging
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -49,6 +53,8 @@ from b12x.attention._shared.cute.ops import LOG2_E
 from ._common import GLM53, GLMFGeometry, GLMGeometry, Operand, Scalar, compile_program
 
 __all__ = ["compile_glm_sparse_mla_aot", "decode_buckets"]
+
+_LOG = logging.getLogger(__name__)
 
 _DV = 512
 _CAND = 64
@@ -92,8 +98,19 @@ def decode_buckets(g: GLMGeometry, max_rows: int, *, full_launch_splits: int | N
     that case takes ``full_launch_splits`` splits instead; ``None`` keeps the
     planner's choice for every bucket, so the programs that do not pass it
     keep their plans, keys and objects. ``sm_count`` defaults to the current
-    device's."""
-    from b12x.attention._shared.mla.kernel import _CEIL_WAVES_MAX, plan_unified_decode_splits
+    device's.
+
+    A set ``B12X_MLA_SM120_NUM_SPLITS`` (the planner's per-call override,
+    ahead of any preferred count) pins every bucket's split count,
+    ``full_launch_splits`` included: at 170 SMs ``B12X_MLA_SM120_NUM_SPLITS=33``
+    keeps the 128-row bucket at 33 splits and its 554,729,472-byte scratch. A
+    plan where it overrides ``full_launch_splits`` logs a warning."""
+    from b12x.attention._shared.mla.kernel import (
+        _CEIL_WAVES_MAX,
+        _MLA_SM120_NUM_SPLITS_ENV,
+        _env_num_splits_override,
+        plan_unified_decode_splits,
+    )
 
     if sm_count is None:
         sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
@@ -107,6 +124,11 @@ def decode_buckets(g: GLMGeometry, max_rows: int, *, full_launch_splits: int | N
         _, splits, per_split = plan_unified_decode_splits(
             topk=_topk(g), max_chunks=max_chunks, num_tokens=cap, h_blocks=h_blocks, sm_count=sms,
             preferred_num_splits=int(full_launch_splits) if full else None)
+        override = _env_num_splits_override()
+        if full and override > 0 and override != int(full_launch_splits):
+            _LOG.warning("%s=%d overrides full_launch_splits=%d: the %d-row bucket takes %d splits, "
+                         "and the scratch follows that plan", _MLA_SM120_NUM_SPLITS_ENV, override,
+                         int(full_launch_splits), cap, int(splits))
         out.append((cap, int(splits), int(per_split)))
     return tuple(out)
 
@@ -263,7 +285,8 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
     BF16 and unchanged. Other families keep their existing BF16 path. The
     opt-in ``full_launch_splits`` gives the decode buckets whose unsplit
     launch already exceeds the split planner's waves that many splits
-    (``decode_buckets``); the scratch follows the plan."""
+    (``decode_buckets``); the scratch follows the plan. A set
+    ``B12X_MLA_SM120_NUM_SPLITS`` overrides it (``decode_buckets`` warns)."""
     if fp32_partials and (route != "decode" or not isinstance(g, GLMFGeometry)):
         raise ValueError("fp32_partials is supported only for GLM Flash decode")
     if full_launch_splits is not None and (route != "decode" or int(full_launch_splits) < 1):
