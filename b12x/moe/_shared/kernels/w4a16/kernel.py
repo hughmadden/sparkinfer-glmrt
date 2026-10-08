@@ -1986,10 +1986,15 @@ class W4A16GemmKernel:
                         Int32(self.l2_prefetch_row_bytes),
                     )
         if tid == Int32(self.cta_threads - 1):
+            # A grouped route-block schedule (schedule_route_block_factor > 1:
+            # grouped FC2) runs route blocks route_block_idx * factor onward
+            # (the tier GEMM's subtiles), whose indices are contiguous: warm
+            # those, not block route_block_idx. Factor 1 is the same address.
             prefetch_global_l2(
                 get_ptr_as_int64(
                     packed_route_indices,
-                    route_block_idx * Int32(self.moe_block_size),
+                    route_block_idx
+                    * Int32(self.moe_block_size * self.schedule_route_block_factor),
                 )
             )
 
