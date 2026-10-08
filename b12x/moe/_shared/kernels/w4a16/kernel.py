@@ -1442,6 +1442,19 @@ class W4A16GemmKernel:
             return ()
         return (("l2_schedule", evict_first, prefetch),)
 
+    def _require_wired_l2_prefetch(self) -> None:
+        """The next-tile L2 prefetch (l2_prefetch_k_tiles) runs only where an
+        entry passes _run_persistent_gemm a prefetch_tile hook that resolves
+        each tile's expert: the cooperative mixed-Trellis kernel. This GEMM's
+        own entry passes none, so refuse the option there rather than compile
+        a kernel that silently skips it. Evict-first staging needs no hook."""
+        if self.l2_prefetch_k_tiles:
+            raise ValueError(
+                "l2_prefetch_k_tiles needs an entry that wires the next-tile L2 "
+                "prefetch (the cooperative mixed-Trellis kernel); the standalone "
+                "W4A16 GEMM entry does not"
+            )
+
     @cute.jit
     def _activation_smem_permuted_offset(self, i: Int32) -> Int32:
         row = i // Int32(self.a_gl_rd_delta_o)
@@ -1584,6 +1597,7 @@ class W4A16GemmKernel:
         grid_x: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        self._require_wired_l2_prefetch()
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
             layout=cute.make_layout((active_m * Int32(self.size_k),), stride=(1,)),
@@ -6935,6 +6949,20 @@ class W4A16FusedMoeKernel:
             ("phase_l2_prefetch",) if getattr(self, "phase_l2_prefetch", False) else ()
         )
 
+    def _require_wired_l2_prefetch(self) -> None:
+        """The FC1/FC2 next-tile and phase L2 prefetches run only through the
+        prefetch hooks the cooperative mixed-Trellis kernel passes _moe_body
+        (mixed_trellis._prefetch_tier_tile). This single-tier entry passes
+        none, so refuse a positive request rather than compile a kernel that
+        silently skips it. Evict-first staging (l2_evict_first_b) needs no hook
+        and stays available here."""
+        if self.fc1.l2_prefetch_k_tiles or self.fc2.l2_prefetch_k_tiles or self.phase_l2_prefetch:
+            raise ValueError(
+                "the FC1/FC2 and phase L2 prefetches need the cooperative "
+                "mixed-Trellis entry, which wires them; the single-tier fused "
+                "W4A16 entry does not"
+            )
+
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
         if cutlass.const_expr(self.is_fp16):
@@ -7084,6 +7112,7 @@ class W4A16FusedMoeKernel:
         grid_x: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        self._require_wired_l2_prefetch()
         expert_count = Int64(weight_num_experts)
         w13_i32_flat = cute.make_tensor(
             w13_ptr,

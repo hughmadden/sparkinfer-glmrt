@@ -151,6 +151,21 @@ def test_phase_prefetch_needs_both_tile_prefetches() -> None:
     assert (scheduled.fc1.l2_prefetch_k_tiles, scheduled.fc2.l2_prefetch_k_tiles) == (4, 8)
 
 
+def test_entries_without_prefetch_hooks_refuse_the_tile_prefetch() -> None:
+    """Only the cooperative mixed-Trellis kernel wires the next-tile and phase
+    prefetches (its _prefetch_tier_tile hooks). The standalone GEMM entry and
+    the single-tier fused entry refuse them instead of compiling a kernel that
+    silently skips them; evict-first staging needs no hook and stays."""
+    for kernel in (_fc2_gemm(), _fc2_gemm(l2_evict_first_b=True), _fused(), _fused(l2_evict_first_b=True),
+                   _fused(**parse_decode_schedule("gb10").kernel_options())):
+        kernel._require_wired_l2_prefetch()
+    for kernel in (_fc2_gemm(l2_prefetch_k_tiles=8), _fused(fc1_l2_prefetch_k_tiles=4),
+                   _fused(fc2_l2_prefetch_k_tiles=8),
+                   _fused(**parse_decode_schedule("l2=2,pf1=4,pf2=8,pdl=2").kernel_options())):
+        with pytest.raises(ValueError, match="mixed-Trellis"):
+            kernel._require_wired_l2_prefetch()
+
+
 # ---------------------------------------------------------------------------
 # GPU: bit identity and batch invariance (SM120/SM121).
 
