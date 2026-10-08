@@ -66,6 +66,19 @@ def test_the_wide_scratch_holds_the_unsplit_partials():
         assert used <= _scratch(one, rows) <= _scratch(one, 128)
 
 
+def test_the_wide_benchmark_needs_every_selected_slot_in_its_context(monkeypatch, capsys):
+    # Every row selects 2112 distinct slots: a --context that rounds down (to whole 64-slot pages)
+    # below that stops before any device work.
+    from benchmarks import bench_glmf_sparse_mla_wide as bench
+
+    monkeypatch.delenv("B12X_MLA_SM120_NUM_SPLITS", raising=False)
+    for context in ("0", "2048", "2111"):
+        monkeypatch.setattr("sys.argv", ["bench", "--context", context])
+        with pytest.raises(SystemExit) as stop:
+            bench.main()
+        assert stop.value.code == 2 and "needs at least 2112" in capsys.readouterr().err, context
+
+
 def test_full_launch_splits_plan_decode_buckets_only():
     with pytest.raises(ValueError, match="full_launch_splits"):
         compile_glm_sparse_mla_aot(G, route="prefill", max_rows=4096, full_launch_splits=1)

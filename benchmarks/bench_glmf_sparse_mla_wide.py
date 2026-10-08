@@ -6,11 +6,12 @@ the 128-row bucket's split count: the split planner's own (``planner``: 33 on a 
 where no count keeps 128 rows x 4 head blocks within its three waves) and
 ``full_launch_splits`` 1, 2 and 3. Each runs at every ``--rows`` count above 64 (127 rows x 4
 blocks = 508 CTAs is the largest launch within three waves of 170 SMs), the 64-row program
-at the counts up to 64. Synthetic FP8 records over ``--context`` slots, 2112 distinct
-selected slots per row, all valid. Reported per variant and row count: the plan, CTAs and
-waves, the median of CUDA-event timings with the L2 flushed before each launch (``cold``)
-and the mean over CUDA-graph replays (``warm``); each variant's scratch. Every variant's
-output is checked against the one-split variant's first. Component timings, not tok/s.
+at the counts up to 64. Synthetic FP8 records over ``--context`` slots (rounded down to whole
+64-slot pages, at least 2112), 2112 distinct selected slots per row, all valid. Reported per
+variant and row count: the plan, CTAs and waves, the median of CUDA-event timings with the L2
+flushed before each launch (``cold``) and the mean over CUDA-graph replays (``warm``); each
+variant's scratch. Every variant's output is checked against the one-split variant's first.
+Component timings, not tok/s.
 
   python benchmarks/bench_glmf_sparse_mla_wide.py [--iters 50] [--rows 64,96,120,126,127,128]
       [--context 65536] [--output out.json]
@@ -76,6 +77,11 @@ def main() -> None:
     parser.add_argument("--context", type=int, default=65536)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    # Every row selects SLOTS distinct slots of the cache: a shorter one would leave the selections
+    # short of their lengths and the kernel reading past them.
+    if args.context // 64 * 64 < SLOTS:
+        parser.error(f"--context {args.context} rounds down to {args.context // 64 * 64} slots (whole 64-slot "
+                     f"pages); every row selects {SLOTS} distinct slots, so it needs at least {SLOTS}")
     if os.environ.get("B12X_MLA_SM120_NUM_SPLITS"):
         raise SystemExit("unset B12X_MLA_SM120_NUM_SPLITS: it pins every bucket's split count")
 
