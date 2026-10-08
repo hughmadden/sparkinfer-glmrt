@@ -2278,6 +2278,20 @@ def parse_decode_schedule(spec: str | None) -> MixedTrellisDecodeSchedule | None
     return None if schedule == MixedTrellisDecodeSchedule() else schedule
 
 
+def effective_decode_schedule(driver: W4A16FusedMoeKernel) -> str | None:
+    """The canonical decode schedule a kernel built from ``driver`` runs: each
+    GEMM bounds a prefetch depth by its own K tiles (``W4A16GemmKernel``), so
+    requests that differ only past that bound build one program, share one
+    cache entry and report one schedule (None: the default schedule)."""
+    schedule = MixedTrellisDecodeSchedule(
+        l2_evict_first_b=bool(driver.fc1.l2_evict_first_b),
+        fc1_prefetch_k_tiles=int(driver.fc1.l2_prefetch_k_tiles),
+        fc2_prefetch_k_tiles=int(driver.fc2.l2_prefetch_k_tiles),
+        phase_prefetch=bool(driver.phase_l2_prefetch),
+    )
+    return None if schedule == MixedTrellisDecodeSchedule() else schedule.canonical()
+
+
 def compile_mixed_trellis(
     *,
     size_m: int,
@@ -2486,6 +2500,9 @@ def compile_mixed_trellis(
         use_expert_map=True,
         broadcast_svh=broadcast_svh,
     )
+    # The schedule this program runs, as built: a prefetch depth past a GEMM's
+    # K tiles builds the same program as that bound, and reports the bound.
+    decode_schedule = None if schedule is None else effective_decode_schedule(kernel.driver)
     cached = _CACHE.get(cache_key)
     if cached is not None:
         # Compilation is independent of an artifact's tier partition. Replace
@@ -2499,6 +2516,7 @@ def compile_mixed_trellis(
             sms=int(sms),
             broadcast_suh=bool(broadcast_suh),
             broadcast_svh=bool(broadcast_svh),
+            decode_schedule=decode_schedule,
         )
 
     compile_m = _fake_m_for_specialization(size_m)
@@ -2628,7 +2646,7 @@ def compile_mixed_trellis(
         input_format=str(input_format),
         ws_input_stages=ws_input_stages,
         activations=activations,
-        decode_schedule=None if schedule is None else schedule.canonical(),
+        decode_schedule=decode_schedule,
     )
     _CACHE[cache_key] = result
     return result
