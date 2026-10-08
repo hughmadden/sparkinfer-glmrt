@@ -24,6 +24,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     build_tiered_maps,
     combine_trellis_rotations,
     compile_mixed_trellis,
+    effective_decode_schedule,
     make_mixed_trellis_buffers,
     parse_decode_schedule,
     run_bound_mixed_trellis,
@@ -151,6 +152,36 @@ def test_phase_prefetch_needs_both_tile_prefetches() -> None:
     assert (scheduled.fc1.l2_prefetch_k_tiles, scheduled.fc2.l2_prefetch_k_tiles) == (4, 8)
 
 
+def test_entries_without_prefetch_hooks_refuse_the_tile_prefetch() -> None:
+    """Only the cooperative mixed-Trellis kernel wires the next-tile and phase
+    prefetches (its _prefetch_tier_tile hooks). The standalone GEMM entry and
+    the single-tier fused entry refuse them instead of compiling a kernel that
+    silently skips them; evict-first staging needs no hook and stays."""
+    for kernel in (_fc2_gemm(), _fc2_gemm(l2_evict_first_b=True), _fused(), _fused(l2_evict_first_b=True),
+                   _fused(**parse_decode_schedule("gb10").kernel_options())):
+        kernel._require_wired_l2_prefetch()
+    for kernel in (_fc2_gemm(l2_prefetch_k_tiles=8), _fused(fc1_l2_prefetch_k_tiles=4),
+                   _fused(fc2_l2_prefetch_k_tiles=8),
+                   _fused(**parse_decode_schedule("l2=2,pf1=4,pf2=8,pdl=2").kernel_options())):
+        with pytest.raises(ValueError, match="mixed-Trellis"):
+            kernel._require_wired_l2_prefetch()
+
+
+def test_the_reported_schedule_is_the_one_built() -> None:
+    """A prefetch depth past a GEMM's K tiles builds that bound's program (one
+    cache key), so compile_mixed_trellis reports the bound for both requests,
+    in either order; the presets and the default are unaffected."""
+    deep = _fused(**parse_decode_schedule("l2=2,pf2=20").kernel_options())
+    bound = _fused(**parse_decode_schedule("l2=2,pf2=8").kernel_options())
+    assert deep.__cache_key__ == bound.__cache_key__
+    assert effective_decode_schedule(deep) == effective_decode_schedule(bound) == "l2=2,pf1=0,pf2=8,pdl=1"
+    gb10 = _fused(**parse_decode_schedule("gb10").kernel_options())
+    assert effective_decode_schedule(gb10) == DECODE_SCHEDULE_PRESETS["gb10"]
+    full = parse_decode_schedule("l2=2,pf1=4,pf2=8,pdl=2")
+    assert effective_decode_schedule(_fused(**full.kernel_options())) == full.canonical()
+    assert effective_decode_schedule(_fused()) is None
+
+
 # ---------------------------------------------------------------------------
 # GPU: bit identity and batch invariance (SM120/SM121).
 
@@ -244,6 +275,27 @@ VARIANTS = [
     (None, (64, 128, 64, 128), 2),
     ("gb10", (64, 128, 64, 128), 2),
 ]
+
+
+@requires_sm12x
+def test_a_cache_hit_reports_the_schedule_its_program_runs() -> None:
+    """The deeper request compiles first; the bound's request then hits its
+    cache entry. Both report the schedule the shared program runs."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    slots = route_pack_capacity(80 * TOPK, 8, EXPERTS, topk=TOPK)[1]
+    kwargs = dict(
+        size_m=80, hidden_size=HIDDEN, intermediate_size=INTERMEDIATE,
+        tier0_num_experts=len(TIER0_IDS), tier1_num_experts=len(TIER1_IDS), top_k=TOPK,
+        route_num_experts=EXPERTS, max_m_blocks=(slots + 7) // 8,
+        sms=int(props.multi_processor_count), max_shared_mem=int(props.shared_memory_per_block_optin),
+        force_tile_config=K64_N256, tier0_bits=3, tier1_bits=4, trellis_codebook="mcg",
+        swiglu_limit=10.0, moe_block_size=8, rotation_input_dtype="bf16",
+        full_rotation_output_dtype="bf16", route_ids_dtype=torch.int32,
+    )
+    deep = compile_mixed_trellis(**kwargs, decode_schedule="l2=2,pf2=12")
+    bound = compile_mixed_trellis(**kwargs, decode_schedule="l2=2,pf2=8")
+    assert bound.compiled is deep.compiled
+    assert deep.decode_schedule == bound.decode_schedule == "l2=2,pf1=0,pf2=8,pdl=1"
 
 
 @requires_sm12x
