@@ -54,6 +54,30 @@ def test_buckets_within_the_waves_keep_the_planner(sms, max_rows):
     assert _plan(planner, max_rows)[0] <= 2
 
 
+@pytest.mark.parametrize("sms", [170, 188])
+def test_explicit_card_plan_reaches_compiler_and_scratch(monkeypatch, sms):
+    from types import SimpleNamespace
+    from b12x.integration.cuteafd import glm_sparse_mla as module
+    buckets = decode_buckets(G, 128, sm_count=sms)
+    seen = []
+    def decode(g, rows, fp32, full, sm_count):
+        seen.append((g, rows, fp32, full, sm_count))
+        return SimpleNamespace(buckets=buckets, key=("decode", buckets))
+    monkeypatch.setattr(module, "_Decode", decode)
+    monkeypatch.setattr(module, "compile_program", lambda *_, **kwargs: kwargs)
+    program = compile_glm_sparse_mla_aot(G, route="decode", max_rows=128,
+                                       fp32_partials=True, sm_count=sms)
+    assert seen == [(G, 128, True, None, sms)]
+    assert program["geometry"]["decode_buckets"] == [list(b) for b in buckets]
+    assert program["scratch"]["scratch"](128) == _scratch(buckets, 128)
+
+
+@pytest.mark.parametrize("sms", [0, -1, True, 170.0])
+def test_explicit_card_plan_rejects_invalid_counts(sms):
+    with pytest.raises(ValueError, match="sm_count must be a positive integer"):
+        compile_glm_sparse_mla_aot(G, route="decode", sm_count=sms)
+
+
 def test_the_wide_scratch_holds_the_unsplit_partials():
     planner = decode_buckets(G, 128, sm_count=170)
     one = decode_buckets(G, 128, sm_count=170, full_launch_splits=1)

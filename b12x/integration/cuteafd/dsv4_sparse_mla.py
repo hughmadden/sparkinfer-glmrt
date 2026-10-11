@@ -203,7 +203,8 @@ class _Prefill:
 class _Decode:
     """Split-KV decode + sink merge (``mode="decode"`` on SM120)."""
 
-    def __init__(self, geometry: DSV4Geometry, max_rows: int, width: int, page_rows: int):
+    def __init__(self, geometry: DSV4Geometry, max_rows: int, width: int, page_rows: int,
+                 sm_count: int | None = None):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         from b12x.attention._shared.mla.kernel import (
@@ -222,7 +223,8 @@ class _Decode:
         self.has_extra = self.width > 0
         query = _prepared_query(geometry, "decode", max_rows, self.width, page_rows)
         device = detect_device(torch.device("cuda", torch.cuda.current_device()))
-        configuration = TUNING.configure(query, device=device.identity)
+        identity = device.identity if sm_count is None else replace(device.identity, sm_count=sm_count)
+        configuration = TUNING.configure(query, device=identity)
         config = configuration.default if configuration.pinned is None else configuration.pinned
         if config.single_pass:
             raise ValueError("this device plans the single-pass decode; use route='prefill'")
@@ -232,7 +234,7 @@ class _Decode:
             plan = prepare_unified_decode_launch(
                 q_all=binding.q, q_alignment=16, swa_k_cache=swa, swa_indices=binding.swa_indices,
                 swa_page_size=_SWA_PAGE, workspace=binding.scratch,
-                sm_count=torch.cuda.get_device_properties(ordinal).multi_processor_count,
+                sm_count=identity.sm_count,
                 indexed_k_cache=indexed, indexed_indices=binding.indexed_indices,
                 indexed_page_size=page_rows if self.has_extra else None,
                 attn_sink=_fake((self.heads,), dtype=torch.float32, device=_dev),
@@ -323,7 +325,7 @@ class _Decode:
 
 def compile_dsv4_sparse_mla_aot(geometry: DSV4Geometry = FLASH, *, route: str = "prefill",
                                 max_rows: int = 1, indexed_width: int = 0,
-                                indexed_page_rows: int = 64):
+                                indexed_page_rows: int = 64, sm_count: int | None = None):
     """Compressed sparse MLA with sink; see the module docstring for the ABI.
 
     ``indexed_width`` 0 compiles the window-only program (compress ratio 0
@@ -331,6 +333,8 @@ def compile_dsv4_sparse_mla_aot(geometry: DSV4Geometry = FLASH, *, route: str = 
     ``indexed_page_rows=64``; C128 layers ``indexed_page_rows=2`` and a width
     that is a multiple of 64 covering the longest compressed prefix.
     """
+    if sm_count is not None and (type(sm_count) is not int or sm_count <= 0):
+        raise ValueError("sm_count must be a positive integer")
     width = int(indexed_width)
     if width < 0 or (width and width % _CAND):
         raise ValueError("indexed_width must be zero or a positive multiple of 64")
@@ -340,7 +344,7 @@ def compile_dsv4_sparse_mla_aot(geometry: DSV4Geometry = FLASH, *, route: str = 
         launch = _Prefill(geometry, width, indexed_page_rows)
         splits = 0
     elif route == "decode":
-        launch = _Decode(geometry, int(max_rows), width, indexed_page_rows)
+        launch = _Decode(geometry, int(max_rows), width, indexed_page_rows, sm_count)
         splits = launch.splits
     else:
         raise ValueError("route must be 'prefill' or 'decode'")

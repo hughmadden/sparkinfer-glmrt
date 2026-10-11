@@ -196,7 +196,8 @@ class _Prefill:
 
 
 class _Decode:
-    def __init__(self, g: GLMGeometry, max_rows: int, fp32_partials=False, full_launch_splits=None):
+    def __init__(self, g: GLMGeometry, max_rows: int, fp32_partials=False, full_launch_splits=None,
+                 sm_count: int | None = None):
         from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel
         from b12x.attention._shared.mla.merge import SparseMLASplitDecodeMergeKernel
         from b12x.attention._shared.mla.smem import make_smem_layout
@@ -210,7 +211,8 @@ class _Decode:
         hpb = int(traits.hpb)
         if self.heads % hpb:
             raise ValueError("GLM decode needs heads divisible by 16")
-        self.buckets = decode_buckets(g, max_rows, full_launch_splits=full_launch_splits)
+        self.buckets = decode_buckets(g, max_rows, full_launch_splits=full_launch_splits,
+                                      sm_count=sm_count)
         n = self.heads
         self.kernels, self.merges = [], []
         for _, splits, per_split in self.buckets:
@@ -276,7 +278,7 @@ class _Decode:
 
 def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill", max_rows: int = 1,
                                name: str = "glm_sparse_mla", fp32_partials: bool = False,
-                               full_launch_splits: int | None = None):
+                               full_launch_splits: int | None = None, sm_count: int | None = None):
     """GLM latent sparse MLA; see the module docstring for the ABI. A GLM 5.3
     Flash geometry (``GLMFGeometry``) selects the 512-wide query, 528-byte
     records (``ModelType.GLM_NEXT``) and its 2112-slot index rows. The opt-in
@@ -287,6 +289,8 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
     launch already exceeds the split planner's waves that many splits
     (``decode_buckets``); the scratch follows the plan. A set
     ``B12X_MLA_SM120_NUM_SPLITS`` overrides it (``decode_buckets`` warns)."""
+    if sm_count is not None and (type(sm_count) is not int or sm_count <= 0):
+        raise ValueError("sm_count must be a positive integer")
     if fp32_partials and (route != "decode" or not isinstance(g, GLMFGeometry)):
         raise ValueError("fp32_partials is supported only for GLM Flash decode")
     if full_launch_splits is not None and (route != "decode" or int(full_launch_splits) < 1):
@@ -295,7 +299,7 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         launch = _Prefill(g)
         buckets = ()
     elif route == "decode":
-        launch = _Decode(g, int(max_rows), fp32_partials, full_launch_splits)
+        launch = _Decode(g, int(max_rows), fp32_partials, full_launch_splits, sm_count)
         buckets = launch.buckets
     else:
         raise ValueError("route must be 'prefill' or 'decode'")

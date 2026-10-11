@@ -14,6 +14,31 @@ HIGH_PAGE = (2**31) // SWA_PAGE_BYTES + 3
 LAYER = 2
 
 
+@pytest.mark.parametrize("sms", [170, 188])
+def test_explicit_card_plan_reaches_decode_and_scratch(monkeypatch, sms):
+    from types import SimpleNamespace
+    from b12x.integration.cuteafd import dsv4_sparse_mla as module
+    seen = []
+    def decode(g, rows, width, page_rows, sm_count):
+        seen.append((rows, width, page_rows, sm_count))
+        return SimpleNamespace(splits=3, key=("decode", 3))
+    monkeypatch.setattr(module, "_Decode", decode)
+    monkeypatch.setattr(module, "compile_program", lambda *_, **kwargs: kwargs)
+    program = module.compile_dsv4_sparse_mla_aot(route="decode", max_rows=64,
+                                               indexed_width=512, sm_count=sms)
+    assert seen == [(64, 512, 64, sms)]
+    assert program["geometry"]["num_splits"] == 3
+    assert program["scratch"]["scratch"](64) == module.sparse_mla_scratch_bytes(
+        route="decode", heads=64, rows=64, num_splits=3)
+
+
+@pytest.mark.parametrize("sms", [0, -1, True, 170.0])
+def test_explicit_card_plan_rejects_invalid_counts(sms):
+    from b12x.integration.cuteafd.dsv4_sparse_mla import compile_dsv4_sparse_mla_aot
+    with pytest.raises(ValueError, match="sm_count must be a positive integer"):
+        compile_dsv4_sparse_mla_aot(route="decode", sm_count=sms)
+
+
 def _page_bytes(rows: int) -> int:
     return (rows * 584 + 575) // 576 * 576
 
