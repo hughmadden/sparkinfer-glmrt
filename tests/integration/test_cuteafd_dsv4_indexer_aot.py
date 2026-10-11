@@ -98,14 +98,23 @@ def _assert_same_selection(actual, expected, lengths, topk):
     ("paged_fused", False, 188, 0),
     ("paged_tiled", False, 0, 0),
 ])
-def test_export_geometry_declares_cooperative_minimum_sms(monkeypatch, route, cooperative, ctas, minimum):
-    from b12x.integration.cuteafd import dsv4_indexer
+@pytest.mark.parametrize("family", ["dsv4", "glm", "glmf"])
+def test_export_geometry_declares_cooperative_minimum_sms(monkeypatch, route, cooperative, ctas, minimum, family):
+    from b12x.integration.cuteafd import dsv4_indexer, glm_indexer, GLM53_FLASH
     launch = SimpleNamespace(topk=512, route=route, supertile=4096,
                              layout=SimpleNamespace(nbytes=64, fused_ctas_per_group=ctas),
                              fused=SimpleNamespace(coop_merge_possible=cooperative), key=lambda: ())
-    monkeypatch.setattr(dsv4_indexer, "_TopK", lambda *_: launch)
-    monkeypatch.setattr(dsv4_indexer, "compile_program", lambda *_, **kwargs: kwargs)
-    result = dsv4_indexer.compile_dsv4_index_topk_aot(max_rows=1, max_pages=4096, mode="decode")
+    monkeypatch.setattr(dsv4_indexer, "_TopK", lambda *_, **__: launch)
+    module = dsv4_indexer if family == "dsv4" else glm_indexer
+    monkeypatch.setattr(module, "compile_program", lambda *_, **kwargs: kwargs)
+    if family == "dsv4":
+        result = dsv4_indexer.compile_dsv4_index_topk_aot(max_rows=1, max_pages=4096, mode="decode")
+    else:
+        if family == "glmf":
+            from b12x.integration.cuteafd.glmf import compile_glmf_index_topk_aot
+            result = compile_glmf_index_topk_aot(GLM53_FLASH, max_rows=1, max_pages=4096, mode="decode")
+        else:
+            result = glm_indexer.compile_glm_index_topk_aot(max_rows=1, max_pages=4096, mode="decode")
     assert result["geometry"]["minimum_sms"] == minimum
 
 

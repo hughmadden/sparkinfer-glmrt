@@ -70,7 +70,9 @@ def compile_glm_index_topk_aot(g: GLMGeometry = GLM53, *, max_rows: int, max_pag
         scalars=(Scalar("rows"), Scalar("table_width"), Scalar("table_stride")),
         key=launch.key(),
         geometry={"topk": k, "heads": i, "max_rows": int(max_rows), "max_pages": int(max_pages),
-                  "mode": mode, "route": launch.route, "supertile_tokens": launch.supertile},
+                  "mode": mode, "route": launch.route, "supertile_tokens": launch.supertile,
+                  "minimum_sms": (int(launch.layout.fused_ctas_per_group)
+                                  if launch.route == "paged_fused" and launch.fused.coop_merge_possible else 0)},
         scratch={"scratch": lambda rows: nbytes},
         doc=__doc__,
     )
