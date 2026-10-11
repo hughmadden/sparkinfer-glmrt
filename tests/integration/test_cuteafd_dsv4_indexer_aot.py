@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -88,6 +90,23 @@ def _assert_same_selection(actual, expected, lengths, topk):
     # -1 padding exactly where fewer than topk index rows are visible.
     pads = (actual == -1).sum(dim=1)
     assert torch.equal(pads, (topk - lengths.clamp(max=topk)).to(pads.dtype))
+
+
+@pytest.mark.parametrize("route,cooperative,ctas,minimum", [
+    ("paged_fused", True, 188, 188),
+    ("paged_fused", True, 11, 11),
+    ("paged_fused", False, 188, 0),
+    ("paged_tiled", False, 0, 0),
+])
+def test_export_geometry_declares_cooperative_minimum_sms(monkeypatch, route, cooperative, ctas, minimum):
+    from b12x.integration.cuteafd import dsv4_indexer
+    launch = SimpleNamespace(topk=512, route=route, supertile=4096,
+                             layout=SimpleNamespace(nbytes=64, fused_ctas_per_group=ctas),
+                             fused=SimpleNamespace(coop_merge_possible=cooperative), key=lambda: ())
+    monkeypatch.setattr(dsv4_indexer, "_TopK", lambda *_: launch)
+    monkeypatch.setattr(dsv4_indexer, "compile_program", lambda *_, **kwargs: kwargs)
+    result = dsv4_indexer.compile_dsv4_index_topk_aot(max_rows=1, max_pages=4096, mode="decode")
+    assert result["geometry"]["minimum_sms"] == minimum
 
 
 @pytest.fixture(scope="module")

@@ -419,7 +419,9 @@ def compile_dsv4_index_topk_aot(geometry: DSV4Geometry = FLASH, *, max_rows: int
         scalars=(Scalar("rows"), Scalar("table_width"), Scalar("table_stride")),
         key=launch.key(),
         geometry={"topk": k, "max_rows": int(max_rows), "max_pages": int(max_pages), "mode": mode,
-                  "route": launch.route, "supertile_tokens": launch.supertile},
+                  "route": launch.route, "supertile_tokens": launch.supertile,
+                  "minimum_sms": (int(launch.layout.fused_ctas_per_group)
+                                  if launch.route == "paged_fused" and launch.fused.coop_merge_possible else 0)},
         scratch={"scratch": lambda rows: nbytes},
         doc=__doc__,
     )
