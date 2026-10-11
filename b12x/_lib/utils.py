@@ -25,8 +25,40 @@ import cutlass._mlir.dialects.cute as _cute_ir
 import cutlass.cute as cute
 import torch
 from cutlass._mlir import ir
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import cuda as _cuda_ir, llvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+
+
+@dsl_user_op
+def runtime_num_sm(*, loc=None, ip=None) -> cutlass.Int32:
+    """Query the launch context, never the compiler's device, for persistent grids."""
+    block = ir.InsertionPoint.current.block
+    module = block.owner
+    while module.operation.name != "builtin.module":
+        module = module.operation.parent
+    declarations = {
+        "_cudaGetDevice": "!llvm.func<i32 (ptr)>",
+        "_cudaDeviceGetAttribute": "!llvm.func<i32 (ptr, i32, i32)>",
+    }
+    symbols = ir.SymbolTable(module)
+    with ir.InsertionPoint(module.regions[0].blocks[0]):
+        for name, signature in declarations.items():
+            if name not in symbols:
+                llvm.func(name, ir.TypeAttr.get(ir.Type.parse(signature)), loc=loc)
+    one = cutlass.Int32(1).ir_value(loc=loc, ip=ip)
+    device = llvm.alloca(ir.Type.parse("!llvm.ptr"), one, T.i32(), alignment=4, loc=loc, ip=ip)
+    count = llvm.alloca(ir.Type.parse("!llvm.ptr"), one, T.i32(), alignment=4, loc=loc, ip=ip)
+
+    def call(name, arguments):
+        result = llvm.call(T.i32(), arguments, [], [], callee=name, loc=loc, ip=ip)
+        _cuda_ir.return_if_error([result], loc=loc, ip=ip)
+
+    call("_cudaGetDevice", [device])
+    # cudaDevAttrMultiProcessorCount is attribute 16 in the stable CUDA ABI.
+    call("_cudaDeviceGetAttribute", [count, cutlass.Int32(16).ir_value(loc=loc, ip=ip),
+                                    llvm.load(T.i32(), device, loc=loc, ip=ip)])
+    return cutlass.Int32(llvm.load(T.i32(), count, loc=loc, ip=ip))
 
 
 def ceil_div(a: int, b: int) -> int:

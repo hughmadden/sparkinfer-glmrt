@@ -67,6 +67,7 @@ from b12x._lib.utils import (
     get_cutlass_dtype,
     get_max_active_clusters,
     get_num_sm,
+    runtime_num_sm,
     is_mxfp6_ab_dtype,
     make_ptr,
     mxfp6_logical_k_from_packed_bytes,
@@ -1208,7 +1209,7 @@ class DenseGemmKernel:
         quant_c_scale_rows: cute.Tensor,
         quant_c_scale_mma: cute.Tensor,
         alpha: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: Int32,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         x_bf16: cute.Tensor = None,
@@ -5172,6 +5173,9 @@ class _DenseGemmLaunch:
             sfa_tensor = cute.make_tensor(sfa_ptr, layout=cute.make_layout((1,)))
             sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
         policy = self._policy
+        max_active_clusters = self._max_active_clusters
+        if cutlass.const_expr(self._block_fp8 and self._cluster_shape_mn == (1, 1)):
+            max_active_clusters = runtime_num_sm() * Int32(self._target_occupancy)
         DenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
             mma_tiler_mn=self._mma_tiler_mn,
@@ -5217,7 +5221,7 @@ class _DenseGemmLaunch:
             quant_c_scale_rows_tensor,
             quant_c_scale_mma_tensor,
             alpha_tensor,
-            self._max_active_clusters,
+            max_active_clusters,
             current_stream,
         )
 

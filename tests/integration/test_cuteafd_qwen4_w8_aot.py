@@ -17,6 +17,10 @@ the recurrent, conv and replay state."""
 
 from __future__ import annotations
 
+import ctypes
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -246,6 +250,97 @@ def test_qwen4_attn_o_w8_decode(rows):
 @pytest.mark.parametrize("rows,fp8_rows", PREFILL)
 def test_qwen4_attn_o_w8_prefill(rows, fp8_rows):
     _o_case(rows, 4096, fp8_rows)
+
+
+def test_qwen4_w8_export_queries_launch_device_sm_count(monkeypatch, tmp_path):
+    """A compiler-side SM count must not leak into exported persistent grids."""
+    from cuda.bindings import driver as cuda
+    from b12x._lib import utils
+    from b12x.integration.cuteafd._common import exportable_compilation
+    from b12x.integration.cuteafd.qwen4_attention import compile_qwen4_attn_o_aot
+
+    actual_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    monkeypatch.setattr(utils, "get_num_sm", lambda *args, **kwargs: 170 if actual_sms != 170 else 188)
+    with exportable_compilation():
+        program = compile_qwen4_attn_o_aot(_g(), max_rows=4096, fp8_only="prefill")
+        program.export_to_c(str(tmp_path), "w8_runtime_sm", "w8_runtime_sm")
+    wrapper = tmp_path / "wrapper.cpp"
+    wrapper.write_text('''#include "w8_runtime_sm.h"
+extern "C" void load(void *module) {
+    w8_runtime_sm_Kernel_Module_Load((w8_runtime_sm_Kernel_Module_t *)module);
+}
+extern "C" void unload(void *module) {
+    w8_runtime_sm_Kernel_Module_Unload((w8_runtime_sm_Kernel_Module_t *)module);
+}
+extern "C" int launch(void *module, void *a, void *g, void *w, void *s,
+                      void *o, void *scratch, int rows, void *stream) {
+    return cute_dsl_w8_runtime_sm_wrapper((w8_runtime_sm_Kernel_Module_t *)module,
+                                         a, g, w, s, o, scratch, rows, 1,
+                                         (cudaStream_t)stream);
+}
+''')
+    library = tmp_path / "w8_runtime_sm.so"
+    runtime_dir = subprocess.check_output(
+        [sys.executable, "-m", "cutlass.cute.export.aot_config", "--libdir"], text=True).strip()
+    subprocess.run(["g++", "-shared", "-fPIC", str(wrapper), str(tmp_path / "w8_runtime_sm.o"),
+                    "-I/usr/local/cuda/include", "-L/usr/local/cuda/lib64", "-lcudart",
+                    f"-L{runtime_dir}", "-lcute_dsl_runtime", f"-Wl,-rpath,{runtime_dir}",
+                    "-Wl,-z,defs", "-o", str(library)], check=True)
+    exported = ctypes.CDLL(str(library))
+    exported.load.argtypes = exported.unload.argtypes = [ctypes.c_void_p]
+    exported.load.restype = exported.unload.restype = None
+    exported.launch.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int32, ctypes.c_void_p]
+    exported.launch.restype = ctypes.c_int32
+    module = ctypes.c_void_p()
+    exported.load(ctypes.byref(module))
+    try:
+        g = _g()
+        weights, scales, bf16 = _w(g.hidden, g.heads * g.head_dim, 6199, scale=0.01)
+        attn = torch.randn((4096, g.heads * g.head_dim), device="cuda").bfloat16()
+        gate = torch.randn_like(attn)
+        scratch = _scratch(program, 4096)
+        output = torch.empty((4096, g.hidden), dtype=torch.bfloat16, device="cuda")
+        reference = torch.empty_like(output)
+        baseline = P("o", max_rows=4096)
+        baseline_scratch = _scratch(baseline, 4096)
+
+        def launch(rows):
+            pointers = [t.data_ptr() for t in (attn, gate, weights, scales, output, scratch)]
+            assert exported.launch(ctypes.byref(module), *pointers, rows,
+                                   torch.cuda.current_stream().cuda_stream) == 0
+
+        for rows in (65, 600, 4096):
+            launch(rows)
+            baseline.launch(attn, gate, bf16, reference, baseline_scratch, scalars=(rows,))
+            torch.cuda.synchronize()
+            assert torch.isfinite(output[:rows]).all() and torch.count_nonzero(output[:rows]) > 0
+            _cmp(output[:rows], reference[:rows], True, f"exported W8 rows={rows}")
+        expected = output.clone()
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(graph):
+            launch(4096)
+        # AOT modules use driver kernels; the runtime getter rejects their functions.
+        error, _, count = cuda.cuGraphGetNodes(graph.raw_cuda_graph())
+        assert error == cuda.CUresult.CUDA_SUCCESS
+        error, nodes, count = cuda.cuGraphGetNodes(graph.raw_cuda_graph(), count)
+        assert error == cuda.CUresult.CUDA_SUCCESS
+        grids = []
+        for node in nodes[:count]:
+            error, kind = cuda.cuGraphNodeGetType(node)
+            assert error == cuda.CUresult.CUDA_SUCCESS
+            if kind == cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+                error, params = cuda.cuGraphKernelNodeGetParams(node)
+                assert error == cuda.CUresult.CUDA_SUCCESS
+                grids.append((params.gridDimX, params.gridDimY, params.gridDimZ))
+        assert (1, 1, actual_sms) in grids, (actual_sms, grids)
+        output.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output, expected)
+        del graph
+    finally:
+        torch.cuda.synchronize()
+        exported.unload(ctypes.byref(module))
 
 
 # ---------------------------------------------------------------------------
