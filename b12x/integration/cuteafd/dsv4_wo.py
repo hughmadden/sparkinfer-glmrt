@@ -67,6 +67,7 @@ import torch
 from cutlass import Int32, Int64, const_expr
 
 from b12x._lib.dense_gemm import _DenseSplitKReduce, dense_gemm_launch_from_lowering
+from b12x._lib.utils import runtime_num_sm
 from b12x.gemm.wo_projection._quant_cute import _GRID_CTAS_PER_SM, _THREADS, _WOQuantCuTeLaunch
 
 from ._common import FLASH, DSV4Geometry, Operand, Scalar, compile_program
@@ -154,7 +155,6 @@ class _WoProjection:
             "group_major", self.g * self.r, self.r, cutlass.BFloat16, False, 0, 0, 0,
             cutlass.Int64, cutlass.BFloat16, _THREADS, False)
         self.store_one = StoreOne()
-        self.grid_cap = int(low_a.sm_count) * _GRID_CTAS_PER_SM
         self.warps = _THREADS // 32
 
     def key(self) -> tuple:
@@ -166,8 +166,9 @@ class _WoProjection:
     @cute.jit
     def _grid(self, rows: Int32, total_k: cutlass.Constexpr):
         grid = (rows * Int32(total_k // 128) + Int32(self.warps - 1)) // Int32(self.warps)
-        if grid > Int32(self.grid_cap):
-            grid = Int32(self.grid_cap)
+        grid_cap = runtime_num_sm() * Int32(_GRID_CTAS_PER_SM)
+        if grid > grid_cap:
+            grid = grid_cap
         return grid
 
     @cute.jit

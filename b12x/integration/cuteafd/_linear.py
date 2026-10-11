@@ -40,6 +40,7 @@ from cutlass import Int32, Int64, const_expr
 
 from b12x._lib.dense_gemm import _DenseSplitKReduce, dense_gemm_launch_from_lowering
 from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch, _GRID_CTAS_PER_SM
+from b12x._lib.utils import runtime_num_sm
 
 __all__ = ["Fp8LinearStage", "StoreOne", "stage_scratch_bytes", "block_fp8_lowering"]
 
@@ -123,7 +124,6 @@ class Fp8LinearStage:
         )
         self.quant_warps = threads // 32
         self.quant_tasks_per_row = (self.k // 32 + (32 // subgroup_width) - 1) // (32 // subgroup_width)
-        self.quant_grid_cap = self.sm_count * _GRID_CTAS_PER_SM
         self.reduce = _DenseSplitKReduce(self.n, self.slices) if self.slices > 1 else None
         self.store_one = StoreOne()
 
@@ -147,8 +147,9 @@ class Fp8LinearStage:
         split_off = alpha_off + Int64(_ALIGN)
 
         grid = (rows * Int32(self.quant_tasks_per_row) + Int32(self.quant_warps - 1)) // Int32(self.quant_warps)
-        if grid > Int32(self.quant_grid_cap):
-            grid = Int32(self.quant_grid_cap)
+        grid_cap = runtime_num_sm() * Int32(_GRID_CTAS_PER_SM)
+        if grid > grid_cap:
+            grid = grid_cap
         self.quant(
             source,
             cute.make_ptr(cutlass.Uint32, scratch + values_off, cute.AddressSpace.gmem, assumed_align=16),

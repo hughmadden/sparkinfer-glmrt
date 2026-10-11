@@ -9,6 +9,7 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from cutlass import Int32, Int64, Float32
+from b12x._lib.utils import runtime_num_sm
 from b12x.moe._shared.kernels.v41_route_plan import V41RoutePlan, V41SliceReduce
 from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 
@@ -146,7 +147,7 @@ class V41DraftSlicePipeline:
         stream: cuda.CUstream,
     ):
         # 160 K32 groups / row, 8 groups / warp, 8 warps / CTA.
-        grid = min(max(1, (rows * 20 + 7) // 8), self.sm_count * 4)
+        grid = min(max(1, (rows * 20 + 7) // 8), runtime_num_sm() * Int32(4))
         self.quant(source.iterator, x.iterator, xs.iterator, xs.iterator,
                    rows, Int32(5120), grid, stream)
         self.pipeline(x, xs, w13, s13, w2, s2, ids, routing, live, packed,

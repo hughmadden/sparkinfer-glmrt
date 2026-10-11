@@ -5014,13 +5014,15 @@ class _DenseGemmLaunch:
             _max_active_clusters_for(self._cluster_shape_mn, sm_count)
             * self._target_occupancy
         )
-        if (
+        self._tile_major_limited = (
             mma_tiler_mn == (32, 64)
             and tile_k == 128
             and b_tile_major
             and sfb_k_reuse
             and alpha_is_one
-        ):
+            and ((n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]) * l == 64
+        )
+        if self._tile_major_limited:
             self._max_active_clusters = _tile_major_cluster_limit(
                 self._max_active_clusters,
                 n=n,
@@ -5174,8 +5176,10 @@ class _DenseGemmLaunch:
             sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
         policy = self._policy
         max_active_clusters = self._max_active_clusters
-        if cutlass.const_expr(self._block_fp8 and self._cluster_shape_mn == (1, 1)):
+        if cutlass.const_expr(self._cluster_shape_mn == (1, 1)):
             max_active_clusters = runtime_num_sm() * Int32(self._target_occupancy)
+            if cutlass.const_expr(self._tile_major_limited):
+                max_active_clusters = min(max_active_clusters, Int32(40))
         DenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
             mma_tiler_mn=self._mma_tiler_mn,
