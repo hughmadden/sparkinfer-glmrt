@@ -20,13 +20,14 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
     div_rn_f32,
+    cvt_f32x4_to_e4m3x4,
     ld_global_v4_u32,
     pack_f32x2_to_bfloat2,
     st_global_v4_u32,
 )
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 
-from ._glm_kernels import _rsqrt, _warp_sum
+from ._glm_kernels import _fp8_scale, _rsqrt, _warp_max, _warp_sum
 
 TOPK_THREADS = 512
 
@@ -94,8 +95,10 @@ class Qwen4AttnPost:
     the cache writes.
     """
 
-    def __init__(self, g):
+    def __init__(self, g, kv_format: str = "bf16"):
         self.g = g
+        self.kv_format = kv_format
+        self.record_bytes = g.kv_record_bytes(kv_format)
         self.heads, self.kv_heads, self.d = g.heads, g.kv_heads, g.head_dim
         self.ih, self.id = g.index_heads, g.index_head_dim
         self.width = g.attn_in_width
@@ -132,7 +135,26 @@ class Qwen4AttnPost:
                          pack_f32x2_to_bfloat2(values[6], values[7]))
 
     @cute.jit
-    def _head256(self, src: Int64, weight: cute.Pointer, position: cute.Tensor, lane: Int32, out: Int64):
+    def _store_fp8_head(self, out: Int64, scale_out: Int64, lane: Int32, values: cute.Tensor):
+        amax = Float32(0.0)
+        for j in cutlass.range_constexpr(8):
+            amax = cutlass.max(amax, cute.math.abs(values[j]))
+        scale = _fp8_scale(_warp_max(amax))
+        if lane == Int32(0):
+            scales = cute.make_tensor(cute.make_ptr(Float32, scale_out, cute.AddressSpace.gmem,
+                                                   assumed_align=4), cute.make_layout((1,)))
+            scales[0] = scale
+        inverse = div_rn_f32(Float32(1.0), scale)
+        words = cute.make_tensor(cute.make_ptr(Uint32, out, cute.AddressSpace.gmem, assumed_align=4),
+                                 cute.make_layout((64,)))
+        for j in cutlass.range_constexpr(2):
+            words[lane * Int32(2) + Int32(j)] = cvt_f32x4_to_e4m3x4(
+                values[j * 4] * inverse, values[j * 4 + 1] * inverse,
+                values[j * 4 + 2] * inverse, values[j * 4 + 3] * inverse)
+
+    @cute.jit
+    def _head256(self, src: Int64, weight: cute.Pointer, position: cute.Tensor, lane: Int32, out: Int64,
+                 scale_out: Int64 = Int64(0), fp8: cutlass.Constexpr = False):
         """Norm (1 + w) + RoPE of one 256-wide head at ``src``; lane owns dims 8l..8l+7."""
         x = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
         self._load8(src + Int64(lane) * Int64(16), x)
@@ -148,7 +170,10 @@ class Qwen4AttnPost:
             dim = Int32(8) * lane + Int32(j)
             if lane < Int32(8):
                 x[j] = self.rope.apply(x[j], partner, dim, position)
-        self._store8(out + Int64(lane) * Int64(16), x)
+        if cutlass.const_expr(fp8):
+            self._store_fp8_head(out, scale_out, lane, x)
+        else:
+            self._store8(out + Int64(lane) * Int64(16), x)
 
     @cute.jit
     def _head128(self, src: cute.Tensor, weight: cute.Pointer, position: cute.Tensor, lane: Int32, out: cute.Tensor,
@@ -196,13 +221,20 @@ class Qwen4AttnPost:
         elif item < Int32(self.heads + self.kv_heads):
             kh = Int64(item - Int32(self.heads))
             if slot >= Int64(0):
-                record = Int64(kv_cache.toint()) + slot * Int64(self.g.record_bytes)
-                self._head256(base + Int64(self.k_off * 2) + kh * Int64(self.d * 2), k_norm, position, lane,
-                              record + kh * Int64(self.d * 2))
+                record = Int64(kv_cache.toint()) + slot * Int64(self.record_bytes)
                 v = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
                 self._load8(base + Int64(self.v_off * 2) + kh * Int64(self.d * 2) + Int64(lane) * Int64(16), v)
-                self._store8(record + Int64(self.kv_heads * self.d * 2) + kh * Int64(self.d * 2)
-                             + Int64(lane) * Int64(16), v)
+                if cutlass.const_expr(self.kv_format == "fp8"):
+                    scales = record + Int64(2 * self.kv_heads * self.d)
+                    self._head256(base + Int64(self.k_off * 2) + kh * Int64(self.d * 2), k_norm,
+                                  position, lane, record + kh * Int64(self.d), scales + kh * Int64(4), True)
+                    self._store_fp8_head(record + Int64(self.kv_heads * self.d) + kh * Int64(self.d),
+                                         scales + Int64(self.kv_heads * 4) + kh * Int64(4), lane, v)
+                else:
+                    self._head256(base + Int64(self.k_off * 2) + kh * Int64(self.d * 2), k_norm, position, lane,
+                                  record + kh * Int64(self.d * 2))
+                    self._store8(record + Int64(self.kv_heads * self.d * 2) + kh * Int64(self.d * 2)
+                                 + Int64(lane) * Int64(16), v)
         elif item < Int32(self.heads + self.kv_heads + self.ih):
             ih = Int64(item - Int32(self.heads + self.kv_heads))
             src = cute.make_tensor(

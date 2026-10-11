@@ -42,6 +42,8 @@ from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compiler import run_compiled
 from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
 from b12x._lib.intrinsics import (
+    bfloat2_to_float2_scaled,
+    pack_f32x2_to_bfloat2,
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
     ld_global_nc_v4_u32,
     shared_ptr_to_u32,
@@ -134,6 +136,7 @@ class _SelectedPositionPagedForwardKernel:
         key_strides: tuple[int, int, int],
         value_strides: tuple[int, int, int],
         selection_width: int = _SELECTION_WIDTH,
+        inline_scale_offsets: tuple[int, int] | None = None,
     ) -> None:
         self.q_heads = int(q_heads)
         self.selection_width = int(selection_width)
@@ -142,6 +145,9 @@ class _SelectedPositionPagedForwardKernel:
         self.kv_heads = int(kv_heads)
         self.heads_per_kv = self.q_heads // self.kv_heads
         self.kv_is_fp8 = bool(kv_is_fp8)
+        self.inline_scale_offsets = inline_scale_offsets
+        if inline_scale_offsets is not None and not self.kv_is_fp8:
+            raise ValueError("inline descales require FP8 KV")
         self.direct_output = bool(direct_output)
         self.kv_warps = int(kv_warps)
         if self.kv_warps not in (1, 2, 4):
@@ -185,6 +191,11 @@ class _SelectedPositionPagedForwardKernel:
         )
 
     @cute.jit
+    def _descale_pair(self, pair: Uint32, scale: Float32) -> Uint32:
+        low, high = bfloat2_to_float2_scaled(pair, scale)
+        return pack_f32x2_to_bfloat2(low, high)
+
+    @cute.jit
     def _load_fp8_vector_to_bf16_shared(
         self,
         source: cute.Pointer,
@@ -192,6 +203,9 @@ class _SelectedPositionPagedForwardKernel:
         destination: cute.Tensor,
         token: Int32,
         dimension_base: Int32,
+        head: Int32,
+        head_stride: cutlass.Constexpr,
+        scale_offset: cutlass.Constexpr,
     ) -> None:
         x0 = Uint32(0)
         x1 = Uint32(0)
@@ -205,6 +219,22 @@ class _SelectedPositionPagedForwardKernel:
         y10, y11 = fp8x4_e4m3_to_bfloat2x2_native_sm120(x1)
         y20, y21 = fp8x4_e4m3_to_bfloat2x2_native_sm120(x2)
         y30, y31 = fp8x4_e4m3_to_bfloat2x2_native_sm120(x3)
+        if const_expr(self.inline_scale_offsets is not None):
+            scale = Float32(1.0)
+            if source_base >= Int64(0):
+                address = (_pointer_as_int64(source, source_base)
+                           - head.to(Int64) * Int64(head_stride)
+                           + Int64(scale_offset) + head.to(Int64) * Int64(4))
+                scale = cute.make_tensor(cute.make_ptr(Float32, address, cute.AddressSpace.gmem,
+                                                      assumed_align=4), cute.make_layout((1,)))[0]
+            y00 = self._descale_pair(y00, scale)
+            y01 = self._descale_pair(y01, scale)
+            y10 = self._descale_pair(y10, scale)
+            y11 = self._descale_pair(y11, scale)
+            y20 = self._descale_pair(y20, scale)
+            y21 = self._descale_pair(y21, scale)
+            y30 = self._descale_pair(y30, scale)
+            y31 = self._descale_pair(y31, scale)
         destination0 = shared_ptr_to_u32(
             destination.iterator
             + cute.crd2idx((token, dimension_base), destination.layout)
@@ -482,6 +512,9 @@ class _SelectedPositionPagedForwardKernel:
                     shared_key,
                     token,
                     dimension_base,
+                    kv_head,
+                    self.key_head_stride,
+                    self.inline_scale_offsets[0] if self.inline_scale_offsets is not None else 0,
                 )
                 self._load_fp8_vector_to_bf16_shared(
                     value_cache,
@@ -489,6 +522,9 @@ class _SelectedPositionPagedForwardKernel:
                     shared_value,
                     token,
                     dimension_base,
+                    kv_head,
+                    self.value_head_stride,
+                    self.inline_scale_offsets[1] if self.inline_scale_offsets is not None else 0,
                 )
         cute.arch.sync_threads()
 
@@ -602,7 +638,7 @@ class _SelectedPositionPagedForwardKernel:
 
         k_scale = Float32(1.0)
         v_scale = Float32(1.0)
-        if const_expr(self.kv_is_fp8):
+        if const_expr(self.kv_is_fp8 and self.inline_scale_offsets is None):
             k_scale = Float32(k_descale[0])
             v_scale = Float32(v_descale[0])
 

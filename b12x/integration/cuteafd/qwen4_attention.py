@@ -182,14 +182,14 @@ def attn_producer_scratch_bytes(g: Qwen4Geometry, rows: int) -> int:
 
 
 class _Producer:
-    def __init__(self, g: Qwen4Geometry, fp8: bool = False):
-        self.g, self.fp8 = g, bool(fp8)
+    def __init__(self, g: Qwen4Geometry, fp8: bool = False, kv_format: str = "bf16"):
+        self.g, self.fp8, self.kv_format = g, bool(fp8), kv_format
         self.proj = projection(g.attn_in_width, g.hidden, self.fp8)
-        self.post = Qwen4AttnPost(g)
+        self.post = Qwen4AttnPost(g, kv_format)
         self.pool = Qwen4PoolKeys(g)
 
     def key(self) -> tuple:
-        return (self.proj.key(), self.g, self.fp8)
+        return (self.proj.key(), self.g, self.fp8, self.kv_format)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, q_norm: cute.Pointer, k_norm: cute.Pointer,
@@ -217,8 +217,8 @@ class _Producer:
 
 
 class _ProducerFp8(_Producer):
-    def __init__(self, g: Qwen4Geometry):
-        super().__init__(g, fp8=True)
+    def __init__(self, g: Qwen4Geometry, kv_format: str = "bf16"):
+        super().__init__(g, fp8=True, kv_format=kv_format)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer,
@@ -235,14 +235,14 @@ class _ProducerFp8(_Producer):
 class _ProducerW8:
     """The producer over an FP8-only in-projection (``Fp8Projection``, no BF16 copy)."""
 
-    def __init__(self, g: Qwen4Geometry, max_rows: int, prefill: bool):
-        self.g = g
+    def __init__(self, g: Qwen4Geometry, max_rows: int, prefill: bool, kv_format: str = "bf16"):
+        self.g, self.kv_format = g, kv_format
         self.proj = Fp8Projection(g.attn_in_width, g.hidden, prefill_rows=int(max_rows) if prefill else None)
-        self.post = Qwen4AttnPost(g)
+        self.post = Qwen4AttnPost(g, kv_format)
         self.pool = Qwen4PoolKeys(g)
 
     def key(self) -> tuple:
-        return ("w8", self.proj.key(), self.g)
+        return ("w8", self.proj.key(), self.g, self.kv_format)
 
     def scratch_bytes(self, rows: int) -> int:
         return attn_producer_scratch_bytes(self.g, rows) + self.proj.prefill_scratch_bytes(rows)
@@ -291,7 +291,8 @@ class _ProducerW8Prefill(_ProducerW8):
 
 
 def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
-                                    fp8: bool = False, fp8_only: str | None = None) -> AotProgram:
+                                    fp8: bool = False, fp8_only: str | None = None,
+                                    kv_format: str = "bf16") -> AotProgram:
     """Full-attention producer for ``rows <= max_rows``; see the module docstring.
     ``fp8`` adds ``w_in_fp8``/``w_in_scale`` (E4M3, FP32 128x128 block scales) for rows <= 16;
     ``fp8_only`` (``"decode"`` / ``"prefill"``) takes them in place of ``w_in``."""
@@ -300,9 +301,9 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
         raise ValueError("fp8 and fp8_only are exclusive")
     prefill = fp8_only is not None and check_w8_mode(fp8_only) == "prefill"
     if fp8_only is not None:
-        launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, max_rows, prefill)
+        launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, max_rows, prefill, kv_format)
     else:
-        launch = (_ProducerFp8 if fp8 else _Producer)(g)
+        launch = (_ProducerFp8 if fp8 else _Producer)(g, kv_format=kv_format)
     h, n, d, ih = g.hidden, g.heads, g.head_dim, g.index_heads
     weights = (fp8_only_operands("w_in", g.attn_in_width, h, prefill=prefill) if fp8_only is not None else
                (Operand("w_in", torch.bfloat16, f"[{g.attn_in_width},{h}]"),
@@ -319,7 +320,7 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
         Operand("block_rope_positions", torch.int32, "[rows,3]", align=4),
         Operand("kv_slots", torch.int64, "[rows]", align=8),
         Operand("pool_slots", torch.int64, "[rows]", align=8),
-        Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]", "inout"),
+        Operand("kv_cache", torch.uint8, f"[pages,{g.page_rows * g.kv_record_bytes(kv_format)}]", "inout"),
         Operand("token_keys", torch.bfloat16, f"[record_slots,{g.index_head_dim}]", "inout"),
         Operand("index_cache", torch.bfloat16, f"[pool_slots,{g.index_head_dim}]", "inout"),
         Operand("query", torch.bfloat16, f"[rows,{n},{d}]", "out"),
@@ -332,7 +333,7 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
             launch, name="qwen4_attn_producer", operands=operands, scalars=w8_scalars(prefill),
             key=("mrope-v1", max_rows, fp8_only, launch.key()),
             geometry={"hidden": h, "heads": n, "kv_heads": g.kv_heads, "head_dim": d, "index_heads": ih,
-                      "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "mrope_section": [11, 11, 10], "record_bytes": g.record_bytes,
+                      "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "mrope_section": [11, 11, 10], "record_bytes": g.kv_record_bytes(kv_format), "kv_format": kv_format,
                       "page_rows": g.page_rows, "eps": g.norm_eps, "max_rows": max_rows, "fp8_weights": "only",
                       "mode": fp8_only},
             scratch={"scratch": launch.scratch_bytes},
@@ -342,7 +343,7 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
         launch, name="qwen4_attn_producer", operands=operands, scalars=(Scalar("rows"),),
         key=("mrope-v1", max_rows, launch.key()),
         geometry={"hidden": h, "heads": n, "kv_heads": g.kv_heads, "head_dim": d, "index_heads": ih,
-                  "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "mrope_section": [11, 11, 10], "record_bytes": g.record_bytes,
+                  "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "mrope_section": [11, 11, 10], "record_bytes": g.kv_record_bytes(kv_format), "kv_format": kv_format,
                   "page_rows": g.page_rows, "eps": g.norm_eps, "max_rows": max_rows, "fp8_weights": fp8},
         scratch={"scratch": lambda rows: attn_producer_scratch_bytes(g, rows)},
         doc=__doc__,
@@ -487,17 +488,22 @@ def sparse_gqa_scratch_bytes(g: Qwen4Geometry, rows: int) -> int:
 
 
 class _SparseGqa:
-    def __init__(self, g: Qwen4Geometry, max_rows: int, direct_kv_warps: int = 2, split_kv_warps: int = 2):
+    def __init__(self, g: Qwen4Geometry, max_rows: int, direct_kv_warps: int = 2, split_kv_warps: int = 2,
+                 kv_format: str = "bf16"):
         from b12x.attention.paged._selected_forward import _ShapeAdaptiveSparseGqaMergeKernel
         from b12x.attention.paged.forward_extend_generic import PagedForwardKernel
 
         self.g = g
         self.max_rows = int(max_rows)
         self.layout = _gqa_layout(g, max_rows)
-        token = g.record_bytes // 2
+        self.kv_format = kv_format
+        token = g.kv_record_bytes(kv_format) // (1 if kv_format == "fp8" else 2)
         strides = (g.page_rows * token, token, g.head_dim)
-        common = dict(q_heads=g.heads, kv_heads=g.kv_heads, kv_is_fp8=False, page_size=g.page_rows,
-                      key_strides=strides, value_strides=strides, selection_width=g.sparse_topk)
+        common = dict(q_heads=g.heads, kv_heads=g.kv_heads, kv_is_fp8=kv_format == "fp8", page_size=g.page_rows,
+                      key_strides=strides, value_strides=strides, selection_width=g.sparse_topk,
+                      inline_scale_offsets=(2 * g.kv_heads * g.head_dim,
+                                            g.kv_heads * g.head_dim + g.kv_heads * 4)
+                      if kv_format == "fp8" else None)
         self.kv_warps = (int(split_kv_warps), int(direct_kv_warps))
         self.split = PagedForwardKernel.selected_positions(direct_output=False, kv_warps=self.kv_warps[0], **common)
         self.direct = (PagedForwardKernel.selected_positions(direct_output=True, kv_warps=self.kv_warps[1], **common)
@@ -506,7 +512,7 @@ class _SparseGqa:
         self.tables = Qwen4RowTables()
 
     def key(self) -> tuple:
-        return (tuple(sorted(self.layout.items())), self.max_rows, self.kv_warps, self.g)
+        return (tuple(sorted(self.layout.items())), self.max_rows, self.kv_warps, self.g, self.kv_format)
 
     @cute.jit
     def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer,
@@ -525,8 +531,12 @@ class _SparseGqa:
             shared = Int32(1)
             width = table_width
         self.tables(positions, requests, lengths, rows, shared, stream)
-        keys = _ptr(cutlass.BFloat16, Int64(kv_cache.toint()))
-        values = _ptr(cutlass.BFloat16, Int64(kv_cache.toint()) + Int64(g.kv_heads * g.head_dim * 2))
+        if cutlass.const_expr(self.kv_format == "fp8"):
+            keys = _ptr(cutlass.Float8E4M3FN, Int64(kv_cache.toint()))
+            values = _ptr(cutlass.Float8E4M3FN, Int64(kv_cache.toint()) + Int64(g.kv_heads * g.head_dim))
+        else:
+            keys = _ptr(cutlass.BFloat16, Int64(kv_cache.toint()))
+            values = _ptr(cutlass.BFloat16, Int64(kv_cache.toint()) + Int64(g.kv_heads * g.head_dim * 2))
         dummy = _ptr(Float32, base + Int64(L["lse"]), 16)
         scale = Float32(g.softmax_scale)
         pages = Int64(1 << 40)
@@ -556,14 +566,15 @@ class _SparseGqa:
 
 
 def compile_qwen4_sparse_gqa_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
-                                 direct_kv_warps: int = 2, split_kv_warps: int = 2) -> AotProgram:
+                                 direct_kv_warps: int = 2, split_kv_warps: int = 2,
+                                 kv_format: str = "bf16") -> AotProgram:
     """GQA over each row's selected positions; see the module docstring."""
     max_rows = _check_rows(max_rows)
-    launch = _SparseGqa(g, max_rows, direct_kv_warps, split_kv_warps)
+    launch = _SparseGqa(g, max_rows, direct_kv_warps, split_kv_warps, kv_format)
     n, d = g.heads, g.head_dim
     operands = (
         Operand("query", torch.bfloat16, f"[rows,{n},{d}]"),
-        Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]"),
+        Operand("kv_cache", torch.uint8, f"[pages,{g.page_rows * g.kv_record_bytes(kv_format)}]"),
         Operand("positions", torch.int64, "[rows]", align=8),
         Operand("page_table", torch.int32, "[rows|1,table_stride]", align=4),
         Operand("indices", torch.int32, f"[rows,{g.sparse_topk}]", align=4),
@@ -575,7 +586,8 @@ def compile_qwen4_sparse_gqa_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_ro
         scalars=(Scalar("rows"), Scalar("table_width"), Scalar("table_stride")), key=(max_rows, launch.key()),
         geometry={"heads": n, "kv_heads": g.kv_heads, "head_dim": d, "width": g.sparse_topk,
                   "softmax_scale": g.softmax_scale, "max_rows": max_rows, "split_max_rows": SPLIT_MAX_ROWS,
-                  "kv_warps": list(launch.kv_warps)},
+                  "kv_warps": list(launch.kv_warps), "kv_format": kv_format,
+                  "record_bytes": g.kv_record_bytes(kv_format)},
         scratch={"scratch": lambda rows: sparse_gqa_scratch_bytes(g, rows)},
         doc=__doc__,
     )

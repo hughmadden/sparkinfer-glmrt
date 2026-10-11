@@ -500,6 +500,14 @@ class Qwen4Geometry:
     def kv_page_bytes(self) -> int:
         return self.page_rows * self.record_bytes
 
+    def kv_record_bytes(self, kv_format: str = "bf16") -> int:
+        """K/V payload plus immutable per-token/per-head FP32 descales."""
+        if kv_format == "bf16":
+            return self.record_bytes
+        if kv_format == "fp8":
+            return 2 * self.kv_heads * (self.head_dim + 4)
+        raise ValueError(f"unsupported Qwen KV format: {kv_format}")
+
     @property
     def index_blocks(self) -> int:
         """Selected key blocks per row past the dense limit."""
