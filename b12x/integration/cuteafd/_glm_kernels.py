@@ -333,10 +333,13 @@ class GlmRankNormPackKV:
 
 
 class GlmQueryRope:
-    """``query[:, h, 512:576] = rope(q[:, h, nope:nope+64])`` (BF16, de-interleaved)."""
+    """``query[:, h, 512:576] = rope(q[:, h, nope:nope+64])`` (BF16, de-interleaved).
+    ``query_row``: elements between query rows (default ``heads * latent``; a context-split
+    producer writes its heads' half of a two-GPU assembled query, rows ``2 * heads * latent``)."""
 
-    def __init__(self, *, heads: int, qk_nope: int, qk_head: int, latent: int = 576):
+    def __init__(self, *, heads: int, qk_nope: int, qk_head: int, latent: int = 576, query_row: int | None = None):
         self.heads, self.nope, self.head, self.latent = int(heads), int(qk_nope), int(qk_head), int(latent)
+        self.query_row = int(query_row) if query_row is not None else self.heads * self.latent
 
     @cute.jit
     def __call__(self, q: cute.Pointer, positions: cute.Pointer, cos_sin: cute.Pointer,
@@ -347,7 +350,7 @@ class GlmQueryRope:
             cute.make_tensor(q, cute.make_layout((m, h, self.head), stride=(h * self.head, self.head, 1))),
             cute.make_tensor(positions, cute.make_layout((m,))),
             cos_sin,
-            cute.make_tensor(query, cute.make_layout((m, h, self.latent), stride=(h * self.latent, self.latent, 1))),
+            cute.make_tensor(query, cute.make_layout((m, h, self.latent), stride=(self.query_row, self.latent, 1))),
         ).launch(grid=(rows, 1, 1), block=(ROPE_PAIRS * 8, 1, 1), stream=stream)
 
     @cute.kernel

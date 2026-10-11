@@ -130,9 +130,11 @@ def o_scratch_bytes(g: GLMGeometry, rows: int) -> int:
 
 
 class _Producer:
-    def __init__(self, g: GLMGeometry, fp8: bool = False):
+    def __init__(self, g: GLMGeometry, fp8: bool = False, query_row: int | None = None):
         self.g = g
         n, q = g.heads, g.q_lora_rank
+        # Query rows: contiguous by default, or the head-split half of an assembled query.
+        self.query_row = int(query_row) if query_row is not None else n * g.latent_dim
         self.qkv_a = projection(g.qkv_a_width, g.hidden, fp8)
         self.q_b = projection(n * g.qk_head_dim, q, fp8)
         self.pack = GlmRankNormPackKV(q_rank=q, eps=g.norm_eps, page_rows=g.page_rows,
@@ -140,12 +142,13 @@ class _Producer:
         # q_nope [rows, N, 192] (row stride N*256) @ W_UK^T -> query[:, :, :512].
         self.absorb = BatchedBf16Gemm(
             n=g.kv_lora_rank, k=g.qk_nope_dim, batch=n, a_row=n * g.qk_head_dim,
-            a_batch=g.qk_head_dim, o_row=n * g.latent_dim, o_batch=g.latent_dim)
+            a_batch=g.qk_head_dim, o_row=self.query_row, o_batch=g.latent_dim)
         self.rope = GlmQueryRope(heads=n, qk_nope=g.qk_nope_dim, qk_head=g.qk_head_dim,
-                                 latent=g.latent_dim)
+                                 latent=g.latent_dim, query_row=self.query_row)
 
     def key(self) -> tuple:
-        return (self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
+        key = (self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
+        return key if self.query_row == self.g.heads * self.g.latent_dim else key + (("query_row", self.query_row),)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, positions: cute.Pointer, kv_slots: cute.Pointer,
@@ -305,22 +308,24 @@ class _ProducerW8:
     """MLA producer over FP8-only weights. Prefill programs take ``q_a|kv_a`` (2624 rows: the
     block-FP8 GEMM wants whole 128-row blocks) with per-row scales, K-block major."""
 
-    def __init__(self, g: GLMGeometry, prefill_rows: int | None):
+    def __init__(self, g: GLMGeometry, prefill_rows: int | None, query_row: int | None = None):
         self.g = g
         n, q = g.heads, g.q_lora_rank
+        self.query_row = int(query_row) if query_row is not None else n * g.latent_dim
         self.qkv_a = _w8_projection(g.qkv_a_width, g.hidden, prefill_rows, row_scales=True)
         self.q_b = _w8_projection(n * g.qk_head_dim, q, prefill_rows)
         self.pack = GlmRankNormPackKV(q_rank=q, eps=g.norm_eps, page_rows=g.page_rows,
                                       record_bytes=g.record_bytes)
         self.absorb = BatchedFp8Gemm(
             n=g.kv_lora_rank, k=g.qk_nope_dim, batch=n, a_row=n * g.qk_head_dim,
-            a_batch=g.qk_head_dim, o_row=n * g.latent_dim, o_batch=g.latent_dim,
+            a_batch=g.qk_head_dim, o_row=self.query_row, o_batch=g.latent_dim,
             compute_warps=_w8_batched_warps(prefill_rows))
         self.rope = GlmQueryRope(heads=n, qk_nope=g.qk_nope_dim, qk_head=g.qk_head_dim,
-                                 latent=g.latent_dim)
+                                 latent=g.latent_dim, query_row=self.query_row)
 
     def key(self) -> tuple:
-        return ("w8", self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
+        key = ("w8", self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
+        return key if self.query_row == self.g.heads * self.g.latent_dim else key + (("query_row", self.query_row),)
 
     def scratch_bytes(self, rows: int) -> int:
         return producer_scratch_bytes(self.g, rows) + self.qkv_a.prefill_scratch_bytes(rows)
@@ -464,14 +469,16 @@ class _OutputW8Prefill(_OutputW8):
         self.body(attn, w_uv_fp8, w_uv_scale, w_o_fp8, w_o_scale, out, scratch, rows, fp8_rows, stream)
 
 
-def _compile_w8(kind: str, g: GLMGeometry, max_rows: int, mode: str):
+def _compile_w8(kind: str, g: GLMGeometry, max_rows: int, mode: str, query_row: int | None = None):
     prefill = check_w8_mode(mode) == "prefill"
+    if query_row is not None and kind != "producer":
+        raise ValueError("query_row applies to the producer only")
     rows_cap = int(max_rows) if prefill else None
     h, q, n, i = g.hidden, g.q_lora_rank, g.heads, g.index_heads
     w8 = lambda name, n_, k_, row=False: fp8_only_operands(name, n_, k_, row_scales=row and prefill,  # noqa: E731
                                                          prefill=prefill)
     if kind == "producer":
-        launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, rows_cap)
+        launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, rows_cap, query_row)
         operands = (
             Operand("x", torch.bfloat16, f"[rows,{h}]"),
             Operand("positions", torch.int64, "[rows]", align=8),
@@ -483,12 +490,15 @@ def _compile_w8(kind: str, g: GLMGeometry, max_rows: int, mode: str):
             *w8("w_q_b", n * g.qk_head_dim, q),
             *kv_b_fp8_operands("w_uk", g),
             Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]", "inout"),
-            Operand("query", torch.bfloat16, f"[rows,{n},{g.latent_dim}]", "out"),
+            Operand("query", torch.bfloat16, f"[rows,{n},{g.latent_dim}]" if query_row is None
+                    else f"[rows,{n},{g.latent_dim}] (rows {query_row} apart)", "out"),
             Operand("q_resid", torch.bfloat16, f"[rows,{q}]", "out"),
             Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"),
         )
         name, geometry = "glm_producer", {"hidden": h, "q_lora_rank": q, "heads": n, "record_bytes": g.record_bytes,
                                           "page_rows": g.page_rows, "eps": g.norm_eps}
+        if query_row is not None:
+            geometry["query_row"] = int(query_row)
     elif kind == "index_producer":
         launch = (_IndexProducerW8Prefill if prefill else _IndexProducerW8Decode)(g, rows_cap)
         operands = (
@@ -526,13 +536,17 @@ def _compile_w8(kind: str, g: GLMGeometry, max_rows: int, mode: str):
 
 
 def compile_glm_producer_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool = False,
-                             fp8_only: str | None = None):
+                             fp8_only: str | None = None, query_row: int | None = None):
     """MLA producer for ``rows <= max_rows``; see the module docstring. ``fp8``
-    adds the decode FP8 weight operands."""
+    adds the decode FP8 weight operands. ``query_row`` (elements) writes ``query`` rows that far
+    apart: a context-split producer writes its heads straight into its half of the two-GPU
+    assembled query (``2 * heads * latent``); unset keeps contiguous rows and every key."""
+    if query_row is not None and int(query_row) < g.heads * g.latent_dim:
+        raise ValueError("query rows must not overlap")
     if fp8_only is not None:
-        return _compile_w8("producer", g, max_rows, fp8_only)
+        return _compile_w8("producer", g, max_rows, fp8_only, query_row)
     max_rows = _check_rows(max_rows)
-    launch = (_ProducerFp8 if fp8 else _Producer)(g, fp8)
+    launch = (_ProducerFp8 if fp8 else _Producer)(g, fp8, query_row)
     h, q, n = g.hidden, g.q_lora_rank, g.heads
     extra = lambda name, n_, k_: fp8_operands(name, n_, k_) if fp8 else ()  # noqa: E731
     operands = (
@@ -548,15 +562,19 @@ def compile_glm_producer_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool
         *extra("w_q_b", n * g.qk_head_dim, q),
         Operand("w_uk", torch.bfloat16, f"[{n},512,{g.qk_nope_dim}]"),
         Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]", "inout"),
-        Operand("query", torch.bfloat16, f"[rows,{n},{g.latent_dim}]", "out"),
+        Operand("query", torch.bfloat16, f"[rows,{n},{g.latent_dim}]" if query_row is None
+                else f"[rows,{n},{g.latent_dim}] (rows {query_row} apart)", "out"),
         Operand("q_resid", torch.bfloat16, f"[rows,{q}]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"),
     )
+    geometry = {"hidden": h, "q_lora_rank": q, "heads": n, "max_rows": max_rows, "fp8_weights": fp8,
+                "record_bytes": g.record_bytes, "page_rows": g.page_rows, "eps": g.norm_eps}
+    if query_row is not None:
+        geometry["query_row"] = int(query_row)
     return compile_program(
         launch, name="glm_producer", operands=operands, scalars=(Scalar("rows"),),
         key=(max_rows, fp8, launch.key()),
-        geometry={"hidden": h, "q_lora_rank": q, "heads": n, "max_rows": max_rows, "fp8_weights": fp8,
-                  "record_bytes": g.record_bytes, "page_rows": g.page_rows, "eps": g.norm_eps},
+        geometry=geometry,
         scratch={"scratch": lambda rows: producer_scratch_bytes(g, rows)},
         doc=__doc__,
     )

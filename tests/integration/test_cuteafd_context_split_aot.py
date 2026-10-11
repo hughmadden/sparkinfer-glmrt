@@ -395,3 +395,69 @@ def test_frozen_resolution_graph_replay_live_rows():
             assert torch.equal(out[:n],o0[:n])
             assert (po[:n]==0).all() and torch.isneginf(pl[:n]).all()
             assert (ii[:n]==-1).all() and torch.isneginf(iv[:n]).all()
+
+
+@pytest.mark.parametrize("weights", ["fp8", "bf16"])
+@pytest.mark.parametrize("rows", [1, 3, 8, 64])
+def test_producer_query_row_writes_the_half_of_an_assembled_query(weights, rows):
+    """A head-split producer with ``query_row = 2 * heads * latent`` (context decode: this GPU's
+    heads into its half of the two-GPU assembled query) writes bitwise what the contiguous producer
+    writes, at the strided rows, and leaves the other half alone; records and q_resid are equal."""
+    require_b12x()
+    import dataclasses, re
+    from b12x.integration.cuteafd import GLM53, exportable_compilation
+    from b12x.integration.cuteafd.glm_attention import compile_glm_producer_aot
+    g = dataclasses.replace(GLM53, name="glm53_tp2", heads=GLM53.heads // 2,
+                            dense_inter=GLM53.dense_inter // 2, moe_inter=GLM53.moe_inter // 2)
+    row = 2 * g.heads * g.latent_dim
+    kw = {"fp8_only": "decode"} if weights == "fp8" else {}
+    with exportable_compilation():
+        flat = compile_glm_producer_aot(g, max_rows=64, **kw)
+        half = compile_glm_producer_aot(g, max_rows=64, query_row=row, **kw)
+    assert half.geometry["query_row"] == row and "query_row" not in flat.geometry
+    gen = torch.Generator(device="cuda").manual_seed(7 + rows)
+    pages = 8
+    sizes = {"rows": rows, "pages": pages, "P": 8192,
+             "producer_scratch_bytes": flat.scratch_bytes(64)["scratch"]}
+
+    def shape(text):
+        return [int(sizes.get(d.strip(), d.strip())) for d in re.findall(r"[^\[\],]+", text.split(" ")[0])]
+
+    inputs = {}
+    for op in flat.operands:
+        dims = shape(op.shape)
+        if op.name == "positions":
+            t = torch.randperm(8192, generator=gen, device="cuda")[:rows].to(torch.int64)
+        elif op.name == "kv_slots":
+            t = torch.randperm(pages * 64, generator=gen, device="cuda")[:rows].to(torch.int64)
+        elif op.name == "cos_sin":
+            angles = torch.rand((8192, 32), generator=gen, device="cuda") * 6.0
+            t = torch.cat([angles.cos(), angles.sin()], 1)
+        elif op.dtype == torch.float8_e4m3fn:
+            t = (torch.randn(dims, generator=gen, device="cuda") * 0.5).to(op.dtype)
+        elif op.dtype == torch.float32:
+            t = torch.rand(dims, generator=gen, device="cuda") * 0.02 + 0.005
+        elif op.dtype == torch.bfloat16:
+            t = (torch.randn(dims, generator=gen, device="cuda") * 0.1).bfloat16()
+        else:
+            t = torch.zeros(dims, dtype=op.dtype, device="cuda")
+        inputs[op.name] = t
+
+    def run(program, query):
+        cache = torch.zeros((pages, g.kv_page_bytes), dtype=torch.uint8, device="cuda")
+        q_resid = torch.zeros((rows, g.q_lora_rank), dtype=torch.bfloat16, device="cuda")
+        scratch = torch.zeros(program.scratch_bytes(64)["scratch"], dtype=torch.uint8, device="cuda")
+        args = {**inputs, "kv_cache": cache, "query": query, "q_resid": q_resid, "scratch": scratch}
+        program.launch(*(args[op.name] for op in program.operands), scalars=(rows,))
+        torch.cuda.synchronize()
+        return cache, q_resid
+
+    contiguous = torch.zeros((rows, g.heads, g.latent_dim), dtype=torch.bfloat16, device="cuda")
+    ref_cache, ref_resid = run(flat, contiguous)
+    for rank in (0, 1):
+        assembled = torch.full((rows, 2, g.heads, g.latent_dim), 7.0, dtype=torch.bfloat16, device="cuda")
+        cache, resid = run(half, assembled[:, rank])
+        assert torch.equal(assembled[:, rank], contiguous), f"rank {rank}: strided query rows differ"
+        assert (assembled[:, 1 - rank] == 7.0).all(), f"rank {rank}: wrote the peer's half"
+        assert torch.equal(cache, ref_cache) and torch.equal(resid, ref_resid)
+    assert contiguous.abs().sum() > 0
