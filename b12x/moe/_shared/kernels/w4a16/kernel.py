@@ -6576,6 +6576,7 @@ class W4A16FusedMoeKernel:
         fc1_l2_prefetch_k_tiles: int = 0,
         fc2_l2_prefetch_k_tiles: int = 0,
         phase_l2_prefetch: bool = False,
+        workspace_sms: int | None = None,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6901,8 +6902,13 @@ class W4A16FusedMoeKernel:
             ) // 4
             self.fc1.sqg_xor_cheb_t12_smem = True
             self.fc2.sqg_xor_cheb_t12_smem = True
-        self.barrier_count_off = self.sms * 4
-        self.barrier_sense_off = self.sms * 4 + 1
+        # An AOT workspace capacity is independent of the card tracing this
+        # kernel. The cooperative barrier still counts the runtime grid.
+        self.workspace_sms = self.sms if workspace_sms is None else int(workspace_sms)
+        if self.workspace_sms < self.sms:
+            raise ValueError("W4A16 workspace SM capacity is smaller than the device")
+        self.barrier_count_off = self.workspace_sms * 4
+        self.barrier_sense_off = self.barrier_count_off + 1
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -6947,7 +6953,7 @@ class W4A16FusedMoeKernel:
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
             self.cta_threads,
-            self.sms,
+            self.workspace_sms,
             self.shared_words,
             self.blocks_per_sm,
         ) + (("activation_output_a8",) if self.activation_output_a8 else ()) + (

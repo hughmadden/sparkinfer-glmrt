@@ -80,6 +80,49 @@ def test_mixed_a8_rejects_unsupported_plans_before_cuda(
         )
 
 
+def test_mixed_aot_workspace_offsets_and_buffers_ignore_export_sms(monkeypatch) -> None:
+    capacity = mixed_trellis_module.EXL3_AOT_MAX_SMS[(12, 0)]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    kernels = []
+    for sms in (188, 170, 48):
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _, sms=sms:
+                            SimpleNamespace(multi_processor_count=sms,
+                                            shared_memory_per_block_optin=101376))
+        kernel = W4A16FusedMoeKernel(
+            size_m=3, hidden_size=128, intermediate_size=128,
+            num_experts=4, top_k=2, activation="silu",
+            apply_router_weight_on_input=False, zero_fc2_output=False,
+            fc1_tile_n=128, fc1_tile_k=128, fc2_tile_n=128, fc2_tile_k=128,
+            moe_block_size=8, max_m_blocks=8, element_dtype="fp16",
+            weight_layout="trellis_t256", scale_format="e4m3_k32",
+            w13_layout="trellis_t256_proj", trellis_codebook="mcg",
+            intermediate_rotation=True, full_rotation=True,
+            schedule_whole_tiles=True, workspace_sms=capacity,
+        )
+        assert kernel.sms == sms
+        assert kernel.barrier_count_off == capacity * 4
+        assert kernel.barrier_sense_off == capacity * 4 + 1
+        kernels.append(kernel)
+    assert kernels[0].__cache_key__ == kernels[1].__cache_key__ == kernels[2].__cache_key__
+    plan = SimpleNamespace(
+        workspace_sms=capacity, size_m=4096, top_k=2, hidden_size=128,
+        intermediate_size=128, direct_topk_routes=True, moe_block_size=8,
+        max_m_blocks=8192, blocks_per_sm=1,
+        topk_sum=SimpleNamespace(full_rotation_output_dtype="bf16"),
+    )
+    buffers = [mixed_trellis_module._make_mixed_trellis_buffers(
+        plan, device=torch.device("meta"), sms=sms, route_num_experts=4,
+    ) for sms in (188, 170, 48)]
+    for field in ("workspace", "fc1_scratch", "fc2_scratch"):
+        assert len({getattr(buf, field).numel() for buf in buffers}) == 1
+    assert buffers[0].workspace.numel() == capacity * 4 + 2
+    with pytest.raises(ValueError, match="capacity is smaller"):
+        mixed_trellis_module._make_mixed_trellis_buffers(
+            plan, device=torch.device("meta"), sms=capacity + 1, route_num_experts=4,
+        )
+
+
 def test_explicit_mixed_residency_limits_and_cache_identity() -> None:
     apply = mixed_trellis_module._apply_mixed_residency
     kernel = object.__new__(W4A16MixedTrellisKernel)
@@ -470,6 +513,15 @@ def _serial_tier(
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("direct", [False, True])
+def test_mixed_aot_workspace_matches_serial_and_captures(direct) -> None:
+    test_mixed_two_tier_matches_serial_and_captures(
+        torch.int32, "mcg", (3, 4), direct, "bf16",
+        workspace_sms=mixed_trellis_module.EXL3_AOT_MAX_SMS[(12, 0)],
+    )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
     "codebook,bits", [("mcg", (2, 3)), ("mcg", (3, 4)), ("sqg_e4m3", (2, 3))]
@@ -485,6 +537,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
     geometry: tuple[int, int] = (128, 128),
     tile_config: tuple[int, int, int, int] | None = None,
     swiglu_limit: float | None = None,
+    workspace_sms: int | None = None,
 ) -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -554,6 +607,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
         tier1_bits=bits[1],
         direct_topk_routes=direct_topk_routes,
         full_rotation_output_dtype=full_rotation_output_dtype,
+        workspace_sms=workspace_sms,
     )
     assert launch.direct_topk_routes is direct_topk_routes
     global_to_combined, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)

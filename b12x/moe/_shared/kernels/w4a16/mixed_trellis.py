@@ -63,6 +63,9 @@ from .kernel import (
 _TIER_DESCRIPTOR_BITS = 9
 _TIER_DESCRIPTOR_MASK = (1 << _TIER_DESCRIPTOR_BITS) - 1
 _MAX_TIER_EXPERTS = 1 << _TIER_DESCRIPTOR_BITS
+# One SM120 AOT package serves the 188-SM PRO 6000 and the 170-SM 5090.
+# Only workspace sizing uses these bounds; cooperative grids use the live card.
+EXL3_AOT_MAX_SMS = {(12, 0): 188, (12, 1): 48}
 
 
 # Below this many rows a (route, block) unit per warp keeps the grid busy;
@@ -118,6 +121,8 @@ class MixedTrellisCompileResult:
     activations: str = field(default="a16", kw_only=True)
     # The L2 decode schedule's canonical spec (None: the default schedule).
     decode_schedule: str | None = field(default=None, kw_only=True)
+    # AOT workspace capacity; None preserves device-sized JIT allocations.
+    workspace_sms: int | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -249,7 +254,7 @@ class W4A16MixedTrellisKernel:
 
     # Persistent compile keys do not include launch source text. Change this
     # version whenever the compiled argument or tensor-layout contract changes.
-    ABI_VERSION = 20
+    ABI_VERSION = 21
     _token_major_rotation = False
 
     def __init__(
@@ -1358,7 +1363,7 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
     """
 
     # The three-tier ABI has an independent persistent compile namespace.
-    ABI_VERSION = 6
+    ABI_VERSION = 7
 
     def __init__(
         self,
@@ -2326,6 +2331,7 @@ def compile_mixed_trellis(
     ws_dynamic_tiles: bool = False,
     activations: str = "a16",
     decode_schedule: str | None = None,
+    workspace_sms: int | None = None,
 ) -> MixedTrellisCompileResult:
     if activations not in ("a16", "a8"):
         raise ValueError(f"unsupported EXL3 activations {activations!r}")
@@ -2418,6 +2424,7 @@ def compile_mixed_trellis(
             trellis_codebook=trellis_codebook,
             intermediate_rotation=True,
             full_rotation=True,
+            workspace_sms=workspace_sms,
             rotation_input_dtype=rotation_input_dtype,
             broadcast_suh=broadcast_suh,
             direct_topk_routes=direct_topk_routes,
@@ -2517,6 +2524,7 @@ def compile_mixed_trellis(
             broadcast_suh=bool(broadcast_suh),
             broadcast_svh=bool(broadcast_svh),
             decode_schedule=decode_schedule,
+            workspace_sms=workspace_sms,
         )
 
     compile_m = _fake_m_for_specialization(size_m)
@@ -2647,6 +2655,7 @@ def compile_mixed_trellis(
         ws_input_stages=ws_input_stages,
         activations=activations,
         decode_schedule=decode_schedule,
+        workspace_sms=workspace_sms,
     )
     _CACHE[cache_key] = result
     return result
@@ -2677,6 +2686,7 @@ def compile_mixed_trellis3(
     broadcast_suh: bool = False,
     broadcast_svh: bool = False,
     route_num_experts: int | None = None,
+    workspace_sms: int | None = None,
 ) -> MixedTrellis3CompileResult:
     """Compile the dedicated three-bitrate cooperative Trellis grid."""
 
@@ -2743,6 +2753,7 @@ def compile_mixed_trellis3(
             trellis_codebook=trellis_codebook,
             intermediate_rotation=True,
             full_rotation=True,
+            workspace_sms=workspace_sms,
             rotation_input_dtype=rotation_input_dtype,
             broadcast_suh=broadcast_suh,
             schedule_whole_tiles=True,
@@ -2914,6 +2925,7 @@ def compile_mixed_trellis3(
         direct_topk_routes=False,
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
+        workspace_sms=workspace_sms,
     )
     _CACHE3[cache_key] = result
     return result
@@ -2926,6 +2938,10 @@ def _make_mixed_trellis_buffers(
     sms: int,
     route_num_experts: int,
 ) -> MixedTrellisBuffers:
+    if launch.workspace_sms is not None:
+        if int(sms) > int(launch.workspace_sms):
+            raise ValueError("mixed Trellis workspace SM capacity is smaller than the device")
+        sms = int(launch.workspace_sms)
     capacity_rows = launch.size_m * launch.top_k
     route_slots = (
         capacity_rows

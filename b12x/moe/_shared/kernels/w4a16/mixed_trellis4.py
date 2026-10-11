@@ -63,7 +63,7 @@ class W4A16MixedTrellis4Kernel(W4A16MixedTrellisKernel):
     """One cooperative grid over four native Trellis bitrates."""
 
     # The four-tier ABI has an independent persistent compile namespace.
-    ABI_VERSION = 1
+    ABI_VERSION = 2
 
     def __init__(
         self,
@@ -919,6 +919,7 @@ def compile_mixed_trellis4(
     broadcast_suh: bool = False,
     broadcast_svh: bool = False,
     route_num_experts: int | None = None,
+    workspace_sms: int | None = None,
 ) -> MixedTrellis4CompileResult:
     """Compile the dedicated four-bitrate cooperative Trellis grid."""
 
@@ -986,6 +987,7 @@ def compile_mixed_trellis4(
             trellis_codebook=trellis_codebook,
             intermediate_rotation=True,
             full_rotation=True,
+            workspace_sms=workspace_sms,
             rotation_input_dtype=rotation_input_dtype,
             broadcast_suh=broadcast_suh,
             schedule_whole_tiles=True,
@@ -1166,6 +1168,7 @@ def compile_mixed_trellis4(
         direct_topk_routes=False,
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
+        workspace_sms=workspace_sms,
     )
     _CACHE4[cache_key] = result
     return result
