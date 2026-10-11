@@ -90,8 +90,8 @@ def _tscale(input_scale, *weight_scales):
 
 
 @pytest.mark.parametrize("layer", [0, 2])
-@pytest.mark.parametrize("rows", [1, 77, 1024, 4096])
-def test_glm_ffn_tensor_fp8_prefill(layer, rows):
+@pytest.mark.parametrize("rows,capacity", [(1, 64), (16, 64), (64, 64), (77, 4096), (1024, 4096), (4096, 4096)])
+def test_glm_ffn_tensor_fp8_prefill(layer, rows, capacity):
     m = f"model.layers.{layer}.mlp."
     gate, up, down = _proj(m + "gate_proj"), _proj(m + "up_proj"), _proj(m + "down_proj")
     assert gate[2] == up[2], "gate and up share the calibrated input scale"
@@ -100,7 +100,7 @@ def test_glm_ffn_tensor_fp8_prefill(layer, rows):
     norm = _raw(f"model.layers.{layer}.post_attention_layernorm.weight").cuda()
     x = norm * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-5)).bfloat16()
 
-    program = P(inter=12288, max_rows=4096, fp8_only="prefill", tensor_scales=True)
+    program = P(inter=12288, max_rows=capacity, fp8_only="prefill", tensor_scales=True)
     out = torch.empty_like(x)
     program.launch(x, torch.cat([gate[0], up[0]]).contiguous(), _tscale(gate[2], gate[1], up[1]), down[0],
                    _tscale(down[2], down[1]), out, _scratch(program, rows), scalars=(rows,))

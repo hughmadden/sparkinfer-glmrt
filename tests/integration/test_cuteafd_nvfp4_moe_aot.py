@@ -1,14 +1,9 @@
-"""cuteafd NVFP4 routed-expert programs (``fp8_moe`` with ``weights="nvfp4"``) vs torch.
+"""NVFP4 expert programs vs independent CPU FP64 W4A4 products.
 
-Random ModelOpt NVFP4 experts (packed E2M1 bytes, E4M3 per-16 scales, an FP32
-``weight_scale_2`` per expert and projection) at the GLM 5.3 Flash (H 4096,
-288 experts, top-8, SwiGLU clamp 10) and Qwen 3.8 Flash Next (H 2560, 512
-experts, top-10, intermediate 640) geometries: full width (TP1, BF16 input:
-the RTX local layers) and zero-padded Spark slices (FP8 K32 wire input). The
-reference dequantizes in torch: ``e2m1 * e4m3`` (E4M3 through
-``torch.float8_e4m3fn``) in FP32, ``F.linear`` in FP32 times alpha, one BF16
-rounding per projection, ``bf16(silu(g)) * u`` with the config's clamp, FP32
-weighted route sum.
+All local and Spark slices quantize original BF16 activations once with each
+expert's calibrated input_scale, E4M3 K16 scales and nearest-even E2M1 values.
+Packed weights dequantize exactly; nonlinear/quantizer boundaries remain FP32
+and projection stores BF16. Exercise decode, verification and large prefill.
 """
 
 from __future__ import annotations
@@ -78,9 +73,9 @@ def _weights(g, real: int):
                 w[:, :, real_k // 2:] = 0
                 s[:, :, real_k // 16:] = 0
             alpha = (torch.rand(e, device="cuda", generator=gen) * 4e-3 + 1e-3).float()
-            # One static input scale per layer and projection, as the ModelOpt releases store it
-            # (amax / (6 * 448) of activations ~N(0, 1) and of the SwiGLU outputs).
-            inscale = torch.full((e,), float(k_scale[0]), device="cuda")
+            # Nonuniform expert calibration catches accidentally shared FC1 scales.
+            inscale = (float(k_scale[0]) * torch.pow(2.0,
+                torch.arange(e, device="cuda", dtype=torch.float32).remainder(7) - 3)).contiguous()
             return w, torch.cat([s.flatten(), alpha.view(torch.uint8), inscale.view(torch.uint8)]).contiguous()
 
         k_scale = [5.0 / (6 * 448)]
@@ -95,7 +90,7 @@ def _weights(g, real: int):
 _THRESHOLDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
-def quantize_nvfp4(x: torch.Tensor, inscale: float) -> torch.Tensor:
+def quantize_nvfp4(x: torch.Tensor, inscale: float, *, include_input_scale: bool = True) -> torch.Tensor:
     """FP32 ``[rows, K]`` -> its NVFP4 value (``quantize_block_fp4``: E4M3 scale of
     ``amax * gs / 6`` per 16, E2M1 nearest-even), dequantized with ``input_scale``."""
     gs = torch.tensor(1.0, dtype=torch.float32) / torch.tensor(inscale, dtype=torch.float32)
@@ -115,7 +110,8 @@ def quantize_nvfp4(x: torch.Tensor, inscale: float) -> torch.Tensor:
     code = torch.where((mag >= t[5]) & (mag <= t[6]), 4.0, code)
     code = torch.where(mag > t[6], 6.0, code)
     code = torch.where(sf == 0, 0.0, code)
-    return (torch.sign(blocks) * code * sf * inscale).reshape(x.shape)
+    value = torch.sign(blocks) * code * sf
+    return (value * inscale if include_input_scale else value).reshape(x.shape)
 
 
 def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
@@ -124,25 +120,50 @@ def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
                                     split_scales(s2, e, h, i))
     limit = g.swiglu_limit
     in1, in2 = input_scales(s1, e, i, h), input_scales(s2, e, h, i)
-    out = torch.zeros(x.shape, device=x.device)
+    device = x.device
+    if a4:
+        # Independent CPU FP64 products; activation scale formation intentionally
+        # remains FP32, matching the declared E4M3/E2M1 quantizer's rounding.
+        x, ids, weights = x.cpu(), ids.cpu(), weights.cpu()
+        a1, a3, a2, in1, in2 = (s.cpu() for s in (a1, a3, a2, in1, in2))
+    dtype = torch.float64 if a4 else torch.float32
+    out = torch.zeros(x.shape, device=x.device, dtype=dtype)
+    routes = torch.zeros((*ids.shape, h), device=x.device, dtype=torch.float32) if a4 else None
     for expert in ids.unique().tolist():
         rows, slots = torch.where(ids == expert)
         xr = x[rows].float()
         if a4:
-            xr = quantize_nvfp4(xr, float(in1[expert]))
-        gate = (xr @ dequant(w1[expert], q1[expert]).T * a1[expert]).bfloat16().float()
-        up = (xr @ dequant(w3[expert], q3[expert]).T * a3[expert]).bfloat16().float()
+            xr = quantize_nvfp4(xr, float(in1[expert]), include_input_scale=False)
+        xr = xr.to(dtype)
+        operand = lambda w, q: dequant(w[expert].cpu() if a4 else w[expert],
+                                      q[expert].cpu() if a4 else q[expert]).to(dtype)
+        # Independent FP64 products, then the kernel's FP32 accumulator/factor
+        # boundary before BF16 projection stores. Do not pre-round dequantized
+        # activations by folding the global input scale into every element.
+        project = lambda a, w, alpha, inscale: ((a @ w.T).float() *
+            (alpha * inscale if a4 else alpha)).bfloat16().to(dtype)
+        gate = project(xr, operand(w1, q1), a1[expert], in1[expert])
+        up = project(xr, operand(w3, q3), a3[expert], in1[expert])
         if limit > 0:
             gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
-        act = (torch.nn.functional.silu(gate).bfloat16().float() * up).bfloat16().float()
+        act = (torch.nn.functional.silu(gate.float()).bfloat16().to(dtype) * up).bfloat16().to(dtype)
         if a4:
-            act = quantize_nvfp4(act, float(in2[expert]))
-        y = (act @ dequant(w2[expert], q2[expert]).T * a2[expert]).bfloat16()
-        out.index_add_(0, rows, y.float() * weights[rows, slots][:, None])
-    return out.bfloat16()
+            act = quantize_nvfp4(act, float(in2[expert]), include_input_scale=False).to(dtype)
+        y = project(act, operand(w2, q2), a2[expert], in2[expert]).bfloat16()
+        if a4:
+            routes[rows, slots] = y.float()
+        else:
+            out.index_add_(0, rows, y.to(dtype) * weights[rows, slots][:, None].to(dtype))
+    if a4:
+        # Serving combines BF16 routes in router-slot order using FP32, not an
+        # expert-ordered FP64 index_add. Products remain independently FP64.
+        out = torch.zeros(x.shape, dtype=torch.float32)
+        for slot in range(g.top_k):
+            out += routes[:, slot] * weights[:, slot, None]
+    return out.bfloat16().to(device)
 
 
-def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, scale=1.0, route="auto"):
+def _run(g, real, capacity, rows, wire=False, seed=1, hot=0, scale=1.0, route="auto"):
     from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
 
     gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -161,16 +182,20 @@ def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, scale=1.0, route="au
     scratch = torch.empty(fp8_moe_scratch_bytes(g, route, capacity, wire), dtype=torch.uint8, device="cuda")
     _PROGRAMS[key].launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
     torch.cuda.synchronize()
-    from b12x.integration.cuteafd.fp8_moe import auto_large_rows
-
-    a4 = g.activations == "a4" and (route == "stream" or (route == "auto" and rows > auto_large_rows(wire, g.kind)))
+    a4 = g.activations == "a4"
     expected = reference(g, x_exact, ids, weights, *w, a4=a4)
     a, b = out.float(), expected.float()
     c = float((a * b).sum() / (a.norm() * b.norm()))
     worst = float(torch.nn.functional.cosine_similarity(a, b, dim=1).min())
     if a4:
-        exact = reference(g, x_exact, ids, weights, *w).float()
-        print(f"  W4A4 vs the W4A16 reference: cosine {float((a * exact).sum() / (a.norm() * exact.norm())):.6f}")
+        assert torch.isfinite(a).all() and torch.isfinite(b).all()
+        relative_l2 = float((a - b).norm() / b.norm().clamp_min(1e-12))
+        row_l2 = (a - b).norm(dim=1) / b.norm(dim=1).clamp_min(1e-12)
+        normalized_max = float((a - b).abs().max() / b.square().mean().sqrt().clamp_min(1e-12))
+        print(f"  CPU FP64 W4A4: rel_l2={relative_l2:.7f} worst_row={float(row_l2.max()):.7f} "
+              f"normalized_max={normalized_max:.7f}")
+        assert relative_l2 <= 0.02 and float(row_l2.max()) <= 0.04
+        assert normalized_max <= 0.15
     return c, worst
 
 
@@ -186,14 +211,14 @@ CASES = [
     ("glmf_nvfp4", 1, 2048, 1024, 700, False, 8, 1.0), ("glmf_nvfp4", 1, 2048, 4096, 4096, False, 0, 1.0),
     # Large inputs drive gate/up past the clamp.
     ("glmf_nvfp4", 1, 2048, 16, 16, False, 0, 40.0),
-    ("glmf_nvfp4", 4, 512, 1, 1, True, 0, 1.0), ("glmf_nvfp4", 4, 512, 256, 256, True, 8, 1.0),
+    ("glmf_nvfp4", 4, 512, 1, 1, False, 0, 1.0), ("glmf_nvfp4", 4, 512, 256, 256, False, 8, 1.0),
     # TP6 of 2048 in 16-blocks: 22 blocks (352) or 21 (336) stored 384 wide.
-    ("glmf_nvfp4", 6, 352, 16, 16, True, 0, 1.0), ("glmf_nvfp4", 6, 336, 1024, 1000, True, 0, 1.0),
-    ("glmf_nvfp4", 2, 1024, 80, 80, True, 0, 1.0),
+    ("glmf_nvfp4", 6, 352, 16, 16, False, 0, 1.0), ("glmf_nvfp4", 6, 336, 1024, 1000, False, 0, 1.0),
+    ("glmf_nvfp4", 2, 1024, 80, 80, False, 0, 1.0),
     ("qwen4_nvfp4", 1, 640, 1, 1, False, 0, 1.0), ("qwen4_nvfp4", 1, 640, 80, 80, False, 0, 1.0),
     ("qwen4_nvfp4", 1, 640, 4096, 4096, False, 0, 1.0),
     # Qwen TP2 / TP3 of 640: 20 blocks (320) in 384, 14 blocks (224) in 256.
-    ("qwen4_nvfp4", 2, 320, 16, 16, True, 0, 1.0), ("qwen4_nvfp4", 3, 224, 256, 200, True, 0, 1.0),
+    ("qwen4_nvfp4", 2, 320, 16, 16, False, 0, 1.0), ("qwen4_nvfp4", 3, 224, 256, 200, False, 0, 1.0),
     # GLM 5.3 Flash's dense MLP as one expert (ids 0).
     ("glmfdense_nvfp4", 1, 12288, 1, 1, False, 0, 1.0), ("glmfdense_nvfp4", 1, 12288, 16, 16, False, 0, 1.0),
     ("glmfdense_nvfp4", 1, 12288, 4096, 3000, False, 0, 1.0),
@@ -213,10 +238,10 @@ STREAM_CASES = [
     # (geometry, tp, real rows, capacity, rows, wire, hot, scale, route): the stream route, forced and via auto.
     ("glmf_nvfp4", 1, 2048, 4096, 4096, False, 0, 1.0, "stream"), ("glmf_nvfp4", 1, 2048, 4096, 3000, False, 8, 1.0, "auto"),
     ("glmf_nvfp4", 1, 2048, 256, 17, False, 0, 40.0, "stream"),
-    ("glmf_nvfp4", 4, 512, 4096, 4096, True, 0, 1.0, "stream"), ("glmf_nvfp4", 6, 336, 1024, 1000, True, 8, 1.0, "stream"),
-    ("glmf_nvfp4", 3, 688, 4096, 2100, True, 0, 1.0, "auto"),
+    ("glmf_nvfp4", 4, 512, 4096, 4096, False, 0, 1.0, "stream"), ("glmf_nvfp4", 6, 336, 1024, 1000, False, 8, 1.0, "stream"),
+    ("glmf_nvfp4", 3, 688, 4096, 2100, False, 0, 1.0, "auto"),
     ("qwen4_nvfp4", 1, 640, 4096, 4096, False, 0, 1.0, "stream"), ("qwen4_nvfp4", 1, 640, 4096, 4000, False, 0, 1.0, "auto"),
-    ("qwen4_nvfp4", 2, 320, 1024, 1024, True, 0, 1.0, "stream"), ("qwen4_nvfp4", 6, 112, 4096, 4096, True, 0, 1.0, "stream"),
+    ("qwen4_nvfp4", 2, 320, 1024, 1024, False, 0, 1.0, "stream"), ("qwen4_nvfp4", 6, 112, 4096, 4096, False, 0, 1.0, "stream"),
 ]
 
 
@@ -230,11 +255,15 @@ def test_nvfp4_moe_stream(name, tp, real, capacity, rows, wire, hot, scale, rout
 
 
 A4_CASES = [
+    ("glm_nvfp4a4", 4, 512, 1, 1, False, 0, 1.0, "decode"),
+    ("glm_nvfp4a4", 4, 512, 2048, 1500, False, 8, 1.0, "prefill"),
+    ("glmf_nvfp4a4", 4, 512, 16, 16, False, 0, 1.0, "auto"),
+    ("qwen4_nvfp4a4", 5, 128, 80, 17, False, 0, 1.0, "auto"),
     # (geometry, tp, real rows, capacity, rows, wire, hot, scale, route): the W4A4 stream route,
-    # forced and via auto (decode rows stay W4A16).
+    # forced and via auto, including decode and verification.
     ("glmf_nvfp4a4", 1, 2048, 4096, 4096, False, 0, 1.0, "stream"), ("glmf_nvfp4a4", 1, 2048, 256, 17, False, 0, 40.0, "stream"),
-    ("glmf_nvfp4a4", 4, 512, 4096, 3000, True, 8, 1.0, "auto"), ("glmf_nvfp4a4", 6, 336, 1024, 1000, True, 0, 1.0, "stream"),
-    ("qwen4_nvfp4a4", 1, 640, 4096, 4096, False, 0, 1.0, "auto"), ("qwen4_nvfp4a4", 3, 224, 2048, 2000, True, 0, 1.0, "stream"),
+    ("glmf_nvfp4a4", 4, 512, 4096, 3000, False, 8, 1.0, "auto"), ("glmf_nvfp4a4", 6, 336, 1024, 1000, False, 0, 1.0, "stream"),
+    ("qwen4_nvfp4a4", 1, 640, 4096, 4096, False, 0, 1.0, "auto"), ("qwen4_nvfp4a4", 3, 224, 2048, 2000, False, 0, 1.0, "stream"),
     ("qwen4_nvfp4a4", 1, 640, 4096, 300, False, 0, 1.0, "auto"),
     ("glmfdense_nvfp4a4", 1, 12288, 4096, 1500, False, 0, 1.0, "auto"),
 ]
@@ -252,8 +281,8 @@ def test_nvfp4_moe_a4(name, tp, real, capacity, rows, wire, hot, scale, route):
 FUSED_CASES = [
     # (geometry, tp, real rows, capacity, rows, wire, hot, scale): fused vs separate W4A4 gate/up.
     ("glmf_nvfp4a4", 1, 2048, 4096, 4096, False, 0, 1.0), ("glmf_nvfp4a4", 1, 2048, 256, 17, False, 0, 40.0),
-    ("glmf_nvfp4a4", 6, 336, 1024, 1000, True, 8, 1.0), ("qwen4_nvfp4a4", 1, 640, 4096, 3000, False, 0, 1.0),
-    ("qwen4_nvfp4a4", 6, 112, 1024, 1000, True, 0, 1.0), ("glmfdense_nvfp4a4", 1, 12288, 2048, 1500, False, 0, 1.0),
+    ("glmf_nvfp4a4", 6, 336, 1024, 1000, False, 8, 1.0), ("qwen4_nvfp4a4", 1, 640, 4096, 3000, False, 0, 1.0),
+    ("qwen4_nvfp4a4", 6, 112, 1024, 1000, False, 0, 1.0), ("glmfdense_nvfp4a4", 1, 12288, 2048, 1500, False, 0, 1.0),
 ]
 
 
@@ -286,6 +315,20 @@ def test_nvfp4_moe_a4_fused_exact(name, tp, real, capacity, rows, wire, hot, sca
 
 
 def test_nvfp4_geometry():
+    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, Fp8MoeGeometry, _resolve, auto_large_rows
+
+    for g in GEOMETRIES.values():
+        if g.weights != "nvfp4":
+            continue
+        assert g.activations == "a4" and g.kind == "nvfp4a4"
+        for rows in (1, 16, 80, 1024, 4096):
+            for route in ("decode", "prefill", "auto", "stream"):
+                assert _resolve(route, rows, False, g.kind) == "stream"
+                with pytest.raises(ValueError, match="original BF16"):
+                    _resolve(route, rows, True, g.kind)
+        assert auto_large_rows(False, g.kind) == 0
+    with pytest.raises(ValueError, match="W4A16 is not a serving mode"):
+        Fp8MoeGeometry("bad", hidden=128, experts=1, top_k=1, intermediate=128, weights="nvfp4")
     assert [_geometry("glmf_nvfp4", tp).slice for tp in (1, 2, 3, 4, 6)] == [2048, 1024, 768, 512, 384]
     assert [_geometry("qwen4_nvfp4", tp).slice for tp in (1, 2, 3, 4, 6)] == [640, 384, 256, 256, 128]
 
