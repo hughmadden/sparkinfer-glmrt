@@ -38,7 +38,7 @@ def _geometry(tp):
 
 
 def _weights(g, real: int):
-    key = (g.tp, real)
+    key = (g, real)
     if key not in _WEIGHTS:
         _WEIGHTS.clear()
         gen = torch.Generator(device="cuda").manual_seed(0)
@@ -77,7 +77,7 @@ def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, mxfp4_down_a8=False):
     return out.bfloat16()
 
 
-def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, route="auto"):
+def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, route="auto", graph=False):
     from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
 
     gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -94,8 +94,22 @@ def _run(g, real, capacity, rows, wire=True, seed=1, hot=0, route="auto"):
         _PROGRAMS[key] = compile_fp8_moe_aot(g, route=route, max_rows=capacity, wire=wire)
     out = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device="cuda")
     scratch = torch.empty(fp8_moe_scratch_bytes(g, route, capacity, wire), dtype=torch.uint8, device="cuda")
-    _PROGRAMS[key].launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
+    program = _PROGRAMS[key]
+    program.launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
     torch.cuda.synchronize()
+    if graph:
+        from b12x._lib.runtime_control import kernel_resolution_guard
+
+        capture = torch.cuda.CUDAGraph()
+        with kernel_resolution_guard("native MXFP4 coordinator rows"):
+            with torch.cuda.graph(capture):
+                program.launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
+            expected_replay = out.clone()
+            out.fill_(float("nan"))
+            capture.replay()
+            torch.cuda.synchronize()
+        assert torch.equal(out, expected_replay)
+        assert torch.isfinite(out).all() and out.count_nonzero() > 0
     # Wire-input streams run the down projection A8 by default (MXFP4_STREAM_DOWN_A8).
     from b12x.integration.cuteafd.fp8_moe import MXFP4_STREAM_DOWN_A8, auto_large_rows
     streamed = wire and (route == "stream" or (route == "auto" and capacity > auto_large_rows(True, "mxfp4")
@@ -149,6 +163,16 @@ def test_mxfp4_moe_stream(tp, real, capacity, rows, hot, route):
     # A8 down: E4M3 SwiGLU rows (K32 UE8M0 scales) against the FP32 reference
     # of the same quantization; the GPU sums in a different order.
     assert c >= (0.9998 if MXFP4_STREAM_DOWN_A8 else 0.99999) and worst >= (0.999 if MXFP4_STREAM_DOWN_A8 else 0.9999)
+
+
+@pytest.mark.parametrize("family", ["mimof", "mimop"])
+@pytest.mark.parametrize("rows,hot", [(1, 0), (1024, 0), (1025, 0), (4096, 0), (4096, 8)])
+def test_mxfp4_coordinator_native_bf16_auto(family, rows, hot):
+    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES
+
+    g = GEOMETRIES[family].with_tp(2)
+    c, worst = _run(g, g.slice, 4096, rows, wire=False, hot=hot, graph=True)
+    assert c >= COS and worst >= 0.999
 
 
 def test_mxfp4_geometry():

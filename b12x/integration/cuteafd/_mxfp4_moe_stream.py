@@ -17,6 +17,8 @@ accumulation.
     ``StreamFp8GateUp`` (A by 8-bit ``ldmatrix`` under its K permutation);
     each thread widens the B fragment of that permutation straight from the
     swizzled E2M1 tile (two bytes per 16-K MMA half), SwiGLU fused.
+    ``wire=False`` reads native BF16 activations directly with 16-bit ldmatrix,
+    the same exact weight widening and BF16 MMAs (no activation quantization).
 ``StreamMxfp4Down``    down over the BF16 act rows as ``StreamFp8Down``, the
     E2M1 tile widened to BF16 in shared memory (double-buffered).
 """
@@ -102,11 +104,18 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     w_k = 256
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False,
-                 act_mxfp8: bool = False):
+                 act_mxfp8: bool = False, wire: bool = True):
         super().__init__(inter=inter, hidden=hidden, experts=experts, limit=limit)
         # qmma: block-scaled E4M3 x E2M1 MMAs (m16n8k32, UE8M0 per 32 on both
         # operands) read the wire rows and the packed weights as they are.
+        self.wire = bool(wire)
+        if not self.wire and (qmma or act_mxfp8):
+            raise ValueError("native BF16 MXFP4 stream cannot quantize activations")
         self.qmma = bool(qmma)
+        if not self.wire:
+            self.row_bytes = 2 * self.hidden
+            self.a_bytes = STREAM_TILE_M * self.k_step * 2
+            self.a_ring = self.w_ring = 2
         self.act_mxfp8 = bool(act_mxfp8)
         self.act_row_bytes = mxfp8_down_row_bytes(self.inter) if self.act_mxfp8 else 2 * self.inter
         # Once its async reads drain, reuse A shared memory for exact BF16
@@ -123,7 +132,7 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
 
     def key(self) -> tuple:
         key = ("stream_gate_up_mxfp4", 1, self.inter, self.hidden, self.experts, self.limit, self.a_ring,
-               self.w_ring, self.qmma)
+               self.w_ring, self.qmma, self.wire)
         return key + (("act_mxfp8", self.act_row_bytes),) if self.act_mxfp8 else key
 
     def _storage(self, w_layout):
@@ -193,19 +202,20 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                     cute.arch.mbarrier_init(mbar + slot, 1)
                 cute.arch.mbarrier_init_fence()
             cute.arch.sync_threads()
-            ch = tidx % Int32(8)
-            r_base = tidx // Int32(8)
-            src = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Int64)
-            for q in cutlass.range_constexpr(4):
-                row = r_base + Int32(32 * q)
+            ch = tidx % Int32(8 if self.wire else 16)
+            r_base = tidx // Int32(8 if self.wire else 16)
+            src = cute.make_rmem_tensor(cute.make_layout((4 if self.wire else 8,), stride=(1,)), Int64)
+            for q in cutlass.range_constexpr(4 if self.wire else 8):
+                row = r_base + Int32((32 if self.wire else 16) * q)
                 src[q] = Int64(-1)
                 if row < live:
                     source = _i32_at(Int64(pair_row.toint()), first + row)
                     src[q] = Int64(x.toint()) + Int64(source) * Int64(self.row_bytes) + Int64(ch) * Int64(16)
             s_src = Int64(-1)
-            if tidx < live:
-                source = _i32_at(Int64(pair_row.toint()), first + tidx)
-                s_src = Int64(x.toint()) + Int64(source) * Int64(self.row_bytes) + Int64(h)
+            if cutlass.const_expr(self.wire):
+                if tidx < live:
+                    source = _i32_at(Int64(pair_row.toint()), first + tidx)
+                    s_src = Int64(x.toint()) + Int64(source) * Int64(self.row_bytes) + Int64(h)
             # The CTA's scale rows (32 gate then 32 up columns, H/32 bytes each), once;
             # they join the first cp.async group.
             units = self.scale_cols // 16
@@ -315,26 +325,28 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                         s_base = ss + stage * Int32(self.s_bytes)
                         half = step % Int32(2)
                         rsc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Uint32)
-                        for mt in cutlass.range_constexpr(2):
-                            for hi in cutlass.range_constexpr(2):
-                                srow = warp_m * Int32(32) + Int32(16 * mt + 8 * hi) + g
-                                rsc[2 * mt + hi] = ld_shared_u32(s_base + srow * Int32(4))
+                        if cutlass.const_expr(self.wire):
+                            for mt in cutlass.range_constexpr(2):
+                                for hi in cutlass.range_constexpr(2):
+                                    srow = warp_m * Int32(32) + Int32(16 * mt + 8 * hi) + g
+                                    rsc[2 * mt + hi] = ld_shared_u32(s_base + srow * Int32(4))
                         # This step's four UE8M0 weight scales of each column tile nt.
                         wsc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Uint32)
                         for nt in cutlass.range_constexpr(4):
                             col = Int32((nt // 2) * self.cols + (nt % 2) * 8) + warp_n * Int32(16) + g
                             wsc[nt] = ld_shared_u32(sc + col * Int32(self.sc_stride) + step * Int32(4))
                         for ks in cutlass.range_constexpr(4):
-                            a = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
-                            for mt in cutlass.range_constexpr(2):
-                                row = warp_m * Int32(32) + Int32(16 * mt) + (lane % Int32(16))
-                                chunk = Int32(2 * ks) + lane // Int32(16)
-                                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
-                                    a_base + row * Int32(self.k_step) + ((chunk ^ (row % Int32(8))) * Int32(16)))
-                                a[4 * mt] = a0
-                                a[4 * mt + 1] = a1
-                                a[4 * mt + 2] = a2
-                                a[4 * mt + 3] = a3
+                            if cutlass.const_expr(self.wire):
+                                a = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+                                for mt in cutlass.range_constexpr(2):
+                                    row = warp_m * Int32(32) + Int32(16 * mt) + (lane % Int32(16))
+                                    chunk = Int32(2 * ks) + lane // Int32(16)
+                                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                                        a_base + row * Int32(self.k_step) + ((chunk ^ (row % Int32(8))) * Int32(16)))
+                                    a[4 * mt] = a0
+                                    a[4 * mt + 1] = a1
+                                    a[4 * mt + 2] = a2
+                                    a[4 * mt + 3] = a3
                             # B of the A permutation: MMA half q of this 32-K chunk takes
                             # physical K 16q + 4j .. +3 of column g, E2M1 bytes 8q + 2j, +1
                             # of the chunk's 16-byte unit (half * 4 + ks of the 128-byte row).
@@ -351,30 +363,57 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                                     lo_word = v1
                                     hi_word = v3
                                 factor = ue8m0_bf16x2((wsc[nt] >> Uint32(8 * ks)) & Uint32(0xFF))
-                                b0, b1 = e2m1x4_scaled_bf16((lo_word >> shift) & Uint32(0xFFFF), factor)
-                                b2, b3 = e2m1x4_scaled_bf16((hi_word >> shift) & Uint32(0xFFFF), factor)
+                                if cutlass.const_expr(self.wire):
+                                    b0, b1 = e2m1x4_scaled_bf16((lo_word >> shift) & Uint32(0xFFFF), factor)
+                                    b2, b3 = e2m1x4_scaled_bf16((hi_word >> shift) & Uint32(0xFFFF), factor)
+                                else:
+                                    # Native ldmatrix A uses K 2j, 8+2j (not the
+                                    # wire fragment's K 4j permutation).
+                                    byte = Uint32(8) * Uint32(j)
+                                    lo_codes = ((v0 >> byte) & Uint32(0xFF)) | (((v1 >> byte) & Uint32(0xFF)) << Uint32(8))
+                                    hi_codes = ((v2 >> byte) & Uint32(0xFF)) | (((v3 >> byte) & Uint32(0xFF)) << Uint32(8))
+                                    b0, b1 = e2m1x4_scaled_bf16(lo_codes, factor)
+                                    b2, b3 = e2m1x4_scaled_bf16(hi_codes, factor)
                                 wb[4 * nt] = b0
                                 wb[4 * nt + 1] = b1
                                 wb[4 * nt + 2] = b2
                                 wb[4 * nt + 3] = b3
-                            for mt in cutlass.range_constexpr(2):
-                                xa = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
-                                for r in cutlass.range_constexpr(4):
-                                    exponent = (rsc[2 * mt + r % 2] >> Uint32(8 * ks)) & Uint32(0xFF)
-                                    lo, hi = _e4m3x4_scaled_bf16x2x2(a[4 * mt + r], _u32_as_f32(exponent << Uint32(23)))
-                                    xa[2 * r] = lo
-                                    xa[2 * r + 1] = hi
-                                for q in cutlass.range_constexpr(2):
-                                    for nt in cutlass.range_constexpr(4):
-                                        f = 4 * (4 * mt + nt)
-                                        d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                            acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                                            xa[4 * q], xa[4 * q + 2], xa[4 * q + 1], xa[4 * q + 3],
-                                            wb[4 * nt + 2 * q], wb[4 * nt + 2 * q + 1])
-                                        acc[f] = d0
-                                        acc[f + 1] = d1
-                                        acc[f + 2] = d2
-                                        acc[f + 3] = d3
+                            if cutlass.const_expr(self.wire):
+                                for mt in cutlass.range_constexpr(2):
+                                    xa = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+                                    for r in cutlass.range_constexpr(4):
+                                        exponent = (rsc[2 * mt + r % 2] >> Uint32(8 * ks)) & Uint32(0xFF)
+                                        lo, hi = _e4m3x4_scaled_bf16x2x2(a[4 * mt + r], _u32_as_f32(exponent << Uint32(23)))
+                                        xa[2 * r] = lo
+                                        xa[2 * r + 1] = hi
+                                    for q in cutlass.range_constexpr(2):
+                                        for nt in cutlass.range_constexpr(4):
+                                            f = 4 * (4 * mt + nt)
+                                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                                xa[4 * q], xa[4 * q + 2], xa[4 * q + 1], xa[4 * q + 3],
+                                                wb[4 * nt + 2 * q], wb[4 * nt + 2 * q + 1])
+                                            acc[f] = d0
+                                            acc[f + 1] = d1
+                                            acc[f + 2] = d2
+                                            acc[f + 3] = d3
+                            else:
+                                for mt in cutlass.range_constexpr(2):
+                                    row = warp_m * Int32(32) + Int32(16 * mt) + lane % Int32(16)
+                                    for q in cutlass.range_constexpr(2):
+                                        chunk = Int32(2 * (2 * ks + q)) + lane // Int32(16)
+                                        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                                            a_base + row * Int32(2 * self.k_step)
+                                            + ((chunk ^ (row % Int32(8))) * Int32(16)))
+                                        for nt in cutlass.range_constexpr(4):
+                                            f = 4 * (4 * mt + nt)
+                                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                                a0, a1, a2, a3, wb[4 * nt + 2 * q], wb[4 * nt + 2 * q + 1])
+                                            acc[f] = d0
+                                            acc[f + 1] = d1
+                                            acc[f + 2] = d2
+                                            acc[f + 3] = d3
             cute.arch.cp_async_wait_group(0)
             if cutlass.const_expr(self.act_mxfp8):
                 cute.arch.sync_threads()
@@ -415,6 +454,29 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                                          payload[4 * half], payload[4 * half + 1],
                                          payload[4 * half + 2], payload[4 * half + 3])
                     st_global_u8(at + Int64(i) + Int64(n0 // Int32(32)), cutlass.Uint8(scale))
+
+    @cute.jit
+    def _load_a(self, step, sa, ss, src, s_src, ch, r_base, tidx):
+        stage = Int32(step) % Int32(self.a_ring)
+        if cutlass.const_expr(self.wire):
+            for q in cutlass.range_constexpr(4):
+                if src[q] >= Int64(0):
+                    row = r_base + Int32(32 * q)
+                    cp_async4_shared_global(
+                        sa + stage * Int32(self.a_bytes) + row * Int32(self.k_step)
+                        + ((ch ^ (row % Int32(8))) * Int32(16)),
+                        src[q] + Int64(step) * Int64(self.k_step))
+            if s_src >= Int64(0):
+                cp_async_u32_shared_global(ss + stage * Int32(self.s_bytes) + tidx * Int32(4),
+                                           s_src + Int64(step) * Int64(4))
+        else:
+            for q in cutlass.range_constexpr(8):
+                if src[q] >= Int64(0):
+                    row = r_base + Int32(16 * q)
+                    cp_async4_shared_global(
+                        sa + stage * Int32(self.a_bytes) + row * Int32(2 * self.k_step)
+                        + ((ch ^ (row % Int32(8))) * Int32(16)),
+                        src[q] + Int64(step) * Int64(2 * self.k_step))
 
 
 class StreamMxfp4Down(StreamFp8Down):

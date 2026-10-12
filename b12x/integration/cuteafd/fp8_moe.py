@@ -61,7 +61,9 @@ MXFP4 wire-input stream programs run the down projection A8 by default
 each row's K32 blocks are quantized to E4M3 with UE8M0 scales and the down
 GEMM uses direct block-scaled E4M3 x E2M1 MMAs. ``prefill="w8a16"`` keeps the
 former BF16 down projection (``mxfp4_down_a8=False`` forces it too); decode
-is unchanged. Scratch must be sized with the same form.
+is unchanged. Native BF16 MXFP4 programs read original BF16 activations and
+retain BF16 SwiGLU/down math at every row count; only the kernel schedule
+changes above the runtime row threshold. Scratch covers both routes.
 """
 
 from __future__ import annotations
@@ -116,7 +118,7 @@ AUTO_W8A8_STREAM_ROWS_SM121 = 768
 # 4101 / 7300; 1024 5724 / 4178 / 7492; 2048 10528 / 4438 / 10246; 4096 21160 /
 # 5916 / 16882.
 AUTO_W8A8_STREAM_ROWS_SM120 = 512
-# MXFP4 (MiMo V2.6 Pro) live rows above which ``auto`` streams (wire input);
+# MXFP4 live rows above which ``auto`` streams (wire or native BF16 input);
 # RTX PRO 6000 (us, GEMV / stream): TP6 1024 rows 1662 / 1729, 2048 2598 / 1907;
 # TP1 512 8965 / 7952, 1024 13654 / 10653.
 AUTO_MXFP4_STREAM_ROWS = 1024
@@ -184,11 +186,11 @@ def _mxfp4_down_a8(wire: bool, weights: str, prefill: str, explicit: "bool | Non
 
 def _streams(wire: bool, weights: str = "fp8", prefill: str = "auto") -> bool:
     """Whether ``auto``'s large route is ``stream``: MXFP4 weights (wire
-    input; their only large route), NVFP4 (original BF16 input), W8A8 FP8
+    or native BF16 input; their only large route), NVFP4 (original BF16 input), W8A8 FP8
     programs (``_w8a8``), and W8A16 FP8 wire input on GB10 (weight-bandwidth
     bound); otherwise the grouped GEMM SM120 was measured with."""
     if weights == "mxfp4":
-        return bool(wire)
+        return True
     if weights in ("nvfp4", "nvfp4a4"):
         return True
     if _w8a8(wire, weights, prefill):
@@ -354,7 +356,7 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
             pairs * 4,                                 # pair_pos
             stream_max_tiles(g.experts, pairs) * STREAM_TILE_M * act_bytes,  # SwiGLU, chunk-padded rows
             pairs * g.hidden * 2,                      # down output
-        ] + ([] if wire else [rows * (g.hidden + g.hidden // 32)])  # BF16 input: its wire rows
+        ] + ([] if wire or g.weights == "mxfp4" else [rows * (g.hidden + g.hidden // 32)])
     grouped = _grouped_rows(g, route, rows)
     act_rows = rows if route == "decode" else grouped
     return [
@@ -388,8 +390,6 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8",
     if weights == "mxfp4":
         if route == "prefill":
             raise ValueError("MXFP4 experts have no prefill route (use stream)")
-        if route == "auto" and not wire:
-            return "decode"
     large = auto_large_rows(wire, weights, prefill)
     return "decode" if route == "auto" and int(max_rows) <= large else route
 
@@ -498,14 +498,12 @@ class _StreamRoute:
 
     def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool, prefill: str = "auto",
                  mxfp4_down_a8: bool = False):
-        if not wire and g.weights != "fp8":
-            raise ValueError("the MXFP4 stream route takes FP8 K32 wire rows")
         self.g, self.wire = g, bool(wire)
         self.mxfp4_down_a8 = bool(mxfp4_down_a8)
         self.act_bytes = mxfp8_down_row_bytes(g.slice) if self.mxfp4_down_a8 else 2 * g.slice
         # BF16 input: the rows are first quantized to FP8 K32 wire rows (the
         # coordinator's expert-input rule: UE8M0 per 32, amax floor 1e-4).
-        self.quant = None if wire else _MXFP8RowsQuantLaunch(
+        self.quant = None if wire or g.weights == "mxfp4" else _MXFP8RowsQuantLaunch(
             g.hidden, BFloat16, _WARP_SUBGROUP_WIDTH, _QUANT_THREADS, 32, False, 1e-4, wire_rows=True)
         h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
         self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
@@ -513,7 +511,8 @@ class _StreamRoute:
                             chunked=True)
         if g.weights == "mxfp4":
             self.gate_up = StreamMxfp4GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
-                                             qmma=MXFP4_STREAM_QMMA, act_mxfp8=self.mxfp4_down_a8)
+                                             qmma=MXFP4_STREAM_QMMA and wire,
+                                             act_mxfp8=self.mxfp4_down_a8, wire=wire)
             self.down = (StreamMxfp4DownA8 if self.mxfp4_down_a8 else StreamMxfp4Down)(hidden=h, inter=i, experts=e)
         else:
             self.gate_up = StreamFp8GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
@@ -541,7 +540,7 @@ class _StreamRoute:
         y_at = act_at + _al(Int64(max_tiles) * Int64(STREAM_TILE_M * self.act_bytes))
         ptr = lambda dtype, at: cute.make_ptr(dtype, at, cute.AddressSpace.gmem, assumed_align=16)  # noqa: E731
         rows_x = x
-        if cutlass.const_expr(not self.wire):
+        if cutlass.const_expr(self.quant is not None):
             wire_at = y_at + _al(Int64(pairs) * Int64(g.hidden * 2))
             # One warp quantizes 8 K32 groups of a row (subgroups of 4 lanes); grid-stride over rows.
             tasks = rows * Int32((g.hidden // 32 + 7) // 8)
