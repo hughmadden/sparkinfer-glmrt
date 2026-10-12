@@ -76,6 +76,7 @@ from cutlass import BFloat16, Int32, Int64
 
 from b12x._lib.quant.mxfp8_rows import _THREADS as _QUANT_THREADS
 from b12x._lib.quant.mxfp8_rows import _WARP_SUBGROUP_WIDTH, _MXFP8RowsQuantLaunch
+from b12x._lib.utils import runtime_num_sm
 
 from ._common import AotProgram, Operand, Scalar, compile_program
 from ._fp8_moe_kernels import (
@@ -584,11 +585,24 @@ class _StreamNvfp4A4Route:
             self.gate_up = StreamNvfp4LinearA4(n=i, k=h, experts=e)
             self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
         self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e)
+        self.small_gate = ()
+        self.small_down = ()
+        if self.fused:
+            # Separate kernels keep the wide tile's SMEM reservation out of the
+            # sparse-expert launch. Every specialization is planned before capture.
+            self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+                                               live_min=17)
+            self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e, live_min=17)
+            self.small_gate = tuple(StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+                                                        tile_m=16, tile_n=n, live_max=16) for n in (32, 64, 128))
+            self.small_down = tuple(StreamNvfp4LinearA4(n=h, k=i, experts=e, tile_m=16, tile_n=n,
+                                                        live_max=16) for n in (32, 64, 128))
         self.combine = MoeCombine(hidden=h, top_k=k)
 
     def key(self) -> tuple:
         return ("stream_nvfp4_a4", self.max_tiles, self.rows_in.key(), self.gate_up.key(),
-                None if self.swiglu is None else self.swiglu.key(), self.down.key(), self.combine.key())
+                None if self.swiglu is None else self.swiglu.key(), self.down.key(), self.combine.key(),
+                tuple(p.key() for p in self.small_gate), tuple(p.key() for p in self.small_down))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
@@ -622,14 +636,33 @@ class _StreamNvfp4A4Route:
         y = ptr(cutlass.BFloat16, y_at)
         ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
         self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
-        self.rows_in(x, pair_row, meta, s1, xq, xs, max_tiles, stream)
+        self.rows_in(x, pair_row, meta, s1, xq, xs, pairs, stream)
         if cutlass.const_expr(self.fused):
-            self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
+            sms = runtime_num_sm()
+            # The sparsest valid routing has top_k experts. Narrow N until its
+            # grid fills the queried device; sparse M keeps CTA SMEM small.
+            if Int32(g.top_k * (g.slice // 32)) >= sms * Int32(2):
+                self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
+            else:
+                self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
+            # Bound by pairs, so duplicate expert ids cannot bypass the wide path.
+            if pairs > Int32(16):
+                self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
         else:
             self.gate_up(xq, xs, meta, w1, s1, gate, max_tiles, stream)
             self.gate_up(xq, xs, meta, w3, s3, up, max_tiles, stream)
             self.swiglu(gate, up, meta, s2, aq, a_s, max_tiles, stream)
-        self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream)
+        if cutlass.const_expr(self.fused):
+            if Int32(g.top_k * (g.hidden // 128)) >= sms * Int32(2):
+                self.small_down[2](aq, a_s, meta, w2, s2, y, max_tiles, stream)
+            elif Int32(g.top_k * (g.hidden // 64)) >= sms * Int32(2):
+                self.small_down[1](aq, a_s, meta, w2, s2, y, max_tiles, stream)
+            else:
+                self.small_down[0](aq, a_s, meta, w2, s2, y, max_tiles, stream)
+            if pairs > Int32(16):
+                self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream)
+        else:
+            self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream)
         self.combine(y, pair_pos, weights, out, rows, stream)
 
 

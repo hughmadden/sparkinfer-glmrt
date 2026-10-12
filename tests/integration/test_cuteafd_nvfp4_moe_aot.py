@@ -314,6 +314,70 @@ def test_nvfp4_moe_a4_fused_exact(name, tp, real, capacity, rows, wire, hot, sca
     assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
 
 
+def test_nvfp4_sparse_tiles_reuse_and_graph(monkeypatch):
+    """One capacity program covers sparse/dense chunks under frozen resolution."""
+    from b12x.integration.cuteafd import fp8_moe
+
+    g = fp8_moe.Fp8MoeGeometry("nvfp4_sparse_test", hidden=256, experts=32, top_k=2,
+                              intermediate=256, weights="nvfp4", activations="a4")
+    capacity = 256
+    w = _weights(g, g.slice)
+    monkeypatch.setenv("B12X_NVFP4_A4_FUSED", "1")
+    program = fp8_moe.compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False)
+    monkeypatch.setenv("B12X_NVFP4_A4_FUSED", "0")
+    separate = fp8_moe.compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False)
+    monkeypatch.setenv("B12X_NVFP4_A4_FUSED", "1")
+    gen = torch.Generator(device="cuda").manual_seed(91)
+    x = torch.randn(capacity, g.hidden, device="cuda", generator=gen).bfloat16()
+    ids = torch.empty(capacity, g.top_k, device="cuda", dtype=torch.int32)
+    weights = torch.rand(capacity, g.top_k, device="cuda", generator=gen)
+    out = torch.empty_like(x)
+    scratch = torch.empty(fp8_moe.fp8_moe_scratch_bytes(g, "stream", capacity, False),
+                          device="cuda", dtype=torch.uint8)
+    separate_out = torch.empty_like(out)
+    separate_scratch = torch.empty(fp8_moe.fp8_moe_scratch_bytes(g, "stream", capacity, False),
+                                   device="cuda", dtype=torch.uint8)
+    pointers = tuple(t.data_ptr() for t in (x, ids, weights, *w, out, scratch))
+
+    def no_compile(*args, **kwargs):
+        pytest.fail("live rows must reuse the precompiled capacity program")
+
+    monkeypatch.setattr(fp8_moe, "compile_program", no_compile)
+    cases = [(rows, False) for rows in (1, 8, 16, 17, 31, 64, 129, 256)] + [(8, True), (16, True)]
+    for rows, duplicate in cases:
+        # Hot e0/e1 cross the 16/128-row boundaries; remaining routes are sparse.
+        ids.copy_(torch.rand(capacity, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int())
+        ids[:max(1, rows * 3 // 4)].copy_(torch.arange(g.top_k, device="cuda", dtype=torch.int32))
+        if duplicate:
+            ids[:rows].zero_()
+        out.fill_(float("nan"))
+        scratch.fill_(0xA5)
+
+        def run():
+            program.launch(x, ids, weights, *w, out, scratch, scalars=(rows,))
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert pointers == tuple(t.data_ptr() for t in (x, ids, weights, *w, out, scratch))
+        separate_out.fill_(float("nan"))
+        separate_scratch.fill_(0xA5)
+        separate.launch(x, ids, weights, *w, separate_out, separate_scratch, scalars=(rows,))
+        torch.cuda.synchronize()
+        assert torch.equal(out[:rows].view(torch.int16), separate_out[:rows].view(torch.int16))
+        actual = out[:rows].float()
+        expected = reference(g, x[:rows], ids[:rows], weights[:rows], *w, a4=True).float()
+        assert torch.isfinite(actual).all() and actual.count_nonzero() > 0
+        assert float((actual * expected).sum() / (actual.norm() * expected.norm())) >= COS
+        assert float((actual - expected).norm() / expected.norm()) <= 0.02
+        assert float((actual - expected).abs().max() / expected.square().mean().sqrt()) <= 0.15
+        assert torch.isnan(out[rows:]).all()
+        del graph
+
+
 def test_nvfp4_geometry():
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, Fp8MoeGeometry, _resolve, auto_large_rows
 
