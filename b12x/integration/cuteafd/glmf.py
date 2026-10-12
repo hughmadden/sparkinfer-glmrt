@@ -504,9 +504,15 @@ def _replay_geometry(launch) -> dict:
     return {} if launch.replay_rows == REPLAY_ROWS else {"replay_rows": launch.replay_rows}
 
 
+def _seq_geometry(launch) -> dict:
+    """Manifest geometry of a KDA program whose recurrence spreads a step's sequences over
+    ``seq_ctas`` CTAs (none at 1, whose programs' geometry is unchanged)."""
+    return {} if launch.seq_ctas == 1 else {"seq_ctas": launch.seq_ctas}
+
+
 class _Kda:
     def __init__(self, g: GLMFGeometry, max_rows: int = 64, fp8=False, state_dtype: str = "float32",
-                 state_rounding: str = "window", decode: bool | None = None):
+                 state_rounding: str = "window", decode: bool | None = None, seq_ctas: int = 1):
         self.g = g
         self.output_norm = False
         fp8, prefill = _fp8_mode(fp8)
@@ -522,6 +528,9 @@ class _Kda:
         structure = min(int(max_rows), CHUNKED_MIN_ROWS) if decode else int(max_rows)
         self.replay_rows = max(int(max_rows), REPLAY_ROWS) if decode else REPLAY_ROWS
         self.replay_key = () if self.replay_rows == REPLAY_ROWS else (("replay_rows", self.replay_rows),)
+        # The recurrence's CTAs per head block, a step's sequences shared among them: likewise only past 1.
+        self.seq_ctas = int(seq_ctas)
+        self.seq_key = () if self.seq_ctas == 1 else (("seq_ctas", self.seq_ctas),)
         self.chunked = _KdaChunked(g, max_rows, state, round_tiles) if structure > CHUNKED_MIN_ROWS else None
         d, p = g.kda_width, g.kda_in_width
         self.d, self.p = d, p
@@ -537,14 +546,15 @@ class _Kda:
         self.conv = (GlmfKdaConvRows if wide else GlmfKdaConv)(channels=3 * d, proj_width=p)
         self.conv_state = GlmfKdaConvState(channels=3 * d, proj_width=p, row_block=64 if wide else 0)
         self.recurrent = GlmfKdaRecurrent(heads=g.kda_heads, lower_bound=g.gate_lower_bound, qkv_width=3 * d,
-                                          g_stride=2 * d, b_stride=p, state_dtype=state, replay_rows=self.replay_rows)
+                                          g_stride=2 * d, b_stride=p, state_dtype=state, replay_rows=self.replay_rows,
+                                          seq_ctas=self.seq_ctas)
         self.norm = GlmfKdaGatedNorm(heads=g.kda_heads, eps=g.norm_eps, gate_stride=2 * d)
         self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=2)
 
     def key(self) -> tuple:
         return (self.in_proj.key(), self.fg.key(), self.o_proj.key(), self.g,
                 None if self.chunked is None else self.chunked.key()) + (("norm",) if self.output_norm else ()) \
-            + self.state_key + self.replay_key
+            + self.state_key + self.replay_key + self.seq_key
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_fg: cute.Pointer, conv_w: cute.Pointer,
@@ -626,8 +636,8 @@ class _KdaW8(_Kda):
 
     def __init__(self, g: GLMFGeometry, max_rows: int, prefill: bool, out_dtype=cutlass.BFloat16,
                  prefill_expanded: bool = False, output_kind: str = "projection", state_dtype: str = "float32",
-                 state_rounding: str = "window"):
-        super().__init__(g, max_rows, False, state_dtype, state_rounding, decode=not prefill)
+                 state_rounding: str = "window", seq_ctas: int = 1):
+        super().__init__(g, max_rows, False, state_dtype, state_rounding, decode=not prefill, seq_ctas=seq_ctas)
         self.output_norm = output_kind == "norm"
         prefill_rows = int(max_rows) if prefill else None
         self.prefill = bool(prefill)
@@ -674,7 +684,7 @@ class _KdaW8Prefill(_KdaW8):
 def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
                        output_dtype: str = "bfloat16", prefill_expanded: bool = False,
                        output_kind: str = "projection", state_dtype: str = "float32",
-                       state_rounding: str = "window") -> AotProgram:
+                       state_rounding: str = "window", seq_ctas: int = 1) -> AotProgram:
     prefill = _w8_mode(fp8_only)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
     types = {"bfloat16": (cutlass.BFloat16, torch.bfloat16),
@@ -690,7 +700,7 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
     cute_dtype, torch_dtype = types[output_dtype]
     launch = (_KdaW8Prefill if prefill else _KdaW8)(g, max_rows, prefill,
                                                 cute_dtype, prefill_expanded, output_kind,
-                                                state_dtype, state_rounding)
+                                                state_dtype, state_rounding, seq_ctas)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, d, p, heads = g.hidden, g.kda_width, g.kda_in_width, g.kda_heads
     from ._fp8_weights import fp8_only_operands
@@ -727,7 +737,8 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
                   "output_dtype": output_dtype, "output_kind": output_kind, "prefill_expanded": prefill_expanded,
                   "decode_gemv_rows": 32 if (h, heads, g.kda_head_dim) == (4096, 32, 128) else FP8_ROWS,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
-                  **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch)},
+                  **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch),
+                  **_seq_geometry(launch)},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill, prefill_expanded)},
         doc=__doc__,
     )
@@ -736,7 +747,8 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
 def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=False,
                          fp8_only: str | None = None, output_dtype: str = "bfloat16",
                          prefill_expanded: bool = False, output_kind: str = "projection",
-                         state_dtype: str = "float32", state_rounding: str = "window") -> AotProgram:
+                         state_dtype: str = "float32", state_rounding: str = "window",
+                         seq_ctas: int = 1) -> AotProgram:
     """One KDA layer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds ``w_in``/``w_o`` E4M3 copies with per-row scales and the ``fp8_rows``
     scalar (decode steps up to that many rows read them); ``fp8="prefill"``
@@ -766,19 +778,24 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
     Decode programs (``fp8=True``, ``fp8_only="decode"``) past ``CHUNKED_MIN_ROWS`` rows (a wide
     verify, e.g. ``max_rows=128``) keep the decode structures, the token-sequential recurrence
     included, and record every row: their ``replay`` is ``kda_replay_layout(..., max_rows)``,
-    for ``compile_glmf_kda_commit_aot(replay_rows=max_rows)``."""
+    for ``compile_glmf_kda_commit_aot(replay_rows=max_rows)``.
+
+    ``seq_ctas`` (default 1) launches the token-sequential recurrence over that many CTAs per
+    head block, a step's sequences shared among them (``GlmfKdaRecurrent``): the operands,
+    scalars, outputs, stored states and replay records of ``seq_ctas=1``, each non-negative
+    slot in one stretch of a step's rows. Past 1 it extends the key and geometry."""
     max_rows = _check_rows(max_rows)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
     if fp8_only is not None:
         if fp8 is not False:
             raise ValueError("fp8_only takes no fp8 copies")
         return _compile_glmf_kda_w8(g, max_rows, fp8_only, output_dtype, prefill_expanded, output_kind,
-                                    state_dtype, state_rounding)
+                                    state_dtype, state_rounding, seq_ctas)
     if output_dtype != "bfloat16" or prefill_expanded or output_kind != "projection":
         raise ValueError("KDA output_dtype/prefill_expanded/output_kind require fp8_only")
     fp8_on, prefill = _fp8_mode(fp8)
     launch = (_KdaFp8Prefill if prefill else _KdaFp8 if fp8_on else _Kda)(g, max_rows, fp8, state_dtype,
-                                                                           state_rounding)
+                                                                           state_rounding, seq_ctas=seq_ctas)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, d, p, heads = g.hidden, g.kda_width, g.kda_in_width, g.kda_heads
     operands = (
@@ -810,7 +827,8 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
         geometry={"hidden": h, "heads": heads, "head_dim": g.kda_head_dim, "max_rows": max_rows,
                   "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
-                  **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch)},
+                  **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch),
+                  **_seq_geometry(launch)},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill)},
         doc=__doc__,
     )
