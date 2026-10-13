@@ -158,15 +158,17 @@ class _Fp8Switch:
     128-K block, FP32 scales) when ``fp8_rows`` is nonzero; per-row weight
     scales are then stored K-block major, ``[K/128, N]``. ``qscratch`` holds
     the quantized rows (``quant_scratch_bytes``); ``prefill_mask`` selects the
-    ``fp8_rows`` bits that turn this projection's FP8 route on."""
+    ``fp8_rows`` bits that turn this projection's FP8 route on.
+
+    ``row_tiles``: the BF16 projection's TMA tiles by live rows (``glm_projection``)."""
 
     def __init__(self, n: int, k: int, *, fp8: bool, row_scales: bool = False, prefill_rows: int | None = None,
-                 prefill_mask: int = 0xFF, wide_rows: int = 0):
+                 prefill_mask: int = 0xFF, wide_rows: int = 0, row_tiles: tuple = ()):
         from ._fp8_weights import MmaFp8Gemv, gemv_warps
         from ._glmf_fp8 import BlockFp8Projection
 
         self.n, self.k = int(n), int(k)
-        self.bf16 = glm_projection(self.n, self.k, wide=prefill_rows is not None)
+        self.bf16 = glm_projection(self.n, self.k, wide=prefill_rows is not None, row_tiles=row_tiles)
         self.prefill = None
         self.fp8 = None
         self.fp8_wide = None
@@ -510,9 +512,29 @@ def _seq_geometry(launch) -> dict:
     return {} if launch.seq_ctas == 1 else {"seq_ctas": launch.seq_ctas}
 
 
+# TMA tiles of the BF16 KDA projections by live rows, per weight shape [N, K] (``decode_tiles``;
+# ``RowTiledBf16Projection`` entries: rows up to, MMA warps of 16 tile rows each, tile columns,
+# stages; rows past the last entry keep ``prefill_config``, whose 64 x 128 x 3-stage tile is 195
+# CTAs for the in-projection and 32 for o_proj). RTX 5090 (170 SMs), L2-cold, us at 16/32/64/128
+# rows, ``prefill_config`` -> chosen: in 24896x4096 156/156/158/164 -> 125/131/131/164 (past 64
+# rows no tile gained more than the timer's 2 us step), o 4096x8192 100/100/100/102 ->
+# 47/47/57/59. Every entry gave ``prefill_config``'s bits at 1 to 128 rows there.
+KDA_DECODE_TILES = {
+    (24896, 4096): ((32, 1, 32, 4), (64, 4, 128, 2)),
+    (4096, 8192): ((32, 1, 32, 4), (128, 4, 64, 3)),
+}
+
+
+def _tile_geometry(launch) -> dict:
+    """Manifest geometry of a KDA program built with ``decode_tiles`` (none for a program without
+    a table, whose geometry is unchanged)."""
+    return {"decode_tiles": dict(launch.decode_tiles)} if launch.decode_tiles else {}
+
+
 class _Kda:
     def __init__(self, g: GLMFGeometry, max_rows: int = 64, fp8=False, state_dtype: str = "float32",
-                 state_rounding: str = "window", decode: bool | None = None, seq_ctas: int = 1):
+                 state_rounding: str = "window", decode: bool | None = None, seq_ctas: int = 1,
+                 decode_tiles: bool = False):
         self.g = g
         self.output_norm = False
         fp8, prefill = _fp8_mode(fp8)
@@ -525,6 +547,8 @@ class _Kda:
         # 64-row batched tiles, and its replay record holds max_rows rows. Prefill and
         # BF16-only programs take the prefill structures past CHUNKED_MIN_ROWS rows.
         decode = (fp8 and not prefill) if decode is None else bool(decode)
+        if decode_tiles and not decode:
+            raise ValueError("decode_tiles takes a decode KDA program over BF16 projections (fp8=True)")
         structure = min(int(max_rows), CHUNKED_MIN_ROWS) if decode else int(max_rows)
         self.replay_rows = max(int(max_rows), REPLAY_ROWS) if decode else REPLAY_ROWS
         self.replay_key = () if self.replay_rows == REPLAY_ROWS else (("replay_rows", self.replay_rows),)
@@ -536,8 +560,14 @@ class _Kda:
         self.d, self.p = d, p
         prefill_rows = int(max_rows) if prefill else None
         self.chunked_bytes = 0 if self.chunked is None else self.chunked.nbytes
+        # decode_tiles: the BF16 projections whose shape has a table pick their TMA tiles by live
+        # rows; a table extends that projection's key, the programs without one keep theirs.
+        self.decode_tiles = {name: KDA_DECODE_TILES[shape]
+                             for name, shape in (("in", (p, g.hidden)), ("out", (g.hidden, d)))
+                             if decode_tiles and shape in KDA_DECODE_TILES}
         # Prefill: fp8_rows bit 0 turns the in-projection's FP8 GEMM on, bit 1 o_proj's.
-        self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=1)
+        self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=1,
+                                  row_tiles=self.decode_tiles.get("in", ()))
         # f_b(f_a) and g_b(g_a): two 128 -> D products off the in-projection row.
         self.fg = BatchedBf16Gemm(n=d, k=g.kda_head_dim, batch=2, a_row=p, a_batch=g.kda_head_dim,
                                   o_row=2 * d, o_batch=d, compute_warps=_batched_warps(structure))
@@ -549,7 +579,8 @@ class _Kda:
                                           g_stride=2 * d, b_stride=p, state_dtype=state, replay_rows=self.replay_rows,
                                           seq_ctas=self.seq_ctas)
         self.norm = GlmfKdaGatedNorm(heads=g.kda_heads, eps=g.norm_eps, gate_stride=2 * d)
-        self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=2)
+        self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=2,
+                                 row_tiles=self.decode_tiles.get("out", ()))
 
     def key(self) -> tuple:
         return (self.in_proj.key(), self.fg.key(), self.o_proj.key(), self.g,
@@ -748,7 +779,7 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
                          fp8_only: str | None = None, output_dtype: str = "bfloat16",
                          prefill_expanded: bool = False, output_kind: str = "projection",
                          state_dtype: str = "float32", state_rounding: str = "window",
-                         seq_ctas: int = 1) -> AotProgram:
+                         seq_ctas: int = 1, decode_tiles: bool = False) -> AotProgram:
     """One KDA layer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds ``w_in``/``w_o`` E4M3 copies with per-row scales and the ``fp8_rows``
     scalar (decode steps up to that many rows read them); ``fp8="prefill"``
@@ -783,19 +814,29 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
     ``seq_ctas`` (default 1) launches the token-sequential recurrence over that many CTAs per
     head block, a step's sequences shared among them (``GlmfKdaRecurrent``): the operands,
     scalars, outputs, stored states and replay records of ``seq_ctas=1``, each non-negative
-    slot in one stretch of a step's rows. Past 1 it extends the key and geometry."""
+    slot in one stretch of a step's rows. Past 1 it extends the key and geometry.
+
+    ``decode_tiles`` (default off; decode programs over BF16 projections, ``fp8=True``): steps
+    past the skinny GEMV's rows run the BF16 in-projection and o_proj on TMA tiles picked by the
+    live rows from ``KDA_DECODE_TILES`` (per weight shape; a shape without a table keeps
+    ``prefill_config``). The operands, scalars and scratch of the default program; the tiles
+    keep each output's K order, so the outputs are expected bit-identical to it. With a table it
+    extends the key and geometry."""
     max_rows = _check_rows(max_rows)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
     if fp8_only is not None:
         if fp8 is not False:
             raise ValueError("fp8_only takes no fp8 copies")
+        if decode_tiles:
+            raise ValueError("decode_tiles takes a decode KDA program over BF16 projections (fp8=True)")
         return _compile_glmf_kda_w8(g, max_rows, fp8_only, output_dtype, prefill_expanded, output_kind,
                                     state_dtype, state_rounding, seq_ctas)
     if output_dtype != "bfloat16" or prefill_expanded or output_kind != "projection":
         raise ValueError("KDA output_dtype/prefill_expanded/output_kind require fp8_only")
     fp8_on, prefill = _fp8_mode(fp8)
     launch = (_KdaFp8Prefill if prefill else _KdaFp8 if fp8_on else _Kda)(g, max_rows, fp8, state_dtype,
-                                                                           state_rounding, seq_ctas=seq_ctas)
+                                                                           state_rounding, seq_ctas=seq_ctas,
+                                                                           decode_tiles=decode_tiles)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, d, p, heads = g.hidden, g.kda_width, g.kda_in_width, g.kda_heads
     operands = (
@@ -828,7 +869,7 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
                   "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
                   **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch),
-                  **_seq_geometry(launch)},
+                  **_seq_geometry(launch), **_tile_geometry(launch)},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill)},
         doc=__doc__,
     )
