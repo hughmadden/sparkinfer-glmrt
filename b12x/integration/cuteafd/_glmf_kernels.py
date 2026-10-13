@@ -1036,9 +1036,105 @@ class GlmfIndexExpand:
                 lengths[row] = Int32(filled + tail)
 
 
+class GlmfIndexExpandOwned:
+    """One GPU's share of ``GlmfIndexExpand`` under token-split (context) attention.
+
+    Allocation units of ``unit_rows`` tokens (four 64-row record pages and the pool page of
+    the same index) are owned by parity: logical unit ``u`` of every sequence lives on GPU
+    ``u % 2``, as local unit ``L``. A local unit's records are contiguous, so the record slot
+    of position ``q`` is ``L * unit_rows + q % unit_rows``, and pool slot ``s`` (``L * 64 + j``)
+    holds the key of record slots ``4 s .. 4 s + 3``. ``units`` is each row's compact table of
+    this GPU's units in logical order (column ``j``: logical unit ``2 j + rank``).
+
+    Rows whose context ``p + 1 <= dense_limit`` select every earlier token on this GPU's
+    units, ascending. Longer rows expand this GPU's picks of the merged global top-k pools
+    (``local_pools``/``local_lengths``: ``dsa_candidate_merge``'s ascending local slots over the
+    same compact table) to their four tokens, then append the open tail pool when this GPU
+    owns its unit. Shard unions equal the full selection; an empty share has length 0. A
+    masked row (``p < 0``) selects nothing. One CTA of 256 threads per row, no shared state.
+    """
+
+    threads = 256
+
+    def __init__(self, *, pools: int, width: int, dense_limit: int, kpool: int = 4, unit_rows: int = 256):
+        if unit_rows % kpool or unit_rows % 64:
+            raise ValueError("units hold whole pools and whole 64-row pages")
+        self.pools, self.width, self.dense_limit = int(pools), int(width), int(dense_limit)
+        self.kpool, self.unit_rows = int(kpool), int(unit_rows)
+
+    @cute.jit
+    def __call__(self, positions: cute.Pointer, local_pools: cute.Pointer, local_lengths: cute.Pointer,
+                 units: cute.Pointer, indices: cute.Pointer, lengths: cute.Pointer, rows: Int32, stride: Int32,
+                 rank: Int32, stream: cuda.CUstream):
+        m = Int64(rows)
+        self.kernel(
+            cute.make_tensor(positions, cute.make_layout((m,))),
+            cute.make_tensor(local_pools, cute.make_layout((m, self.pools), stride=(self.pools, 1))),
+            cute.make_tensor(local_lengths, cute.make_layout((m,))),
+            units,
+            cute.make_tensor(indices, cute.make_layout((m, self.width), stride=(self.width, 1))),
+            cute.make_tensor(lengths, cute.make_layout((m,))),
+            stride, rank,
+        ).launch(grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.jit
+    def _unit(self, units: cute.Pointer, base: Int64, column: Int64) -> Int64:
+        entry = cute.make_ptr(Int32, Int64(units.toint()) + (base + column) * Int64(4),
+                              cute.AddressSpace.gmem, assumed_align=4)
+        return Int64(entry[0])
+
+    @cute.kernel
+    def kernel(self, positions: cute.Tensor, local_pools: cute.Tensor, local_lengths: cute.Tensor,
+               units: cute.Pointer, indices: cute.Tensor, lengths: cute.Tensor, stride: Int32, rank: Int32):
+        row = Int64(cute.arch.block_idx()[0])
+        tidx = Int64(cute.arch.thread_idx()[0])
+        span = Int64(self.unit_rows)
+        owner = Int64(rank)
+        base = row * Int64(stride)
+        count = Int64(positions[row]) + Int64(1)
+        if count < Int64(0):
+            count = Int64(0)
+        if count <= Int64(self.dense_limit):
+            # Owned complete units below `count`, then the partial unit if it is ours.
+            full = count // span
+            mine = (full + Int64(1) - owner) // Int64(2) * span
+            if full % Int64(2) == owner:
+                mine = mine + count - full * span
+            for it in cutlass.range_constexpr((self.width + self.threads - 1) // self.threads):
+                i = Int64(it * self.threads) + tidx
+                if i < Int64(self.width):
+                    value = Int32(-1)
+                    if i < mine:
+                        value = Int32(self._unit(units, base, i // span) * span + i % span)
+                    indices[row, i] = value
+            if tidx == Int64(0):
+                lengths[row] = Int32(mine)
+        else:
+            picked = Int64(local_lengths[row]) * Int64(self.kpool)
+            tail_start = count // Int64(self.kpool) * Int64(self.kpool)
+            tail_unit = tail_start // span
+            tail = Int64(0)
+            if tail_unit % Int64(2) == owner:
+                tail = count - tail_start
+            for it in cutlass.range_constexpr((self.width + self.threads - 1) // self.threads):
+                i = Int64(it * self.threads) + tidx
+                if i < Int64(self.width):
+                    value = Int32(-1)
+                    if i < picked:
+                        value = Int32(Int64(local_pools[row, i // Int64(self.kpool)]) * Int64(self.kpool)
+                                      + i % Int64(self.kpool))
+                    elif i < picked + tail:
+                        value = Int32(self._unit(units, base, tail_unit // Int64(2)) * span
+                                      + tail_start % span + (i - picked))
+                    indices[row, i] = value
+            if tidx == Int64(0):
+                lengths[row] = Int32(picked + tail)
+
+
 __all__ = [
     "GlmfAdd",
     "GlmfIndexExpand",
+    "GlmfIndexExpandOwned",
     "GlmfIndexPost",
     "GlmfPoolKeys",
     "GlmfKdaConv",

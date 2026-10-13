@@ -461,3 +461,110 @@ def test_producer_query_row_writes_the_half_of_an_assembled_query(weights, rows)
         assert (assembled[:, 1 - rank] == 7.0).all(), f"rank {rank}: wrote the peer's half"
         assert torch.equal(cache, ref_cache) and torch.equal(resid, ref_resid)
     assert contiguous.abs().sum() > 0
+
+
+def _glmf_expand_programs():
+    require_b12x()
+    from b12x.integration.cuteafd import GLM53_FLASH, exportable_compilation
+    from b12x.integration.cuteafd import glmf
+    key = ("glmf_expand_pair",)
+    if key not in _PROGRAMS:
+        with exportable_compilation():
+            _PROGRAMS[key] = (glmf.compile_glmf_index_expand_aot(GLM53_FLASH),
+                              glmf.compile_glmf_index_expand_owned_aot(GLM53_FLASH), GLM53_FLASH)
+    return _PROGRAMS[key]
+
+
+@pytest.mark.parametrize("ties", [False, True])
+def test_glmf_owned_expand_shards_union_the_full_selection(ties):
+    """GLM Flash under context: per GPU, the scored pool top-k over its units, the candidate
+    merge, then the owned expansion. The union of both GPUs' selections (as logical
+    positions) equals the head split's selection over the full table, row by row: dense
+    rows (every earlier token), long rows (expanded top-512 pools) and the open tail pool,
+    whichever GPU owns it. Empty shares have length 0; masked rows (position -1) none."""
+    full_expand, owned_expand, g = _glmf_expand_programs()
+    index = program("scored_index_topk", "glmf", max_rows=16, max_pages=192, mode="decode")
+    merge = program("dsa_candidate_merge", topk=512)
+    heads, k, kpool, unit = index.geometry["heads"], 512, 4, 256
+    units = 40                     # logical units of the longest row: 10,240 tokens
+    width = g.sparse_topk
+    # Each GPU's local units: logical unit u of the sequence -> local unit L[u] on GPU u % 2,
+    # and in the head split's full pool, unit id 2 L + u % 2 (the parity pool's id space).
+    local = [torch.randperm(units)[:units // 2] + 3 for _ in range(2)]
+    ids = torch.tensor([2 * int(local[u % 2][u // 2]) + u % 2 for u in range(units)], dtype=torch.int32)
+    positions = torch.tensor([-1, 0, 5, 255, 256, 700, 2050, 2051, 2052, 2055, 4096, 5000, 9001, 10239],
+                             dtype=torch.int64)
+    rows = len(positions)
+    pool_units = int(ids.max()) + 1
+    # Pool-key cache in the full (head split) id space: page `id` holds units' 64 pools.
+    keys = torch.randint(-3, 4, (pool_units * 64, 128), device="cuda").to(torch.float8_e4m3fn)
+    full_cache = torch.zeros((pool_units, 8448), dtype=torch.uint8, device="cuda")
+    full_cache[:, :8192] = keys.view(torch.uint8).view(pool_units, 8192)
+    full_cache[:, 8192:] = torch.ones((pool_units, 64), device="cuda").view(torch.uint8).view(pool_units, 256)
+    q = torch.randint(-2, 3, (rows, heads, 128), device="cuda").to(torch.float8_e4m3fn)
+    if ties:
+        q.zero_()
+    weights = torch.full((rows, heads), 1 / 32, device="cuda")
+    pools_seen = ((positions + 1).clamp(min=0) // kpool).int().cuda()
+    # The head split: top-k over the full pool table, expand over full record pages.
+    table = ids.cuda()[None].expand(rows, -1).contiguous()
+    scratch = torch.zeros(index.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
+    top_i = torch.empty((rows, k), device="cuda", dtype=torch.int32)
+    top_v = torch.empty((rows, k), device="cuda")
+    index.launch(q, weights, full_cache, table, pools_seen, top_i, top_v, scratch, scalars=(rows, units, units, 1, 0))
+    # glmf_index_topk emits physical pool slots; scored emits logical. Map logical -> physical.
+    full_pools = torch.where(top_i >= 0, table.gather(1, (top_i.clamp(min=0) // 64).long()) * 64 + top_i % 64,
+                             torch.zeros_like(top_i)).int()
+    pool_logical = torch.zeros(pool_units, dtype=torch.int32, device="cuda")
+    pool_logical[ids.long().cuda()] = torch.arange(units, dtype=torch.int32, device="cuda")
+    record_pages = torch.stack([ids * 4 + e for e in range(4)], 1).reshape(-1).int().cuda()
+    page_table = record_pages[None].expand(rows, -1).contiguous()
+    pos = positions.cuda()
+    full_idx = torch.empty((rows, width), device="cuda", dtype=torch.int32)
+    full_len = torch.empty(rows, device="cuda", dtype=torch.int32)
+    full_expand.launch(pos.clamp(min=0), full_pools, pool_logical, page_table, full_idx, full_len,
+                       scalars=(rows, page_table.shape[1]))
+    # Context: each GPU scores its own units (compact half table, shard lengths), merges.
+    halves_v, halves_i = [], []
+    local_cache = []
+    for rank in (0, 1):
+        n = len(local[rank])
+        cache = torch.zeros((int(local[rank].max()) + 1, 8448), dtype=torch.uint8, device="cuda")
+        logical_units = torch.arange(rank, units, 2)
+        cache[local[rank].long().cuda()] = full_cache[ids[logical_units].long().cuda()]
+        local_cache.append(cache)
+        half = local[rank].int().cuda()[None].expand(rows, -1).contiguous()
+        u, r = (pools_seen // 64), (pools_seen % 64)
+        shard = ((u + 1 - rank) // 2) * 64 + torch.where(u % 2 == rank, r, torch.zeros_like(r))
+        oi = torch.empty_like(top_i); ov = torch.empty_like(top_v)
+        index.launch(q, weights, cache, half, shard.int(), oi, ov, scratch, scalars=(rows, n, n, 2, rank))
+        halves_v.append(ov); halves_i.append(oi)
+    v, i = torch.cat(halves_v, 1), torch.cat(halves_i, 1)
+    selected = [set() for _ in range(rows)]
+    for rank in (0, 1):
+        half = local[rank].int().cuda()[None].expand(rows, -1).contiguous()
+        out_v = torch.empty_like(top_v); out_i = torch.empty_like(top_i)
+        slots = torch.empty_like(top_i); lens = torch.empty(rows, device="cuda", dtype=torch.int32)
+        merge.launch(v, i, out_v, out_i, half, slots, lens, scalars=(rows, half.shape[1], rank))
+        assert torch.equal(out_i, top_i)
+        idx = torch.full((rows, width), 7, device="cuda", dtype=torch.int32)
+        ln = torch.full((rows,), 7, device="cuda", dtype=torch.int32)
+        owned_expand.launch(pos, slots, lens, half, idx, ln, scalars=(rows, half.shape[1], rank))
+        torch.cuda.synchronize()
+        # Local record slot -> logical position through this GPU's unit map.
+        to_logical = {int(local[rank][j]): 2 * j + rank for j in range(len(local[rank]))}
+        for r in range(rows):
+            n = int(ln[r])
+            got = idx[r, :n].tolist()
+            assert (idx[r, n:] == -1).all(), (rank, r)
+            assert all(s >= 0 for s in got)
+            logical = [to_logical[s // unit] * unit + s % unit for s in got]
+            assert all(p // unit % 2 == rank for p in logical)
+            assert not (set(logical) & selected[r]), "a position selected by both GPUs"
+            selected[r] |= set(logical)
+    # The full selection, as logical positions through the head split's record pages.
+    page_logical = {int(record_pages[j]): j for j in range(len(record_pages))}
+    for r in range(rows):
+        n = int(full_len[r]) if positions[r] >= 0 else 0
+        want = {page_logical[s // 64] * 64 + s % 64 for s in full_idx[r, :n].tolist()}
+        assert selected[r] == want, f"row {r} position {int(positions[r])}"

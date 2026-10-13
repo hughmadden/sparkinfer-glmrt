@@ -81,6 +81,7 @@ from ._glm_kernels import BatchedBf16Gemm, GlmRankNormPackKV, GlmSwiGLU, glm_pro
 from ._glmf_kernels import (
     GlmfAdd,
     GlmfIndexExpand,
+    GlmfIndexExpandOwned,
     GlmfIndexPost,
     GlmfPoolKeys,
     REPLAY_ROWS,
@@ -108,6 +109,7 @@ __all__ = [
     "compile_glmf_head_fp8_aot",
     "compile_glmf_kda_commit_aot",
     "compile_glmf_index_expand_aot",
+    "compile_glmf_index_expand_owned_aot",
     "compile_glmf_index_producer_aot",
     "compile_glmf_index_topk_aot",
     "compile_glmf_kda_aot",
@@ -1362,6 +1364,38 @@ def compile_glmf_index_expand_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
         scalars=(Scalar("rows"), Scalar("stride")), key=(pools, g.sparse_topk, g.index_kpool),
         geometry={"pools": pools, "width": g.sparse_topk, "dense_limit": g.index_topk + g.index_kpool - 1},
         doc=compile_glmf_index_expand_aot.__doc__,
+    )
+
+
+def compile_glmf_index_expand_owned_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
+    """One GPU's selection under token-split attention (``GlmfIndexExpandOwned``): its own
+    tokens below the dense limit, else its picks of the merged top-k pools expanded to
+    tokens plus the open tail pool when its unit is this GPU's.
+
+    ``positions`` i64 [rows] (negative: a masked row, empty), ``local_pools`` i32
+    [rows, index_topk/kpool] (``dsa_candidate_merge``'s ``local_slots``: this GPU's pool slots,
+    ascending, -1 padded), ``local_lengths`` i32 [rows], ``units`` i32 [rows, stride] (each
+    row's compact table of this GPU's local units: column ``j`` is logical unit ``2 j + rank``),
+    ``indices`` i32 [rows, sparse_topk] out (local record slots), ``lengths`` i32 [rows] out;
+    scalars ``rows``, ``stride``, ``rank``.
+    """
+    pools = g.index_topk // g.index_kpool
+    unit_rows = g.index_kpool * g.page_rows
+    launch = GlmfIndexExpandOwned(pools=pools, width=g.sparse_topk, dense_limit=g.index_topk + g.index_kpool - 1,
+                                  kpool=g.index_kpool, unit_rows=unit_rows)
+    return compile_program(
+        launch, name="glmf_index_expand_owned",
+        operands=(Operand("positions", torch.int64, "[rows]", align=8),
+                  Operand("local_pools", torch.int32, f"[rows,{pools}]", align=4),
+                  Operand("local_lengths", torch.int32, "[rows]", align=4),
+                  Operand("units", torch.int32, "[rows,stride]", align=4),
+                  Operand("indices", torch.int32, f"[rows,{g.sparse_topk}]", "out", align=4),
+                  Operand("lengths", torch.int32, "[rows]", "out", align=4)),
+        scalars=(Scalar("rows"), Scalar("stride"), Scalar("rank")),
+        key=(pools, g.sparse_topk, g.index_kpool, unit_rows),
+        geometry={"pools": pools, "width": g.sparse_topk, "dense_limit": g.index_topk + g.index_kpool - 1,
+                  "unit_rows": unit_rows},
+        doc=compile_glmf_index_expand_owned_aot.__doc__,
     )
 
 
