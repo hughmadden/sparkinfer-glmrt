@@ -9,9 +9,11 @@ the default route.
   projection's bound of the FP64 product.
 - A CUDA graph of the tiled launch replays new activations written into the captured buffers with the bytes
   of the eager default launch.
-- The decode KDA programs (64 and 128 rows, FP32 and BF16 state) built with ``decode_tiles`` against the
-  default build: the same ABI, and byte-identical outputs, recurrent state, conv state and replay record over
-  plain and speculative steps of several sequences at 16, 32, 64, 127 and 128 rows.
+- The decode KDA programs (64 and 128 rows, FP32 and BF16 state) built with ``decode_tiles`` and
+  ``seq_ctas`` 1 or 8 against the default build: the same ABI, and byte-identical outputs, recurrent state,
+  conv state and replay record over plain and speculative steps at 1, 8, 9, 16, 32, 64, 127 and 128 rows.
+  The shipping combination (8 CTAs plus tiles), including the half-head decode stem, also replays graphs
+  captured on masked slots with fresh activations, tables and pools.
 - Malformed tables and programs without BF16 decode projections are refused.
 """
 
@@ -29,7 +31,7 @@ _PROGRAMS: dict = {}
 _TENSORS: dict = {}
 
 #: (program rows, step rows): a step is sequences of 8 rows, the last one shorter when the rows do not divide.
-KDA_STEPS = [(64, 16), (64, 32), (64, 64), (128, 127), (128, 128)]
+KDA_STEPS = [(64, 1), (64, 8), (64, 9), (64, 16), (64, 32), (64, 64), (128, 127), (128, 128)]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -66,15 +68,15 @@ def _projection(name: str, tiled: bool):
     return _PROGRAMS[key]
 
 
-def _kda(max_rows: int, state_dtype: str, tiled: bool):
+def _kda(max_rows: int, state_dtype: str, tiled: bool, seq_ctas: int = 1):
     """The decode KDA program (``fp8=True``, run with ``fp8_rows`` 0: the BF16 projections)."""
-    key = ("kda", max_rows, state_dtype, tiled)
+    key = ("kda", max_rows, state_dtype, tiled, seq_ctas)
     if key not in _PROGRAMS:
         from b12x.integration.cuteafd import glmf
 
         kw = {"decode_tiles": True} if tiled else {}
         _PROGRAMS[key] = glmf.compile_glmf_kda_aot(_geometry(), max_rows=max_rows, fp8=True, state_dtype=state_dtype,
-                                                   **kw)
+                                                   seq_ctas=seq_ctas, **kw)
     return _PROGRAMS[key]
 
 
@@ -172,56 +174,122 @@ def _tables(step) -> tuple[torch.Tensor, torch.Tensor]:
             torch.tensor(first, dtype=torch.int32, device="cuda"))
 
 
-def _pools(state_dtype: str) -> tuple[torch.Tensor, torch.Tensor]:
+def _pools(state_dtype: str, g=None) -> tuple[torch.Tensor, torch.Tensor]:
     """A BF16-representable state pool ``[POOL, H, 128, 128]`` and a conv state pool (cloned by every step)."""
-    if ("pools", state_dtype) not in _TENSORS:
-        g = _geometry()
+    g = _geometry() if g is None else g
+    key = ("pools", state_dtype, g.kda_heads)
+    if key not in _TENSORS:
         gen = torch.Generator(device="cuda").manual_seed(11)
         state = (torch.randn((POOL, g.kda_heads, 128, 128), generator=gen, device="cuda") * 0.05).bfloat16()
         conv = (torch.randn((POOL, 3, 3 * g.kda_width), generator=gen, device="cuda") * 0.1).bfloat16()
-        _TENSORS[("pools", state_dtype)] = (state if state_dtype == "bfloat16" else state.float(), conv)
-    return _TENSORS[("pools", state_dtype)]
+        _TENSORS[key] = (state if state_dtype == "bfloat16" else state.float(), conv)
+    return _TENSORS[key]
 
 
-def _run_kda(prog, x, step, state_dtype: str, spec: int, record_rows: int):
+def _run_kda(prog, x, step, state_dtype: str, spec: int, record_rows: int, graph_replay: bool = False,
+             geometry=None, weights=None):
     """One step of the KDA program: (outputs, state pool, conv state pool, replay record)."""
     from b12x.integration.cuteafd._glmf_kernels import kda_replay_layout
 
-    w, g = _weights(), _geometry()
+    w = _weights() if weights is None else weights
+    g = _geometry() if geometry is None else geometry
     rows = int(x.shape[0])
     slots, seq_first = _tables(step)
     out = torch.zeros((rows, g.hidden), dtype=torch.bfloat16, device="cuda")
     record = torch.zeros((kda_replay_layout(g.kda_heads, 3 * g.kda_width, record_rows)[2] // 4,), device="cuda")
     scratch = torch.zeros(prog.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
-    state, conv = (pool.clone() for pool in _pools(state_dtype))
-    prog.launch(x, w["w_in"], w["w_in"], w["dummy"], w["w_fg"], w["conv_w"], w["a_log"], w["dt_bias"], w["o_norm"],
-                w["w_o"], w["w_o"], w["dummy"], conv, state, slots, seq_first, out, record, scratch,
-                scalars=(rows, 0, spec))
+    state, conv = (pool.clone() for pool in _pools(state_dtype, g))
+    def launch():
+        prog.launch(x, w["w_in"], w["w_in"], w["dummy"], w["w_fg"], w["conv_w"], w["a_log"], w["dt_bias"], w["o_norm"],
+                    w["w_o"], w["w_o"], w["dummy"], conv, state, slots, seq_first, out, record, scratch,
+                    scalars=(rows, 0, spec))
+
+    launch()
     torch.cuda.synchronize()
+    if graph_replay:
+        eager = tuple(t.clone() for t in (out, state, conv, record))
+        # Serving startup captures masked slots, then fills live tables before replay.
+        saved_slots = slots.clone()
+        slots.fill_(-1)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        torch.cuda.synchronize()
+        slots.copy_(saved_slots)
+        # Replay with fresh activations and pools, not the capture's inputs/state.
+        saved = x.clone()
+        x.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        x.copy_(saved)
+        for pool, initial in zip((state, conv), _pools(state_dtype, g)):
+            pool.copy_(initial)
+        out.fill_(float("nan"))
+        record.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        for want, got in zip(eager, (out, state, conv, record)):
+            assert _same(want, got), "shipping KDA eager launch differs from graph replay"
     return out, state, conv, record
 
 
+@pytest.mark.parametrize("seq_ctas", [1, 8])
 @pytest.mark.parametrize("state_dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("spec", [0, 1])
 @pytest.mark.parametrize("max_rows,rows", KDA_STEPS)
-def test_kda_program_with_decode_tiles_is_the_default_program(max_rows, rows, spec, state_dtype):
+def test_kda_program_with_decode_tiles_is_the_default_program(max_rows, rows, spec, state_dtype, seq_ctas):
     """``compile_glmf_kda_aot(decode_tiles=True)``: the default program's ABI and, over a step of several
     sequences, its outputs, recurrent state, conv state and replay record."""
     g = _geometry()
-    base, tiled = _kda(max_rows, state_dtype, False), _kda(max_rows, state_dtype, True)
+    base, tiled = _kda(max_rows, state_dtype, False), _kda(max_rows, state_dtype, True, seq_ctas)
     assert tiled.name == base.name and tiled.abi == base.abi
     assert "decode_tiles" not in base.geometry
     assert tiled.geometry["decode_tiles"] == {"in": _tiles("in"), "out": _tiles("out")}
-    assert {k: v for k, v in tiled.geometry.items() if k != "decode_tiles"} == dict(base.geometry)
+    assert tiled.geometry.get("seq_ctas", 1) == seq_ctas
+    assert {k: v for k, v in tiled.geometry.items() if k not in ("decode_tiles", "seq_ctas")} == dict(base.geometry)
     assert tiled.scratch_bytes(max_rows) == base.scratch_bytes(max_rows)
     step = _step(rows)
     gen = torch.Generator(device="cuda").manual_seed(6000 + rows + spec)
     x = torch.randn((rows, g.hidden), generator=gen, device="cuda").bfloat16()
     want = _run_kda(base, x, step, state_dtype, spec, max(max_rows, 64))
-    got = _run_kda(tiled, x, step, state_dtype, spec, max(max_rows, 64))
+    got = _run_kda(tiled, x, step, state_dtype, spec, max(max_rows, 64), graph_replay=seq_ctas == 8)
     assert bool(want[0].float().abs().sum() > 0)
     for what, a, b in zip(("outputs", "state pool", "conv state pool", "replay record"), want, got):
         assert _same(a, b), f"{what}: decode_tiles against the default, {rows} rows in the {max_rows}-row program"
+
+
+@pytest.mark.parametrize("rows", [1, 16, 64])
+@pytest.mark.parametrize("spec", [0, 1])
+def test_head_split_shipping_combination_replays_default_bytes(rows, spec):
+    from dataclasses import replace
+    from b12x.integration.cuteafd import glmf
+
+    full = _geometry()
+    g = replace(full, name="glm53_flash_tp2", heads=full.heads // 2, kda_heads=full.kda_heads // 2,
+                dense_inter=full.dense_inter // 2, moe_inter=full.moe_inter // 2)
+    key = ("head_split",)
+    if key not in _PROGRAMS:
+        _PROGRAMS[key] = (
+            glmf.compile_glmf_kda_aot(g, max_rows=64, fp8=True),
+            glmf.compile_glmf_kda_aot(g, max_rows=64, fp8=True, seq_ctas=8, decode_tiles=True))
+    base, tiled = _PROGRAMS[key]
+    assert "decode_tiles" not in tiled.geometry  # Half-head shapes have no tile table.
+    assert tiled.geometry["seq_ctas"] == 8
+    assert tiled.abi == base.abi and tiled.scratch_bytes(64) == base.scratch_bytes(64)
+    if key not in _TENSORS:
+        w = dict(_weights())
+        for name, tensor in (
+                ("w_in", w["w_in"][:g.kda_in_width]), ("w_o", w["w_o"][:, :g.kda_width]),
+                ("w_fg", w["w_fg"][:, :g.kda_width]), ("conv_w", w["conv_w"][:3 * g.kda_width]),
+                ("a_log", w["a_log"][:g.kda_heads]), ("dt_bias", w["dt_bias"][:g.kda_width])):
+            w[name] = tensor.contiguous()
+        _TENSORS[key] = w
+    x = _activations("in", rows, 7000 + rows + spec)
+    step = _step(rows)
+    want = _run_kda(base, x, step, "float32", spec, 64, geometry=g, weights=_TENSORS[key])
+    got = _run_kda(tiled, x, step, "float32", spec, 64, graph_replay=True, geometry=g, weights=_TENSORS[key])
+    for a, b in zip(want, got):
+        assert _same(a, b)
 
 
 def test_tiles_by_rows_and_decode_tiles_are_checked():
