@@ -5,7 +5,7 @@ only) the router scores.
 Accuracy contract: every output is within the rounding of one
 FP32-accumulated dot product of the FP64 reference,
 ``|out - ref| <= K * 2^-24 * sum_k |x_k w_k| (+ half an ulp of the output
-dtype)``, and within one BF16 ulp of torch.mm for BF16 outputs.
+dtype)``. A separate FP32 reference obeys the same FP64 bound.
 """
 
 from __future__ import annotations
@@ -68,15 +68,18 @@ def test_routed_projection_accuracy_across_route_boundary(n, k, dtype):
         run(x, w, out)
         torch.cuda.synchronize()
         _check(out, x, w)
-        if dtype == torch.bfloat16:
-            # torch.mm obeys the same single-dot-product bound; the two differ
-            # by at most twice it (in practice one BF16 ulp).
-            _, bound = _bound(out, x, w)
-            diff = (out.double() - torch.mm(x, w.t()).double()).abs()
-            assert bool((diff <= 2 * bound).all())
-            assert float((out != torch.mm(x, w.t())).float().mean()) < 1e-2  # ~0.2% one-ulp flips
-        else:
-            torch.testing.assert_close(out, x.float() @ w.float().t(), rtol=1e-4, atol=1e-4)
+        # FP64 bounds define the contract, not cuBLAS's device-dependent
+        # BF16 reduction order or its rate of last-bit flips.
+        # TF32 is not an FP32-dot-product reference.
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            reference = x.float() @ w.float().t()
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        _check(reference, x, w)
+        _, bound = _bound(out, x, w)
+        assert bool(((out.double() - reference.double()).abs() <= 2 * bound).all())
 
 
 def test_routed_projection_replays_in_cuda_graph():

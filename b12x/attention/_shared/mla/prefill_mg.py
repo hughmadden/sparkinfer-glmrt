@@ -74,7 +74,7 @@ from .decode_math import (
     st_shared_f32,
     s7_epilogue,
 )
-from .io_mg import io_issue_gather_dsv4_nope, io_issue_gather_glm_mg
+from .io_mg import _GLM_NOPE_SCALE_BYTES, io_issue_gather_dsv4_nope, io_issue_gather_glm_mg
 from .smem_mg import get_prefill_mg_shared_storage_cls, make_smem_layout_mg
 from .traits import (
     ComputeMode,
@@ -2132,11 +2132,26 @@ class UnifiedPrefillMGKernel:
         head_offset=0,
         valid_hpb=None,
         pack_hilo_rows=False,
+        zero_masked_v=False,
     ):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
         self.num_tiles = int(num_tiles)
+        # A masked candidate's slot stages record slot 0 (the gather copies row
+        # 0 for a negative index) and S6 weights it by zero; the UE8M0 S6 zeroes
+        # its V first (0 x NaN = NaN). ``zero_masked_v`` does the same for GLM's
+        # ARBITRARY_FP32 rows: the E4M3 V and its inline FP32 group scales. Off
+        # by default: every existing specialization keeps its trace and PTX.
+        self.zero_masked_v = bool(zero_masked_v)
+        if self.zero_masked_v and not (
+            int(traits.model_type) in (int(ModelType.GLM_NSA), int(ModelType.GLM_NEXT))
+            and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+        ):
+            raise ValueError(
+                "zero_masked_v applies to GLM ARBITRARY_FP32 records (UE8M0 "
+                "records always zero a masked candidate's V)"
+            )
         self.replicate_h = int(replicate_h)
         self.num_heads = int(num_heads)
         self.q_stride_row = int(q_stride[0])
@@ -3523,6 +3538,28 @@ class UnifiedPrefillMGKernel:
                         )
                         w_head_sc_view_all[slot_hs] = Float32(0.0)
                         i_hs += Int32(self.math_threads)
+                    if cutlass.const_expr(self.zero_masked_v):
+                        # Zero a masked candidate's E4M3 V and inline FP32 group
+                        # scales (staged bytes [0, 528)) before S6 weights them by
+                        # zero, as the UE8M0 S6 does: S4's barriers already retired
+                        # every QK read of this tile, and the barrier below orders
+                        # the stores before S6.
+                        tile_length = split_cand_end - split_cand_start
+                        for part in cutlass.range_constexpr(
+                            (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                        ):
+                            entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                            if entry < Int32(t.bi):
+                                index = Int32(-1)
+                                if entry < tile_length:
+                                    index = _ld_global_index_i32(index_base_ptr, entry)
+                                if index < Int32(0):
+                                    for chunk in cutlass.range_constexpr(_GLM_NOPE_SCALE_BYTES // 16):
+                                        offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                        st_shared_u32(
+                                            kv_fp8_b + entry * Int32(L.kv_smem_stride) + offset,
+                                            Uint32(0),
+                                        )
                     cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
                     acc0 = s6_xv_nope(
                         w_pre0,
