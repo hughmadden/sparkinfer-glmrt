@@ -489,10 +489,10 @@ def export_all(out_dir: Path):
     made = []
     with exportable_compilation():
         programs = [("qwen4_index_expand", qa.compile_qwen4_index_expand_aot())]
-        for rows in (64, 4096):
+        for route, rows in (("decode", 64), ("prefill", 4096)):
             programs += [(f"qwen4_attn_producer_m{rows}", qa.compile_qwen4_attn_producer_aot(max_rows=rows)),
                          (f"qwen4_index_topk_m{rows}", qa.compile_qwen4_index_topk_aot(max_rows=rows)),
-                         (f"qwen4_sparse_gqa_m{rows}", qa.compile_qwen4_sparse_gqa_aot(max_rows=rows)),
+                         (f"qwen4_sparse_gqa_m{rows}", qa.compile_qwen4_sparse_gqa_aot(max_rows=rows, route=route)),
                          (f"qwen4_attn_o_m{rows}", qa.compile_qwen4_attn_o_aot(max_rows=rows))]
         for stem, prog in programs:
             prog.export_to_c(out_dir, stem, "cuteafd_" + stem)
