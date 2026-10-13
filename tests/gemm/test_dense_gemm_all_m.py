@@ -34,13 +34,13 @@ def test_m1_recipe_all_m_matches_serial_and_old_grid_drops_rows(capacity, rows, 
         quantize_mxfp8_rows_cute(source, value.values, value.scale_rows, value.scale_mma,
                                scale_block_size=32, amax_floor=1e-4, expected_m=1)
         return value
-    def compile(all_m):
+    def compile(all_m, admitted=capacity):
         kernel, actual_slices = compile_dense_gemm_mxfp8_aot(
-            size_m=capacity, size_n=n, size_k=k, expected_m=1, sm_count=188,
+            size_m=admitted, size_n=n, size_k=k, expected_m=1, sm_count=188,
             return_split_k_metadata=True, split_k_all_m=all_m)
         assert actual_slices == slices
         return kernel
-    fixed, old = compile(True), compile(False)
+    fixed, old, serial = compile(True), compile(False), compile(False, 1)
     def arguments(value, partial):
         return (pointer(cutlass.Float8E4M3FN, value.values),
                 pointer(cutlass.Float8E4M3FN, weight.values),
@@ -60,7 +60,7 @@ def test_m1_recipe_all_m_matches_serial_and_old_grid_drops_rows(capacity, rows, 
         kernel(*arguments(value, partial), source.shape[0], stream)
         return partial, folded(partial)
     partial, actual = launch(fixed, x)
-    expected = torch.cat([launch(old, x[i:i+1])[1] for i in range(rows)])
+    expected = torch.cat([launch(serial, x[i:i+1])[1] for i in range(rows)])
     assert torch.isfinite(partial).all()
     assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
     dropped, dropped_output = launch(old, x)
@@ -82,7 +82,7 @@ def test_m1_recipe_all_m_matches_serial_and_old_grid_drops_rows(capacity, rows, 
     x.mul_(-0.5)
     quantize_mxfp8_rows_cute(x, value.values, value.scale_rows, value.scale_mma,
                            scale_block_size=32, amax_floor=1e-4, expected_m=1)
-    replay_expected = torch.cat([launch(old, x[i:i+1])[1] for i in range(rows)])
+    replay_expected = torch.cat([launch(serial, x[i:i+1])[1] for i in range(rows)])
 
     def forbidden(*args, **kwargs):
         raise AssertionError("frozen replay must not resolve or compile a kernel")
