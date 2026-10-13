@@ -56,12 +56,14 @@ ROPE_PAIRS = 32
 WIDE_SKINNY_MAX_ROWS = 8
 
 
-def glm_projection(n: int, k: int, wide: bool = False):
+def glm_projection(n: int, k: int, wide: bool = False, row_tiles: tuple = ()):
     """``RoutedBf16Projection`` with the GLM crossover (narrow outputs keep the default);
-    ``wide`` adds its 128 x 128-tile route for prefill capacities."""
+    ``wide`` adds its 128 x 128-tile route for prefill capacities, ``row_tiles`` picks the
+    TMA route's tiles by live rows (the crossover is unchanged)."""
     from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
 
-    return RoutedBf16Projection(n, k, max_skinny_rows=WIDE_SKINNY_MAX_ROWS if n >= 2048 else None, wide=wide)
+    return RoutedBf16Projection(n, k, max_skinny_rows=WIDE_SKINNY_MAX_ROWS if n >= 2048 else None, wide=wide,
+                                row_tiles=row_tiles)
 
 
 @cute.jit
