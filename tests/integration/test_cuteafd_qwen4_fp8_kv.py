@@ -116,9 +116,12 @@ def test_fp8_sparse_fp64_and_replay(rows, large):
     indices[:, :131] = selected
     out = torch.empty(rows, 24 * 256, device="cuda", dtype=torch.bfloat16)
     program = _sparse()
-    scratch = torch.empty(program.scratch_bytes(128)["scratch"], device="cuda", dtype=torch.uint8)
+    from b12x.integration.cuteafd.qwen4_attention import sparse_gqa_scratch_bytes
+    scratch_bytes = sparse_gqa_scratch_bytes(g, 128, plan_rows=4)
+    storage = torch.full((scratch_bytes + 1024,), 0xA5, device="cuda", dtype=torch.uint8)
+    scratch = storage[:scratch_bytes]
     def run():
-        program.launch(query, cache, positions, tables, indices, out, scratch, scalars=[rows, 4, 0])
+        program.launch(query, cache, positions, tables, indices, out, scratch, scalars=[rows, 4, 0, 4])
     run()
     torch.cuda.synchronize()
     actual = out.clone()
@@ -130,6 +133,10 @@ def test_fp8_sparse_fp64_and_replay(rows, large):
     relative = (actual.double() - expected).norm() / expected.norm()
     assert relative < .01, relative.item()
     assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+    serial = torch.empty_like(out[:1])
+    program.launch(query[:1], cache, positions[:1], tables, indices[:1], serial, scratch, scalars=[1, 4, 0, 4])
+    torch.cuda.synchronize()
+    assert torch.equal(actual[:1], serial)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
@@ -140,3 +147,4 @@ def test_fp8_sparse_fp64_and_replay(rows, large):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.count_nonzero(out) == 0
+    assert torch.all(storage[scratch_bytes:] == 0xA5), "selected GQA scratch overrun"

@@ -11,9 +11,9 @@ latent per head (``glm_o`` applies W_UV).
 Routes (both take the live row count as a launch scalar):
 
 ``route="decode"``  split-KV decode kernel (normalized BF16 partials + LSE)
-    then the split merge. The split count is planned per live-row bucket
-    (``rows == 1``, ``rows <= 8``, ``rows <= max_rows``) with the prepared
-    plan's wave-balanced planner, and the program branches on ``rows``.
+    then the split merge. Numerical recipes use the wave-balanced planner
+    at hints 1, 8 and ``plan_capacity_rows`` (default ``max_rows``). The
+    program branches on immutable startup ``plan_rows``, never live ``rows``.
     ``full_launch_splits`` (opt-in) plans the buckets whose unsplit launch
     already exceeds the planner's waves; see ``decode_buckets``. A set
     ``B12X_MLA_SM120_NUM_SPLITS`` pins every bucket's split count and so
@@ -30,12 +30,14 @@ ABI (``N`` = 64 heads, ``K`` = 2048 selected slots per row)::
     out       bf16 [rows,N,512]     out
     scratch   u8   sparse_mla_scratch_bytes(...)
     rows      int32
+    plan_rows int32                 decode only, fixed before admission/capture
 
 Scratch (size with ``rows = max_rows``):
     prefill: lse f32 [rows,N]
-    decode:  partials bf16 [rows,N,S,512] then (1024-aligned) lse f32
-             [rows,N,S] for the live bucket's split count ``S``; sized for
-             the largest ``rows * S`` over the buckets.
+    decode:  normalized BF16 (or FP32) partials [rows,N,S,512] then
+             (1024-aligned) lse f32 [rows,N,S]. Selected-recipe metadata charges
+             its ``S`` at full execution capacity; the default ABI envelope
+             holds every recipe at that capacity.
 """
 
 from __future__ import annotations
@@ -133,11 +135,18 @@ def decode_buckets(g: GLMGeometry, max_rows: int, *, full_launch_splits: int | N
     return tuple(out)
 
 
-def sparse_mla_scratch_bytes(g: GLMGeometry, *, route: str, rows: int, buckets=(), fp32_partials=False) -> int:
+def sparse_mla_scratch_bytes(g: GLMGeometry, *, route: str, rows: int, buckets=(), fp32_partials=False,
+                             plan_rows: int | None = None) -> int:
     rows = max(int(rows), 1)
     if route == "prefill":
         return rows * g.heads * 4
-    units = max(min(rows, cap) * splits for cap, splits, _ in buckets)
+    if plan_rows is None:
+        splits = max(s for _, s, _ in buckets)
+    else:
+        if not 1 <= int(plan_rows) <= buckets[-1][0]:
+            raise ValueError("plan_rows outside numerical plan domain")
+        splits = next(s for cap, s, _ in buckets if cap >= int(plan_rows))
+    units = rows * splits
     return _align(units * g.heads * _DV * (4 if fp32_partials else 2)) + units * g.heads * 4
 
 
@@ -197,7 +206,7 @@ class _Prefill:
 
 class _Decode:
     def __init__(self, g: GLMGeometry, max_rows: int, fp32_partials=False, full_launch_splits=None,
-                 sm_count: int | None = None):
+                 sm_count: int | None = None, plan_capacity_rows: int | None = None):
         from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel
         from b12x.attention._shared.mla.merge import SparseMLASplitDecodeMergeKernel
         from b12x.attention._shared.mla.smem import make_smem_layout
@@ -211,7 +220,7 @@ class _Decode:
         hpb = int(traits.hpb)
         if self.heads % hpb:
             raise ValueError("GLM decode needs heads divisible by 16")
-        self.buckets = decode_buckets(g, max_rows, full_launch_splits=full_launch_splits,
+        self.buckets = decode_buckets(g, plan_capacity_rows or max_rows, full_launch_splits=full_launch_splits,
                                       sm_count=sm_count)
         n = self.heads
         self.kernels, self.merges = [], []
@@ -258,19 +267,19 @@ class _Decode:
     @cute.jit
     def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, indices: cute.Pointer,
                  lengths: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-                 stream: cuda.CUstream):
+                 plan_rows: Int32, stream: cuda.CUstream):
         base = Int64(scratch.toint())
         if cutlass.const_expr(len(self.buckets) == 1):
             self._run(0, q, kv_cache, indices, lengths, out, base, rows, stream)
         elif cutlass.const_expr(len(self.buckets) == 2):
-            if rows <= Int32(self.buckets[0][0]):
+            if plan_rows <= Int32(self.buckets[0][0]):
                 self._run(0, q, kv_cache, indices, lengths, out, base, rows, stream)
             else:
                 self._run(1, q, kv_cache, indices, lengths, out, base, rows, stream)
         else:
-            if rows <= Int32(self.buckets[0][0]):
+            if plan_rows <= Int32(self.buckets[0][0]):
                 self._run(0, q, kv_cache, indices, lengths, out, base, rows, stream)
-            elif rows <= Int32(self.buckets[1][0]):
+            elif plan_rows <= Int32(self.buckets[1][0]):
                 self._run(1, q, kv_cache, indices, lengths, out, base, rows, stream)
             else:
                 self._run(2, q, kv_cache, indices, lengths, out, base, rows, stream)
@@ -278,7 +287,8 @@ class _Decode:
 
 def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill", max_rows: int = 1,
                                name: str = "glm_sparse_mla", fp32_partials: bool = False,
-                               full_launch_splits: int | None = None, sm_count: int | None = None):
+                               full_launch_splits: int | None = None, sm_count: int | None = None,
+                               plan_capacity_rows: int | None = None):
     """GLM latent sparse MLA; see the module docstring for the ABI. A GLM 5.3
     Flash geometry (``GLMFGeometry``) selects the 512-wide query, 528-byte
     records (``ModelType.GLM_NEXT``) and its 2112-slot index rows. The opt-in
@@ -289,6 +299,9 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
     launch already exceeds the split planner's waves that many splits
     (``decode_buckets``); the scratch follows the plan. A set
     ``B12X_MLA_SM120_NUM_SPLITS`` overrides it (``decode_buckets`` warns)."""
+    if plan_capacity_rows is not None and (route != "decode" or type(plan_capacity_rows) is not int
+                                           or not 1 <= plan_capacity_rows <= int(max_rows)):
+        raise ValueError("plan_capacity_rows must be a positive decode domain within execution capacity")
     if sm_count is not None and (type(sm_count) is not int or sm_count <= 0):
         raise ValueError("sm_count must be a positive integer")
     if fp32_partials and (route != "decode" or not isinstance(g, GLMFGeometry)):
@@ -299,7 +312,7 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         launch = _Prefill(g)
         buckets = ()
     elif route == "decode":
-        launch = _Decode(g, int(max_rows), fp32_partials, full_launch_splits, sm_count)
+        launch = _Decode(g, int(max_rows), fp32_partials, full_launch_splits, sm_count, plan_capacity_rows)
         buckets = launch.buckets
     else:
         raise ValueError("route must be 'prefill' or 'decode'")
@@ -313,10 +326,15 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         Operand("scratch", torch.uint8, "[sparse_mla_scratch_bytes]", "scratch"),
     )
     return compile_program(
-        launch, name=f"{name}_{route}", operands=operands, scalars=(Scalar("rows"),),
+        launch, name=f"{name}_{route}", operands=operands,
+        scalars=(Scalar("rows"), Scalar("plan_rows")) if route == "decode" else (Scalar("rows"),),
         key=(n, k, int(max_rows), launch.key),
         geometry={"heads": n, "route": route, "max_rows": int(max_rows), "topk": k,
                   "softmax_scale": g.softmax_scale, "decode_buckets": [list(b) for b in buckets],
+                  **({"attention_plan_capacity_rows": buckets[-1][0],
+                      "attention_plan_scratch": [{"rows_cap": cap, "scratch": sparse_mla_scratch_bytes(
+                          g, route=route, rows=max_rows, buckets=buckets, fp32_partials=fp32_partials,
+                          plan_rows=cap)} for cap, _, _ in buckets]} if route == "decode" else {}),
                   **({"partial_dtype": "float32"} if fp32_partials else {})},
         scratch={"scratch": lambda rows: sparse_mla_scratch_bytes(g, route=route, rows=rows, buckets=buckets,
                                                                fp32_partials=fp32_partials)},

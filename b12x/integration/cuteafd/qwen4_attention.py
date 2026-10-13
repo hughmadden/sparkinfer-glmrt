@@ -81,13 +81,14 @@ to the lower block id. ``max_context`` bounds the blocks a row may see.
     indices     i32  [rows,2112]         in   index_expand indices
     out         bf16 [rows,N*256]        out  softmax(q.k / 16) . v over the selected tokens
     scratch     u8   sparse_gqa_scratch_bytes(rows)
-    rows, table_width, table_stride int32   table_width: pages in the shared table (stride 0);
-                                            with table_stride > 0 each row reads table_stride entries
+    rows, table_width, table_stride, plan_rows int32
+        table_width: pages in the shared table (stride 0); with table_stride > 0
+        each row reads table_stride entries. plan_rows is immutable at startup.
 
 b12x's selected-position paged GQA (``attention.paged._selected_forward``:
-FP32 scores and online softmax, BF16 probabilities, FP32 PV); rows <= 64 split
-every row's selection over 64/32/16 CTAs (1 / <=4 / <=64 rows) and merge the
-FP32 partials, more rows write BF16 directly.
+FP32 scores and online softmax, BF16 probabilities, FP32 PV). Explicit decode
+splits every row over 64/32/16 CTAs selected by startup plan_rows (1 / <=4 / >4),
+then merges FP32 partials. Explicit prefill writes BF16 directly at any live width.
 
 ``fp8_only="decode" | "prefill"`` (producer and attn_o): ``w_in`` / ``w_o`` are
 taken as E4M3 only, ``w_in_fp8``/``w_in_scale`` and ``w_o_fp8``/``w_o_scale``
@@ -468,10 +469,9 @@ def compile_qwen4_index_expand_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotP
 # ---------------------------------------------------------------------------
 
 
-def _gqa_layout(g: Qwen4Geometry, max_rows: int) -> dict[str, int]:
+def _gqa_layout(g: Qwen4Geometry, max_rows: int, *, route="decode", plan_rows=None) -> dict[str, int]:
     rows = max(int(max_rows), 1)
-    split_rows = min(rows, SPLIT_MAX_ROWS)
-    row_splits = max(r * split_count(r) for r in range(1, split_rows + 1))
+    row_splits = 0 if route == "prefill" else rows * (64 if plan_rows is None else split_count(plan_rows))
     offsets, at = {}, 0
     for name, nbytes in (("requests", rows * 4), ("lengths", rows * 4),
                          ("partial", row_splits * g.heads * g.head_dim * 4), ("lse", row_splits * g.heads * 4)):
@@ -481,21 +481,22 @@ def _gqa_layout(g: Qwen4Geometry, max_rows: int) -> dict[str, int]:
     return offsets
 
 
-def sparse_gqa_scratch_bytes(g: Qwen4Geometry, rows: int) -> int:
-    """requests/lengths i32 [rows], then FP32 split partials [rows * splits, N, 256] and LSE
-    [rows * splits, N] for the split route (at most 1024 row-splits)."""
-    return _gqa_layout(g, rows)["nbytes"]
+def sparse_gqa_scratch_bytes(g: Qwen4Geometry, rows: int, *, route="decode", plan_rows=None) -> int:
+    """Row tables followed by the selected recipe's FP32 partials and LSE at full capacity."""
+    return _gqa_layout(g, rows, route=route, plan_rows=plan_rows)["nbytes"]
 
 
 class _SparseGqa:
     def __init__(self, g: Qwen4Geometry, max_rows: int, direct_kv_warps: int = 2, split_kv_warps: int = 2,
-                 kv_format: str = "bf16"):
+                 kv_format: str = "bf16", route: str = "decode", plan_capacity_rows: int = SPLIT_MAX_ROWS):
         from b12x.attention.paged._selected_forward import _ShapeAdaptiveSparseGqaMergeKernel
         from b12x.attention.paged.forward_extend_generic import PagedForwardKernel
 
         self.g = g
         self.max_rows = int(max_rows)
-        self.layout = _gqa_layout(g, max_rows)
+        self.route = route
+        self.plan_capacity_rows = int(plan_capacity_rows)
+        self.layout = _gqa_layout(g, max_rows, route=route)
         self.kv_format = kv_format
         token = g.kv_record_bytes(kv_format) // (1 if kv_format == "fp8" else 2)
         strides = (g.page_rows * token, token, g.head_dim)
@@ -507,24 +508,31 @@ class _SparseGqa:
         self.kv_warps = (int(split_kv_warps), int(direct_kv_warps))
         self.split = PagedForwardKernel.selected_positions(direct_output=False, kv_warps=self.kv_warps[0], **common)
         self.direct = (PagedForwardKernel.selected_positions(direct_output=True, kv_warps=self.kv_warps[1], **common)
-                       if self.max_rows > SPLIT_MAX_ROWS else None)
+                       if route == "prefill" else None)
         self.merge = _ShapeAdaptiveSparseGqaMergeKernel(q_heads=g.heads)
         self.tables = Qwen4RowTables()
 
     def key(self) -> tuple:
-        return (tuple(sorted(self.layout.items())), self.max_rows, self.kv_warps, self.g, self.kv_format)
+        return (tuple(sorted(self.layout.items())), self.max_rows, self.kv_warps, self.g, self.kv_format,
+                self.route, self.plan_capacity_rows)
 
     @cute.jit
     def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer,
                  page_table: cute.Pointer, indices: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer,
-                 rows: Int32, table_width: Int32, table_stride: Int32, stream: cuda.CUstream):
+                 rows: Int32, table_width: Int32, table_stride: Int32, plan_rows: Int32,
+                 stream: cuda.CUstream):
         g = self.g
         L = self.layout
         base = Int64(scratch.toint())
         requests = _ptr(Int32, base + Int64(L["requests"]), 4)
         lengths = _ptr(Int32, base + Int64(L["lengths"]), 4)
         partial = _ptr(Float32, base + Int64(L["partial"]), 16)
-        lse = _ptr(Float32, base + Int64(L["lse"]), 16)
+        splits = self._splits(plan_rows)
+        lse_offset = Int64(L["partial"])
+        if cutlass.const_expr(self.route == "decode"):
+            partial_bytes = Int64(self.max_rows * g.heads * g.head_dim * 4) * Int64(splits)
+            lse_offset += _align_i64(partial_bytes)
+        lse = _ptr(Float32, base + lse_offset, 16)
         shared = Int32(0)
         width = table_stride
         if table_stride == Int32(0):
@@ -537,23 +545,21 @@ class _SparseGqa:
         else:
             keys = _ptr(cutlass.BFloat16, Int64(kv_cache.toint()))
             values = _ptr(cutlass.BFloat16, Int64(kv_cache.toint()) + Int64(g.kv_heads * g.head_dim * 2))
-        dummy = _ptr(Float32, base + Int64(L["lse"]), 16)
+        dummy = lse
         scale = Float32(g.softmax_scale)
         pages = Int64(1 << 40)
-        if cutlass.const_expr(self.direct is None):
-            splits = self._splits(rows)
+        if cutlass.const_expr(self.route == "decode"):
             self.split(query, keys, values, dummy, dummy, page_table, requests, indices, positions, partial, lse,
                        out, pages, Int64(rows), Int64(width), scale, rows, splits, stream)
-            self.merge(partial, lse, out, rows, splits, stream)
-        else:
-            if rows <= Int32(SPLIT_MAX_ROWS):
-                splits = self._splits(rows)
-                self.split(query, keys, values, dummy, dummy, page_table, requests, indices, positions, partial,
-                           lse, out, pages, Int64(rows), Int64(width), scale, rows, splits, stream)
-                self.merge(partial, lse, out, rows, splits, stream)
+            if plan_rows > splits:
+                self.merge.serial.kernel(partial, lse, out, splits).launch(
+                    grid=(g.heads, rows, 1), block=(128, 1, 1), stream=stream)
             else:
-                self.direct(query, keys, values, dummy, dummy, page_table, requests, indices, positions, partial,
-                            lse, out, pages, Int64(rows), Int64(width), scale, rows, Int32(1), stream)
+                self.merge.cooperative.kernel(partial, lse, out, splits).launch(
+                    grid=(g.heads, rows, g.head_dim // 32), block=(128, 1, 1), stream=stream)
+        else:
+            self.direct(query, keys, values, dummy, dummy, page_table, requests, indices, positions, partial,
+                        lse, out, pages, Int64(rows), Int64(width), scale, rows, Int32(1), stream)
 
     @cute.jit
     def _splits(self, rows: Int32) -> Int32:
@@ -567,10 +573,15 @@ class _SparseGqa:
 
 def compile_qwen4_sparse_gqa_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
                                  direct_kv_warps: int = 2, split_kv_warps: int = 2,
-                                 kv_format: str = "bf16") -> AotProgram:
-    """GQA over each row's selected positions; see the module docstring."""
+                                 kv_format: str = "bf16", route: str = "decode",
+                                 plan_capacity_rows: int = SPLIT_MAX_ROWS) -> AotProgram:
+    """Explicit prefill/direct or decode/split GQA; live rows never choose the recipe."""
     max_rows = _check_rows(max_rows)
-    launch = _SparseGqa(g, max_rows, direct_kv_warps, split_kv_warps, kv_format)
+    if route not in ("decode", "prefill"):
+        raise ValueError("route must be decode or prefill")
+    if type(plan_capacity_rows) is not int or not 1 <= plan_capacity_rows <= SPLIT_MAX_ROWS:
+        raise ValueError("plan_capacity_rows outside sparse GQA numerical domain")
+    launch = _SparseGqa(g, max_rows, direct_kv_warps, split_kv_warps, kv_format, route, plan_capacity_rows)
     n, d = g.heads, g.head_dim
     operands = (
         Operand("query", torch.bfloat16, f"[rows,{n},{d}]"),
@@ -583,12 +594,18 @@ def compile_qwen4_sparse_gqa_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_ro
     )
     return compile_program(
         launch, name="qwen4_sparse_gqa", operands=operands,
-        scalars=(Scalar("rows"), Scalar("table_width"), Scalar("table_stride")), key=(max_rows, launch.key()),
+        scalars=(Scalar("rows"), Scalar("table_width"), Scalar("table_stride"), Scalar("plan_rows")),
+        key=(max_rows, launch.key()),
         geometry={"heads": n, "kv_heads": g.kv_heads, "head_dim": d, "width": g.sparse_topk,
                   "softmax_scale": g.softmax_scale, "max_rows": max_rows, "split_max_rows": SPLIT_MAX_ROWS,
                   "kv_warps": list(launch.kv_warps), "kv_format": kv_format,
-                  "record_bytes": g.kv_record_bytes(kv_format)},
-        scratch={"scratch": lambda rows: sparse_gqa_scratch_bytes(g, rows)},
+                  "record_bytes": g.kv_record_bytes(kv_format), "route": route,
+                  **({"attention_plan_capacity_rows": plan_capacity_rows,
+                      "attention_plan_scratch": [{"rows_cap": cap, "scratch": sparse_gqa_scratch_bytes(
+                          g, max_rows, route=route, plan_rows=cap)}
+                          for cap in sorted({min(c, plan_capacity_rows) for c in (1, 4, plan_capacity_rows)})]}
+                     if route == "decode" else {})},
+        scratch={"scratch": lambda rows: sparse_gqa_scratch_bytes(g, max_rows, route=route)},
         doc=__doc__,
     )
 

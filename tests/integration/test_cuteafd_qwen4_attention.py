@@ -158,7 +158,39 @@ def program(name: str, rows: int, **kwargs):
             "sparse_gqa": qa.compile_qwen4_sparse_gqa_aot, "o": qa.compile_qwen4_attn_o_aot}
     if name == "expand":
         return qa.compile_qwen4_index_expand_aot()
+    if name == "sparse_gqa":
+        kwargs.setdefault("route", "decode" if rows == 64 else "prefill")
     return make[name](max_rows=rows, **kwargs)
+
+
+@pytest.mark.parametrize("route", ["decode", "prefill"])
+def test_sparse_gqa_explicit_route_and_selected_scratch_contract(monkeypatch, route):
+    from types import SimpleNamespace
+    from b12x.integration.cuteafd import qwen4_attention as qa
+    from b12x.integration.cuteafd._common import QWEN38_FLASH_NEXT as g
+    seen = []
+    def launch(*args):
+        seen.append(args)
+        return SimpleNamespace(key=lambda: (route,), kv_warps=(2, 2))
+    monkeypatch.setattr(qa, "_SparseGqa", launch)
+    monkeypatch.setattr(qa, "compile_program", lambda *args, **kwargs: kwargs)
+    result = qa.compile_qwen4_sparse_gqa_aot(g, max_rows=128, route=route)
+    assert seen[0][-2:] == (route, 64)
+    assert [s.name for s in result["scalars"]] == ["rows", "table_width", "table_stride", "plan_rows"]
+    geometry = result["geometry"]
+    assert geometry["route"] == route
+    if route == "decode":
+        assert geometry["attention_plan_capacity_rows"] == 64
+        for recipe in geometry["attention_plan_scratch"]:
+            hint = recipe["rows_cap"]
+            layout = qa._gqa_layout(g, 128, plan_rows=hint)
+            assert recipe["scratch"] == layout["nbytes"]
+            for rows in (1, 4, 64, 128):
+                used = rows * qa.split_count(hint) * g.heads * 4
+                assert layout["lse"] + qa._align(used) <= layout["nbytes"]
+    else:
+        assert "attention_plan_scratch" not in geometry
+        assert result["scratch"]["scratch"](1) == result["scratch"]["scratch"](128)
 
 
 def scratch(prog, rows):
@@ -268,7 +300,7 @@ def run_step(g, w: Weights, caches: Caches, rows_of: list[tuple[Sequence, int]],
     events[2].record()
     expand.launch(pos, blocks, indices, lengths, scalars=[t])
     events[3].record()
-    sparse.launch(query, caches.kv, pos, page_table, indices, attn, ss, scalars=[t, width, stride])
+    sparse.launch(query, caches.kv, pos, page_table, indices, attn, ss, scalars=[t, width, stride, 4])
     events[4].record()
     o.launch(attn, gate, w.w_o, out, so, scalars=[t])
     events[5].record()
@@ -457,10 +489,10 @@ def export_all(out_dir: Path):
     made = []
     with exportable_compilation():
         programs = [("qwen4_index_expand", qa.compile_qwen4_index_expand_aot())]
-        for rows in (64, 4096):
+        for route, rows in (("decode", 64), ("prefill", 4096)):
             programs += [(f"qwen4_attn_producer_m{rows}", qa.compile_qwen4_attn_producer_aot(max_rows=rows)),
                          (f"qwen4_index_topk_m{rows}", qa.compile_qwen4_index_topk_aot(max_rows=rows)),
-                         (f"qwen4_sparse_gqa_m{rows}", qa.compile_qwen4_sparse_gqa_aot(max_rows=rows)),
+                         (f"qwen4_sparse_gqa_m{rows}", qa.compile_qwen4_sparse_gqa_aot(max_rows=rows, route=route)),
                          (f"qwen4_attn_o_m{rows}", qa.compile_qwen4_attn_o_aot(max_rows=rows))]
         for stem, prog in programs:
             prog.export_to_c(out_dir, stem, "cuteafd_" + stem)

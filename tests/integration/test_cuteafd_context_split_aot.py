@@ -339,7 +339,7 @@ def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
         all_sink=torch.cat((sink,sink))
         full.launch(q,main,full_ix,ml,extra,full_ei,el,all_sink,fo,fs,scalars=(rows,))
     else:
-        full.launch(q,main,full_ix,ml,fo,fs,scalars=(rows,))
+        full.launch(q,main,full_ix,ml,fo,fs,scalars=(rows,8))
     torch.testing.assert_close(combined.float(),fo[:,g.heads//2:].float(),rtol=.025,atol=.002)
     torch.cuda.synchronize()
 

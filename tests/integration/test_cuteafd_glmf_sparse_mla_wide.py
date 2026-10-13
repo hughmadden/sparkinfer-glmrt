@@ -1,13 +1,9 @@
 """GLM 5.3 Flash's 128-row sparse MLA decode program (``glmf_sparse_mla_decode_m128``).
 
-128-row verify steps run the 128-row decode programs for 65..128 live rows. On a
-170-SM GPU the split planner finds no split count for the program's 128-row bucket
-within its three waves (128 rows x 4 head blocks is 512 CTAs) and splits it
-maximally: 33 splits of one 64-slot chunk, FP32 partials of every chunk in a
-554,729,472-byte scratch. ``full_launch_splits`` plans such a bucket with the given
-splits instead. The contract tests take explicit SM counts and need no device; the
-program tests compare the wide program with the FP8-record reference and, row for
-row, with the 64-row program wherever both run the same plan.
+128-row verify steps run wide execution with the same 64-row numerical domain
+as serial decode. The startup hint fixes split grouping for every live width.
+Contract tests take explicit SM counts without a device; program tests compare
+nonuniform FP8 records against the reference, narrow chunks and one-row decode.
 """
 
 from __future__ import annotations
@@ -30,8 +26,9 @@ G = GLM53_FLASH
 SLOTS = 2112
 
 
-def _scratch(buckets, rows: int) -> int:
-    return sparse_mla_scratch_bytes(G, route="decode", rows=rows, buckets=buckets, fp32_partials=True)
+def _scratch(buckets, rows: int, plan_rows=None) -> int:
+    return sparse_mla_scratch_bytes(G, route="decode", rows=rows, buckets=buckets, fp32_partials=True,
+                                    plan_rows=plan_rows)
 
 
 def _plan(buckets, rows: int) -> tuple[int, int]:
@@ -58,17 +55,21 @@ def test_buckets_within_the_waves_keep_the_planner(sms, max_rows):
 def test_explicit_card_plan_reaches_compiler_and_scratch(monkeypatch, sms):
     from types import SimpleNamespace
     from b12x.integration.cuteafd import glm_sparse_mla as module
-    buckets = decode_buckets(G, 128, sm_count=sms)
+    buckets = decode_buckets(G, 64, sm_count=sms)
     seen = []
-    def decode(g, rows, fp32, full, sm_count):
-        seen.append((g, rows, fp32, full, sm_count))
+    def decode(g, rows, fp32, full, sm_count, plan_capacity_rows):
+        seen.append((g, rows, fp32, full, sm_count, plan_capacity_rows))
         return SimpleNamespace(buckets=buckets, key=("decode", buckets))
     monkeypatch.setattr(module, "_Decode", decode)
     monkeypatch.setattr(module, "compile_program", lambda *_, **kwargs: kwargs)
     program = compile_glm_sparse_mla_aot(G, route="decode", max_rows=128,
-                                       fp32_partials=True, sm_count=sms)
-    assert seen == [(G, 128, True, None, sms)]
+                                       fp32_partials=True, sm_count=sms, plan_capacity_rows=64)
+    assert seen == [(G, 128, True, None, sms, 64)]
     assert program["geometry"]["decode_buckets"] == [list(b) for b in buckets]
+    assert program["geometry"]["attention_plan_capacity_rows"] == 64
+    assert program["geometry"]["attention_plan_scratch"] == [
+        {"rows_cap": cap, "scratch": _scratch(buckets, 128, cap)} for cap, _, _ in buckets]
+    assert [scalar.name for scalar in program["scalars"]] == ["rows", "plan_rows"]
     assert program["scratch"]["scratch"](128) == _scratch(buckets, 128)
 
 
@@ -82,14 +83,15 @@ def test_the_wide_scratch_holds_the_unsplit_partials():
     planner = decode_buckets(G, 128, sm_count=170)
     one = decode_buckets(G, 128, sm_count=170, full_launch_splits=1)
     assert _scratch(planner, 128) == 554_729_472
-    # 128 rows x 64 heads x 512 FP32 partials, 1024-aligned, then the LSE: the 1- and
-    # 8-row buckets' 33 and 8 x 5 partial rows fit within.
-    assert _scratch(one, 128) == 16_809_984 == 128 * 64 * 512 * 4 + 128 * 64 * 4
-    for rows in range(1, 129):
-        splits, _ = _plan(one, rows)
-        partial_bytes = rows * G.heads * splits * 512 * 4
-        used = (partial_bytes + 1023) // 1024 * 1024 + rows * G.heads * splits * 4
-        assert used <= _scratch(one, rows) <= _scratch(one, 128)
+    # The safe fallback holds all recipes at full capacity, not just live buckets.
+    assert _scratch(one, 128) == 554_729_472
+    assert _scratch(one, 128, 128) == 16_809_984 == 128 * 64 * 512 * 4 + 128 * 64 * 4
+    for hint in (1, 8, 128):
+        splits, _ = _plan(one, hint)
+        for rows in range(1, 129):
+            partial_bytes = rows * G.heads * splits * 512 * 4
+            used = (partial_bytes + 1023) // 1024 * 1024 + rows * G.heads * splits * 4
+            assert used == _scratch(one, rows, hint) <= _scratch(one, 128, hint)
 
 
 def test_the_split_count_override_wins_over_full_launch_splits_and_says_so(monkeypatch, caplog):
@@ -131,6 +133,12 @@ def test_the_wide_benchmark_needs_every_selected_slot_in_its_context(monkeypatch
         assert stop.value.code == 2 and "needs at least 2112" in capsys.readouterr().err, context
 
 
+@pytest.mark.parametrize("domain", [0, -1, 129, True, 64.0])
+def test_numerical_domain_rejects_invalid_geometry(domain):
+    with pytest.raises(ValueError, match="plan_capacity_rows"):
+        compile_glm_sparse_mla_aot(G, route="decode", max_rows=128, plan_capacity_rows=domain)
+
+
 def test_full_launch_splits_plan_decode_buckets_only():
     with pytest.raises(ValueError, match="full_launch_splits"):
         compile_glm_sparse_mla_aot(G, route="prefill", max_rows=4096, full_launch_splits=1)
@@ -145,7 +153,8 @@ def _program(max_rows: int, full_launch_splits: int | None = None):
     key = (max_rows, full_launch_splits)
     if key not in _PROGRAMS:
         _PROGRAMS[key] = compile_glm_sparse_mla_aot(G, route="decode", max_rows=max_rows, name="glmf_sparse_mla",
-                                                    fp32_partials=True, full_launch_splits=full_launch_splits)
+                                                    fp32_partials=True, full_launch_splits=full_launch_splits,
+                                                    plan_capacity_rows=64)
     return _PROGRAMS[key]
 
 
@@ -167,12 +176,17 @@ def _inputs(rows: int, seed: int, context: int = 8192):
     return q, cache, records, indices.cuda(), lengths.cuda()
 
 
-def _run(program, q, cache, indices, lengths):
+def _run(program, q, cache, indices, lengths, plan_rows=8):
     rows = q.shape[0]
     out = torch.empty((rows, G.heads, 512), dtype=torch.bfloat16, device="cuda")
-    scratch = torch.empty(program.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
-    program.launch(q, cache, indices, lengths, out, scratch, scalars=(rows,))
+    scratch_bytes = sparse_mla_scratch_bytes(
+        G, route="decode", rows=program.geometry["max_rows"],
+        buckets=decode_buckets(G, 64), fp32_partials=True, plan_rows=plan_rows)
+    storage = torch.full((scratch_bytes + 1024,), 0xA5, dtype=torch.uint8, device="cuda")
+    scratch = storage[:scratch_bytes]
+    program.launch(q, cache, indices, lengths, out, scratch, scalars=(rows, plan_rows))
     torch.cuda.synchronize()
+    assert torch.all(storage[scratch_bytes:] == 0xA5), "selected MLA scratch overrun"
     return out
 
 
@@ -193,15 +207,10 @@ def test_the_wide_program_is_the_reference_and_the_64_row_program(rows):
     expected = sparse_mla_reference(q_all=q, kv_cache=records.view(-1, 1, 528), page_table_1=indices,
                                     active_token_counts=lengths, sm_scale=G.softmax_scale, v_head_dim=512)
     assert _cosine(out, expected) >= 0.9995
-    # The 64-row program over the first 64 rows and the rest: rows independent, so every row
-    # whose two plans agree is bit-identical (and the rest equal to rounding).
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    wide_plan = _plan(decode_buckets(G, 128, sm_count=sms, full_launch_splits=1), rows)
-    narrow_buckets = decode_buckets(G, 64, sm_count=sms)
+    # Different execution capacities share one startup numerical recipe, byte-exactly.
     for start in (0, 64):
         part = slice(start, min(start + 64, rows))
         got = _run(narrow, q[part].contiguous(), cache, indices[part].contiguous(), lengths[part].contiguous())
-        if _plan(narrow_buckets, part.stop - part.start) == wide_plan:
-            assert torch.equal(out[part], got), (rows, start)
-        else:
-            assert _cosine(out[part], got) >= 0.9999, (rows, start)
+        assert torch.equal(out[part], got), (rows, start)
+    serial = _run(narrow, q[:1].contiguous(), cache, indices[:1].contiguous(), lengths[:1].contiguous())
+    assert torch.equal(out[:1], serial)
