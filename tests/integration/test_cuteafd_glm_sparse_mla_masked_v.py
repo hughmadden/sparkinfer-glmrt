@@ -7,8 +7,8 @@ need finite bytes there; ``zero_masked_v`` zeroes the staged V and its inline
 FP32 scales first, as the UE8M0 kernels always do. No row here selects slot 0,
 so what it holds is only ever the stand-in, and:
 
-- with NaN bytes there, the default programs' outputs are not finite and the
-  opt-in programs' are, bit for bit the default programs' over a zeroed slot 0;
+- with NaN bytes there, the legacy unprotected outputs are not finite and the
+  protected programs' are, bit for bit the legacy programs' over a zeroed slot 0;
 - with finite bytes there, the protected programs still equal their zero-slot
   outputs and the legacy programs over a zero slot. Legacy fully masked
   leading chunks may normalize the stand-in before later valid chunks, so
@@ -217,6 +217,32 @@ def test_finite_stand_in_bytes_do_not_change_protected_output(g, route, max_rows
         assert bool((a[all_masked] != 0).any())
     if empty := _rows(rows, "empty"):
         assert _same(a[empty], b[empty], zero_sign=False)
+
+
+@pytest.mark.parametrize("g", GEOMETRIES)
+@pytest.mark.parametrize("route", ["decode", "prefill"])
+def test_masked_v_with_live_pages_above_signed32_byte_offset(g, route):
+    require_b12x()
+    rows = 8
+    cache, q = _cache(g, 7), _query(g, rows, 8)
+    zero = _with_stand_in(cache, g, "zero")
+    indices, lengths = _selection(g, rows, 9)
+    stride = cache.shape[1]
+    first_page = (1 << 31) // stride + 1
+    first_token = first_page * 64
+    # Only the stand-in page and the live tail are initialized; the large gap
+    # makes selected record offsets cross 2 GiB without touching its contents.
+    pool = torch.empty((first_page + cache.shape[0], stride), dtype=torch.uint8, device="cuda")
+    pool[0].zero_()
+    pool[first_page:].copy_(cache)
+    high_indices = torch.where(indices >= 0, indices + first_token, indices)
+    program = _program(g, route, 64, None, True)
+    expected = _run(program, q, zero, indices, lengths)
+    for kind in ["zero", "nan", "finite"]:
+        pool[0, :g.record_bytes].copy_(_with_stand_in(cache, g, kind)[0, :g.record_bytes])
+        actual = _run(program, q, pool, high_indices, lengths)
+        assert bool(torch.isfinite(actual).all())
+        assert _same(actual, expected, zero_sign=False)
 
 
 @pytest.mark.parametrize("g", GEOMETRIES)
