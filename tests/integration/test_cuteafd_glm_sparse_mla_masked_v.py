@@ -1,5 +1,5 @@
 """Masked slots of the GLM sparse MLA programs over a poisoned record slot 0
-(``zero_masked_v``).
+(``zero_masked_v``, enabled by default in production).
 
 A masked slot (``-1``, or past its row's length) stages record slot 0, page 0's
 first record, and is weighted by zero. 0 x NaN is NaN, so the default programs
@@ -55,7 +55,8 @@ def _program(g, route: str, max_rows: int, splits, zero_masked_v: bool):
         flash = isinstance(g, GLMFGeometry)
         _PROGRAMS[key] = compile_glm_sparse_mla_aot(
             g, route=route, max_rows=max_rows, name="glmf_sparse_mla" if flash else "glm_sparse_mla",
-            fp32_partials=flash and route == "decode", full_launch_splits=splits, zero_masked_v=zero_masked_v)
+            fp32_partials=flash and route == "decode", full_launch_splits=splits,
+            plan_capacity_rows=64 if max_rows == 128 else None, zero_masked_v=zero_masked_v)
     return _PROGRAMS[key]
 
 
@@ -150,7 +151,8 @@ def _run(program, q, cache, indices, lengths) -> torch.Tensor:
     out = torch.zeros((rows, q.shape[1], 512), dtype=torch.bfloat16, device="cuda")
     scratch = torch.zeros(program.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
     program.launch(q, cache, indices, lengths, out, scratch,
-                   scalars=(rows, rows) if program.geometry["route"] == "decode" else (rows,))
+                   scalars=(rows, min(rows, program.geometry["attention_plan_capacity_rows"]))
+                   if program.geometry["route"] == "decode" else (rows,))
     torch.cuda.synchronize()
     return out
 
@@ -218,7 +220,7 @@ def test_finite_stand_in_bytes_reach_no_row_with_a_valid_slot(g, route, max_rows
 
 
 @pytest.mark.parametrize("g", GEOMETRIES)
-def test_zero_masked_v_is_opt_in_and_keyed(g):
+def test_zero_masked_v_is_keyed(g):
     require_b12x()
     from b12x.integration.cuteafd.glm_sparse_mla import _Decode, _Prefill
 
