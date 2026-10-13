@@ -727,6 +727,7 @@ class DenseGemmKernel:
         direct_one_m_tile_scheduler: bool = False,
         split_k_slices: int = 1,
         split_k_atomic_bf16: bool = False,
+        split_k_all_m: bool = False,
         large_m_unroll: bool = False,
         use_m1_non_tma_a: bool = False,
         use_m1_non_tma_c: bool = False,
@@ -881,6 +882,7 @@ class DenseGemmKernel:
         self.direct_one_m_tile_scheduler = direct_one_m_tile_scheduler
         self.split_k_slices = split_k_slices
         self.split_k_atomic_bf16 = split_k_atomic_bf16
+        self.split_k_all_m = split_k_all_m
         self.large_m_unroll = large_m_unroll
         self.use_m1_non_tma_a = use_m1_non_tma_a
         self.use_m1_non_tma_c = use_m1_non_tma_c
@@ -1364,7 +1366,7 @@ class DenseGemmKernel:
             self.direct_one_m_tile_scheduler,
             self.split_k_slices,
             self.large_m_unroll,
-            self.a16,
+            self.a16 or self.split_k_all_m,
         )
 
         @cute.struct
@@ -2201,7 +2203,7 @@ class DenseGemmKernel:
                 tile_sched_params.problem_shape_ntile_mnl[1]
             )
             work_tile = WorkTileInfo(
-                (Int32(block_idx[0]) if self.a16 else Int32(0), Int32(block_idx[2]), Int32(0)),
+                (Int32(block_idx[0]) if self.a16 or self.split_k_all_m else Int32(0), Int32(block_idx[2]), Int32(0)),
                 direct_tile_valid,
             )
         else:
@@ -3423,39 +3425,76 @@ class DenseGemmKernel:
                                 if cutlass.const_expr(
                                     self.use_m1_non_tma_c and not self.quantize_c
                                 ):
-                                    for n_iter in cutlass.range_constexpr(
-                                        (
-                                            self.epi_tile[1]
-                                            + self.num_mma_warps
-                                            * self.num_threads_per_warp
-                                            - 1
-                                        )
-                                        // (
-                                            self.num_mma_warps
-                                            * self.num_threads_per_warp
-                                        )
-                                    ):
-                                        n_local = Int32(tidx) + Int32(
-                                            n_iter
-                                            * self.num_mma_warps
-                                            * self.num_threads_per_warp
-                                        )
-                                        n_coord = (
-                                            tile_coord_mnl[1]
-                                            * Int32(self.tile_shape_mnk[1])
-                                            + Int32(epi_n * self.epi_tile[1])
-                                            + n_local
-                                        )
-                                        if n_local < Int32(
-                                            self.epi_tile[1]
-                                        ) and n_coord < Int32(directC_mnl.shape[1]):
-                                            directC_mnl[
+                                    if cutlass.const_expr(self.split_k_all_m):
+                                        for m_iter in cutlass.range_constexpr(self.epi_tile[0]):
+                                            for n_iter in cutlass.range_constexpr(
                                                 (
-                                                    Int32(0),
-                                                    n_coord,
-                                                    tile_coord_mnl[2],
+                                                    self.epi_tile[1]
+                                                    + self.num_mma_warps
+                                                    * self.num_threads_per_warp
+                                                    - 1
                                                 )
-                                            ] = sC[(Int32(0), n_local, epi_buffer)]
+                                                // (
+                                                    self.num_mma_warps
+                                                    * self.num_threads_per_warp
+                                                )
+                                            ):
+                                                n_local = Int32(tidx) + Int32(
+                                                    n_iter
+                                                    * self.num_mma_warps
+                                                    * self.num_threads_per_warp
+                                                )
+                                                n_coord = (
+                                                    tile_coord_mnl[1]
+                                                    * Int32(self.tile_shape_mnk[1])
+                                                    + Int32(epi_n * self.epi_tile[1])
+                                                    + n_local
+                                                )
+                                                m_coord = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + Int32(epi_m * self.epi_tile[0] + m_iter)
+                                                if m_coord < Int32(directC_mnl.shape[0]) and n_local < Int32(
+                                                    self.epi_tile[1]
+                                                ) and n_coord < Int32(directC_mnl.shape[1]):
+                                                    directC_mnl[
+                                                        (
+                                                            m_coord,
+                                                            n_coord,
+                                                            tile_coord_mnl[2],
+                                                        )
+                                                    ] = sC[(Int32(m_iter), n_local, epi_buffer)]
+                                    else:
+                                        for n_iter in cutlass.range_constexpr(
+                                            (
+                                                self.epi_tile[1]
+                                                + self.num_mma_warps
+                                                * self.num_threads_per_warp
+                                                - 1
+                                            )
+                                            // (
+                                                self.num_mma_warps
+                                                * self.num_threads_per_warp
+                                            )
+                                        ):
+                                            n_local = Int32(tidx) + Int32(
+                                                n_iter
+                                                * self.num_mma_warps
+                                                * self.num_threads_per_warp
+                                            )
+                                            n_coord = (
+                                                tile_coord_mnl[1]
+                                                * Int32(self.tile_shape_mnk[1])
+                                                + Int32(epi_n * self.epi_tile[1])
+                                                + n_local
+                                            )
+                                            if n_local < Int32(
+                                                self.epi_tile[1]
+                                            ) and n_coord < Int32(directC_mnl.shape[1]):
+                                                directC_mnl[
+                                                    (
+                                                        Int32(0),
+                                                        n_coord,
+                                                        tile_coord_mnl[2],
+                                                    )
+                                                ] = sC[(Int32(0), n_local, epi_buffer)]
                                 elif cutlass.const_expr(not self.quantize_c):
                                     if warp_idx == 0:
                                         cute.copy(
@@ -4931,8 +4970,10 @@ class _DenseGemmLaunch:
         alpha_reciprocal: bool = False,
         input_k: Optional[int] = None,
         block_fp8_row_b: bool = False,
+        split_k_all_m: bool = False,
     ):
         self._block_fp8_row_b = bool(block_fp8_row_b)
+        self._split_k_all_m = bool(split_k_all_m)
         self._weight_only = weight_only
         self._alpha_reciprocal = alpha_reciprocal
         self._input_k = k if input_k is None else input_k
@@ -5069,6 +5110,8 @@ class _DenseGemmLaunch:
         )
         if self._block_fp8_row_b:
             key = key + ("block_fp8_row_b",)
+        if self._split_k_all_m:
+            key = key + ("split_k_all_m",)
 
         return key if self._weight_only is None else key + (
             self._weight_only, self._alpha_reciprocal, self._input_k,
@@ -5190,6 +5233,7 @@ class _DenseGemmLaunch:
             direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
             split_k_slices=policy.split_k_slices,
             split_k_atomic_bf16=policy.split_k_atomic_bf16,
+            split_k_all_m=self._split_k_all_m,
             large_m_unroll=policy.large_m_unroll,
             # M=1 FP8 benefits from normal TMA loads for A/SFA on the
             # standalone tiny-M profile. Keep C on the direct epilogue path;
@@ -5982,6 +6026,7 @@ def compile_dense_gemm_mxfp8_aot(
     sm_count: Optional[int] = None,
     device: Optional[torch.device] = None,
     return_split_k_metadata: bool = False,
+    split_k_all_m: bool = False,
 ) -> object:
     """Compile one runtime-M MXFP8-to-BF16 GEMM for native AOT export.
 
@@ -6068,6 +6113,8 @@ def compile_dense_gemm_mxfp8_aot(
     if num_groups > 1 and policy.split_k_slices != 1:
         raise ValueError("grouped MXFP8 AOT does not support split-K")
     slices = int(policy.split_k_slices)
+    if split_k_all_m and (num_groups != 1 or not policy.direct_one_m_tile_scheduler):
+        raise ValueError("all-M scheduling requires a single-group direct recipe")
     if slices not in (1, 2, 4):
         raise ValueError(f"unsupported MXFP8 AOT split count: {slices}")
     if slices > 1:
@@ -6098,6 +6145,7 @@ def compile_dense_gemm_mxfp8_aot(
         sfb_k_reuse=sfb_k_reuse,
         b_tile_major=False,
         alpha_is_one=True,
+        split_k_all_m=split_k_all_m,
         direct_sfa_live16=_use_direct_sfa_live16(
             m=size_m,
             n=size_n,
@@ -6685,6 +6733,7 @@ def _new_dense_gemm_launch(
     alpha_reciprocal: bool = False,
     input_k: Optional[int] = None,
     block_fp8_row_b: bool = False,
+    split_k_all_m: bool = False,
 ) -> "_DenseGemmLaunch":
     """Construct (without compiling) the exact launch _get_compiled_dense_gemm compiles."""
     return _DenseGemmLaunch(
@@ -6721,6 +6770,7 @@ def _new_dense_gemm_launch(
         alpha_reciprocal=alpha_reciprocal,
         input_k=input_k,
         block_fp8_row_b=block_fp8_row_b,
+        split_k_all_m=split_k_all_m,
         target_occupancy=(
             target_occupancy_override
             if target_occupancy_override is not None
@@ -6778,6 +6828,7 @@ def _get_compiled_dense_gemm(
     alpha_reciprocal: bool = False,
     input_k: Optional[int] = None,
     device_ordinal: Optional[int] = None,
+    split_k_all_m: bool = False,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -6870,6 +6921,7 @@ def _get_compiled_dense_gemm(
         direct_m1_wo_a_inputs=direct_m1_wo_a_inputs, plain_fp8=plain_fp8,
         block_fp8=block_fp8, target_occupancy_override=target_occupancy_override,
         weight_only=weight_only, alpha_reciprocal=alpha_reciprocal, input_k=input_k,
+        split_k_all_m=split_k_all_m,
     )
     if weight_only is not None and torch.cuda.is_current_stream_capturing():
         raise RuntimeError("A16 dense GEMM must be prewarmed before CUDA graph capture")

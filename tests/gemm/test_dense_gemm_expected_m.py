@@ -1285,6 +1285,7 @@ def _bk64_launch(
     l: int = 1,
     mma_tiler_mn: tuple[int, int] = (128, 128),
     b_tile_major: bool = False,
+    split_k_all_m: bool = False,
 ) -> _DenseGemmLaunch:
     if policy is None:
         policy = _DenseGemmPolicy(
@@ -1319,6 +1320,7 @@ def _bk64_launch(
         swap_ab=False,
         sfb_k_reuse=sfb_k_reuse,
         b_tile_major=b_tile_major,
+        split_k_all_m=split_k_all_m,
     )
 
 
@@ -1371,6 +1373,46 @@ def test_dense_compile_key_separates_replicated_sfb_reuse():
     assert _compile_key_differences(generic_scales, replicated_scales) == [
         (False, True)
     ]
+
+
+def test_dense_all_m_opt_in_preserves_default_compile_key():
+    default = _bk64_launch()
+    unset = _bk64_launch(split_k_all_m=False)
+    enabled = _bk64_launch(split_k_all_m=True)
+    assert default.compile_key() == unset.compile_key()
+    assert enabled.compile_key() == default.compile_key() + ("split_k_all_m",)
+
+
+@pytest.mark.parametrize("capacity", [1, 16, 80])
+def test_aot_all_m_preserves_serial_recipe(capacity, monkeypatch):
+    from types import SimpleNamespace
+
+    recorded = []
+    compiled = object()
+
+    def compiler(**kwargs):
+        recorded.append(kwargs)
+        return SimpleNamespace(compiled=compiled)
+
+    monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compiler)
+    for all_m in (False, True):
+        result, slices = dense_module.compile_dense_gemm_mxfp8_aot(
+            size_m=capacity, size_n=5120, size_k=8192, expected_m=1,
+            sm_count=HIGH_SM, device=torch.device("cuda"),
+            return_split_k_metadata=True, split_k_all_m=all_m)
+        assert result is compiled and slices == 2
+    old, fixed = recorded
+    assert old.pop("split_k_all_m") is False
+    assert fixed.pop("split_k_all_m") is True
+    assert old == fixed
+
+
+def test_aot_all_m_rejects_non_direct_recipe(monkeypatch):
+    with pytest.raises(ValueError, match="single-group direct recipe"):
+        dense_module.compile_dense_gemm_mxfp8_aot(
+            size_m=80, size_n=5120, size_k=8192, expected_m=80,
+            sm_count=HIGH_SM, device=torch.device("cuda"),
+            return_split_k_metadata=True, split_k_all_m=True)
 
 
 def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
