@@ -56,6 +56,66 @@ def test_coordinator_auto_covers_decode_and_prefill(sm, weights):
         assert calls[-1] == ("decode" if resolved == "auto" and rows <= threshold else expected_large)
 
 
+def grouping_method():
+    tree = ast.parse(SOURCE.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Fp8Moe")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "weight_read_grouping")
+    env = {"_Route": type("Route", (), {}), "_StreamRoute": type("Stream", (), {})}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(SOURCE), "exec"), env)
+    return env
+
+
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("capacity,tiles", [(1, 1), (16, 1), (17, 2), (40, 3), (80, 4), (4096, 4)])
+def test_weight_read_groups_use_actual_gemv_launch_tiles(weights, capacity, tiles):
+    env = grouping_method()
+    route = env["_Route"]()
+    route.route = "decode"
+    route.gate_up = SimpleNamespace(m_tiles=tiles)
+    route.down = SimpleNamespace(m_tiles=tiles)
+    launch = SimpleNamespace(route="decode", decode=route)
+    assert env["weight_read_grouping"](launch, weights, capacity) == {
+        "contract": "exact_grouping", "segments": [{"end_rows": capacity, "group_rows": 16 * tiles}]}
+
+
+@pytest.mark.parametrize("stream,large", [(False, 64), (True, 128)])
+def test_weight_read_groups_follow_actual_auto_cutoff_and_large_route(stream, large):
+    env = grouping_method()
+    decode = env["_Route"]()
+    decode.route = "decode"
+    decode.gate_up = decode.down = SimpleNamespace(m_tiles=4)
+    prefill = env["_StreamRoute" if stream else "_Route"]()
+    if stream:
+        prefill.prep = SimpleNamespace(tile_rows=large)
+    else:
+        prefill.route = "prefill"
+        prefill.gate_up = prefill.down = SimpleNamespace(tile_m=large)
+    launch = SimpleNamespace(route="auto", threshold=80, decode=decode, prefill=prefill)
+    expected = ([{"end_rows": 80, "group_rows": 64}, {"end_rows": 4096, "group_rows": large}]
+                if stream else [{"end_rows": 4096, "group_rows": 64}])
+    assert env["weight_read_grouping"](launch, "mxfp4" if stream else "fp8", 4096) == {
+        "contract": "exact_grouping", "segments": expected}
+
+
+def test_nvfp4_reports_a_bound_not_a_fabricated_installed_tile():
+    env = grouping_method()
+    # It must not inspect the occupancy-dependent sparse/wide launch objects.
+    assert env["weight_read_grouping"](None, "nvfp4", 4096) == {
+        "contract": "conservative_route_upper_bound",
+        "segments": [{"end_rows": 4096, "group_rows": 1}]}
+
+
+def test_weight_read_groups_reject_different_gate_and_down_tiles():
+    env = grouping_method()
+    route = env["_Route"]()
+    route.route = "decode"
+    route.gate_up = SimpleNamespace(m_tiles=1)
+    route.down = SimpleNamespace(m_tiles=2)
+    with pytest.raises(ValueError, match="groups differ"):
+        env["weight_read_grouping"](SimpleNamespace(route="decode", decode=route), "fp8", 16)
+
+
 def test_mxfp4_stream_preserves_native_bf16():
     _, env = policy(120)
     assert env["_streams"](False, "mxfp4")

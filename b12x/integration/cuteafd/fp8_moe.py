@@ -688,6 +688,41 @@ class _Fp8Moe:
         return (self.threshold,) + tuple(part.key() if part is not None else None
                                          for part in (self.decode, self.prefill))
 
+    def weight_read_grouping(self, weights: str, max_rows: int) -> dict:
+        """Static accounting only; never part of the compiler key or launch."""
+        if weights == "nvfp4":
+            # Sparse/wide W4A4 tiles depend on expert occupancy, not only rows.
+            # One full slice per routed occurrence is an explicit traffic bound.
+            return {"contract": "conservative_route_upper_bound",
+                    "segments": [{"end_rows": int(max_rows), "group_rows": 1}]}
+
+        def group(part):
+            if isinstance(part, _Route):
+                gate, down = part.gate_up, part.down
+                values = ((16 * gate.m_tiles, 16 * down.m_tiles) if part.route == "decode"
+                          else (gate.tile_m, down.tile_m))
+                if values[0] != values[1]:
+                    raise ValueError("expert gate/up and down weight-read groups differ")
+                return int(values[0])
+            if isinstance(part, _StreamRoute):
+                return int(part.prep.tile_rows)
+            raise ValueError("expert route has no exact weight-read grouping contract")
+
+        segments = []
+        if self.route == "auto":
+            cutoff = min(int(max_rows), int(self.threshold))
+            segments.append({"end_rows": cutoff, "group_rows": group(self.decode)})
+            if cutoff < int(max_rows):
+                large = group(self.prefill)
+                if large == segments[-1]["group_rows"]:
+                    segments[-1]["end_rows"] = int(max_rows)
+                else:
+                    segments.append({"end_rows": int(max_rows), "group_rows": large})
+        else:
+            part = self.decode if self.route == "decode" else self.prefill
+            segments.append({"end_rows": int(max_rows), "group_rows": group(part)})
+        return {"contract": "exact_grouping", "segments": segments}
+
     @cute.jit
     def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
                  s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer, w2: cute.Pointer, s2: cute.Pointer,
@@ -763,7 +798,8 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         geometry={"requested_route": requested, "hidden": h, "experts": e, "top_k": k, "intermediate": g.intermediate, "tp": g.tp,
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
                   "wire": bool(wire), "weights": g.weights, "activations": g.activations,
-                  "prefill": prefill, "mxfp4_down_a8": bool(mxfp4_down_a8)},
+                  "prefill": prefill, "mxfp4_down_a8": bool(mxfp4_down_a8),
+                  "weight_read_grouping": launch.weight_read_grouping(g.weights, max_rows)},
         scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire, prefill, mxfp4_down_a8)},
         doc=__doc__,
     )
