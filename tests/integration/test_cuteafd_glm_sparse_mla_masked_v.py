@@ -9,11 +9,11 @@ so what it holds is only ever the stand-in, and:
 
 - with NaN bytes there, the default programs' outputs are not finite and the
   opt-in programs' are, bit for bit the default programs' over a zeroed slot 0;
-- with finite bytes there, the opt-in programs equal the default programs on
-  every row with a valid slot (decode bit for bit: the split merge sums from
-  +0, so even a zero's sign agrees; prefill up to a zero's sign), and give
-  zeros on a row whose every slot is masked, where the default programs return
-  an average of the stand-in.
+- with finite bytes there, the protected programs still equal their zero-slot
+  outputs and the legacy programs over a zero slot. Legacy fully masked
+  leading chunks may normalize the stand-in before later valid chunks, so
+  finite legacy output is not a correctness oracle. Fully masked rows return
+  zero under protection rather than the legacy stand-in average.
 
 Rows take every way a slot is masked: the tail of a short row's last chunk,
 holes, wholly masked leading chunks (a masked prefix inside a split, and whole
@@ -195,7 +195,7 @@ def test_a_nan_stand_in_reaches_only_the_default_programs(g, route, max_rows, sp
 
 @pytest.mark.parametrize("g", GEOMETRIES)
 @pytest.mark.parametrize("route,max_rows,splits,rows", CASES)
-def test_finite_stand_in_bytes_reach_no_row_with_a_valid_slot(g, route, max_rows, splits, rows):
+def test_finite_stand_in_bytes_do_not_change_protected_output(g, route, max_rows, splits, rows):
     require_b12x()
     _skip_unless_exported(g, splits)
     cache, q = _cache(g, 4), _query(g, rows, 5)
@@ -209,8 +209,8 @@ def test_finite_stand_in_bytes_reach_no_row_with_a_valid_slot(g, route, max_rows
     assert bool(torch.isfinite(a).all()) and bool(torch.isfinite(b).all())
     valid = _valid_rows(rows)
     sign = route == "prefill"
-    assert _same(a[valid], b[valid], zero_sign=sign)
-    assert _same(a[valid], clean[valid], zero_sign=sign)
+    assert _same(b, _run(masked, q, zero, indices, lengths), zero_sign=False)
+    assert _same(b[valid], clean[valid], zero_sign=sign)
     if all_masked := _rows(rows, "all_masked"):
         # Every slot masked: zeros, where the default programs average the stand-in.
         assert not bool(_bits(b[all_masked]).any())
