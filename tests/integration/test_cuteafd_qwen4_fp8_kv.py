@@ -130,6 +130,10 @@ def test_fp8_sparse_fp64_and_replay(rows, large):
     relative = (actual.double() - expected).norm() / expected.norm()
     assert relative < .01, relative.item()
     assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+    serial = torch.empty_like(out[:1])
+    program.launch(query[:1], cache, positions[:1], tables, indices[:1], serial, scratch, scalars=[1, 4, 0, 4])
+    torch.cuda.synchronize()
+    assert torch.equal(actual[:1], serial)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
