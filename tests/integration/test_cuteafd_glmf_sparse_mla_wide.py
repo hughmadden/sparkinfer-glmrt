@@ -179,9 +179,14 @@ def _inputs(rows: int, seed: int, context: int = 8192):
 def _run(program, q, cache, indices, lengths, plan_rows=8):
     rows = q.shape[0]
     out = torch.empty((rows, G.heads, 512), dtype=torch.bfloat16, device="cuda")
-    scratch = torch.empty(program.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
+    scratch_bytes = sparse_mla_scratch_bytes(
+        G, route="decode", rows=program.geometry["max_rows"],
+        buckets=decode_buckets(G, 64), fp32_partials=True, plan_rows=plan_rows)
+    storage = torch.full((scratch_bytes + 1024,), 0xA5, dtype=torch.uint8, device="cuda")
+    scratch = storage[:scratch_bytes]
     program.launch(q, cache, indices, lengths, out, scratch, scalars=(rows, plan_rows))
     torch.cuda.synchronize()
+    assert torch.all(storage[scratch_bytes:] == 0xA5), "selected MLA scratch overrun"
     return out
 
 
