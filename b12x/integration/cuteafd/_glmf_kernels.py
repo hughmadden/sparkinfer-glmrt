@@ -499,20 +499,30 @@ class GlmfKdaRecurrent:
     ``[slots, H, 128 (v), 128 (k)]`` (the b12x ``gdn_decode`` layout), ``slots``
     i32 ``[rows]`` (negative: zero state, not stored), ``out`` BF16 ``[rows, D]``.
 
-    Grid ``(H, 128 / 32)``: a CTA owns 32 value rows of one head, each of its 8
+    Grid ``(H, 128 / 32, seq_ctas)``: a CTA owns 32 value rows of one head, each of its 8
     warps 4 rows, each lane 4 key columns of those rows in registers. Rows run
     in order; a row whose slot differs from the previous row's stores the
     previous sequence's state and loads its own. A BF16 state is rounded after
     every row's read-out (stores are then exact). ``replay_rows``: the rows of
     the replay record (``kda_replay_layout``), at least the rows of a speculative
     step.
+
+    ``seq_ctas`` > 1 shares a step's sequences among the grid's third dimension.
+    A run is a maximal stretch of rows with one slot value, runs counted from 0
+    in row order; CTA ``z`` takes the runs whose index is ``z`` modulo
+    ``seq_ctas``, in order, each as the rows of a step of its own: state loaded
+    at its first row (zeros for a negative slot) and stored after its last, the
+    arithmetic and replay records of ``seq_ctas=1`` in between. Rows of other
+    runs cost a CTA two reads of ``slots``, a step with no run for it nothing
+    else. A non-negative slot must then name one run of a step (two CTAs would
+    share the state of a slot that came back).
     """
 
     threads = 256
     v_block = 32
 
     def __init__(self, *, heads: int, lower_bound: float, qkv_width: int, g_stride: int, b_stride: int,
-                 eps: float = 1.0e-6, state_dtype=Float32, replay_rows: int = REPLAY_ROWS):
+                 eps: float = 1.0e-6, state_dtype=Float32, replay_rows: int = REPLAY_ROWS, seq_ctas: int = 1):
         self.heads = int(heads)
         self.width = self.heads * KDA_HEAD
         self.lower_bound = float(lower_bound)
@@ -521,6 +531,9 @@ class GlmfKdaRecurrent:
         self.scale = KDA_HEAD ** -0.5
         self.state_dtype, self.state_bytes = _state_type(state_dtype)
         self.replay_rows = int(replay_rows)
+        self.seq_ctas = int(seq_ctas)
+        if not 1 <= self.seq_ctas <= 65535:
+            raise ValueError("seq_ctas is a grid dimension, 1 to 65535")
 
     @cute.jit
     def __call__(self, qkv: cute.Pointer, g_raw: cute.Pointer, b_raw: cute.Pointer, a_log: cute.Pointer,
@@ -541,7 +554,8 @@ class GlmfKdaRecurrent:
             cute.make_tensor(slots, cute.make_layout((m,))),
             cute.make_tensor(out, cute.make_layout((m, d), stride=(d, 1))),
             replay, spec, rows,
-        ).launch(grid=(self.heads, KDA_HEAD // self.v_block, 1), block=(self.threads, 1, 1), stream=stream)
+        ).launch(grid=(self.heads, KDA_HEAD // self.v_block, self.seq_ctas), block=(self.threads, 1, 1),
+                 stream=stream)
 
     @cute.jit
     def _state_tensor(self, state: cute.Pointer, slot: Int64, head: Int64) -> cute.Tensor:
@@ -554,6 +568,31 @@ class GlmfKdaRecurrent:
     def kernel(self, qkv: cute.Tensor, g_raw: cute.Tensor, b_raw: cute.Tensor, a_log: cute.Tensor,
                dt_bias: cute.Tensor, state: cute.Pointer, slots: cute.Tensor, out: cute.Tensor,
                replay_ptr: cute.Pointer, spec: Int32, rows: Int32):
+        if cutlass.const_expr(self.seq_ctas == 1):
+            self.span(qkv, g_raw, b_raw, a_log, dt_bias, state, slots, out, replay_ptr, spec, Int64(0), rows)
+        else:
+            # CTA z runs every seq_ctas-th run from run z. It reads slots for each run's last row
+            # and, before a run of its own, nothing else.
+            first = Int32(0)
+            ahead = Int32(cute.arch.block_idx()[2])
+            for t in cutlass.range(rows, unroll=1):
+                last = t + Int32(1) == rows
+                if not last:
+                    last = slots[Int64(t) + Int64(1)] != slots[Int64(t)]
+                if last:
+                    if ahead == Int32(0):
+                        self.span(qkv, g_raw, b_raw, a_log, dt_bias, state, slots, out, replay_ptr, spec,
+                                  Int64(first), t + Int32(1) - first)
+                        ahead = Int32(self.seq_ctas)
+                    ahead = ahead - Int32(1)
+                    first = t + Int32(1)
+
+    @cute.jit
+    def span(self, qkv: cute.Tensor, g_raw: cute.Tensor, b_raw: cute.Tensor, a_log: cute.Tensor,
+             dt_bias: cute.Tensor, state: cute.Pointer, slots: cute.Tensor, out: cute.Tensor,
+             replay_ptr: cute.Pointer, spec: Int32, first: Int64, rows: Int32):
+        """The CTA's share of step rows ``first .. first + rows``, in order (``seq_ctas`` 1: the
+        step, ``first`` unread; else one run)."""
         head = Int64(cute.arch.block_idx()[0])
         tidx = Int32(cute.arch.thread_idx()[0])
         beta_off, _, _ = kda_replay_layout(self.heads, 3 * self.width, self.replay_rows)
@@ -579,6 +618,8 @@ class GlmfKdaRecurrent:
         current = Int64(-1)
         for t in cutlass.range(rows, unroll=1):
             row = Int64(t)
+            if cutlass.const_expr(self.seq_ctas > 1):
+                row = first + row
             slot = Int64(slots[row])
             if slot != current:
                 if current >= Int64(0):
