@@ -21,7 +21,7 @@ from cutlass import Float32, Int32, Int64, Uint32, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-__all__ = ["RoutedBf16Projection", "SkinnyBf16Gemv", "TmaBf16Projection", "prefill_config", "skinny_config", "skinny_max_rows"]
+__all__ = ["RoutedBf16Projection", "RowTiledBf16Projection", "SkinnyBf16Gemv", "TmaBf16Projection", "prefill_config", "skinny_config", "skinny_max_rows"]
 
 
 @dsl_user_op
@@ -225,6 +225,53 @@ class TmaBf16Projection:
         self.kernel(xt, wt, ot, rows, stream)
 
 
+class RowTiledBf16Projection:
+    """``TmaBf16Projection`` with its tiles picked by the live rows of a launch.
+
+    ``tiles_by_rows`` entries are ``(rows, compute_warps, tile_n, num_stages)`` in
+    ascending ``rows``: a launch runs the first entry whose ``rows`` it does
+    not exceed (``16 * compute_warps`` x ``tile_n`` tiles, ``prefill_config``'s
+    other settings; ``ceil(rows / (16 * compute_warps))`` row tiles) and
+    ``prefill_config``'s kernel past the last entry. The entries retile one
+    MMA accumulation: each output keeps its K order, so every entry is
+    expected to give the bits of ``prefill_config``'s kernel
+    (tests/integration/test_cuteafd_glmf_kda_decode_tiles.py). The branch is
+    on the ``rows`` launch scalar, as ``RoutedBf16Projection``'s.
+    """
+
+    def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16):
+        self.n, self.k = int(n), int(k)
+        self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
+        if not self.tiles_by_rows or any(len(entry) != 4 for entry in self.tiles_by_rows):
+            raise ValueError("tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages)")
+        self.limits = tuple(entry[0] for entry in self.tiles_by_rows)
+        # Entry i serves floors[i] < rows <= limits[i].
+        self.floors = (0,) + self.limits[:-1]
+        if any(limit <= floor for floor, limit in zip(self.floors, self.limits)):
+            raise ValueError("tiles_by_rows rows must be positive and ascending")
+        self.default = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype)
+        self.config = self.default.config
+        self.tiled = [TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, compute_warps=warps, tile_n=tile_n,
+                                        num_stages=stages) for _, warps, tile_n, stages in self.tiles_by_rows]
+        capacity = cutlass_utils.get_smem_capacity_in_bytes("sm_120")
+        for entry, launch in zip(self.tiles_by_rows, self.tiled):
+            kernel = launch.kernel
+            # Bf16PrefillKernel's shared storage: the barriers' block, then the A and B stages.
+            smem = kernel.buffer_align_bytes + (kernel.tile_m + kernel.tile_n) * kernel.tile_k * 2 * kernel.num_stages
+            if smem > capacity:
+                raise ValueError(f"tiles_by_rows entry {entry} needs {smem} B of shared memory a CTA; SM120 has {capacity}")
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        for i in cutlass.range_constexpr(len(self.tiled)):
+            if rows > Int32(self.floors[i]):
+                if rows <= Int32(self.limits[i]):
+                    self.tiled[i](x, w, out, rows, stream)
+        if rows > Int32(self.limits[-1]):
+            self.default(x, w, out, rows, stream)
+
+
 class RoutedBf16Projection:
     """``out = x @ w^T``: skinny GEMV for few live rows, TMA tensor-core GEMM above.
 
@@ -235,21 +282,33 @@ class RoutedBf16Projection:
     """
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, max_skinny_rows: int | None = None,
-                 wide: bool = False):
+                 wide: bool = False, tiles_by_rows: tuple = ()):
         """``wide`` adds the ``WIDE_PREFILL_CONFIG`` TMA route from
-        ``WIDE_PREFILL_MIN_ROWS`` live rows (prefill capacities)."""
+        ``WIDE_PREFILL_MIN_ROWS`` live rows (prefill capacities).
+
+        ``tiles_by_rows`` (default none) picks the TMA route's tiles by live rows
+        below that (``RowTiledBf16Projection``; its first entry's rows exceed
+        the skinny GEMV's). The skinny route and its row limit are unchanged."""
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
         self.max_skinny_rows = int(skinny_max_rows(n, k) if max_skinny_rows is None else max_skinny_rows)
         self.skinny = SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, **skinny_config(n, k, out_dtype))
-        self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype)
+        if tiles_by_rows:
+            self.large = RowTiledBf16Projection(self.n, self.k, tiles_by_rows, out_dtype=out_dtype)
+            if self.large.limits[0] <= self.max_skinny_rows:
+                raise ValueError("tiles_by_rows serves rows past max_skinny_rows")
+        else:
+            self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype)
+        self.tiles_by_rows = self.large.tiles_by_rows if tiles_by_rows else ()
         self.wide = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, **WIDE_PREFILL_CONFIG) \
             if wide and self.n % 2 == 0 else None
 
     def key(self) -> tuple:
         s = self.skinny
+        # tiles_by_rows extends the key; projections without it keep theirs.
         return (self.n, self.k, str(self.out_dtype), self.max_skinny_rows, s.cols, s.rows_per_tile,
-                s.threads, tuple(sorted(self.large.config.items())), self.wide is not None)
+                s.threads, tuple(sorted(self.large.config.items())), self.wide is not None) \
+            + ((("tiles_by_rows", self.tiles_by_rows),) if self.tiles_by_rows else ())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
