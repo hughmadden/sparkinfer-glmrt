@@ -948,6 +948,7 @@ class W4A16GemmKernel:
         fused_input_rotation: bool = False,
         l2_evict_first_b: bool = False,
         l2_prefetch_k_tiles: int = 0,
+        compile_sms: int | None = None,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1243,6 +1244,12 @@ class W4A16GemmKernel:
         else:
             self.sms = 120
             max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+        # AOT residency is an architecture policy, not the exporting card's
+        # geometry. Actual cooperative grids remain runtime launch arguments.
+        if compile_sms is not None:
+            if int(compile_sms) < 1:
+                raise ValueError("W4A16 compile SM capacity must be positive")
+            self.sms = int(compile_sms)
         self.blocks_per_sm = _determine_blocks_per_sm(
             problem_m=self.size_m,
             problem_n=self.covered_size_n,
@@ -6835,6 +6842,7 @@ class W4A16FusedMoeKernel:
             fused_input_rotation=self.fused_input_rotation,
             l2_evict_first_b=l2_evict_first_b,
             l2_prefetch_k_tiles=fc1_l2_prefetch_k_tiles,
+            compile_sms=workspace_sms,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -6870,6 +6878,7 @@ class W4A16FusedMoeKernel:
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
             l2_evict_first_b=l2_evict_first_b,
             l2_prefetch_k_tiles=fc2_l2_prefetch_k_tiles,
+            compile_sms=workspace_sms,
         )
         # Prefetch each GEMM's first tile into L2 before the grid barrier that
         # precedes it (the rotation phase's for FC1, FC1's own for FC2): the

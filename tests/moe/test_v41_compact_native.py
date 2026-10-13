@@ -119,9 +119,8 @@ def test_compact_wire_pipeline_live_rows(n, hybrid):
         tensors[14] = torch.empty(cap*topk, device='cuda', dtype=torch.int32)
         tensors[15] = torch.empty(planes,cap*topk,h, device='cuda')
     args = [from_dlpack(t,assumed_align=16) for t in tensors]
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    pipeline = (V41HybridPipeline(cap,192,sms,intermediate=n,cutoff=8 if n==1152 else 2)
-                if hybrid else V41CompactPipeline(cap,sms))
+    pipeline = (V41HybridPipeline(cap,192,intermediate=n,cutoff=8 if n==1152 else 2)
+                if hybrid else V41CompactPipeline(cap))
     compiled = cute.compile(pipeline,
                             *args,cutlass.Int32(1),current_cuda_stream())
     for rows in ((1,2,4,8,16,1,16,2) if hybrid else (1,3,4)):

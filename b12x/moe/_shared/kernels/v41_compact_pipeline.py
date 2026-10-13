@@ -13,8 +13,7 @@ from b12x.moe._shared.kernels.w4a8_compact_micro import _DirectW4A8CompactLaunch
 
 
 class V41CompactPipeline:
-    def __init__(self, capacity, sm_count, *, kernel_intermediate=1152):
-        self.sm_count = int(sm_count)
+    def __init__(self, capacity, *, kernel_intermediate=1152):
         self.compact = _DirectW4A8CompactLaunch(
             max_tokens=capacity, num_topk=6, k=5120, n=kernel_intermediate, experts=384,
             input_scale_count=384, down_scale_count=384, swiglu_limit=10,
@@ -30,13 +29,15 @@ class V41CompactPipeline:
         partial: cute.Tensor, output: cute.Tensor,
         rows: Int32, stream: cuda.CUstream,
     ):
+        # Direct routes launch one CTA per output tile, not a persistent SM
+        # grid. Its shared launch signature's cluster cap is unused here.
         self.compact(
             cute.recast_ptr(x.iterator, dtype=Uint8), xs.iterator,
             w13.iterator, s13.iterator, cute.recast_ptr(packed.iterator, dtype=Uint32),
             cute.recast_ptr(partial.iterator, dtype=BFloat16),
             routing.iterator, ids.iterator, cute.recast_ptr(counts.iterator, dtype=Float32), cute.recast_ptr(counts.iterator, dtype=Float32),
             w2.iterator, s2.iterator, output.iterator, cute.recast_ptr(counts.iterator, dtype=Float32),
-            cute.recast_ptr(counts.iterator, dtype=Float32), rows * Int32(6), Int32(self.sm_count), stream)
+            cute.recast_ptr(counts.iterator, dtype=Float32), rows * Int32(6), Int32(1), stream)
 
 
 class V41HybridPipeline:
@@ -47,12 +48,12 @@ class V41HybridPipeline:
     in the FP32 slice partial arena. Neither path retains state between calls.
     """
 
-    def __init__(self, capacity, width, sm_count, *, intermediate, cutoff, exact_storage=False):
+    def __init__(self, capacity, width, *, intermediate, cutoff, exact_storage=False):
         from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
         if intermediate not in (576, 1152) or not 1 <= cutoff <= capacity:
             raise ValueError("invalid native hybrid geometry or cutoff")
         self.cutoff = int(cutoff)
-        self.compact = V41CompactPipeline(capacity, sm_count,
+        self.compact = V41CompactPipeline(capacity,
             kernel_intermediate=intermediate if exact_storage else (intermediate + 127) // 128 * 128)
         self.grouped = V41SlicePipeline(capacity, width, intermediate=intermediate, exact_storage=exact_storage)
 

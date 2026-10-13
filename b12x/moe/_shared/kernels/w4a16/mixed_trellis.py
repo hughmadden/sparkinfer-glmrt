@@ -342,7 +342,6 @@ class W4A16MixedTrellisKernel:
         self.intermediate_size = driver.intermediate_size
         self.top_k = driver.top_k
         self.cta_threads = driver.cta_threads
-        self.sms = driver.sms
         self.blocks_per_sm = min(
             driver.blocks_per_sm, tier0.blocks_per_sm, tier1.blocks_per_sm
         )
@@ -1441,7 +1440,6 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
         self.intermediate_size = driver.intermediate_size
         self.top_k = driver.top_k
         self.cta_threads = driver.cta_threads
-        self.sms = driver.sms
         self.blocks_per_sm = min(tier.blocks_per_sm for tier in kernels)
         self.shared_words = max(tier.shared_words for tier in kernels)
         self.sqg_xor_cheb_t12_smem_off = max(

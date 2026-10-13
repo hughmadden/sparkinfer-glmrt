@@ -111,10 +111,8 @@ class V41DraftSlicePipeline:
     # Qualified model recipe; explicit widths remain available for comparison.
     DEFAULT_WIDTH = 192
 
-    def __init__(self, capacity, width, sm_count):
+    def __init__(self, capacity, width):
         from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch
-        assert sm_count > 0
-        self.sm_count = sm_count
         self.quant = _MXFP8RowsQuantLaunch(
             5120, cutlass.BFloat16, 4, 256, 32, False, 1e-4, wire_rows=True
         )

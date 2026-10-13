@@ -80,7 +80,8 @@ def test_mixed_a8_rejects_unsupported_plans_before_cuda(
         )
 
 
-def test_mixed_aot_workspace_offsets_and_buffers_ignore_export_sms(monkeypatch) -> None:
+@pytest.mark.parametrize("rows,block", [(3, 8), (48, 16)])
+def test_mixed_aot_workspace_offsets_and_buffers_ignore_export_sms(monkeypatch, rows, block) -> None:
     capacity = mixed_trellis_module.EXL3_AOT_MAX_SMS[(12, 0)]
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -90,17 +91,17 @@ def test_mixed_aot_workspace_offsets_and_buffers_ignore_export_sms(monkeypatch) 
                             SimpleNamespace(multi_processor_count=sms,
                                             shared_memory_per_block_optin=101376))
         kernel = W4A16FusedMoeKernel(
-            size_m=3, hidden_size=128, intermediate_size=128,
+            size_m=rows, hidden_size=128, intermediate_size=128,
             num_experts=4, top_k=2, activation="silu",
             apply_router_weight_on_input=False, zero_fc2_output=False,
             fc1_tile_n=128, fc1_tile_k=128, fc2_tile_n=128, fc2_tile_k=128,
-            moe_block_size=8, max_m_blocks=8, element_dtype="fp16",
+            moe_block_size=block, max_m_blocks=16, element_dtype="fp16",
             weight_layout="trellis_t256", scale_format="e4m3_k32",
             w13_layout="trellis_t256_proj", trellis_codebook="mcg",
             intermediate_rotation=True, full_rotation=True,
             schedule_whole_tiles=True, workspace_sms=capacity,
         )
-        assert kernel.sms == sms
+        assert kernel.sms == capacity
         assert kernel.barrier_count_off == capacity * 4
         assert kernel.barrier_sense_off == capacity * 4 + 1
         kernels.append(kernel)
