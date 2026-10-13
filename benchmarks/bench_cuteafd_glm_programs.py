@@ -145,7 +145,8 @@ def main() -> None:
                 (f"glm_index_topk_{route}_m{cap}", lambda: p_topk.launch(
                     q8, hw, index_cache, page_table, lengths, topk_out, s_topk, scalars=(rows, width, stride))),
                 (f"glm_sparse_mla_{route}_m{cap}", lambda: p_mla.launch(
-                    query, kv_cache, indices, full, latent, s_mla, scalars=(rows,))),
+                    query, kv_cache, indices, full, latent, s_mla,
+                    scalars=(rows, 8) if route == "decode" else (rows,))),
                 (f"glm_o_m{cap}", lambda: p_o.launch(latent, W["w_uv"], W["w_o"], out, s_o, scalars=(rows,))),
                 (f"glm_ffn_i2048_m{cap}", lambda: p_f2.launch(x, *W["ffn2048"], out, s_f2, scalars=(rows,))),
                 (f"glm_ffn_i12288_m{cap}", lambda: p_f12.launch(x, *W["ffn12288"], out, s_f12, scalars=(rows,))),

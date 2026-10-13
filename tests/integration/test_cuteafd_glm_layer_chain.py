@@ -141,7 +141,8 @@ def run_attention(w: LayerWeights, seq: Sequence, h, positions, cs, route, capac
     mla = P("mla", route=route, max_rows=capacity)
     lengths = torch.full((rows,), 2048, dtype=torch.int32, device="cuda")
     latent = torch.empty((rows, 64, 512), dtype=torch.bfloat16, device="cuda")
-    mla.launch(query, seq.kv_cache, indices, lengths, latent, scratch(mla, rows), scalars=(rows,))
+    mla.launch(query, seq.kv_cache, indices, lengths, latent, scratch(mla, rows),
+               scalars=(rows, 8) if route == "decode" else (rows,))
     o = P("o", max_rows=capacity)
     out = torch.empty_like(h)
     o.launch(latent, w.w_uv, w.w_o, out, scratch(o, rows), scalars=(rows,))

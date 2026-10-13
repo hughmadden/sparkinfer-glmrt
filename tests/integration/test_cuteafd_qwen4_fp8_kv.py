@@ -118,7 +118,7 @@ def test_fp8_sparse_fp64_and_replay(rows, large):
     program = _sparse()
     scratch = torch.empty(program.scratch_bytes(128)["scratch"], device="cuda", dtype=torch.uint8)
     def run():
-        program.launch(query, cache, positions, tables, indices, out, scratch, scalars=[rows, 4, 0])
+        program.launch(query, cache, positions, tables, indices, out, scratch, scalars=[rows, 4, 0, 4])
     run()
     torch.cuda.synchronize()
     actual = out.clone()

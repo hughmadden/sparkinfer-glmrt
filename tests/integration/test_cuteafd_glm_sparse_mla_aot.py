@@ -107,7 +107,8 @@ def _check(world, route, capacity, rows_pos, seed):
     q = world["query"][rows_pos].contiguous()
     out = torch.empty((rows, 64, 512), dtype=torch.bfloat16, device="cuda")
     scratch = torch.empty(program.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
-    program.launch(q, world["cache"], indices, lengths, out, scratch, scalars=(rows,))
+    program.launch(q, world["cache"], indices, lengths, out, scratch,
+                   scalars=(rows, 8) if route == "decode" else (rows,))
     torch.cuda.synchronize()
     records = world["cache"].view(-1, 1, 656)
     expected = sparse_mla_reference(q_all=q, kv_cache=records, page_table_1=indices,

@@ -123,12 +123,12 @@ def main() -> None:
         outputs = {}
         for name in names:
             program, buckets = programs[name]
-            splits = next(s for cap, s, _ in buckets if rows <= cap)
+            splits = next(s for cap, s, _ in buckets if 8 <= cap)
             out = torch.empty((rows, g.heads, 512), dtype=torch.bfloat16, device=dev)
             scratch = torch.empty(program.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device=dev)
 
             def launch(program=program, out=out, scratch=scratch):
-                program.launch(q, cache, indices, lengths, out, scratch, scalars=(rows,))
+                program.launch(q, cache, indices, lengths, out, scratch, scalars=(rows, 8))
 
             launch()
             torch.cuda.synchronize()

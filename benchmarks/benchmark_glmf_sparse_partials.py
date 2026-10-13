@@ -37,11 +37,11 @@ def capture(program, q, cache, indices, lengths):
     scratch = torch.empty(program.scratch_bytes(64)["scratch"], dtype=torch.uint8, device="cuda")
     args = q, cache, indices, lengths, out, scratch
     for _ in range(3):
-        program.launch(*args, scalars=(rows,))
+        program.launch(*args, scalars=(rows, 8))
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        program.launch(*args, scalars=(rows,))
+        program.launch(*args, scalars=(rows, 8))
     graph.replay()
     torch.cuda.synchronize()
     assert torch.isfinite(out).all() and torch.count_nonzero(out) > 0

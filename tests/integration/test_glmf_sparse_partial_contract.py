@@ -11,7 +11,7 @@ def test_every_live_bucket_fits_the_planned_partial_and_lse_scratch(fp32):
     buckets = ((1, 33, 1), (8, 17, 2), (64, 2, 17))
     capacity = sparse_mla_scratch_bytes(GLM53_FLASH, route="decode", rows=64,
                                        buckets=buckets, fp32_partials=fp32)
-    assert capacity == (17_860_608 if fp32 else 8_947_712)
+    assert capacity == 64 * 33 * GLM53_FLASH.heads * (512 * (4 if fp32 else 2) + 4)
     for rows in range(1, 65):
         splits = next(s for cap, s, _ in buckets if rows <= cap)
         partial_bytes = rows * GLM53_FLASH.heads * splits * 512 * (4 if fp32 else 2)
@@ -19,6 +19,11 @@ def test_every_live_bucket_fits_the_planned_partial_and_lse_scratch(fp32):
         advertised = sparse_mla_scratch_bytes(GLM53_FLASH, route="decode", rows=rows,
                                              buckets=buckets, fp32_partials=fp32)
         assert used <= advertised <= capacity
+    for hint, splits, _ in buckets:
+        selected = sparse_mla_scratch_bytes(GLM53_FLASH, route="decode", rows=64,
+            buckets=buckets, fp32_partials=fp32, plan_rows=hint)
+        assert selected == 64 * splits * GLM53_FLASH.heads * (512 * (4 if fp32 else 2) + 4)
+        assert selected <= capacity
 
 
 @pytest.mark.parametrize("geometry,route", [(GLM53, "decode"), (GLM53_FLASH, "prefill")])
