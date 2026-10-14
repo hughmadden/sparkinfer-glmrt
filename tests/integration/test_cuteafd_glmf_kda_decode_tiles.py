@@ -3,7 +3,7 @@
 the default route.
 
 - The in-projection ``[24896, 4096]`` and o_proj ``[4096, 8192]`` alone, ``glm_projection`` with the shape's
-  table against ``glm_projection`` without, at 1, 2 and 8 rows (the skinny GEMV in both) and 9, 12, 16, 17, 32,
+  table against ``glm_projection`` without, at 1, 2, 8, 9, 12, 16, 17, 32,
   33, 64, 65, 127 and 128 rows (each table entry at its first and last rows, at one and at several row tiles,
   and the rows past an entry): byte-identical outputs, and the default route's outputs within the routed
   projection's bound of the FP64 product.
@@ -295,13 +295,13 @@ def test_head_split_shipping_combination_replays_default_bytes(rows, spec):
 def test_tiles_by_rows_and_decode_tiles_are_checked():
     from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection, RowTiledBf16Projection
     from b12x.integration.cuteafd import glmf
-    from b12x.integration.cuteafd._glm_kernels import WIDE_SKINNY_MAX_ROWS, glm_projection
+    from b12x.integration.cuteafd._glm_kernels import glm_projection
 
     n, k = _shape("out")
     tiles = _tiles("out")
     plain, tiled = glm_projection(n, k), glm_projection(n, k, tiles_by_rows=tiles)
-    assert plain.tiles_by_rows == () and plain.key() == RoutedBf16Projection(n, k, max_skinny_rows=8).key()
-    assert tiled.max_skinny_rows == plain.max_skinny_rows == WIDE_SKINNY_MAX_ROWS
+    assert plain.tiles_by_rows == () and plain.key() == RoutedBf16Projection(n, k, max_skinny_rows=0).key()
+    assert tiled.max_skinny_rows == plain.max_skinny_rows == 0
     assert tiled.key()[:len(plain.key())] == plain.key() and tiled.key()[-1] == ("tiles_by_rows", tiles)
     for bad, match in (
             (((32, 1, 32),), "entries"),                               # an entry is four numbers
@@ -311,8 +311,9 @@ def test_tiles_by_rows_and_decode_tiles_are_checked():
     ):
         with pytest.raises(ValueError, match=match):
             RowTiledBf16Projection(n, k, bad)
+    assert glm_projection(n, k, tiles_by_rows=((8, 1, 32, 4),)).max_skinny_rows == 0
     with pytest.raises(ValueError, match="max_skinny_rows"):
-        glm_projection(n, k, tiles_by_rows=((8, 1, 32, 4),))               # the skinny GEMV's rows
+        RoutedBf16Projection(n, k, max_skinny_rows=8, tiles_by_rows=((8, 1, 32, 4),))
     g = _geometry()
     for kw in ({"fp8": False}, {"fp8": "prefill"}, {"fp8_only": "decode"}, {"fp8_only": "prefill"}):
         with pytest.raises(ValueError, match="decode_tiles"):

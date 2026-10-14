@@ -1,7 +1,7 @@
 """GLM 5.3 Flash MLA / o / FFN programs over FP8-only weights (``fp8_only``) against
 the BF16 + FP8 programs fed the dequantized weights as their BF16 copy: decode
 programs bitwise at every row count, prefill programs bitwise in both routes
-(W8A8 ``fp8_rows`` 1, W8A16 ``fp8_rows`` 0) above the BF16 skinny GEMV rows."""
+(W8A8 ``fp8_rows`` 1, W8A16 ``fp8_rows`` 0) above the activation-quant row threshold."""
 
 from __future__ import annotations
 
@@ -39,6 +39,54 @@ def _w(n, k, seed):
 
 def _scratch(program, rows):
     return torch.empty(program.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
+
+
+@pytest.mark.parametrize("n,threshold", [(4096, 8), (2048, 8), (1024, 64), (256, 160)])
+def test_activation_quant_admission_is_independent_of_bf16_route(n, threshold):
+    import cutlass
+    import cutlass.cute as cute
+
+    from b12x.gemm.bf16_gemv._skinny import skinny_max_rows
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._glmf_fp8 import quant_scratch_bytes
+    from b12x.integration.cuteafd.glmf import _Fp8Switch
+
+    k, cap = 4096, threshold + 1
+    switch = _Fp8Switch(n, k, fp8=True, prefill_rows=cap, prefill_mask=2)
+    assert switch.bf16.max_skinny_rows == 0
+    assert switch.activation_quant_row_threshold == threshold == (8 if n >= 2048 else skinny_max_rows(n, k))
+    key = switch.key()
+    switch.activation_quant_row_threshold += 1
+    assert switch.key() != key
+    switch.activation_quant_row_threshold = threshold
+
+    class Launch:
+        @cute.jit
+        def __call__(self, x, w, w8, scale, out, scratch, rows, mask, stream):
+            switch.run(x, w, w8, scale, out, rows, mask, cutlass.Int64(scratch.toint()), stream)
+
+    operands = (Operand("x", torch.bfloat16, "x"), Operand("w", torch.bfloat16, "w"),
+                Operand("w8", torch.float8_e4m3fn, "w8"), Operand("scale", torch.float32, "scale"),
+                Operand("out", torch.bfloat16, "out", "out"), Operand("scratch", torch.uint8, "scratch", "scratch"))
+    program = compile_program(Launch(), name="activation_quant_admission", operands=operands,
+                              scalars=(Scalar("rows"), Scalar("mask")), key=key)
+    canonical = compile_program(switch.bf16, name="activation_quant_bf16", operands=operands[:2] + operands[4:5],
+                                scalars=(Scalar("rows"),), key=switch.bf16.key())
+    w8, scale, weight = _w(n, k, n)
+    x = torch.randn(cap, k, device="cuda").bfloat16()
+    scratch = torch.empty(quant_scratch_bytes(k, cap), device="cuda", dtype=torch.uint8)
+    out = torch.empty(cap, n, device="cuda", dtype=torch.bfloat16)
+    want = torch.empty_like(out)
+    for rows in (1, threshold, cap):
+        canonical.launch(x, weight, want, scalars=(rows,))
+        for mask in (0, 1, 2, 3):
+            scratch.fill_(165)
+            program.launch(x, weight, w8, scale, out, scratch, scalars=(rows, mask))
+            torch.cuda.synchronize()
+            quantized = rows > threshold and bool(mask & 2)
+            assert bool((scratch != 165).any()) == quantized, f"N={n}, M={rows}, mask={mask}"
+            if not quantized:
+                assert torch.equal(out[:rows].view(torch.int16), want[:rows].view(torch.int16))
 
 
 CASES = [("decode", 64, r, 16) for r in (1, 16, 17, 64)] + \

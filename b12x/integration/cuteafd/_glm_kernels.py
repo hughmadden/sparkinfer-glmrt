@@ -48,22 +48,18 @@ from ._fp8_weights import _e4m3x8_scaled_bf16, _ld_f32
 
 FP8_MAX = 448.0
 ROPE_PAIRS = 32
-# Skinny GEMV -> TMA crossover for the GLM BF16 projections with N >= 2048:
-# the GEMV is flat to 8 rows then grows linearly, the TMA route is flat
-# (SM120, L2-cold, us at M=1/8/16/24: q_b 45/47/59/102 vs 49/49/49/49;
-# o_proj 127/133/174/231 vs 135/133/133/133; gate_up(12288) 186/190/248/383
-# vs 225/223/223/225).
-WIDE_SKINNY_MAX_ROWS = 8
 
 
 def glm_projection(n: int, k: int, wide: bool = False, tiles_by_rows: tuple = ()):
-    """``RoutedBf16Projection`` with the GLM crossover (narrow outputs keep the default);
-    ``wide`` adds its 128 x 128-tile route for prefill capacities, ``tiles_by_rows`` picks the
-    TMA route's tiles by live rows (the crossover is unchanged)."""
+    """One BF16 MMA accumulation at every live width, including serial decode.
+
+    SIMT and MMA sum K differently; crossing their former M8/M9 boundary
+    changed a verified row's bits. Row and wide-prefill tiles only retile the
+    same MMA fold, so decode, verify and prefill share canonical arithmetic.
+    """
     from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
 
-    return RoutedBf16Projection(n, k, max_skinny_rows=WIDE_SKINNY_MAX_ROWS if n >= 2048 else None, wide=wide,
-                                tiles_by_rows=tiles_by_rows)
+    return RoutedBf16Projection(n, k, max_skinny_rows=0, wide=wide, tiles_by_rows=tiles_by_rows)
 
 
 @cute.jit
@@ -901,7 +897,6 @@ class BatchedFp8Gemm(BatchedBf16Gemm):
 
 
 __all__ = [
-    "WIDE_SKINNY_MAX_ROWS",
     "glm_projection",
     "BatchedBf16Gemm",
     "BatchedFp8Gemm",

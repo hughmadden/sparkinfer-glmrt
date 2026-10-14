@@ -155,7 +155,7 @@ class _Fp8Switch:
     ``[N, K/128]`` (per-row quantization of a BF16 weight) instead of the
     checkpoint's 128x128 block grid.
 
-    Prefill programs (``prefill_rows``): rows past the skinny BF16 GEMV run
+    Prefill programs (``prefill_rows``): rows past ``activation_quant_row_threshold`` run
     the block-FP8 GEMM (``BlockFp8Projection``: E4M3 activations per row and
     128-K block, FP32 scales) when ``fp8_rows`` is nonzero; per-row weight
     scales are then stored K-block major, ``[K/128, N]``. ``qscratch`` holds
@@ -166,10 +166,13 @@ class _Fp8Switch:
 
     def __init__(self, n: int, k: int, *, fp8: bool, row_scales: bool = False, prefill_rows: int | None = None,
                  prefill_mask: int = 0xFF, wide_rows: int = 0, tiles_by_rows: tuple = ()):
+        from b12x.gemm.bf16_gemv._skinny import skinny_max_rows
         from ._fp8_weights import MmaFp8Gemv, gemv_warps
         from ._glmf_fp8 import BlockFp8Projection
 
         self.n, self.k = int(n), int(k)
+        # Preserve activation quantization admission independently of BF16 implementation.
+        self.activation_quant_row_threshold = 8 if self.n >= 2048 else skinny_max_rows(self.n, self.k)
         self.bf16 = glm_projection(self.n, self.k, wide=prefill_rows is not None, tiles_by_rows=tiles_by_rows)
         self.prefill = None
         self.fp8 = None
@@ -190,7 +193,8 @@ class _Fp8Switch:
 
     def key(self) -> tuple:
         return (self.bf16.key(), None if self.fp8 is None else self.fp8.key(),
-                None if self.prefill is None else (self.prefill.key(), self.prefill_mask),
+                None if self.prefill is None else (self.prefill.key(), self.prefill_mask,
+                                                   self.activation_quant_row_threshold),
                 None if self.fp8_wide is None else self.fp8_wide.key())
 
     @cute.jit
@@ -198,7 +202,7 @@ class _Fp8Switch:
             rows: Int32, fp8_rows: Int32, qscratch: Int64, stream: cuda.CUstream):
         """``__call__`` with the prefill route's quantization scratch."""
         if cutlass.const_expr(self.prefill is not None):
-            if (fp8_rows & Int32(self.prefill_mask)) != Int32(0) and rows > Int32(self.bf16.max_skinny_rows):
+            if (fp8_rows & Int32(self.prefill_mask)) != Int32(0) and rows > Int32(self.activation_quant_row_threshold):
                 self.prefill(x, w_fp8, scale, out, qscratch, rows, stream)
             else:
                 self.bf16(x, w, out, rows, stream)
