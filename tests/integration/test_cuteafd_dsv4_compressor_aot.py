@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from ..conftest import require_b12x
-from ._cuteafd import check_export, checkpoint_tensor, cosine, has_checkpoint
+from ._cuteafd import assert_bitwise, check_export, checkpoint_tensor, cosine, has_checkpoint
 
 EPS = 1.0e-6
 C4_PAGE_BYTES = 37_440
@@ -302,8 +302,10 @@ def programs():
         out = {}
         for ratio in (4, 128):
             out[("decode", ratio)] = c.compile_dsv4_compressor_decode_aot(FLASH, ratio=ratio)
+            out[("pro_decode", ratio)] = c.compile_dsv4_compressor_decode_aot(PRO, ratio=ratio)
             out[("prefill", ratio)] = c.compile_dsv4_compressor_prefill_aot(FLASH, ratio=ratio)
             out[("continuation", ratio)] = c.compile_dsv4_compressor_continuation_aot(FLASH, ratio=ratio)
+            out[("pro_continuation", ratio)] = c.compile_dsv4_compressor_continuation_aot(PRO, ratio=ratio)
             out[("pro_prefill", ratio)] = c.compile_dsv4_compressor_prefill_aot(PRO, ratio=ratio)
         return out
 
@@ -521,3 +523,157 @@ def test_decode_is_deterministic(programs):
     for other in results[1:]:
         for name in ("cache", "index_cache", "kv", "score", "ikv", "iscore"):
             assert torch.equal(getattr(other, name), getattr(results[0], name)), name
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("geometry_name", ["flash", "pro"])
+def test_decode_bucket_rows_preserve_projection_and_every_state_write(programs, ratio, geometry_name):
+    device = require_b12x()
+    hidden_size = 4096 if geometry_name == "flash" else 7168
+    weights = _weights(ratio, device, hidden=hidden_size)
+    rope = _cos_sin(512, device)
+    program = programs[("decode" if geometry_name == "flash" else "pro_decode", ratio)]
+    hidden = _hidden(64, 64022, device, hidden=hidden_size)
+    base = Pools(ratio, 64, device, high_page=0)
+    # Keep the full touched allocation small; big-page addressing is covered above.
+    base.cache = base.cache[:(2 if ratio == 4 else 32)].clone()
+    if ratio == 4:
+        base.index_cache = base.index_cache[:2].clone()
+    for name in ("kv", "score", "ikv", "iscore"):
+        value = getattr(base, name)
+        if value is not None:
+            value.normal_(mean=0.25, std=0.5)
+    i32 = dict(dtype=torch.int32, device=device)
+    ladder = (*range(1, 17), 24, 32, 40, 48, 56, 64)
+    for rows in range(1, 65):
+        bucket = next(width for width in ladder if width >= rows)
+        actual, expected = base.clone(), base.clone()
+        seq = torch.arange(bucket, **i32)
+        pos = torch.full((bucket,), ratio - 1, **i32)
+        slots = torch.arange(bucket, **i32)
+        # A masked row must skip position, slot, APE and all state/cache accesses.
+        seq[rows:] = -(2**31)
+        pos[rows:] = 2**31 - 1
+        slots[rows:] = 2**31 - 1
+        scratch = torch.empty((program.scratch_bytes(bucket)["scratch"],),
+                              dtype=torch.uint8, device=device)
+        exact_scratch = torch.empty((program.scratch_bytes(rows)["scratch"],),
+                                    dtype=torch.uint8, device=device)
+        padded = hidden[:bucket].clone()
+        padded[rows:] = 0
+        program.launch(padded, pos, seq, slots, rope, weights.joint_projection,
+                       *actual.pointers(weights), scratch, scalars=(bucket,))
+        program.launch(hidden[:rows], pos[:rows], seq[:rows], slots[:rows], rope,
+                       weights.joint_projection, *expected.pointers(weights), exact_scratch,
+                       scalars=(rows,))
+        torch.cuda.synchronize()
+        assert_bitwise(_aot_projection(program, scratch, bucket)[:rows],
+                       _aot_projection(program, exact_scratch, rows),
+                       f"projection ratio={ratio} rows={rows} bucket={bucket}")
+        for name in ("cache", "index_cache", "kv", "score", "ikv", "iscore"):
+            value = getattr(actual, name)
+            if value is not None:
+                assert_bitwise(value, getattr(expected, name),
+                               f"{name} ratio={ratio} rows={rows} bucket={bucket}")
+        for name in ("kv", "score", "ikv", "iscore"):
+            value = getattr(actual, name)
+            if value is not None:
+                assert_bitwise(value[rows:], getattr(base, name)[rows:],
+                               f"untouched {name} rows={rows}")
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("complete_group", [False, True])
+@pytest.mark.parametrize("negative_group_slot", [False, True])
+def test_continuation_skips_poisoned_sequence_metadata(
+        programs, ratio, complete_group, negative_group_slot):
+    device = require_b12x()
+    weights = _weights(ratio, device)
+    pools = Pools(ratio, 1, device, high_page=0)
+    pools.cache.fill_(0xA5)
+    if pools.index_cache is not None:
+        pools.index_cache.fill_(0xA5)
+    for name in ("kv", "score", "ikv", "iscore"):
+        value = getattr(pools, name)
+        if value is not None:
+            value.normal_(mean=0.25, std=0.5)
+    before = pools.clone()
+    i32 = dict(dtype=torch.int32, device=device)
+    # One real launch row can complete a group using retained rolling state.
+    meta = _continuation_meta(ratio, [(ratio - 1 if complete_group else 0, 1)], device, 0)
+    meta["state_sequence_ids"].fill_(-(2**31))
+    if negative_group_slot:
+        meta["group_sequence_slots"].fill_(-(2**31))
+    for key in ("group_source_positions", "group_rope_positions", "compressed_slots",
+                "sequence_offsets", "sequence_start_positions"):
+        meta[key].fill_(2**31 - 1)
+    program = programs[("continuation", ratio)]
+    scratch = torch.empty((program.scratch_bytes(1)["scratch"],), dtype=torch.uint8, device=device)
+    program.launch(_hidden(1, 9, device), *[meta[k] for k in _CONT_KEYS], _cos_sin(8, device),
+                   weights.joint_projection, *pools.pointers(weights), scratch, scalars=(1, 1, 1))
+    torch.cuda.synchronize()
+    for name in ("cache", "index_cache", "kv", "score", "ikv", "iscore"):
+        value = getattr(pools, name)
+        if value is not None:
+            assert_bitwise(value, getattr(before, name), f"poisoned {name} ratio={ratio}")
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("geometry_name", ["flash", "pro"])
+def test_continuation_bucket_rows_preserve_projection_and_every_state_write(programs, ratio, geometry_name):
+    device = require_b12x()
+    hidden_size = 4096 if geometry_name == "flash" else 7168
+    weights = _weights(ratio, device, hidden=hidden_size)
+    rope = _cos_sin(512, device)
+    program = programs[("continuation" if geometry_name == "flash" else "pro_continuation", ratio)]
+    hidden = _hidden(64, 64022, device, hidden=hidden_size)
+    base = Pools(ratio, 2, device, high_page=0)
+    for name in ("kv", "score", "ikv", "iscore"):
+        value = getattr(base, name)
+        if value is not None:
+            value.normal_(mean=0.25, std=0.5)
+    i32 = dict(dtype=torch.int32, device=device)
+    ladder = (*range(1, 17), 24, 32, 40, 48, 56, 64)
+    for rows in range(1, 65):
+        bucket = next(width for width in ladder if width >= rows)
+        # Start with a partial retained group; real offsets never include padding.
+        meta = _continuation_meta(ratio, [(ratio - 1, rows)], device, 0)
+        groups = int(meta["active_groups"])
+        group_rows = max(groups, 1)
+        padded_meta = {key: value.clone() for key, value in meta.items()}
+        for key in ("group_sequence_slots", "group_source_positions", "group_rope_positions",
+                    "compressed_slots"):
+            padded_meta[key] = torch.cat((meta[key], torch.full((bucket - group_rows,),
+                                                                2**31 - 1, **i32)))
+        padded_meta["state_sequence_ids"] = torch.cat((meta["state_sequence_ids"],
+                                                        torch.full((bucket - 1,), -(2**31), **i32)))
+        padded_meta["sequence_start_positions"] = torch.cat((meta["sequence_start_positions"],
+                                                              torch.full((bucket - 1,), 2**31 - 1, **i32)))
+        padded_meta["sequence_offsets"] = torch.cat((meta["sequence_offsets"],
+                                                     torch.full((bucket - 1,), 2**31 - 1, **i32)))
+        actual, expected = base.clone(), base.clone()
+        padded = hidden[:bucket].clone()
+        padded[rows:] = 0
+        scratch = torch.empty((program.scratch_bytes(bucket)["scratch"],),
+                              dtype=torch.uint8, device=device)
+        exact_scratch = torch.empty((program.scratch_bytes(rows)["scratch"],),
+                                    dtype=torch.uint8, device=device)
+        program.launch(padded, *[padded_meta[k] for k in _CONT_KEYS], rope,
+                       weights.joint_projection, *actual.pointers(weights), scratch,
+                       scalars=(bucket, bucket, bucket))
+        program.launch(hidden[:rows], *[meta[k] for k in _CONT_KEYS], rope,
+                       weights.joint_projection, *expected.pointers(weights), exact_scratch,
+                       scalars=(rows, group_rows, 1))
+        torch.cuda.synchronize()
+        assert_bitwise(_aot_projection(program, scratch, bucket)[:rows],
+                       _aot_projection(program, exact_scratch, rows),
+                       f"continuation projection ratio={ratio} rows={rows} bucket={bucket}")
+        for name in ("cache", "index_cache", "kv", "score", "ikv", "iscore"):
+            value = getattr(actual, name)
+            if value is not None:
+                assert_bitwise(value, getattr(expected, name),
+                               f"continuation {name} ratio={ratio} rows={rows} bucket={bucket}")
+        for name in ("kv", "score", "ikv", "iscore"):
+            value = getattr(actual, name)
+            if value is not None:
+                assert_bitwise(value[1:], getattr(base, name)[1:], f"untouched {name}")

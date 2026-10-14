@@ -177,50 +177,52 @@ class DSV4RankNormPackKV:
             normalized[e] = Float32((kv[e] * k_inv * Float32(kv_norm[d])).to(BFloat16))
 
         slot = Int64(slots[token])
-        page = slot // Int64(DSV4_PAGE_SIZE)
-        row = slot - page * Int64(DSV4_PAGE_SIZE)
-        page_base = Int64(cache.toint()) + page * Int64(DSV4_PAGE_BYTES)
-        data_base = page_base + row * Int64(DSV4_PAYLOAD_BYTES)
-        scale_base = page_base + Int64(DSV4_PAGE_SIZE * DSV4_PAYLOAD_BYTES) + row * Int64(DSV4_SCALE_BYTES)
+        # Negative slots mask bucket padding without changing Q-rank arithmetic.
+        if slot >= Int64(0):
+            page = slot // Int64(DSV4_PAGE_SIZE)
+            row = slot - page * Int64(DSV4_PAGE_SIZE)
+            page_base = Int64(cache.toint()) + page * Int64(DSV4_PAGE_BYTES)
+            data_base = page_base + row * Int64(DSV4_PAYLOAD_BYTES)
+            scale_base = page_base + Int64(DSV4_PAGE_SIZE * DSV4_PAYLOAD_BYTES) + row * Int64(DSV4_SCALE_BYTES)
 
-        # FP8 NoPE groups: 16 threads per 64-dim group (tidx < 112).
-        local = fmax_f32(
-            fmax_f32(fmax_f32(fabs_f32(normalized[0]), fabs_f32(normalized[1])), fabs_f32(normalized[2])),
-            fabs_f32(normalized[3]))
-        group_max = _max16(local)
-        if tidx < Int32(DSV4_NOPE // 4):
-            max_abs = fmax_f32(group_max, Float32(1.0e-4))
-            scale, scale_byte = pow2_ceil_ue8m0(div_full_f32(max_abs, Float32(FP8_MAX)))
-            quant = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
-            for e in cutlass.range_constexpr(4):
-                value = div_full_f32(normalized[e], scale)
-                value = fmin_f32(fmax_f32(value, Float32(-FP8_MAX)), Float32(FP8_MAX))
-                quant[e] = value
-            packed = cvt_f32x4_to_e4m3x4(quant[0], quant[1], quant[2], quant[3])
-            words = cute.make_ptr(Uint32, data_base + Int64(4) * Int64(tidx),
-                                  cute.AddressSpace.gmem, assumed_align=4)
-            words[0] = packed
-            if tidx % Int32(16) == Int32(0):
-                scale_ptr = cute.make_ptr(Uint8, scale_base + Int64(tidx // Int32(16)),
-                                          cute.AddressSpace.gmem, assumed_align=1)
-                scale_ptr[0] = Uint8(scale_byte)
-        else:
-            rope_local = Int32(4) * tidx - Int32(DSV4_NOPE)  # 0, 4, ..., 60
-            position = Int64(positions[token])
-            cs = cute.make_ptr(Float32, Int64(cos_sin.toint()) + position * Int64(64 * 4),
-                               cute.AddressSpace.gmem, assumed_align=4)
-            out = cute.make_ptr(BFloat16, data_base + Int64(DSV4_NOPE) + Int64(2) * Int64(rope_local),
-                                cute.AddressSpace.gmem, assumed_align=2)
-            for pair in cutlass.range_constexpr(2):
-                index = rope_local // Int32(2) + Int32(pair)
-                cos_v = Float32(cs[index])
-                sin_v = Float32(cs[Int32(32) + index])
-                even, odd = rope_pair(normalized[2 * pair], normalized[2 * pair + 1], cos_v, sin_v)
-                out[2 * pair] = even.to(BFloat16)
-                out[2 * pair + 1] = odd.to(BFloat16)
-            if tidx == Int32(DSV4_NOPE // 4):
-                pad = cute.make_ptr(Uint8, scale_base + Int64(7), cute.AddressSpace.gmem, assumed_align=1)
-                pad[0] = Uint8(0)
+            # FP8 NoPE groups: 16 threads per 64-dim group (tidx < 112).
+            local = fmax_f32(
+                fmax_f32(fmax_f32(fabs_f32(normalized[0]), fabs_f32(normalized[1])), fabs_f32(normalized[2])),
+                fabs_f32(normalized[3]))
+            group_max = _max16(local)
+            if tidx < Int32(DSV4_NOPE // 4):
+                max_abs = fmax_f32(group_max, Float32(1.0e-4))
+                scale, scale_byte = pow2_ceil_ue8m0(div_full_f32(max_abs, Float32(FP8_MAX)))
+                quant = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+                for e in cutlass.range_constexpr(4):
+                    value = div_full_f32(normalized[e], scale)
+                    value = fmin_f32(fmax_f32(value, Float32(-FP8_MAX)), Float32(FP8_MAX))
+                    quant[e] = value
+                packed = cvt_f32x4_to_e4m3x4(quant[0], quant[1], quant[2], quant[3])
+                words = cute.make_ptr(Uint32, data_base + Int64(4) * Int64(tidx),
+                                      cute.AddressSpace.gmem, assumed_align=4)
+                words[0] = packed
+                if tidx % Int32(16) == Int32(0):
+                    scale_ptr = cute.make_ptr(Uint8, scale_base + Int64(tidx // Int32(16)),
+                                              cute.AddressSpace.gmem, assumed_align=1)
+                    scale_ptr[0] = Uint8(scale_byte)
+            else:
+                rope_local = Int32(4) * tidx - Int32(DSV4_NOPE)  # 0, 4, ..., 60
+                position = Int64(positions[token])
+                cs = cute.make_ptr(Float32, Int64(cos_sin.toint()) + position * Int64(64 * 4),
+                                   cute.AddressSpace.gmem, assumed_align=4)
+                out = cute.make_ptr(BFloat16, data_base + Int64(DSV4_NOPE) + Int64(2) * Int64(rope_local),
+                                    cute.AddressSpace.gmem, assumed_align=2)
+                for pair in cutlass.range_constexpr(2):
+                    index = rope_local // Int32(2) + Int32(pair)
+                    cos_v = Float32(cs[index])
+                    sin_v = Float32(cs[Int32(32) + index])
+                    even, odd = rope_pair(normalized[2 * pair], normalized[2 * pair + 1], cos_v, sin_v)
+                    out[2 * pair] = even.to(BFloat16)
+                    out[2 * pair + 1] = odd.to(BFloat16)
+                if tidx == Int32(DSV4_NOPE // 4):
+                    pad = cute.make_ptr(Uint8, scale_base + Int64(7), cute.AddressSpace.gmem, assumed_align=1)
+                    pad[0] = Uint8(0)
 
 
 class DSV4QueryNormRope:

@@ -257,22 +257,27 @@ class DSV4CompressorPool(_Head):
         source_start = Int32(0)
         prev_valid = Int32(1)
         if const_expr(self.mode == "decode"):
-            position = _ld(a0, unit)
+            # Negative sequence IDs mask padding before any state or cache access.
             sequence = Int64(_ld(a1, unit))
-            slot = Int64(_ld(a2, unit))
-            lane = position % Int32(self.ratio)
-            # Record this token (value and score + ape) in the rolling state.
-            for e in cutlass.range_constexpr(4):
-                for half in cutlass.range_constexpr(self.coefficient):
-                    column = Int32(half * self.head) + Int32(4) * tidx + Int32(e)
-                    value = self._proj(projection, Int64(unit), column)
-                    score = self._proj(projection, Int64(unit), Int32(self.width) + column) \
-                        + self._ape(ape, lane, column)
-                    self._state_ptr(kv_state, sequence, position, column)[0] = value
-                    self._state_ptr(score_state, sequence, position, column)[0] = score
-            emits = Int32(lane == Int32(self.ratio - 1))
-            group_start = position + Int32(1 - self.ratio)
-            rope_position = group_start
+            active = Int32(sequence >= Int64(0))
+            if active != Int32(0):
+                position = _ld(a0, unit)
+                slot = Int64(_ld(a2, unit))
+                lane = position % Int32(self.ratio)
+                # Record this token (value and score + ape) in the rolling state.
+                for e in cutlass.range_constexpr(4):
+                    for half in cutlass.range_constexpr(self.coefficient):
+                        column = Int32(half * self.head) + Int32(4) * tidx + Int32(e)
+                        value = self._proj(projection, Int64(unit), column)
+                        score = self._proj(projection, Int64(unit), Int32(self.width) + column) \
+                            + self._ape(ape, lane, column)
+                        kv_ptr = self._state_ptr(kv_state, sequence, position, column)
+                        score_ptr = self._state_ptr(score_state, sequence, position, column)
+                        kv_ptr[0] = value
+                        score_ptr[0] = score
+                emits = Int32(lane == Int32(self.ratio - 1))
+                group_start = position + Int32(1 - self.ratio)
+                rope_position = group_start
         else:
             active = Int32(unit < _ld(a0, Int32(0)))
             if active != Int32(0):
@@ -284,14 +289,18 @@ class DSV4CompressorPool(_Head):
                     prev_valid = Int32(rope_position > Int32(0))
                 else:
                     seq_slot = _ld(a1, unit)
-                    group_start = _ld(a2, unit)
-                    rope_position = _ld(a3, unit)
-                    slot = Int64(_ld(a4, unit))
-                    chunk_offset = _ld(a5, seq_slot)
-                    chunk_start = _ld(a6, seq_slot)
-                    sequence = Int64(_ld(a7, seq_slot))
-                    prev_valid = Int32(group_start > Int32(0))
-        if (active != Int32(0)) & (emits != Int32(0)):
+                    active = Int32(seq_slot >= Int32(0))
+                    if active != Int32(0):
+                        sequence = Int64(_ld(a7, seq_slot))
+                        active = Int32(sequence >= Int64(0))
+                        if active != Int32(0):
+                            group_start = _ld(a2, unit)
+                            rope_position = _ld(a3, unit)
+                            slot = Int64(_ld(a4, unit))
+                            chunk_offset = _ld(a5, seq_slot)
+                            chunk_start = _ld(a6, seq_slot)
+                            prev_valid = Int32(group_start > Int32(0))
+        if (active != Int32(0)) & (emits != Int32(0)) & (sequence >= Int64(0)):
             self._emit(projection, cos_sin, ape, norm, cache, kv_state, score_state, sums, tidx,
                        sequence, group_start, rope_position, slot, chunk_offset, chunk_start,
                        source_start, prev_valid)
@@ -514,34 +523,35 @@ class DSV4CompressorFinalize(_Head):
         state_row = Int32(cute.arch.block_idx()[1])
         tidx = Int32(cute.arch.thread_idx()[0])
         if seq_slot < _ld(active_sequences, Int32(0)):
-            chunk_offset = _ld(sequence_offsets, seq_slot)
-            chunk_end = _ld(sequence_offsets, seq_slot + Int32(1))
             sequence = Int64(_ld(state_sequence_ids, seq_slot))
-            chunk_start = Int32(0)
-            if const_expr(self.mode == "continuation"):
-                chunk_start = _ld(sequence_start_positions, seq_slot)
-            last = chunk_start + chunk_end - chunk_offset - Int32(1)
-            cycles = (last - state_row) // Int32(self.state_rows)
-            if last < state_row:
-                cycles = Int32(0)
-            position = state_row + cycles * Int32(self.state_rows)
-            fill = position <= last
-            lane = position % Int32(self.ratio)
-            for e in cutlass.range_constexpr(4):
-                column = Int32(4) * tidx + Int32(e)
-                value = Float32(0.0)
-                score = Float32(_NEG_INF)
-                if fill:
-                    if position >= chunk_start:
-                        prow = Int64(chunk_offset) + Int64(position - chunk_start)
-                        value = _proj_value(projection, prow, self.joint_width, self.offset, column)
-                        score = _proj_value(projection, prow, self.joint_width, self.offset,
-                                            Int32(self.width) + column) + _ape_value(ape, lane, self.width, column)
-                    else:
-                        value = _state_value(kv_state, sequence, position, self.state_rows, self.width, column)
-                        score = _state_value(score_state, sequence, position, self.state_rows, self.width, column)
-                _state_store(kv_state, sequence, state_row, self.state_rows, self.width, column, value)
-                _state_store(score_state, sequence, state_row, self.state_rows, self.width, column, score)
+            if sequence >= Int64(0):
+                chunk_offset = _ld(sequence_offsets, seq_slot)
+                chunk_end = _ld(sequence_offsets, seq_slot + Int32(1))
+                chunk_start = Int32(0)
+                if const_expr(self.mode == "continuation"):
+                    chunk_start = _ld(sequence_start_positions, seq_slot)
+                last = chunk_start + chunk_end - chunk_offset - Int32(1)
+                cycles = (last - state_row) // Int32(self.state_rows)
+                if last < state_row:
+                    cycles = Int32(0)
+                position = state_row + cycles * Int32(self.state_rows)
+                fill = position <= last
+                lane = position % Int32(self.ratio)
+                for e in cutlass.range_constexpr(4):
+                    column = Int32(4) * tidx + Int32(e)
+                    value = Float32(0.0)
+                    score = Float32(_NEG_INF)
+                    if fill:
+                        if position >= chunk_start:
+                            prow = Int64(chunk_offset) + Int64(position - chunk_start)
+                            value = _proj_value(projection, prow, self.joint_width, self.offset, column)
+                            score = _proj_value(projection, prow, self.joint_width, self.offset,
+                                                Int32(self.width) + column) + _ape_value(ape, lane, self.width, column)
+                        else:
+                            value = _state_value(kv_state, sequence, position, self.state_rows, self.width, column)
+                            score = _state_value(score_state, sequence, position, self.state_rows, self.width, column)
+                    _state_store(kv_state, sequence, state_row, self.state_rows, self.width, column, value)
+                    _state_store(score_state, sequence, state_row, self.state_rows, self.width, column, score)
 
 
 @cute.jit

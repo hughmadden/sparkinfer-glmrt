@@ -232,3 +232,39 @@ def test_export_to_c_signature(programs, key, tmp_path):
     stem = "dsv4_" + "_".join(map(str, key))
     info = check_export(programs[key], tmp_path, stem)
     assert info["argument_count"] == len(programs[key].operands) + 2
+
+
+@pytest.mark.parametrize("geometry_name", ["flash", "pro"])
+def test_producer_bucket_rows_preserve_outputs_and_all_cache_bytes(geometry_name):
+    """Every original-ladder padding case uses the same m64 compiled recipe."""
+    device = require_b12x()
+    from b12x.integration.cuteafd import FLASH, PRO, exportable_compilation
+    from b12x.integration.cuteafd.dsv4_producer import compile_dsv4_producer_aot
+
+    geometry = {"flash": FLASH, "pro": PRO}[geometry_name]
+    with exportable_compilation():
+        program = compile_dsv4_producer_aot(geometry, max_rows=64)
+    weights = _producer_weights(geometry, device)
+    gen = torch.Generator(device="cpu").manual_seed(64022)
+    hidden = torch.randn((64, geometry.hidden), generator=gen).bfloat16().to(device)
+    positions = torch.arange(64, dtype=torch.int64, device=device)
+    rope = _cos_sin(64, device)
+    ladder = (*range(1, 17), 24, 32, 40, 48, 56, 64)
+    base = torch.full((2, PAGE_BYTES), 0xA5, dtype=torch.uint8, device=device)
+    for rows in range(1, 65):
+        bucket = next(width for width in ladder if width >= rows)
+        actual, expected = base.clone(), base.clone()
+        slots = torch.arange(bucket, dtype=torch.int64, device=device)
+        # No negative destination may be dereferenced, even a huge poison value.
+        slots[rows:] = -(2**62)
+        padded_hidden = hidden[:bucket].clone()
+        padded_hidden[rows:] = 0
+        query, rank = _aot_producer(program, weights, padded_hidden, positions[:bucket],
+                                    slots, rope, actual, geometry)
+        ref_query, ref_rank = _aot_producer(program, weights, hidden[:rows], positions[:rows],
+                                            slots[:rows], rope, expected, geometry)
+        torch.cuda.synchronize()
+        assert_bitwise(query[:rows], ref_query, f"query rows={rows} bucket={bucket}")
+        assert_bitwise(rank[:rows], ref_rank, f"q_rank rows={rows} bucket={bucket}")
+        assert_bitwise(actual, expected, f"entire cache rows={rows} bucket={bucket}")
+        assert torch.isfinite(query).all() and torch.isfinite(rank).all()
