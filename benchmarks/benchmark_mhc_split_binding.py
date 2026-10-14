@@ -242,6 +242,75 @@ def _run_case(case: Case, args, device: torch.device) -> dict[str, object]:
         }
 
 
+def _run_partial_groups(case: Case, args, device: torch.device) -> dict[str, object]:
+    """Compare the same decode arithmetic with four versus all 25 partials per CTA."""
+    from b12x.integration.cuteafd import GLM53_FLASH, exportable_compilation, glmf
+    from b12x.integration.cuteafd.dsv4_mhc import compile_dsv4_mhc_post_pre_aot
+
+    geometry = glmf.mhc_geometry(GLM53_FLASH)
+    buffers = Buffers(case, device, args.seed)
+    reference, timings = None, {}
+    for groups in (4, 25, "split"):
+        options = ({"wide_partials_per_cta": 25, "wide_min_rows": 64} if groups == "split"
+                   else {"partials_per_cta": groups})
+        with exportable_compilation():
+            program = compile_dsv4_mhc_post_pre_aot(
+                geometry, max_rows=4096, route="decode", **options,
+            )
+        if args.export_dir is not None:
+            args.export_dir.mkdir(parents=True, exist_ok=True)
+            stem = f"mhc_partial_groups_{groups}"
+            program.export_to_c(str(args.export_dir), stem, "cuteafd_" + stem)
+        scratch = torch.empty(program.scratch_bytes(case.tokens)["scratch"], dtype=torch.uint8, device=device)
+
+        def run():
+            program.launch(buffers.x, buffers.residual, buffers.prev_post, buffers.prev_comb,
+                           buffers.fn, buffers.scale, buffers.bias, buffers.norm_weight,
+                           buffers.out, buffers.post, buffers.comb, buffers.y,
+                           scratch, scalars=(case.tokens,))
+
+        buffers.reset()
+        run()
+        torch.cuda.synchronize(device)
+        actual = (buffers.out, buffers.post, buffers.comb, buffers.y)
+        if reference is None:
+            reference = tuple(value.clone() for value in actual)
+        for value, expected in zip(actual, reference, strict=True):
+            if not torch.equal(value.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)):
+                raise AssertionError(f"M{case.tokens} groups{groups}: raw-bit mismatch")
+        for _ in range(args.warmup):
+            run()
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for value in actual:
+            value.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize(device)
+        for value, expected in zip(actual, reference, strict=True):
+            if not torch.equal(value.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)):
+                raise AssertionError(f"M{case.tokens} groups{groups}: poisoned graph raw-bit mismatch")
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(args.replays):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        timings[groups] = start.elapsed_time(end) * 1000.0 / args.replays
+        for value in actual:
+            value.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize(device)
+        for value, expected in zip(actual, reference, strict=True):
+            if not torch.equal(value.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)):
+                raise AssertionError(f"M{case.tokens} groups{groups}: graph raw-bit mismatch")
+    return {"tokens": case.tokens, "hidden": case.hidden, "old_us": timings[4],
+            "new_us": timings[25], "new_over_old": timings[25] / timings[4],
+            "split_us": timings["split"], "split_over_old": timings["split"] / timings[4],
+            "bitwise": True, "graph_replays": args.replays}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, required=True)
@@ -254,13 +323,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tokens")
     parser.add_argument("--geometries")
     parser.add_argument("--splits")
+    parser.add_argument("--partial-groups", action="store_true", help="isolated GLM Flash AOT 4-vs-25 partial fusion")
+    parser.add_argument("--replays", type=int, default=64)
+    parser.add_argument("--export-dir", type=Path)
     args = parser.parse_args(argv)
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-    if not 0 <= args.device < len(visible) or visible[args.device] not in ("6", "7"):
+    if args.partial_groups:
+        if not 0 <= args.device < torch.cuda.device_count():
+            raise ValueError("Invalid visible CUDA device")
+        if args.hidden not in (None, "4096"):
+            raise ValueError("Partial-group mode uses GLM Flash hidden4096")
+    elif not 0 <= args.device < len(visible) or visible[args.device] not in ("6", "7"):
         raise ValueError("Set CUDA_VISIBLE_DEVICES explicitly; this experiment uses physical GPUs6/7")
-    if args.warmup < 1 or args.samples < 1:
-        raise ValueError("Warmup and samples must be positive")
-    cases = _domain()
+    if args.warmup < 1 or args.samples < 1 or args.replays < 1:
+        raise ValueError("Warmup, samples and replays must be positive")
+    cases = ([Case(4096, m, "partial_groups", 1) for m in (1, 8, 16, 64, 128, 4096)]
+             if args.partial_groups else _domain())
     for option, field, convert in (("hidden", "hidden", int), ("tokens", "tokens", int), ("geometries", "geometry", str), ("splits", "splits", int)):
         value = getattr(args, option)
         if value is not None:
@@ -276,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with torch.inference_mode():
             for case in cases:
-                row = _run_case(case, args, device)
+                row = (_run_partial_groups if args.partial_groups else _run_case)(case, args, device)
                 report["pairs"].append(row)
                 print(json.dumps(row, sort_keys=True), flush=True)
         report["status"] = "passed"

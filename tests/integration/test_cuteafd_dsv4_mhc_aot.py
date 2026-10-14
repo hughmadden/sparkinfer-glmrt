@@ -266,6 +266,93 @@ def test_pre_replays_in_cuda_graph(programs):
     assert_bitwise(y, eager, "graph y")
 
 
+def test_post_pre_fused_partial_groups_are_bitwise_and_row_invariant():
+    """The GLM Flash forced-decode recipe must not depend on group or live width."""
+    device = require_b12x()
+    from b12x.integration.cuteafd import GLM53_FLASH, dsv4_mhc, exportable_compilation, glmf
+
+    geometry = glmf.mhc_geometry(GLM53_FLASH)
+    hidden, capacity = geometry.hidden, 4096
+    fn, scale, base, norm = _weights(hidden, "ffn", device)
+    residual = _stream(capacity, hidden, 175, device)
+    x = _stream(capacity, hidden, 176, device)[:, 0].contiguous()
+    gen = torch.Generator(device="cpu").manual_seed(175)
+    prev_post = torch.randn((capacity, 4), generator=gen).to(device)
+    prev_comb = torch.randn((capacity, 4, 4), generator=gen).to(device)
+    # Zero, signed-zero and cancellation rows alongside realistic random mixes.
+    residual[0].zero_()
+    x[0].zero_()
+    residual[1].fill_(-0.0)
+    x[1].fill_(-0.0)
+    residual[2, 1].copy_(-residual[2, 0])
+    residual[2, 3].copy_(-residual[2, 2])
+    prev_comb[2].fill_(1.0)
+    prev_post[2].zero_()
+    with exportable_compilation():
+        programs = {
+            (cap, groups): dsv4_mhc.compile_dsv4_mhc_post_pre_aot(
+                geometry, max_rows=cap, route="decode", partials_per_cta=groups,
+            )
+            for cap in (64, 128, capacity) for groups in (4, 25)
+        }
+        for cap in (64, 128, capacity):
+            programs[(cap, "split")] = dsv4_mhc.compile_dsv4_mhc_post_pre_aot(
+                geometry, max_rows=cap, route="decode", wide_partials_per_cta=25, wide_min_rows=64,
+            )
+
+    def run(program, rows, start=0, graph_replay=False):
+        out = torch.full((rows, 4, hidden), float("nan"), dtype=torch.bfloat16, device=device)
+        post = torch.full((rows, 4), float("nan"), device=device)
+        comb = torch.full((rows, 4, 4), float("nan"), device=device)
+        y = torch.full((rows, hidden), float("nan"), dtype=torch.bfloat16, device=device)
+        size = program.scratch_bytes(rows)["scratch"]
+        storage = torch.full((size + 1024,), 0xA5, dtype=torch.uint8, device=device)
+        scratch = storage[:size].view(torch.float32)
+        args = (x[start:start + rows], residual[start:start + rows],
+                prev_post[start:start + rows], prev_comb[start:start + rows],
+                fn, scale, base, norm, out, post, comb, y, scratch)
+        program.launch(*args, scalars=(rows,))
+        torch.cuda.synchronize()
+        result = out, post, comb, y
+        if graph_replay:
+            graph = torch.cuda.CUDAGraph()
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+                program.launch(*args, scalars=(rows,))
+            for value in result:
+                value.fill_(float("nan"))
+            storage.fill_(0xA5)
+            graph.replay()
+            torch.cuda.synchronize()
+        assert bool((storage[size:] == 0xA5).all()), "scratch guard"
+        assert all(bool(torch.isfinite(value).all()) for value in result), "unwritten output"
+        return result
+
+    reference = run(programs[(capacity, 4)], capacity)
+    widths = (1, 2, 7, 8, 16, 32, 63, 64, 65, 96, 127, 128, 129, 4095, 4096)
+    for cap in (64, 128, capacity):
+        for rows in widths:
+            if rows > cap:
+                continue
+            for groups in (4, 25, "split"):
+                got = run(programs[(cap, groups)], rows)
+                for name, actual, expected in zip(("out", "post", "comb", "y"), got, reference):
+                    assert_bitwise(actual, expected[:rows], f"{name} cap{cap} M{rows} groups{groups}")
+    for rows in range(1, 129):
+        for groups in (4, 25, "split"):
+            got = run(programs[(128, groups)], rows)
+            for name, actual, expected in zip(("out", "post", "comb", "y"), got, reference):
+                assert_bitwise(actual, expected[:rows], f"{name} exhaustive M{rows} groups{groups}")
+    for rows in (1, 63, 64, 65, 128):
+        got = run(programs[(128, "split")], rows, graph_replay=True)
+        for name, actual, expected in zip(("out", "post", "comb", "y"), got, reference):
+            assert_bitwise(actual, expected[:rows], f"{name} poisoned graph M{rows}")
+    for row in range(128):
+        got = run(programs[(128, "split")], 1, row)
+        for name, actual, expected in zip(("out", "post", "comb", "y"), got, reference):
+            assert_bitwise(actual, expected[row:row + 1], f"{name} serial row{row}")
+
+
 @pytest.mark.parametrize("key", ["pre", "post_pre_decode", "post_pre_block_m", "post", "head"])
 def test_export_to_c_signature(programs, key, tmp_path):
     info = check_export(programs[key], tmp_path, f"dsv4_mhc_{key}")

@@ -146,9 +146,19 @@ class _MhcPre:
 
 class _MhcPostPre:
     def __init__(self, geometry: DSV4Geometry, route: str, partials_per_cta: int, block_m: int | None = None,
-                 tile_n: int | None = None):
+                 tile_n: int | None = None, wide_partials_per_cta: int | None = None,
+                 wide_min_rows: int = 64):
         self.h, self.s = geometry.hidden, geometry.mhc_split_k
         self.route = route
+        self.wide_partial = None
+        self.wide_min_rows = int(wide_min_rows)
+        if wide_partials_per_cta is not None:
+            if route != "decode" or self.wide_min_rows < 1:
+                raise ValueError("wide partial groups require decode and a positive row threshold")
+            self.wide_partial = MHCPostPrePartialKernel(
+                hidden_size=self.h, split_k=self.s, compute_gram=True,
+                partials_per_cta=wide_partials_per_cta,
+            )
         if route == "decode":
             self.partial = MHCPostPrePartialKernel(
                 hidden_size=self.h, split_k=self.s, compute_gram=True,
@@ -193,7 +203,14 @@ class _MhcPostPre:
         sc = cute.make_tensor(scale, cute.make_layout((3,)))
         bs = cute.make_tensor(base, cute.make_layout((_MIXES,)))
         if const_expr(self.route == "decode"):
-            self.partial(xt, r, pp, pc, w, p, out, pp, out, rows, stream)
+            if const_expr(self.wide_partial is not None):
+                # Only CTA grouping changes; each partial keeps its reduction order.
+                if rows >= Int32(self.wide_min_rows):
+                    self.wide_partial(xt, r, pp, pc, w, p, out, pp, out, rows, stream)
+                else:
+                    self.partial(xt, r, pp, pc, w, p, out, pp, out, rows, stream)
+            else:
+                self.partial(xt, r, pp, pc, w, p, out, pp, out, rows, stream)
         elif const_expr(self.route == "tf32"):
             if rows >= Int32(_TF32_MIN_ROWS):
                 self.gram(xt, r, pp, pc, p, out, rows, stream)
@@ -290,11 +307,14 @@ def compile_dsv4_mhc_pre_aot(geometry: DSV4Geometry = FLASH, *, partials_per_cta
 
 def compile_dsv4_mhc_post_pre_aot(geometry: DSV4Geometry = FLASH, *, max_rows: int = 1,
                                   route: str | None = None, partials_per_cta: int = 4,
-                                  block_m: int | None = None, tile_n: int | None = None):
+                                  block_m: int | None = None, tile_n: int | None = None,
+                                  wide_partials_per_cta: int | None = None, wide_min_rows: int = 64):
     """Fused mHC post + next pre; ``max_rows`` selects the prepared route (``route="tf32"``:
     TF32 tensor-core mixes with split FP32 fn from 384 live rows, the block_m route below). ``block_m`` /
     ``tile_n`` retile the block_m route (tokens and mixes per CTA; the mix tiles of a
-    token block then launch adjacently) without changing its arithmetic."""
+    token block then launch adjacently) without changing its arithmetic.
+    ``wide_partials_per_cta`` optionally fuses decode partial groups at
+    ``wide_min_rows`` while retaining each output's reduction tree and scratch ABI."""
     route = mhc_post_pre_route(max_rows) if route is None else route
     ops = _stream_ops(geometry)
     h = geometry.hidden
@@ -308,12 +328,18 @@ def compile_dsv4_mhc_post_pre_aot(geometry: DSV4Geometry = FLASH, *, max_rows: i
         ops["post"], ops["comb"], ops["y"], ops["scratch"],
     )
     return compile_program(
-        _MhcPostPre(geometry, route, partials_per_cta, block_m, tile_n), name=f"dsv4_mhc_post_pre_{route}",
+        _MhcPostPre(geometry, route, partials_per_cta, block_m, tile_n,
+                    wide_partials_per_cta, wide_min_rows), name=f"dsv4_mhc_post_pre_{route}",
         operands=operands, scalars=(Scalar("rows"),),
         key=_geometry_key(geometry) + (route, partials_per_cta)
-        + (() if block_m is None and tile_n is None else (block_m, tile_n)),
+        + (() if block_m is None and tile_n is None else (block_m, tile_n))
+        + (() if wide_partials_per_cta is None else ("wide_partials", wide_partials_per_cta, wide_min_rows)),
         geometry={"hidden": h, "split_k": geometry.mhc_split_k, "route": route,
-                  "eps": geometry.norm_eps},
+                  "eps": geometry.norm_eps,
+                  **({} if wide_partials_per_cta is None else {
+                      "partials_per_cta": partials_per_cta, "wide_partials_per_cta": wide_partials_per_cta,
+                      "wide_min_rows": wide_min_rows,
+                  })},
         scratch={"scratch": lambda rows: mhc_scratch_bytes(geometry, rows)},
         doc=__doc__,
     )
