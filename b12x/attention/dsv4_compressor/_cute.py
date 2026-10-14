@@ -271,8 +271,10 @@ class DSV4CompressorPool(_Head):
                         value = self._proj(projection, Int64(unit), column)
                         score = self._proj(projection, Int64(unit), Int32(self.width) + column) \
                             + self._ape(ape, lane, column)
-                        self._state_ptr(kv_state, sequence, position, column)[0] = value
-                        self._state_ptr(score_state, sequence, position, column)[0] = score
+                        kv_ptr = self._state_ptr(kv_state, sequence, position, column)
+                        score_ptr = self._state_ptr(score_state, sequence, position, column)
+                        kv_ptr[0] = value
+                        score_ptr[0] = score
                 emits = Int32(lane == Int32(self.ratio - 1))
                 group_start = position + Int32(1 - self.ratio)
                 rope_position = group_start
