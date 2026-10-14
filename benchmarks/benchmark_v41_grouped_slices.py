@@ -1,41 +1,41 @@
-"""Compare grouped V4.1 slice widths on identical encoded inputs and weights.
+"""Compare native slice widths on identical encoded inputs and weights.
 
-Includes ordered CuTe FP32 slice reduction. Uses the GPU oracle fixture before
-sampling. This is a synchronous-kernel diagnostic, not a serving benchmark.
+Includes ordered CuTe FP32 slice reduction and GPU oracle checks before timing.
+This is a synchronous-kernel diagnostic, not a serving benchmark.
 Run with the repository root on PYTHONPATH; the tests package supplies fixtures.
 """
 
-import json, statistics, torch, cutlass, cutlass.cute as cute
+import argparse
+import json
+import statistics
+import torch
+import cutlass
+import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from b12x._lib.utils import current_cuda_stream
 from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 from tests.moe.test_v41_grouped_slices import _check_grouped_slices
 import cuda.bindings.driver as cuda
 
+PRESETS = {"v41": (5120, 576, 6), "dsv4f": (4096, 512, 6)}
+
 
 class OrderedReduce:
-    def __init__(self, slices):
+    def __init__(self, slices, hidden):
         self.slices = slices
+        self.hidden = hidden
 
     @cute.jit
-    def __call__(
-        self,
-        source: cute.Tensor,
-        dest: cute.Tensor,
-        routes: cutlass.Int32,
-        stream: cuda.CUstream,
-    ):
+    def __call__(self, source: cute.Tensor, dest: cute.Tensor,
+                 routes: cutlass.Int32, stream: cuda.CUstream):
         self.kernel(source, dest, routes).launch(
-            grid=((routes * 5120 + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream
-        )
+            grid=((routes * self.hidden + 255) // 256, 1, 1),
+            block=(256, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, source: cute.Tensor, dest: cute.Tensor, routes: cutlass.Int32):
-        index = cutlass.Int64(cute.arch.block_idx()[0]) * 256 + cutlass.Int64(
-            cute.arch.thread_idx()[0]
-        )
-        row = index // 5120
-        col = index % 5120
+        index = cutlass.Int64(cute.arch.block_idx()[0]) * 256 + cutlass.Int64(cute.arch.thread_idx()[0])
+        row, col = index // self.hidden, index % self.hidden
         if row < routes:
             value = cutlass.Float32(0)
             for plane in cutlass.range_constexpr(self.slices):
@@ -43,121 +43,124 @@ class OrderedReduce:
             dest[row, col] = value
 
 
-state = {}
+def measure_factory(widths, iterations, replays, fc2_n_splits=(1,)):
+    state = {}
 
-
-def measure(**case):
-    args = case["args"]
-    meta = case["meta_view"]
-    m = case["rows"]
-    groups = case["groups"]
-    routes = case["routes"]
-    if not state:
-        for width in [64, 192]:
-            out = torch.empty(((576 + width - 1) // width, 480, 5120), device="cuda")
-            alt_args = list(args)
-            alt_args[-1] = from_dlpack(out, assumed_align=16)
-            compiled = cute.compile(
-                V41FusedSliceKernel(width, grouped=True),
-                *alt_args,
-                cutlass.Int32(80),
-                current_cuda_stream(),
-                meta,
-                cutlass.Int32(64),
-            )
-            state[width] = (out, alt_args, compiled)
-        state[128] = (case["out"], args, case["baseline_compiled"])
-        for width, (out, alt_args, compiled) in list(state.items()):
-            reduced = torch.empty((480, 5120), device="cuda")
-            rv = from_dlpack(reduced, assumed_align=16)
-            reducer = cute.compile(
-                OrderedReduce((576 + width - 1) // width),
-                alt_args[-1],
-                rv,
-                cutlass.Int32(480),
-                current_cuda_stream(),
-            )
-            state[width] = (out, alt_args, compiled, reduced, rv, reducer)
-    graphs = {}
-    for width, (out, alt_args, compiled, reduced, rv, reducer) in state.items():
-        out.fill_(12345)
-        compiled(*alt_args, m, current_cuda_stream(), meta, 64)
-        reducer(alt_args[-1], rv, routes, current_cuda_stream())
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            compiled(*alt_args, m, current_cuda_stream(), meta, 64)
+    def measure(**case):
+        args, meta = case["args"], case["meta_view"]
+        m, routes = case["rows"], case["routes"]
+        h, n, topk, capacity = (case[k] for k in ("hidden", "intermediate", "topk", "capacity"))
+        launch_groups = case["group_capacity"]
+        if not state:
+            for width, splits in [(w, s) for w in widths for s in fc2_n_splits]:
+                out = torch.empty(((n + width - 1) // width, capacity * topk, h), device="cuda")
+                alt_args = [*args[:-1], from_dlpack(out, assumed_align=16)]
+                compiled = cute.compile(
+                    V41FusedSliceKernel(width, grouped=True, intermediate=n, hidden=h, fc2_n_splits=splits),
+                    *alt_args, cutlass.Int32(capacity), current_cuda_stream(), meta,
+                    cutlass.Int32(launch_groups))
+                reduced = torch.empty((capacity * topk, h), device="cuda")
+                rv = from_dlpack(reduced, assumed_align=16)
+                reducer = cute.compile(OrderedReduce(out.shape[0], h), alt_args[-1], rv,
+                                       cutlass.Int32(capacity * topk), current_cuda_stream())
+                state[width, splits] = (out, alt_args, compiled, reduced, rv, reducer)
+        graphs = {}
+        baseline = {}
+        for (width, splits), (out, alt_args, compiled, reduced, rv, reducer) in state.items():
+            out.fill_(12345)
+            compiled(*alt_args, m, current_cuda_stream(), meta, launch_groups)
             reducer(alt_args[-1], rv, routes, current_cuda_stream())
-        before = torch.cuda.memory_allocated()
-        graph.replay()
-        assert before == torch.cuda.memory_allocated()
-        expected_reduced = torch.zeros_like(reduced[:routes])
-        for plane in range(out.shape[0]):
-            expected_reduced.add_(out[plane, :routes])
-        assert torch.equal(reduced[:routes], expected_reduced)
-        partial = reduced[:routes].bfloat16().float()
-        actual = torch.zeros_like(case["expected"])
-        actual.index_add_(0, case["pair_gpu"][:, 0], partial)
-        rel = ((actual - case["expected"]).norm() / case["expected"].norm()).item()
-        assert rel < 0.01 and bool((out[:, routes:] == 12345).all())
-        graphs[width] = graph
-    for _ in range(5):
+            expected_reduced = torch.zeros_like(reduced[:routes])
+            for plane in range(out.shape[0]):
+                expected_reduced.add_(out[plane, :routes])
+            assert torch.equal(reduced[:routes], expected_reduced)
+            if width in baseline:
+                assert torch.equal(out[:, :routes], baseline[width]), (width, splits, "split changed FP32 planes")
+            else:
+                baseline[width] = out[:, :routes].clone()
+            actual = torch.zeros_like(case["expected"])
+            actual.index_add_(0, case["pair_gpu"][:, 0], reduced[:routes].bfloat16().float())
+            rel = ((actual - case["expected"]).norm() / case["expected"].norm()).item()
+            assert torch.isfinite(actual).all() and actual.norm() > 0 and rel < 0.01
+            assert bool((out[:, routes:] == 12345).all())
+            for component in ("compute", "reduce", "combined"):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    if component != "reduce":
+                        compiled(*alt_args, m, current_cuda_stream(), meta, launch_groups)
+                    if component != "compute":
+                        reducer(alt_args[-1], rv, routes, current_cuda_stream())
+                before = torch.cuda.memory_allocated()
+                graph.replay()
+                assert before == torch.cuda.memory_allocated()
+                graphs[width, splits, component] = graph
+        for _ in range(5):
+            for graph in graphs.values():
+                graph.replay()
+        samples = {key: [] for key in graphs}
+        for iteration in range(iterations):
+            order = list(graphs)
+            shift = iteration % len(order)
+            order = order[shift:] + order[:shift]
+            if iteration % 2:
+                order.reverse()
+            for key in order:
+                start, end = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                start.record()
+                for _ in range(replays):
+                    graphs[key].replay()
+                end.record()
+                end.synchronize()
+                samples[key].append(start.elapsed_time(end) * 1000 / replays)
+        print("TIMING " + json.dumps(dict(
+            case=case["case"], rows=m, hidden=h, intermediate=n, capacity=capacity,
+            groups=case["groups"], launch_group_capacity=launch_groups, routes=routes,
+            graph_us={f"w{w}/n{s}/{c}": v for (w, s, c), v in samples.items()},
+            median_us={f"w{w}/n{s}/{c}": statistics.median(v) for (w, s, c), v in samples.items()},
+            scope="fused compute and ordered CuTe FP32 fold; excludes route planning, encoding and transport")), flush=True)
         for graph in graphs.values():
-            graph.replay()
-    samples = {w: [] for w in [64, 128, 192]}
-    for iteration in range(12):
-        order = [64, 128, 192]
-        order = order[iteration % 3 :] + order[: iteration % 3]
-        if iteration % 2:
-            order = order[::-1]
-        for width in order:
-            start, end = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            start.record()
-            for _ in range(20):
-                graphs[width].replay()
-            end.record()
-            end.synchronize()
-            samples[width].append(start.elapsed_time(end) * 1000 / 20)
-    print(
-        "TIMING "
-        + json.dumps(
-            dict(
-                case=case["case"],
-                rows=m,
-                groups=groups,
-                launch_group_capacity=64,
-                routes=routes,
-                graph_us=samples,
-                median_us={w: statistics.median(v) for w, v in samples.items()},
-                scope="fused compute and ordered CuTe FP32 slice reduction; excludes route planning, encoding and transport; synchronous staging",
-            )
-        ),
-        flush=True,
-    )
-    for graph in graphs.values():
-        graph.reset()
+            graph.reset()
+
+    return measure
+
+
+def main():
+    import hashlib
+    import inspect
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--geometry", choices=PRESETS, default="v41")
+    parser.add_argument("--hidden", type=int)
+    parser.add_argument("--intermediate", type=int)
+    parser.add_argument("--topk", type=int)
+    parser.add_argument("--capacity", type=int, default=80)
+    parser.add_argument("--rows", type=int, nargs="+")
+    parser.add_argument("--widths", type=int, nargs="+")
+    parser.add_argument("--fc2-n-splits", type=int, nargs="+", default=[1])
+    parser.add_argument("--iterations", type=int, default=12)
+    parser.add_argument("--replays", type=int, default=20)
+    options = parser.parse_args()
+    h, n, topk = PRESETS[options.geometry]
+    h, n, topk = options.hidden or h, options.intermediate or n, options.topk or topk
+    widths = options.widths or ([64, 128] if options.geometry == "dsv4f" else [64, 128, 192])
+    if options.capacity < 1 or options.iterations < 1 or options.replays < 1 or not widths \
+            or len(set(widths)) != len(widths) or any(w not in (64, 128, 192) or -(-n // w) * w > -(-n // 128) * 128 for w in widths):
+        parser.error("invalid capacity, timing counts, or slice widths")
+    if any(s < 1 or (h // 128) % s for s in options.fc2_n_splits):
+        parser.error("FC2 N splits must divide hidden tile count")
+    if options.rows and any(m < 1 or m > options.capacity for m in options.rows):
+        parser.error("rows must fit capacity")
+    print("SOURCE " + json.dumps(dict(
+        geometry=options.geometry, hidden=h, intermediate=n, topk=topk,
+        capacity=options.capacity, widths=widths, device=torch.cuda.get_device_name(),
+        capability=torch.cuda.get_device_capability(),
+        sha256={name: hashlib.sha256(Path(inspect.getsourcefile(obj)).read_bytes()).hexdigest()
+                for name, obj in [("kernel", V41FusedSliceKernel), ("fixture", _check_grouped_slices),
+                                  ("benchmark", measure_factory)]})), flush=True)
+    _check_grouped_slices(128, measure_factory(widths, options.iterations, options.replays, options.fc2_n_splits),
+                          n=n, topk=topk, h=h, capacity=options.capacity, row_counts=options.rows)
 
 
 if __name__ == "__main__":
-    import hashlib, inspect
-    from pathlib import Path
-
-    print(
-        "SOURCE "
-        + json.dumps(
-            {
-                name: hashlib.sha256(
-                    Path(inspect.getsourcefile(obj)).read_bytes()
-                ).hexdigest()
-                for name, obj in [
-                    ("kernel", V41FusedSliceKernel),
-                    ("fixture", _check_grouped_slices),
-                    ("benchmark", measure),
-                ]
-            }
-        ),
-        flush=True,
-    )
-    _check_grouped_slices(128, measure)
+    main()

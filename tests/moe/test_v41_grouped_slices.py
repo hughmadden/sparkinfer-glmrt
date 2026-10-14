@@ -60,13 +60,15 @@ def test_grouped_slices(width, h, n, topk):
     _check_grouped_slices(width, n=n, topk=topk, h=h)
 
 
-def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120):
+def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
+                          capacity=80, row_counts=None, experts=None):
     if -(-n // width) * width > (n + 127) // 128 * 128:
         pytest.skip("slice width does not tile this intermediate within its packed storage")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("Blackwell GPU required")
     torch.manual_seed(4164)
-    experts, capacity = (128 if n == 2304 else 32), 80
+    experts = experts or (128 if n == 2304 else 32)
+    assert capacity > 0 and 0 < topk <= experts
     weights = {}
     scales = {}
     for name, shape in [
@@ -100,7 +102,7 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120):
     wire = torch.empty((capacity, h + h // 32), device="cuda", dtype=torch.uint8)
     qa = wire[:, :h].view(torch.uint32)
     qs = wire[:, h:]
-    group_capacity = max(64, capacity * topk) if n == 2304 else 64
+    group_capacity = min(capacity * topk, experts + max(capacity * topk - experts, 0) // 16)
     metadata = torch.full((group_capacity, 19), -1, device="cuda", dtype=torch.int32)
     routing = torch.empty(capacity * topk, device="cuda")
     out = torch.empty(((n + width - 1) // width, capacity * topk, h), device="cuda")
@@ -118,8 +120,11 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         compiled(*args, capacity, current_cuda_stream(), meta_view, group_capacity)
-    cases = _routing_cases()
-    if n == 2304:
+    cases = (_routing_cases() if row_counts is None else
+             [(f"shared{m}", torch.arange(topk).expand(m, topk).clone())
+              for m in row_counts])
+    cases = [(name, ids) for name, ids in cases if ids.shape[0] <= capacity]
+    if n == 2304 and row_counts is None:
         cases += [(f"draft{m}", torch.arange(m * topk).reshape(m, topk) % experts)
                   for m in (5, 15, 40)]
     for case_index, (case, ids) in enumerate(cases):
@@ -202,9 +207,66 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120):
                 expected=expected,
                 pair_gpu=pair_gpu,
                 rows=m,
+                hidden=h,
+                intermediate=n,
+                topk=topk,
+                capacity=capacity,
+                experts=experts,
+                group_capacity=group_capacity,
                 groups=groups,
                 routes=routes,
                 baseline_graph=graph,
                 baseline_compiled=compiled,
             )
     graph.reset()
+
+
+def test_dsv4f_canonical_fc2_split_row_invariance():
+    """Frozen input rows retain every FP32 route bit across capacity boundaries."""
+    from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
+
+    def check(**case):
+        packed, wire, ids, route_weights = case["native_inputs"]
+        h, n, topk, experts = 4096, 512, 6, case["experts"]
+        wire = wire[:1].repeat(256, 1)
+        ids = ids[:1].cuda().int().repeat(256, 1).flatten()
+        routing = route_weights[:1].repeat(256, 1).flatten()
+        qa, qs = wire[:, :h].view(torch.uint32), wire[:, h:]
+        expected = None
+        for capacity, rows in [(1, (1,)), (16, (1, 2, 7, 8, 15, 16)),
+                               (80, (1, 16, 17, 64, 80)), (256, (1, 80, 81, 255, 256))]:
+            for splits in (1, 2):
+                routes = capacity * topk
+                partial = torch.empty((4, routes, h), device="cuda")
+                output = torch.empty((routes, h), device="cuda")
+                buffers = [qa, qs, *packed, ids, routing,
+                           torch.empty(1, device="cuda", dtype=torch.int32),
+                           torch.empty(experts * routes, device="cuda", dtype=torch.int32),
+                           torch.empty(experts, device="cuda", dtype=torch.int32),
+                           torch.empty((experts, 2), device="cuda", dtype=torch.int32),
+                           torch.empty((routes, 19), device="cuda", dtype=torch.int32),
+                           torch.empty(routes, device="cuda"),
+                           torch.empty(routes, device="cuda", dtype=torch.int32), partial, output]
+                views = [from_dlpack(t, assumed_align=16) for t in buffers]
+                compiled = cute.compile(V41SlicePipeline(capacity, 128, experts=experts,
+                    hidden=h, intermediate=n, topk=topk, fc2_n_splits=splits),
+                    *views, cutlass.Int32(capacity), current_cuda_stream())
+                for m in rows:
+                    output.fill_(12345)
+                    compiled(*views, m, current_cuda_stream())
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        compiled(*views, m, current_cuda_stream())
+                    before = torch.cuda.memory_allocated()
+                    graph.replay()
+                    assert before == torch.cuda.memory_allocated()
+                    live = output[:m * topk].reshape(m, topk, h)
+                    assert torch.isfinite(live).all() and live.norm() > 0
+                    if expected is None:
+                        expected = live[0].clone()
+                    assert torch.equal(live, expected.expand_as(live)), (capacity, splits, m)
+                    assert bool((output[m * topk:] == 12345).all())
+                    graph.reset()
+                del compiled, views, buffers
+
+    _check_grouped_slices(128, check, n=512, h=4096, capacity=1, row_counts=[1])

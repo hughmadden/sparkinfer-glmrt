@@ -52,11 +52,14 @@ from b12x.moe._shared.kernels.w4a8_staging import (
 
 
 class V41FusedSliceKernel:
-    def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576, hidden=5120, exact_storage=False):
+    def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576, hidden=5120,
+                 exact_storage=False, fc2_n_splits=1):
         assert width in (64, 128, 192)
         assert hidden > 0 and hidden % 128 == 0
         self.hidden = hidden
         self.hidden_tiles = hidden // 128
+        assert fc2_n_splits > 0 and self.hidden_tiles % fc2_n_splits == 0
+        self.fc2_n_splits = fc2_n_splits
         assert not atomic_tokens or grouped
         self.atomic_tokens = atomic_tokens
         self.grouped = grouped
@@ -89,7 +92,7 @@ class V41FusedSliceKernel:
         groups: Int32 = 1,
     ):
         self.kernel(x, xs, w13, s13, w2, s2, routing, out, rows, metadata).launch(
-            grid=(self.slices, groups if self.grouped else 1, 1),
+            grid=(self.slices, groups if self.grouped else 1, self.fc2_n_splits),
             block=(128, 1, 1),
             stream=stream,
         )
@@ -357,7 +360,10 @@ class V41FusedSliceKernel:
                     qa[row, block * 8 + j] = payload[j]
                 qs[row, block] = scale
             cute.arch.sync_threads()
-            for ot in range(self.hidden_tiles):
+            # Replicate FC1, but partition disjoint FC2 outputs without regrouping K.
+            output_begin = cute.arch.block_idx()[2] * (self.hidden_tiles // self.fc2_n_splits)
+            for local_ot in range(self.hidden_tiles // self.fc2_n_splits):
+                ot = output_begin + local_ot
                 if cutlass.const_expr(self.exact_storage):
                     stage_v41_exact_b(
                         w2,
