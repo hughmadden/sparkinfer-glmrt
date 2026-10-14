@@ -75,7 +75,7 @@ def measure_factory(widths, iterations, replays, fc2_n_splits=(1,)):
                 expected_reduced.add_(out[plane, :routes])
             assert torch.equal(reduced[:routes], expected_reduced)
             if width in baseline:
-                assert torch.equal(out[:, :routes], baseline[width]), (width, splits, "split changed FP32 planes")
+                assert torch.equal(out[:, :routes].view(torch.int32), baseline[width].view(torch.int32)), (width, splits, "split changed FP32 planes")
             else:
                 baseline[width] = out[:, :routes].clone()
             actual = torch.zeros_like(case["expected"])

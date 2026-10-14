@@ -221,13 +221,14 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
     graph.reset()
 
 
-def test_dsv4f_canonical_fc2_split_row_invariance():
+@pytest.mark.parametrize("h,n", [(4096, 512), (7168, 768)])
+def test_dsv4_canonical_fc2_split_row_invariance(h, n):
     """Frozen input rows retain every FP32 route bit across capacity boundaries."""
     from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
 
     def check(**case):
         packed, wire, ids, route_weights = case["native_inputs"]
-        h, n, topk, experts = 4096, 512, 6, case["experts"]
+        topk, experts = 6, case["experts"]
         wire = wire[:1].repeat(256, 1)
         ids = ids[:1].cuda().int().repeat(256, 1).flatten()
         routing = route_weights[:1].repeat(256, 1).flatten()
@@ -237,7 +238,7 @@ def test_dsv4f_canonical_fc2_split_row_invariance():
                                (80, (1, 16, 17, 64, 80)), (256, (1, 80, 81, 255, 256))]:
             for splits in (1, 2):
                 routes = capacity * topk
-                partial = torch.empty((4, routes, h), device="cuda")
+                partial = torch.empty((n // 128, routes, h), device="cuda")
                 output = torch.empty((routes, h), device="cuda")
                 buffers = [qa, qs, *packed, ids, routing,
                            torch.empty(1, device="cuda", dtype=torch.int32),
@@ -264,9 +265,10 @@ def test_dsv4f_canonical_fc2_split_row_invariance():
                     assert torch.isfinite(live).all() and live.norm() > 0
                     if expected is None:
                         expected = live[0].clone()
-                    assert torch.equal(live, expected.expand_as(live)), (capacity, splits, m)
+                    assert torch.equal(live.view(torch.int32),
+                                       expected.view(torch.int32).expand_as(live)), (h, n, capacity, splits, m)
                     assert bool((output[m * topk:] == 12345).all())
                     graph.reset()
                 del compiled, views, buffers
 
-    _check_grouped_slices(128, check, n=512, h=4096, capacity=1, row_counts=[1])
+    _check_grouped_slices(128, check, n=n, h=h, capacity=1, row_counts=[1])
