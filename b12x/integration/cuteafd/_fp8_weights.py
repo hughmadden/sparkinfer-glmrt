@@ -325,8 +325,16 @@ def gemv_warps(k: int) -> int:
 def gemv_cta_tiles(n: int, k: int, *, groups: int, warps: int) -> int:
     """Most 16-row M-tiles one ``MmaFp8Gemv`` CTA holds (its fragment registers), leaving the
     rest to the launch grid's M dimension. Measured per shape at SM120/325 W, L2-cold, us
-    at 17/32/64 rows, 1/2/4 tiles per CTA (see the note in ``MmaFp8Gemv``)."""
-    return 2 if int(k) <= 2560 else 4
+    at 17/32/64 rows, 1/2/4 tiles per CTA (see the note in ``MmaFp8Gemv``).
+
+    Requalified per shape (engine #210): two tiles pay only where the doubled M grid fills
+    the machine -- the k=2560 tall-N projections (16480x2560 and 13952x2560, 0.73-0.94 of
+    four tiles at every width, 0.71-0.87 of the one-CTA route). k=2048 stays four: its two
+    16384-wide consumers build the same kernel key yet split on the arm (0.85 with two
+    tiles for the plain one against 1.06-1.12 at 48/64 rows for the routed one), and a
+    thinner K loses outright (16384x1536 at 1.18/1.40 of four at 48/64 rows)."""
+    k = int(k)
+    return 2 if 2048 < k <= 2560 else 4
 
 
 # ---------------------------------------------------------------------------
