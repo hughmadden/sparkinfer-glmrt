@@ -234,17 +234,19 @@ def test_export_to_c_signature(programs, key, tmp_path):
     assert info["argument_count"] == len(programs[key].operands) + 2
 
 
-def test_producer_bucket_rows_preserve_outputs_and_all_cache_bytes():
+@pytest.mark.parametrize("geometry_name", ["flash", "pro"])
+def test_producer_bucket_rows_preserve_outputs_and_all_cache_bytes(geometry_name):
     """Every original-ladder padding case uses the same m64 compiled recipe."""
     device = require_b12x()
-    from b12x.integration.cuteafd import FLASH, exportable_compilation
+    from b12x.integration.cuteafd import FLASH, PRO, exportable_compilation
     from b12x.integration.cuteafd.dsv4_producer import compile_dsv4_producer_aot
 
+    geometry = {"flash": FLASH, "pro": PRO}[geometry_name]
     with exportable_compilation():
-        program = compile_dsv4_producer_aot(FLASH, max_rows=64)
-    weights = _producer_weights(FLASH, device)
+        program = compile_dsv4_producer_aot(geometry, max_rows=64)
+    weights = _producer_weights(geometry, device)
     gen = torch.Generator(device="cpu").manual_seed(64022)
-    hidden = torch.randn((64, FLASH.hidden), generator=gen).bfloat16().to(device)
+    hidden = torch.randn((64, geometry.hidden), generator=gen).bfloat16().to(device)
     positions = torch.arange(64, dtype=torch.int64, device=device)
     rope = _cos_sin(64, device)
     ladder = (*range(1, 17), 24, 32, 40, 48, 56, 64)
@@ -258,9 +260,9 @@ def test_producer_bucket_rows_preserve_outputs_and_all_cache_bytes():
         padded_hidden = hidden[:bucket].clone()
         padded_hidden[rows:] = 0
         query, rank = _aot_producer(program, weights, padded_hidden, positions[:bucket],
-                                    slots, rope, actual, FLASH)
+                                    slots, rope, actual, geometry)
         ref_query, ref_rank = _aot_producer(program, weights, hidden[:rows], positions[:rows],
-                                            slots[:rows], rope, expected, FLASH)
+                                            slots[:rows], rope, expected, geometry)
         torch.cuda.synchronize()
         assert_bitwise(query[:rows], ref_query, f"query rows={rows} bucket={bucket}")
         assert_bitwise(rank[:rows], ref_rank, f"q_rank rows={rows} bucket={bucket}")

@@ -302,8 +302,10 @@ def programs():
         out = {}
         for ratio in (4, 128):
             out[("decode", ratio)] = c.compile_dsv4_compressor_decode_aot(FLASH, ratio=ratio)
+            out[("pro_decode", ratio)] = c.compile_dsv4_compressor_decode_aot(PRO, ratio=ratio)
             out[("prefill", ratio)] = c.compile_dsv4_compressor_prefill_aot(FLASH, ratio=ratio)
             out[("continuation", ratio)] = c.compile_dsv4_compressor_continuation_aot(FLASH, ratio=ratio)
+            out[("pro_continuation", ratio)] = c.compile_dsv4_compressor_continuation_aot(PRO, ratio=ratio)
             out[("pro_prefill", ratio)] = c.compile_dsv4_compressor_prefill_aot(PRO, ratio=ratio)
         return out
 
@@ -524,12 +526,14 @@ def test_decode_is_deterministic(programs):
 
 
 @pytest.mark.parametrize("ratio", [4, 128])
-def test_decode_bucket_rows_preserve_projection_and_every_state_write(programs, ratio):
+@pytest.mark.parametrize("geometry_name", ["flash", "pro"])
+def test_decode_bucket_rows_preserve_projection_and_every_state_write(programs, ratio, geometry_name):
     device = require_b12x()
-    weights = _weights(ratio, device)
+    hidden_size = 4096 if geometry_name == "flash" else 7168
+    weights = _weights(ratio, device, hidden=hidden_size)
     rope = _cos_sin(512, device)
-    program = programs[("decode", ratio)]
-    hidden = _hidden(64, 64022, device)
+    program = programs[("decode" if geometry_name == "flash" else "pro_decode", ratio)]
+    hidden = _hidden(64, 64022, device, hidden=hidden_size)
     base = Pools(ratio, 64, device, high_page=0)
     # Keep the full touched allocation small; big-page addressing is covered above.
     base.cache = base.cache[:(2 if ratio == 4 else 32)].clone()
@@ -615,12 +619,14 @@ def test_continuation_skips_poisoned_sequence_metadata(
 
 
 @pytest.mark.parametrize("ratio", [4, 128])
-def test_continuation_bucket_rows_preserve_projection_and_every_state_write(programs, ratio):
+@pytest.mark.parametrize("geometry_name", ["flash", "pro"])
+def test_continuation_bucket_rows_preserve_projection_and_every_state_write(programs, ratio, geometry_name):
     device = require_b12x()
-    weights = _weights(ratio, device)
+    hidden_size = 4096 if geometry_name == "flash" else 7168
+    weights = _weights(ratio, device, hidden=hidden_size)
     rope = _cos_sin(512, device)
-    program = programs[("continuation", ratio)]
-    hidden = _hidden(64, 64022, device)
+    program = programs[("continuation" if geometry_name == "flash" else "pro_continuation", ratio)]
+    hidden = _hidden(64, 64022, device, hidden=hidden_size)
     base = Pools(ratio, 2, device, high_page=0)
     for name in ("kv", "score", "ikv", "iscore"):
         value = getattr(base, name)
