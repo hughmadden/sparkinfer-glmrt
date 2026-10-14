@@ -15,6 +15,8 @@ from cutlass.cute.runtime import from_dlpack
 from b12x._lib.utils import current_cuda_stream
 from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 from tests.moe.test_v41_grouped_slices import _check_grouped_slices
+from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes, nvidia_smi_gpu_mode_snapshot
+from benchmarks.dense_autotune_common import bench_events
 import cuda.bindings.driver as cuda
 
 PRESETS = {"v41": (5120, 576, 6), "dsv4f": (4096, 512, 6)}
@@ -43,7 +45,7 @@ class OrderedReduce:
             dest[row, col] = value
 
 
-def measure_factory(widths, iterations, replays, fc2_n_splits=(1,)):
+def measure_factory(widths, iterations, replays, fc2_n_splits=(1,), *, cache="warm", l2_flush_bytes=0):
     state = {}
 
     def measure(**case):
@@ -97,27 +99,44 @@ def measure_factory(widths, iterations, replays, fc2_n_splits=(1,)):
         for _ in range(5):
             for graph in graphs.values():
                 graph.replay()
-        samples = {key: [] for key in graphs}
-        for iteration in range(iterations):
-            order = list(graphs)
-            shift = iteration % len(order)
-            order = order[shift:] + order[:shift]
-            if iteration % 2:
-                order.reverse()
-            for key in order:
-                start, end = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-                start.record()
-                for _ in range(replays):
-                    graphs[key].replay()
-                end.record()
-                end.synchronize()
-                samples[key].append(start.elapsed_time(end) * 1000 / replays)
-        print("TIMING " + json.dumps(dict(
-            case=case["case"], rows=m, hidden=h, intermediate=n, capacity=capacity,
-            groups=case["groups"], launch_group_capacity=launch_groups, routes=routes,
-            graph_us={f"w{w}/n{s}/{c}": v for (w, s, c), v in samples.items()},
-            median_us={f"w{w}/n{s}/{c}": statistics.median(v) for (w, s, c), v in samples.items()},
-            scope="fused compute and ordered CuTe FP32 fold; excludes route planning, encoding and transport")), flush=True)
+        cache_modes = ("warm", "cold") if cache == "both" else (cache,)
+        flush = make_l2_flush_fn("cold" in cache_modes, l2_flush_bytes)
+        for cache_mode in cache_modes:
+            samples = {key: [] for key in graphs}
+            raw = {key: [] for key in graphs}
+            gpu = [nvidia_smi_gpu_mode_snapshot()]
+            for iteration in range(iterations):
+                order = list(graphs)
+                shift = iteration % len(order)
+                order = order[shift:] + order[:shift]
+                if iteration % 2:
+                    order.reverse()
+                for key in order:
+                    if cache_mode == "cold":
+                        # Evict before every replay, outside its measured event interval.
+                        times = [value * 1000 for value in bench_events(
+                            graphs[key].replay, warmup=2, iters=replays, l2_flush=flush)]
+                        raw[key].append(times)
+                        samples[key].append(statistics.median(times))
+                    else:
+                        for _ in range(5):
+                            graphs[key].replay()
+                        start, end = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                        start.record()
+                        for _ in range(replays):
+                            graphs[key].replay()
+                        end.record()
+                        end.synchronize()
+                        samples[key].append(start.elapsed_time(end) * 1000 / replays)
+            gpu.append(nvidia_smi_gpu_mode_snapshot())
+            print("TIMING " + json.dumps(dict(
+                case=case["case"], rows=m, hidden=h, intermediate=n, capacity=capacity,
+                groups=case["groups"], launch_group_capacity=launch_groups, routes=routes,
+                cache=cache_mode, l2_flush_bytes=resolve_l2_flush_bytes(l2_flush_bytes) if cache_mode == "cold" else 0,
+                gpu=gpu, graph_us={f"w{w}/n{s}/{c}": v for (w, s, c), v in samples.items()},
+                replay_us={f"w{w}/n{s}/{c}": v for (w, s, c), v in raw.items()},
+                median_us={f"w{w}/n{s}/{c}": statistics.median(v) for (w, s, c), v in samples.items()},
+                scope="fused compute and ordered CuTe FP32 fold; excludes route planning, encoding and transport")), flush=True)
         for graph in graphs.values():
             graph.reset()
 
@@ -140,6 +159,8 @@ def main():
     parser.add_argument("--fc2-n-splits", type=int, nargs="+", default=[1])
     parser.add_argument("--iterations", type=int, default=12)
     parser.add_argument("--replays", type=int, default=20)
+    parser.add_argument("--cache", choices=("warm", "cold", "both"), default="warm")
+    parser.add_argument("--l2-flush-bytes", type=int, default=0, help="0 uses twice the reported L2 size")
     options = parser.parse_args()
     h, n, topk = PRESETS[options.geometry]
     h, n, topk = options.hidden or h, options.intermediate or n, options.topk or topk
@@ -151,15 +172,20 @@ def main():
         parser.error("FC2 N splits must divide hidden tile count")
     if options.rows and any(m < 1 or m > options.capacity for m in options.rows):
         parser.error("rows must fit capacity")
+    if options.l2_flush_bytes < 0:
+        parser.error("L2 flush bytes must be non-negative")
     print("SOURCE " + json.dumps(dict(
         geometry=options.geometry, hidden=h, intermediate=n, topk=topk,
-        capacity=options.capacity, widths=widths, device=torch.cuda.get_device_name(),
+        capacity=options.capacity, widths=widths, fc2_n_splits=options.fc2_n_splits,
+        cache=options.cache, l2_flush_bytes=options.l2_flush_bytes,
+        device=torch.cuda.get_device_name(),
         capability=torch.cuda.get_device_capability(),
         sha256={name: hashlib.sha256(Path(inspect.getsourcefile(obj)).read_bytes()).hexdigest()
                 for name, obj in [("kernel", V41FusedSliceKernel), ("fixture", _check_grouped_slices),
                                   ("benchmark", measure_factory)]})), flush=True)
-    _check_grouped_slices(128, measure_factory(widths, options.iterations, options.replays, options.fc2_n_splits),
-                          n=n, topk=topk, h=h, capacity=options.capacity, row_counts=options.rows)
+    _check_grouped_slices(128, measure_factory(widths, options.iterations, options.replays,
+        options.fc2_n_splits, cache=options.cache, l2_flush_bytes=options.l2_flush_bytes),
+        n=n, topk=topk, h=h, capacity=options.capacity, row_counts=options.rows)
 
 
 if __name__ == "__main__":
