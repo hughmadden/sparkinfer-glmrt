@@ -9,7 +9,8 @@ from cutlass import Int32, Int64
 from ._common import GLMFGeometry, Operand, Scalar, compile_program
 from ._glm_kernels import BatchedBf16Gemm
 from ._glmf_fp8 import quant_scratch_bytes
-from .glmf import FP8_ROWS, _batched_warps, _check_rows, _w8
+from ._fp8_weights import FP8_DECODE_ROWS
+from .glmf import _batched_warps, _check_rows, _w8
 
 
 def _check_geometry(g: GLMFGeometry):
@@ -54,9 +55,9 @@ class GlmfMlaOutputRows:
         if owned_rows > Int32(0):
             route = fp8_rows
             if cutlass.const_expr(not self.prefill):
-                route = Int32(0)
-                if total_rows <= Int32(FP8_ROWS):
-                    route = Int32(FP8_ROWS)
+                # The FP8 route covers the whole decode capacity at every width, so it no
+                # longer turns on and off with total_rows, which moved a row's K order.
+                route = Int32(FP8_DECODE_ROWS)
             self.proj(x, w_fp8, w_scale, out, owned_rows, route, Int64(scratch.toint()), stream)
 
 
@@ -64,10 +65,11 @@ def compile_glmf_mla_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
                                    fp8_only: str = "decode"):
     """Full-N/full-K MLA projection for owned token rows over native block FP8.
 
-    Decode uses the original full-head GEMV only when global ``total_rows<=16``;
-    wider global batches use W8A16 TMA even for skinny owned rows. Prefill
-    retains the original ``fp8_rows`` A8/W8A16 switch. Zero owned rows skips
-    projection. Query scratch with global total rows, not owned rows.
+    Decode runs the full-head GEMV at every width up to the program's capacity
+    (``FP8_DECODE_ROWS``), so neither the route nor a row's K reduction order
+    depends on ``total_rows``. Prefill retains the original ``fp8_rows``
+    A8/W8A16 switch. Zero owned rows skips projection. Query scratch with global
+    total rows, not owned rows.
     """
     _check_geometry(g_half)
     max_rows = _check_rows(max_rows)
@@ -85,7 +87,7 @@ def compile_glmf_mla_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
         scalars=(Scalar("owned_rows"), Scalar("total_rows"), Scalar("fp8_rows")),
         key=(max_rows, fp8_only, fn.key()),
         geometry={"n": n, "k": k, "max_rows": max_rows, "fp8_only": fp8_only,
-                  "decode_gemv_rows": FP8_ROWS, "route_rows": "total_rows", "scratch_rows": "total_rows"},
+                  "decode_gemv_rows": FP8_DECODE_ROWS, "scratch_rows": "total_rows"},
         scratch={"scratch": lambda total_rows: quant_scratch_bytes(k, (int(total_rows) + 1) // 2)
                  if prefill else 0}, doc=compile_glmf_mla_output_rows_aot.__doc__)
 

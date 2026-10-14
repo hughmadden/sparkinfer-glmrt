@@ -95,10 +95,11 @@ followed by ``w_fp8`` (E4M3 ``[N, K]``) and ``w_scale`` (FP32 ``[N, K/128]``,
 one scale per output row and 128-wide K block, so the checkpoint's 128x128
 grids and the per-head full-attention ``k_proj`` grid expand exactly, and a
 BF16 weight such as ``o_proj`` quantizes per row), and the scalar
-``fp8_rows`` follows ``rows``: steps of ``rows <= min(fp8_rows, MIMO_FP8_ROWS)``
-read the E4M3 copy through ``MmaFp8Gemv`` (one 16-row tile up to 16 rows, two
-above; weights widened to ``bf16(w * s)``, the BF16 program's dequantized
-weight), longer steps the BF16 weight; ``fp8_rows`` 0 turns FP8 off.
+``fp8_rows`` follows ``rows``: steps of ``rows <= min(fp8_rows, FP8_DECODE_ROWS)``
+read the E4M3 copy through ``MmaFp8Gemv`` (one 16-row tile up to 16 rows, then
+multi-tile rows on the same warps/groups, so a row's K reduction never moves;
+weights widened to ``bf16(w * s)``, the BF16 program's dequantized weight),
+longer steps the BF16 weight; ``fp8_rows`` 0 turns FP8 off.
 
 ``compile_mimo_head_fp8_aot(g)``: FP32 logits of up to 16 decode rows over an
 E4M3 LM head with per-row x 128-K scales::
@@ -130,11 +131,6 @@ from ._mimo_kernels import (
 KV_FP8_GROUP = 64
 KV_GROUPS = {"fp8": 64, "int8": 32}
 _KV8 = {"bf16": None, "fp8": "e4m3", "int8": "s8"}
-
-# Most rows a MiMo decode program reads the E4M3 copies for (qkv, o, dense FFN): DFlash
-# verify steps of 17-32 rows stay on FP8 (V2.6 Pro coordinator alone, 1 RTX PRO 6000:
-# 16 rows 23.3 ms, 24 rows 44.6 ms on the BF16 projections).
-MIMO_FP8_ROWS = 32
 
 __all__ = [
     "KV_FP8_GROUP",
@@ -219,7 +215,7 @@ class _Producer:
         self.g, self.kind, self.fp8 = g, kind, bool(fp8)
         self.kv = _check_kv(kv)
         self.kv_group = _group(kv, kv_group)
-        self.qkv = _Fp8Switch(g.qkv_width(kind), g.hidden, fp8=True, row_scales=True, wide_rows=MIMO_FP8_ROWS) if fp8 \
+        self.qkv = _Fp8Switch(g.qkv_width(kind), g.hidden, fp8=True, row_scales=True) if fp8 \
             else glm_projection(g.qkv_width(kind), g.hidden)
         self.post = MimoQkvRope(heads=g.heads, kv_heads=g.kv_heads(kind), v_scale=g.v_scale,
                                 head=g.qk_head_dim, v_head=g.v_head_dim, k_stride=g.qkv_k_stride,
@@ -254,15 +250,16 @@ def mimo_w8(n: int, k: int, prefill_rows: int | None):
     """An ``Fp8Projection`` over a per-row x 128-K scaled E4M3 weight (MiMo's FP8 tensors: the
     checkpoint's E4M3 bytes with its 128x128 or per-head grid expanded per row; decode programs
     take the scales row major, ``{w}_scale [N, K/128]``, prefill programs K-block major,
-    ``{w}_kscale [K/128, N]``): decode rows run the 16-row GEMV, the two-tile GEMV up to
-    ``MIMO_FP8_ROWS`` and the W8A16 TMA GEMM above; prefill rows run W8A8 (``fp8_rows`` nonzero)
-    or W8A16. (A K-block-major decode GEMV reads its scales one cache line per K block: SM120,
-    16 rows of 14848x4096 back to back over 40 weights, 40.5 -> 48.7 us.)"""
+    ``{w}_kscale [K/128, N]``): decode rows run the 16-row GEMV, a multi-tile GEMV up to the
+    decode capacity (``FP8_DECODE_ROWS``) and the W8A16 TMA GEMM above; prefill rows run W8A8
+    (``fp8_rows`` nonzero) or W8A16. (A K-block-major decode GEMV reads its scales one cache
+    line per K block: SM120, 16 rows of 14848x4096 back to back over 40 weights, 40.5 -> 48.7
+    us.)"""
     from ._fp8_weights import Fp8Projection, gemv_warps
 
     warps, groups = FP8_GEMV_CONFIG.get((n, k), (gemv_warps(k), 4))
     return Fp8Projection(n, k, prefill_rows=prefill_rows, row_scales=True, gemv_rows=FP8_ROWS,
-                         wide_rows=MIMO_FP8_ROWS, warps=warps, groups=groups)
+                         warps=warps, groups=groups)
 
 
 def mimo_w8_scratch_bytes(k: int, rows: int, prefill: bool) -> int:
@@ -529,7 +526,7 @@ def compile_mimo_attention_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, kind: str, ro
 class _Output:
     def __init__(self, g: MiMoGeometry, fp8: bool = False):
         self.fp8 = bool(fp8)
-        self.o = _Fp8Switch(g.hidden, g.heads * g.v_head_dim, fp8=True, row_scales=True, wide_rows=MIMO_FP8_ROWS) if fp8 \
+        self.o = _Fp8Switch(g.hidden, g.heads * g.v_head_dim, fp8=True, row_scales=True) if fp8 \
             else glm_projection(g.hidden, g.heads * g.v_head_dim)
 
     def key(self) -> tuple:

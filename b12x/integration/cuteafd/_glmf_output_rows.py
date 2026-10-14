@@ -8,7 +8,7 @@ from cutlass import Int32, Int64
 
 from b12x._lib.intrinsics import ld_global_v4_u32, st_global_v4_u32
 from ._common import GLMFGeometry, Operand, Scalar, compile_program
-from ._fp8_weights import Fp8Projection
+from ._fp8_weights import FP8_DECODE_ROWS, Fp8Projection
 from .glmf import _check_rows, _ptr
 
 
@@ -16,8 +16,7 @@ class GlmfOutputRows:
     def __init__(self, n: int, k: int, max_rows: int, prefill: bool, expanded: bool):
         self.prefill = bool(prefill)
         self.proj = Fp8Projection(n, k, prefill_rows=max_rows if prefill else None,
-            row_scales=True, kmajor=True, warps=8, groups=2, wide_rows=32,
-            wide_warps=8, wide_groups=2, prefill_mask=0)
+            row_scales=True, kmajor=True, warps=8, groups=2, prefill_mask=0)
         self.expanded = None
         if expanded:
             from ._glmf_prefill_w8 import ExpandedW8Prefill
@@ -38,11 +37,10 @@ class GlmfOutputRows:
                 else:
                     self.proj(x, w_fp8, w_kscale, out, owned_rows, Int32(0), Int64(scratch.toint()), stream)
             else:
-                fp8_rows = Int32(0)
-                if cutlass.const_expr(not self.prefill):
-                    if total_rows <= Int32(32):
-                        fp8_rows = Int32(32)
-                self.proj(x, w_fp8, w_kscale, out, owned_rows, fp8_rows, Int64(scratch.toint()), stream)
+                # The FP8 route covers the whole decode capacity at every width, so it no
+                # longer turns on and off with total_rows, which moved a row's K order.
+                self.proj(x, w_fp8, w_kscale, out, owned_rows, Int32(FP8_DECODE_ROWS),
+                          Int64(scratch.toint()), stream)
 
 
 class GlmfJoinRows:
@@ -92,8 +90,10 @@ def compile_glmf_kda_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
                                    fp8_only: str = "decode", prefill_expanded: bool = False):
     """Full-N/full-K BF16 output for owned token rows over FP8 row128 weights.
 
-    Decode uses the 8-warp/2-group GEMV when global ``total_rows <=32``,
-    otherwise W8A16 TMA, even if ``owned_rows <=32``. Prefill always uses
+    Decode always uses the 8-warp/2-group GEMV, at every width up to the
+    program's capacity (``FP8_DECODE_ROWS``), so the route and the K reduction
+    order do not depend on ``total_rows`` -- the thin and multi-tile GEMV tiles
+    carry the same (warps, groups) and walk K the same way. Prefill always uses
     W8A16; optional expansion starts at global ``total_rows >=512``.
     Zero owned rows skips projection. Query scratch with global total rows.
     """
@@ -115,7 +115,7 @@ def compile_glmf_kda_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
                   Operand("scratch", torch.uint8, "[scratch_bytes]", "scratch")),
         scalars=(Scalar("owned_rows"), Scalar("total_rows")), key=(max_rows, fp8_only, fn.key()),
         geometry={"n": n, "k": k, "max_rows": max_rows, "fp8_only": fp8_only,
-                  "prefill_expanded": prefill_expanded, "decode_gemv_rows": 32,
-                  "route_rows": "total_rows", "scratch_rows": "total_rows"},
+                  "prefill_expanded": prefill_expanded, "decode_gemv_rows": FP8_DECODE_ROWS,
+                  "scratch_rows": "total_rows"},
         scratch={"scratch": lambda total_rows: n * k * 2 if prefill_expanded and total_rows >= 512 else 0},
         doc=compile_glmf_kda_output_rows_aot.__doc__)

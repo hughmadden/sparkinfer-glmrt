@@ -93,8 +93,9 @@ then merges FP32 partials. Explicit prefill writes BF16 directly at any live wid
 ``fp8_only="decode" | "prefill"`` (producer and attn_o): ``w_in`` / ``w_o`` are
 taken as E4M3 only, ``w_in_fp8``/``w_in_scale`` and ``w_o_fp8``/``w_o_scale``
 (FP32 128x128 block scales ``[ceil(N/128), K/128]``, one layout for decode and
-prefill), no BF16 weight operand: decode programs run the 16-row tensor-core
-GEMV (bitwise the ``fp8`` programs' E4M3 route) then W8A16 TMA; prefill
+prefill), no BF16 weight operand: decode programs run FP8 GEMV tiles up to the
+program's decode capacity (``FP8_DECODE_ROWS``; bitwise the ``fp8`` programs'
+E4M3 route) then W8A16 TMA; prefill
 programs take ``fp8_rows`` (0: W8A16, bitwise the BF16 program over
 ``bf16(w * s)``; nonzero: W8A8, E4M3 activations per row and 128-K block).
 Their scratch appends the W8A8 rows (prefill) after the regions below.
@@ -117,7 +118,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
 
-from ._fp8_weights import FP8_GEMV_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
+from ._fp8_weights import FP8_DECODE_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
     w8_scalars
 from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
 from ._glm_kernels import glm_projection
@@ -274,7 +275,7 @@ class _ProducerW8Decode(_ProducerW8):
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         self.body(x, w_in_fp8, w_in_scale, q_norm, k_norm, iq_norm, ik_norm, positions,
                   rope_positions, block_rope_positions, kv_slots, pool_slots,
-                  kv_cache, token_keys, index_cache, query, gate, index_q, scratch, rows, Int32(FP8_GEMV_ROWS),
+                  kv_cache, token_keys, index_cache, query, gate, index_q, scratch, rows, Int32(FP8_DECODE_ROWS),
                   stream)
 
 
@@ -295,8 +296,9 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
                                     fp8: bool = False, fp8_only: str | None = None,
                                     kv_format: str = "bf16") -> AotProgram:
     """Full-attention producer for ``rows <= max_rows``; see the module docstring.
-    ``fp8`` adds ``w_in_fp8``/``w_in_scale`` (E4M3, FP32 128x128 block scales) for rows <= 16;
-    ``fp8_only`` (``"decode"`` / ``"prefill"``) takes them in place of ``w_in``."""
+    ``fp8`` adds ``w_in_fp8``/``w_in_scale`` (E4M3, FP32 128x128 block scales) for rows up to
+    the program's decode capacity (``FP8_DECODE_ROWS``); ``fp8_only`` (``"decode"`` /
+    ``"prefill"``) takes them in place of ``w_in``."""
     max_rows = _check_rows(max_rows)
     if fp8_only is not None and fp8:
         raise ValueError("fp8 and fp8_only are exclusive")
@@ -680,7 +682,7 @@ class _AttnOW8Decode(_AttnOW8):
     @cute.jit
     def __call__(self, attn: cute.Pointer, gate: cute.Pointer, w_o_fp8: cute.Pointer, w_o_scale: cute.Pointer,
                  out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        self.body(attn, gate, w_o_fp8, w_o_scale, out, scratch, rows, Int32(FP8_GEMV_ROWS), stream)
+        self.body(attn, gate, w_o_fp8, w_o_scale, out, scratch, rows, Int32(FP8_DECODE_ROWS), stream)
 
 
 class _AttnOW8Prefill(_AttnOW8):
@@ -693,7 +695,8 @@ class _AttnOW8Prefill(_AttnOW8):
 def compile_qwen4_attn_o_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
                              fp8: bool = False, fp8_only: str | None = None) -> AotProgram:
     """``o_proj(attn * sigmoid(gate))``; see the module docstring. ``fp8`` adds
-    ``w_o_fp8``/``w_o_scale`` for rows <= 16; ``fp8_only`` (``"decode"`` /
+    ``w_o_fp8``/``w_o_scale`` for rows up to the program's decode capacity;
+    ``fp8_only`` (``"decode"`` /
     ``"prefill"``) takes them in place of ``w_o``."""
     max_rows = _check_rows(max_rows)
     if fp8_only is not None:

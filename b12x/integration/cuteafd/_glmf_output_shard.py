@@ -8,7 +8,7 @@ from cutlass import Int32, Int64
 
 from b12x._lib.intrinsics import ld_global_v4_u32, st_global_v4_u32
 from ._common import GLM53_FLASH, GLMFGeometry, Operand, Scalar, compile_program
-from ._fp8_weights import Fp8Projection
+from ._fp8_weights import FP8_DECODE_ROWS, Fp8Projection
 from .glmf import _check_rows, _ptr
 
 
@@ -44,8 +44,7 @@ class GlmfJoin:
 class GlmfOutputShard:
     def __init__(self, n: int, k: int, max_rows: int, prefill: bool, expanded: bool):
         self.proj = Fp8Projection(n, k, prefill_rows=max_rows if prefill else None,
-            row_scales=True, kmajor=True, warps=8, groups=2, wide_rows=32,
-            wide_warps=8, wide_groups=2, prefill_mask=0)
+            row_scales=True, kmajor=True, warps=8, groups=2, prefill_mask=0)
         self.expanded = None
         if expanded:
             from ._glmf_prefill_w8 import ExpandedW8Prefill
@@ -61,9 +60,9 @@ class GlmfOutputShard:
             if rows >= Int32(512):
                 self.expanded(x, w_fp8, w_kscale, out, _ptr(cutlass.BFloat16, Int64(scratch.toint())), rows, stream)
             else:
-                self.proj(x, w_fp8, w_kscale, out, rows, Int32(32), Int64(scratch.toint()), stream)
+                self.proj(x, w_fp8, w_kscale, out, rows, Int32(FP8_DECODE_ROWS), Int64(scratch.toint()), stream)
         else:
-            self.proj(x, w_fp8, w_kscale, out, rows, Int32(32), Int64(scratch.toint()), stream)
+            self.proj(x, w_fp8, w_kscale, out, rows, Int32(FP8_DECODE_ROWS), Int64(scratch.toint()), stream)
 
 
 def compile_glmf_join_aot(half_width: int):
@@ -99,6 +98,6 @@ def compile_glmf_kda_output_shard_aot(g_half: GLMFGeometry = GLM53_FLASH, *, max
                   Operand("scratch", torch.uint8, "[scratch_bytes]", "scratch")),
         scalars=(Scalar("rows"),), key=(max_rows, fp8_only, fn.key()),
         geometry={"n": n, "k": k, "max_rows": max_rows, "fp8_only": fp8_only,
-                  "prefill_expanded": prefill_expanded, "decode_gemv_rows": 32},
+                  "prefill_expanded": prefill_expanded, "decode_gemv_rows": FP8_DECODE_ROWS},
         scratch={"scratch": lambda rows: n * k * 2 if prefill_expanded and rows >= 512 else 0},
         doc=compile_glmf_kda_output_shard_aot.__doc__)

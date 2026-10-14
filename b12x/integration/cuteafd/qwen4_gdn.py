@@ -34,8 +34,9 @@ projection rows ``C + V + 2 * 48`` = 16480. ``rows`` is the live row count
 projections as E4M3 only (no BF16 copy): ``w_in_fp8 [P,H]`` / ``w_in_scale`` and
 ``w_out_fp8 [H,V]`` / ``w_out_scale`` (FP32 128x128 block scales ``[ceil(N/128), K/128]``,
 one layout for decode and prefill programs) in place of ``w_in`` / ``w_out``
-(``Fp8Projection``: decode programs run the 16-row tensor-core GEMV, bitwise the
-``fp8`` programs' E4M3 route, then the W8A16 TMA GEMM; prefill programs add the
+(``Fp8Projection``: decode programs run FP8 GEMV tiles up to the program's decode
+capacity (``FP8_DECODE_ROWS``), bitwise the ``fp8`` programs' E4M3 route, then
+the W8A16 TMA GEMM; prefill programs add the
 scalar ``fp8_rows``: 0 runs W8A16, bitwise the BF16 program over ``bf16(w * s)``
 weights, nonzero W8A8 with E4M3 activations per row and 128-K block for ``w_out``;
 ``w_in`` (16480 rows, not whole 128-row scale blocks) stays W8A16).
@@ -63,7 +64,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
 
-from ._fp8_weights import FP8_GEMV_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
+from ._fp8_weights import FP8_DECODE_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
     w8_scalars
 from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
 from ._glm_kernels import glm_projection
@@ -320,9 +321,9 @@ class _GdnSpec(_Gdn):
 
 
 class _GdnFp8(_Gdn):
-    """The GDN layer with FP8 in/out projections for decode rows (<= 16 live
-    rows read the E4M3 copies, more rows the BF16 weights) and the speculative
-    replay record."""
+    """The GDN layer with FP8 in/out projections for decode rows (live rows up to the
+    decode capacity read the E4M3 copies, more rows the BF16 weights) and the
+    speculative replay record."""
 
     def __init__(self, g: Qwen4Geometry, max_rows: int = 64):
         super().__init__(g, max_rows, fp8=True)
@@ -361,7 +362,7 @@ class _GdnW8(_Gdn):
 
 
 class _GdnW8Decode(_GdnW8):
-    """Decode capacities (speculative replay record; GEMV to 16 rows, W8A16 TMA above)."""
+    """Decode capacities (speculative replay record; FP8 GEMV to the decode capacity, W8A16 above)."""
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in_fp8: cute.Pointer, w_in_scale: cute.Pointer, conv_w: cute.Pointer,
@@ -370,7 +371,7 @@ class _GdnW8Decode(_GdnW8):
                  seq_first: cute.Pointer, out: cute.Pointer, replay: cute.Pointer, scratch: cute.Pointer,
                  rows: Int32, spec: Int32, stream: cuda.CUstream):
         self.body_w8(x, w_in_fp8, w_in_scale, conv_w, a_log, dt_bias, norm_w, w_out_fp8, w_out_scale, conv_state,
-                     state, slots, seq_first, out, replay, scratch, rows, spec, Int32(FP8_GEMV_ROWS), stream)
+                     state, slots, seq_first, out, replay, scratch, rows, spec, Int32(FP8_DECODE_ROWS), stream)
 
 
 class _GdnW8Prefill(_GdnW8):
@@ -417,7 +418,7 @@ def _compile_gdn_w8(g: Qwen4Geometry, max_rows: int, mode: str) -> AotProgram:
         launch, name="qwen4_gdn", operands=operands, scalars=scalars, key=(max_rows, mode, launch.key()),
         geometry={"hidden": h, "key_heads": g.gdn_key_heads, "value_heads": heads, "head_dim": g.gdn_head_dim,
                   "max_rows": max_rows, "in_width": p, "eps": g.norm_eps, "fp8_weights": "only", "mode": mode,
-                  "fp8_gemv_rows": FP8_GEMV_ROWS if not prefill else 0,
+                  "fp8_gemv_rows": FP8_DECODE_ROWS if not prefill else 0,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if launch.chunked is not None else None,
                   "replay_rows": REPLAY_ROWS if spec else None, "replay_bytes": record if spec else None},
         scratch={"scratch": launch.scratch_bytes},
@@ -429,7 +430,8 @@ def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int
                           fp8_only: str | None = None) -> AotProgram:
     """One GDN layer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds ``w_in_fp8``/``w_in_scale`` and ``w_out_fp8``/``w_out_scale`` (E4M3 with
-    FP32 128x128 block scales) after each BF16 weight for rows <= 16. ``fp8_only``
+    FP32 128x128 block scales) after each BF16 weight for rows up to the program's
+    decode capacity (``FP8_DECODE_ROWS``). ``fp8_only``
     (``"decode"`` for capacities <= 64, ``"prefill"`` above) takes those E4M3
     weights and scales in place of the BF16 ones (no BF16 weight operand)."""
     max_rows = int(max_rows)

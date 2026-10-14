@@ -67,7 +67,7 @@ import torch
 from cutlass import Int32, Int64
 
 from ._common import GLM53, AotProgram, GLMGeometry, Operand, Scalar, compile_program
-from ._fp8_weights import FP8_GEMV_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
+from ._fp8_weights import FP8_DECODE_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
     w8_scalars
 from ._glm_kernels import GlmAddRmsNorm, GlmSwiGLU
 from ._tensor_fp8 import ALPHA0, ALPHA1
@@ -191,7 +191,7 @@ class _FfnW8Decode(_FfnW8):
                  w_down_fp8: cute.Pointer, w_down_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
         self.body(x, w_gate_up_fp8, w_gate_up_scale, w_down_fp8, w_down_scale, out, scratch, rows,
-                  Int32(FP8_GEMV_ROWS), stream)
+                  Int32(FP8_DECODE_ROWS), stream)
 
 
 class _FfnW8Prefill(_FfnW8):

@@ -165,7 +165,7 @@ def test_glmf_kda_w8_bf16_recipe_cross_width_bits(fp8_rows, heads, dtype, kind):
 
     def run(cap, rows, start=0, spec=0):
         prog = P(g, max_rows=cap, fp8_only="decode", state_dtype="bfloat16",
-                 decode_recipe="w8a16", output_dtype=dtype, output_kind=kind)
+                 output_dtype=dtype, output_kind=kind)
         ss, cc = state[start:start + rows].clone(), conv[start:start + rows].clone()
         local_slots = torch.arange(rows, device="cuda", dtype=torch.int32)
         out = torch.full((rows, output_width), float("nan"), device="cuda", dtype=getattr(torch, dtype))
@@ -221,7 +221,7 @@ def test_glmf_kda_w8_bf16_canonical_sequence_commit_and_graph_bits(heads, dtype,
     shared = (weights["w_fg"], weights["conv_w"], weights["a_log"],
               weights["dt_bias"], weights["o_norm"])
     prog = P(g, max_rows=128, fp8_only="decode", state_dtype="bfloat16",
-             decode_recipe="w8a16", output_dtype=dtype, output_kind=kind)
+             output_dtype=dtype, output_kind=kind)
     seqs = rows // per_seq
 
     def buffers():
@@ -311,8 +311,9 @@ def test_glmf_kda_w8_decode_gemv_rows_bitwise(rows, spec):
 @pytest.mark.parametrize("rows", (17, 24, 33, 64))
 @pytest.mark.parametrize("spec", (0, 1))
 def test_glmf_kda_w8_decode_wide_rows(rows, spec):
-    """Rows 17-64: W8A16 over the one FP8 copy against the W8A16 reference (the dual-copy
-    program over the dequantized weight); reports the deviation from the original BF16."""
+    """Rows 17-64: the multi-tile GEMV over the one FP8 copy against the reference (the
+    dual-copy program over the dequantized weight, whose step of these rows leaves the thin
+    tile); reports the deviation from the original BF16."""
     w = _weights()
     ref, new = _run("decode", 64, rows, 16, spec, w["in_q"][3], w["o_q"][3])
     orig, _ = _run("decode", 64, rows, 16, spec, w["w_in"], w["w_o"])

@@ -4,19 +4,30 @@ GLM checkpoints store dense weights as E4M3 ``[N, K]`` with one FP32 scale
 per 128x128 block (``[ceil(N/128), K/128]``). Re-quantizing those scales to
 powers of two costs 0.025 nats, so these kernels apply them exactly:
 
-``MmaFp8Gemv``   decode rows (<= 16 in the programs): m16n8k16 BF16 MMAs fed
+``MmaFp8Gemv``   decode rows (one thin 16-row tile, then multi-tile rows to the
+    program's capacity on the same ``warps``/``groups``): m16n8k16 BF16 MMAs fed
     straight from global memory, weights widened in registers to
     ``bf16(w * s)`` (exactly the BF16 program's dequantized weight), FP32
     accumulation; reads half the weight bytes of the BF16 GEMV.
 ``TmaFp8Gemm``    the BF16 TMA tensor-core GEMM with E4M3 weight tiles widened
     to ``bf16(w * s)`` in shared memory; bitwise equal to the BF16 kernel over
     dequantized weights (W8A16; block, per-row or K-block-major per-row scales).
-``RoutedFp8Projection``  ``MmaFp8Gemv`` up to 16 live rows, the BF16 TMA GEMM
-    over the BF16 copy of the weight above.
+``RoutedFp8Projection``  ``MmaFp8Gemv`` up to ``decode_rows`` live rows, the
+    BF16 TMA GEMM over the BF16 copy of the weight above.
 ``Fp8Projection``  a weight held only as E4M3 + scales (no BF16 copy): decode
     programs run ``MmaFp8Gemv`` then ``TmaFp8Gemm``; prefill programs W8A8
     (``BlockFp8Projection``: E4M3 activations per row and 128-K block, the
     official FP8 releases' served numerics) or ``TmaFp8Gemm`` on a launch switch.
+
+A decode projection is row-invariant: every width from 1 to its program's row
+capacity is computed by ``MmaFp8Gemv`` tiles that walk K in one order -- a thin
+``FP8_GEMV_ROWS``-row tile and a multi-tile GEMV to ``decode_rows`` that keeps
+the thin tile's ``warps``/``groups``. ``m_tiles`` only decides which row tile an
+accumulator set belongs to; it does not change the K-blocks, the k-slot order or
+the warp reduction order, so a row's output bits do not move when the batch
+crosses the 16-row tile boundary. Only widths past the program's capacity (a
+prefill step, or ``decode_rows`` itself for a program exported wider) take the
+TMA GEMM, which reduces K in a different order.
 """
 
 from __future__ import annotations
@@ -37,8 +48,19 @@ from b12x._lib.intrinsics import bf16_mma_m16n8k16_f32, ld_shared_v2_u32, shared
 
 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_stream
 
-__all__ = ["FP8_GEMV_ROWS", "Fp8Projection", "decode_tile_n", "MmaFp8Gemv", "RoutedFp8Projection", "TmaFp8Gemm", "check_w8_mode",
-           "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps", "projection", "w8_scalars"]
+__all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_ROWS", "Fp8Projection", "decode_tile_n", "MmaFp8Gemv", "RoutedFp8Projection",
+           "TmaFp8Gemm", "check_w8_mode", "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps",
+           "projection", "w8_scalars"]
+
+
+# Most decode rows ``MmaFp8Gemv``'s thin tile computes (its M-tile ceiling): the
+# register-resident GEMV every decode program runs at C1 and at narrow batches.
+FP8_GEMV_ROWS = 16
+# Row capacity every decode program reads the FP8 weights through one canonical
+# GEMV reduction up to, unless the caller declares its own. The multi-tile GEMV
+# tiles carry the thin tile's (warps, groups), so the switch at FP8_GEMV_ROWS is
+# a reduction-order-preserving split of the same K walk.
+FP8_DECODE_ROWS = 64
 
 
 def fp8_scale_shape(n: int, k: int) -> tuple[int, int]:
@@ -56,26 +78,41 @@ def _ld_f32(address, *, loc=None, ip=None):
 
 class RoutedFp8Projection:
     """``out = x @ w^T`` for decode rows: ``MmaFp8Gemv`` over the E4M3 weight
-    and its FP32 block scales up to ``max_fp8_rows`` live rows, the BF16 TMA
+    and its FP32 block scales up to ``decode_rows`` live rows, the BF16 TMA
     GEMM over ``w_bf16`` (the same weight dequantized) above; the branch is
-    on the ``rows`` scalar."""
+    on the ``rows`` scalar.
 
-    def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, max_fp8_rows: int = 16):
+    Both GEMV tiles are built with one ``warps``/``groups``, so a row's bits do
+    not move when the batch crosses the ``FP8_GEMV_ROWS`` tile boundary."""
+
+    def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, decode_rows: int | None = None):
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
-        self.max_fp8_rows = int(max_fp8_rows)
-        self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=self.max_fp8_rows, warps=gemv_warps(self.k),
-                              out_dtype=out_dtype)
+        self.decode_rows = FP8_DECODE_ROWS if decode_rows is None else int(decode_rows)
+        if self.decode_rows < FP8_GEMV_ROWS:
+            raise ValueError(f"an FP8 projection covers at least {FP8_GEMV_ROWS} rows")
+        warps = gemv_warps(self.k)
+        self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_GEMV_ROWS, warps=warps, out_dtype=out_dtype)
+        self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=self.decode_rows, warps=warps,
+                                   out_dtype=out_dtype) if self.decode_rows > FP8_GEMV_ROWS else None
+        self.max_fp8_rows = self.decode_rows
         self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype)
 
     def key(self) -> tuple:
-        return (self.fp8.key(), self.max_fp8_rows, tuple(sorted(self.large.config.items())))
+        return (None if self.fp8_wide is None else self.fp8_wide.key(), self.max_fp8_rows,
+                tuple(sorted(self.large.config.items())))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_bf16: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer,
                  out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         if rows <= Int32(self.max_fp8_rows):
-            self.fp8(x, w_fp8, scale, out, rows, stream)
+            if cutlass.const_expr(self.fp8_wide is None):
+                self.fp8(x, w_fp8, scale, out, rows, stream)
+            else:
+                if rows <= Int32(FP8_GEMV_ROWS):
+                    self.fp8(x, w_fp8, scale, out, rows, stream)
+                else:
+                    self.fp8_wide(x, w_fp8, scale, out, rows, stream)
         else:
             self.large(x, w_bf16, out, rows, stream)
 
@@ -97,9 +134,15 @@ class _Bf16Projection:
         self.inner(x, w_bf16, out, rows, stream)
 
 
-def projection(n: int, k: int, fp8: bool):
-    """A GLM projection with the ``(x, w, w_fp8, scale, out, rows, stream)`` call."""
-    return RoutedFp8Projection(n, k) if fp8 else _Bf16Projection(n, k)
+def projection(n: int, k: int, fp8: bool, *, decode_rows: int | None = None):
+    """A GLM projection with the ``(x, w, w_fp8, scale, out, rows, stream)`` call.
+
+    ``decode_rows`` (FP8 only): the GEMV's row capacity, defaulting to
+    ``FP8_DECODE_ROWS``. One ``projection`` serves both a decode program (whose
+    rows are the decode stream, canonical to its capacity) and a prefill program
+    (whose narrow steps are prefill tails, not the decode stream), so a caller
+    that wants a narrower capacity passes it explicitly."""
+    return RoutedFp8Projection(n, k, decode_rows=decode_rows) if fp8 else _Bf16Projection(n, k)
 
 
 class Fp8Projection:
@@ -109,11 +152,10 @@ class Fp8Projection:
     ``[K/128, N]`` in prefill programs).
 
     Decode programs (``prefill_rows`` None): ``MmaFp8Gemv`` for ``rows <= min(fp8_rows,
-    gemv_rows)`` (a 16-row tile, plus a ``wide_rows`` multi-tile GEMV above 16 when given),
-    ``TmaFp8Gemm`` above: W8A16, bitwise the BF16 programs over ``bf16(w * s)`` weights.
-
-    ``decode_recipe="w8a16"`` freezes TMA at every decode width, ignoring fp8_rows.
-    The mixed default and its cache key are unchanged.
+    max_gemv_rows)`` (the ``gemv_rows``-row tile to ``gemv_rows``, the multi-tile GEMV with the
+    same ``warps``/``groups`` above it), ``TmaFp8Gemm`` above: W8A16, bitwise the BF16 programs
+    over ``bf16(w * s)`` weights. Both GEMV tiles walk K in one order, so the decode range is
+    row-invariant to ``max_gemv_rows``.
 
     Prefill programs: W8A8 when ``fp8_rows & prefill_mask`` is nonzero (``BlockFp8Projection``:
     E4M3 activations per row and 128-K block with FP32 ``amax / 448`` scales, the official FP8
@@ -124,12 +166,7 @@ class Fp8Projection:
                  kmajor: bool = False, gemv_rows: int = 16, wide_rows: int = 0, warps: int | None = None,
                  groups: int = 4, prefill_mask: int = 0xFF, out_dtype=cutlass.BFloat16,
                  wide_warps: int | None = None, wide_groups: int | None = None,
-                 decode_recipe: str = "mixed"):
-        if decode_recipe not in ("mixed", "w8a16"):
-            raise ValueError("decode_recipe must be mixed or w8a16")
-        if prefill_rows is not None and decode_recipe != "mixed":
-            raise ValueError("decode_recipe applies only to decode projections")
-        self.decode_recipe = decode_recipe
+                 decode_rows: int | None = None):
         self.n, self.k = int(n), int(k)
         self.row_scales = bool(row_scales)
         # Per-row scales K-block major in decode programs too (one copy serves both).
@@ -151,27 +188,33 @@ class Fp8Projection:
             self.max_gemv_rows = 0
         else:
             warps = gemv_warps(self.k) if warps is None else int(warps)
-            self.gemv = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows), warps=warps, groups=int(groups),
+            groups = int(groups)
+            self.gemv = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows), warps=warps, groups=groups,
                                    row_scales=self.row_scales, kmajor=self.kmajor, out_dtype=out_dtype)
-            if int(wide_rows) > int(gemv_rows):
-                self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=int(wide_rows),
-                                            warps=warps if wide_warps is None else int(wide_warps),
-                                            groups=int(groups) if wide_groups is None else int(wide_groups),
-                                            row_scales=self.row_scales, kmajor=self.kmajor,
-                                            out_dtype=out_dtype)
+            # The decode capacity: FP8_DECODE_ROWS unless the caller exports its program wider;
+            # wide_rows only raises it, so a narrow wide_rows cannot leave decode rows above it
+            # on the TMA route (whose K order differs).
+            cap = max(FP8_DECODE_ROWS if decode_rows is None else int(decode_rows), int(wide_rows),
+                      int(gemv_rows))
+            if (warps if wide_warps is None else int(wide_warps),
+                    groups if wide_groups is None else int(wide_groups)) != (warps, groups):
+                raise ValueError("the wide GEMV tile must keep the thin tile's warps and groups: "
+                                 "one K order covers the decode range")
+            self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=cap, warps=warps, groups=groups,
+                                        row_scales=self.row_scales, kmajor=self.kmajor,
+                                        out_dtype=out_dtype) if cap > int(gemv_rows) else None
             self.gemv_rows = int(gemv_rows)
-            self.max_gemv_rows = max(int(gemv_rows), int(wide_rows))
+            self.max_gemv_rows = cap if self.gemv_wide is not None else int(gemv_rows)
             tile_n = decode_tile_n(self.n)
             self.w8a16 = TmaFp8Gemm(self.n, self.k, scales=("row_kmajor" if self.kmajor else "row")
                                     if self.row_scales else "block", tile_n=tile_n,
                                     num_stages=4 if tile_n == 128 else 6, out_dtype=out_dtype)
 
     def key(self) -> tuple:
-        key = (self.n, self.k, self.row_scales, self.kmajor, self.prefill_mask, self.max_gemv_rows,
+        return (self.n, self.k, self.row_scales, self.kmajor, self.prefill_mask, self.max_gemv_rows,
                 None if self.gemv is None else self.gemv.key(),
                 None if self.gemv_wide is None else self.gemv_wide.key(),
                 None if self.w8a8 is None else self.w8a8.key(), self.w8a16.key())
-        return key if self.decode_recipe == "mixed" else key + ("decode_recipe", self.decode_recipe)
 
     def prefill_scratch_bytes(self, rows: int) -> int:
         from ._glmf_fp8 import quant_scratch_bytes
@@ -189,9 +232,6 @@ class Fp8Projection:
                     self.w8a8(x, w_fp8, scale, out, qscratch, rows, stream)
                 else:
                     self.w8a16(x, w_fp8, scale, out, rows, stream)
-        elif cutlass.const_expr(self.decode_recipe == "w8a16"):
-            # Freeze the reduction recipe across M1 and verification widths.
-            self.w8a16(x, w_fp8, scale, out, rows, stream)
         else:
             limit = fp8_rows
             if limit > Int32(self.max_gemv_rows):
@@ -206,10 +246,6 @@ class Fp8Projection:
                         self.gemv_wide(x, w_fp8, scale, out, rows, stream)
             else:
                 self.w8a16(x, w_fp8, scale, out, rows, stream)
-
-
-# Most decode rows the FP8-only programs run through the tensor-core GEMV (MmaFp8Gemv's 16-row tile).
-FP8_GEMV_ROWS = 16
 
 
 def decode_tile_n(n: int) -> int:

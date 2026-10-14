@@ -10,7 +10,8 @@ checkpoint weight is passed only as ``{w}_fp8`` E4M3 plus ``{w}_scale`` (its
 128x128 grid) in place of the BF16 operand, and ``w_uk`` / ``w_uv`` as
 ``{w}_fp8`` per-head E4M3 slices of ``kv_b_proj`` with ``{w}_scale`` one FP32
 scale per weight row and 64-wide K tile (``[N,512,3]``, ``[N,256,8]``). Decode
-programs run the FP8 GEMV up to 16 rows and W8A16 GEMMs above (bitwise the
+programs run the FP8 GEMV tiles up to the program's decode capacity
+(``FP8_DECODE_ROWS``) and W8A16 GEMMs above (bitwise the
 BF16 programs over the dequantized weights); prefill programs take a second
 scalar ``fp8_rows`` (nonzero: W8A8, E4M3 activations per row and 128-K block;
 0: W8A16) and read ``q_a|kv_a`` with per-row scales K-block major
@@ -80,7 +81,7 @@ import torch
 from cutlass import Int32, Int64
 
 from ._common import GLM53, GLMGeometry, Operand, Scalar, compile_program
-from ._fp8_weights import FP8_GEMV_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
+from ._fp8_weights import FP8_DECODE_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
     w8_scalars
 from ._glm_kernels import (BatchedBf16Gemm, BatchedFp8Gemm, GlmIndexPost, GlmQueryRope, GlmRankNormPackKV,
                            glm_projection)
@@ -358,7 +359,7 @@ class _ProducerW8Decode(_ProducerW8):
                  q_resid: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         self.body(x, positions, kv_slots, cos_sin, w_qkv_a_fp8, w_qkv_a_scale, q_a_norm, kv_a_norm, w_q_b_fp8,
                   w_q_b_scale, w_uk_fp8, w_uk_scale, kv_cache, query, q_resid, scratch, rows,
-                  Int32(FP8_GEMV_ROWS), stream)
+                  Int32(FP8_DECODE_ROWS), stream)
 
 
 class _ProducerW8Prefill(_ProducerW8):
@@ -413,7 +414,7 @@ class _IndexProducerW8Decode(_IndexProducerW8):
                  k_norm_w: cute.Pointer, k_norm_b: cute.Pointer, index_cache: cute.Pointer, q_fp8: cute.Pointer,
                  head_weights: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         self.body(x, q_resid, positions, index_slots, cos_sin, w_iq_fp8, w_iq_scale, w_ik, k_norm_w, k_norm_b,
-                  index_cache, q_fp8, head_weights, scratch, rows, Int32(FP8_GEMV_ROWS), stream)
+                  index_cache, q_fp8, head_weights, scratch, rows, Int32(FP8_DECODE_ROWS), stream)
 
 
 class _IndexProducerW8Prefill(_IndexProducerW8):
@@ -458,7 +459,7 @@ class _OutputW8Decode(_OutputW8):
     def __call__(self, attn: cute.Pointer, w_uv_fp8: cute.Pointer, w_uv_scale: cute.Pointer, w_o_fp8: cute.Pointer,
                  w_o_scale: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
                  stream: cuda.CUstream):
-        self.body(attn, w_uv_fp8, w_uv_scale, w_o_fp8, w_o_scale, out, scratch, rows, Int32(FP8_GEMV_ROWS), stream)
+        self.body(attn, w_uv_fp8, w_uv_scale, w_o_fp8, w_o_scale, out, scratch, rows, Int32(FP8_DECODE_ROWS), stream)
 
 
 class _OutputW8Prefill(_OutputW8):
