@@ -57,7 +57,7 @@ def test_explicit_card_plan_reaches_compiler_and_scratch(monkeypatch, sms):
     from b12x.integration.cuteafd import glm_sparse_mla as module
     buckets = decode_buckets(G, 64, sm_count=sms)
     seen = []
-    def decode(g, rows, fp32, full, sm_count, plan_capacity_rows):
+    def decode(g, rows, fp32, full, sm_count, plan_capacity_rows, **kwargs):
         seen.append((g, rows, fp32, full, sm_count, plan_capacity_rows))
         return SimpleNamespace(buckets=buckets, key=("decode", buckets))
     monkeypatch.setattr(module, "_Decode", decode)
@@ -214,3 +214,68 @@ def test_the_wide_program_is_the_reference_and_the_64_row_program(rows):
         assert torch.equal(out[part], got), (rows, start)
     serial = _run(narrow, q[:1].contiguous(), cache, indices[:1].contiguous(), lengths[:1].contiguous())
     assert torch.equal(out[:1], serial)
+
+
+@pytest.mark.parametrize("fp32", [False, True])
+@pytest.mark.parametrize("heads", [32, 64])
+def test_single_split_direct_output_is_bitwise_old_merge_and_row_invariant(monkeypatch, fp32, heads):
+    """Force the 5090 recipe on PRO; include empty, masked and capacity edges."""
+    require_b12x()
+    from dataclasses import replace
+
+    monkeypatch.setenv("B12X_MLA_SM120_NUM_SPLITS", "1")
+    g = replace(G, heads=heads)
+    programs = {
+        (cap, elide): compile_glm_sparse_mla_aot(
+            g, route="decode", max_rows=cap, fp32_partials=fp32,
+            plan_capacity_rows=64, elide_single_split=elide)
+        for cap in (64, 128) for elide in (False, True)
+    }
+    q, cache, _, indices, lengths = _inputs(128, 176, context=4096)
+    q = q[:, :heads].contiguous()
+    lengths[0] = 0
+    indices[1].fill_(-1)
+    lengths[2] = 1
+    lengths[3] = 63
+    lengths[4] = 64
+    lengths[5] = 65
+    q[6].zero_()
+    records = cache.view(4096, 528)
+    # Explicit FP8 negative-zero inputs and BF16 halfway/adjacent FP32 scales.
+    records[4094, :512].fill_(0x80)
+    records[4094, 512:].view(torch.float32).fill_(1.0)
+    records[4095, :512] = torch.tensor([0x38, 0xB8], device="cuda", dtype=torch.uint8).repeat(256)
+    midpoint = torch.tensor(1.00390625, device="cuda", dtype=torch.float32)
+    records[4095, 512:].view(torch.float32).copy_(torch.stack((
+        midpoint, torch.nextafter(midpoint, torch.full_like(midpoint, float("inf"))),
+        torch.nextafter(midpoint, torch.full_like(midpoint, float("-inf"))), midpoint)))
+    for row, slot in ((7, 4094), (8, 4095)):
+        q[row].zero_()
+        indices[row].fill_(-1)
+        indices[row, 0] = slot
+        lengths[row] = 1
+
+    def run(cap, elide, start, rows):
+        out = torch.full((rows, heads, 512), float("nan"), dtype=torch.bfloat16, device="cuda")
+        size = sparse_mla_scratch_bytes(g, route="decode", rows=cap,
+                                       buckets=programs[cap, elide].geometry["decode_buckets"],
+                                       fp32_partials=fp32)
+        storage = torch.full((size + 1024,), 0xA5, dtype=torch.uint8, device="cuda")
+        programs[cap, elide].launch(q[start:start+rows].contiguous(), cache,
+            indices[start:start+rows].contiguous(), lengths[start:start+rows].contiguous(),
+            out, storage[:size], scalars=(rows, 64))
+        torch.cuda.synchronize()
+        assert torch.all(storage[size:] == 0xA5)
+        return out
+
+    reference = run(128, False, 0, 128)
+    assert torch.count_nonzero(reference[:2]) == 0
+    for rows in (1, 2, 7, 8, 16, 32, 63, 64, 65, 96, 127, 128):
+        caps = (64, 128) if rows <= 64 else (128,)
+        for cap in caps:
+            for elide in (False, True):
+                got = run(cap, elide, 0, rows)
+                assert torch.equal(got.view(torch.int16), reference[:rows].view(torch.int16)), (heads, fp32, cap, rows, elide)
+    for start in range(128):
+        got = run(64, True, start, 1)
+        assert torch.equal(got.view(torch.int16), reference[start:start+1].view(torch.int16)), (heads, fp32, start)

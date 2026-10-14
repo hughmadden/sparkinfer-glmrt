@@ -95,6 +95,22 @@ from b12x._lib.intrinsics import (
 
 
 @dsl_user_op
+def _single_split_value(acc: Float32, inv: Float32, *, partial_bf16: bool, loc=None, ip=None) -> Float32:
+    # The old launch boundary rounds acc*inv before merge's +0. Keep that
+    # boundary explicit: do not let the compiler fuse normalization and merge.
+    value = Float32(llvm.inline_asm(
+        T.f32(), [acc.ir_value(loc=loc, ip=ip), inv.ir_value(loc=loc, ip=ip)],
+        "mul.rn.f32 $0, $1, $2;", "=f,f,f", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+    if partial_bf16:
+        value = Float32(value.to(cutlass.BFloat16))
+    return Float32(llvm.inline_asm(
+        T.f32(), [value.ir_value(loc=loc, ip=ip)], "add.rn.f32 $0, $1, 0f00000000;",
+        "=f,f", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
 def _exp2_approx_ftz_f32(a: Float32, *, loc=None, ip=None) -> Float32:
     """``exp2f``-equivalent base-2 exponential (``ex2.approx.ftz.f32``).
 
@@ -3054,6 +3070,7 @@ def s7_epilogue(
     num_threads: cutlass.Constexpr = 0,
     barrier_id: cutlass.Constexpr = 0,
     coalesced_output: cutlass.Constexpr = False,
+    single_split_partial_bf16: cutlass.Constexpr = None,
 ):
     """S7: normalized O + base-2 LSE epilogue. ``epilogue_mode`` (const_expr)
     selects the destination + normalizer convention; the (gid, d0) output-write
@@ -3152,6 +3169,18 @@ def s7_epilogue(
                         + ((gid + Int32(8)) * Int32(d_v) + d0 + Int32(1)) * Int32(2),
                         acc_nope[at][3] * inv_g1,
                     )
+            elif cutlass.const_expr(single_split_partial_bf16 is not None):
+                values = [Float32(0.0) for _ in range(4)]
+                if global_sum[0] > Float32(0.0):
+                    values[0] = _single_split_value(acc_nope[at][0], inv_g0, partial_bf16=single_split_partial_bf16)
+                    values[1] = _single_split_value(acc_nope[at][1], inv_g0, partial_bf16=single_split_partial_bf16)
+                if global_sum[1] > Float32(0.0):
+                    values[2] = _single_split_value(acc_nope[at][2], inv_g1, partial_bf16=single_split_partial_bf16)
+                    values[3] = _single_split_value(acc_nope[at][3], inv_g1, partial_bf16=single_split_partial_bf16)
+                store_bf16x2(get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)), values[0], values[1])
+                if cutlass.const_expr(valid_hpb > 8):
+                    store_bf16x2(get_ptr_as_int64(out_o, cute.crd2idx((gid + Int32(8), d0), out_o.layout)),
+                                values[2], values[3])
             elif cutlass.const_expr(_ot == cutlass.BFloat16):
                 store_bf16x2(
                     get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)),

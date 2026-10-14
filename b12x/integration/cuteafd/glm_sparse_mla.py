@@ -215,12 +215,13 @@ class _Prefill:
 class _Decode:
     def __init__(self, g: GLMGeometry, max_rows: int, fp32_partials=False, full_launch_splits=None,
                  sm_count: int | None = None, plan_capacity_rows: int | None = None,
-                 zero_masked_v=False):
+                 zero_masked_v=False, elide_single_split=True):
         from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel
         from b12x.attention._shared.mla.merge import SparseMLASplitDecodeMergeKernel
         from b12x.attention._shared.mla.smem import make_smem_layout
 
         self.g = g
+        self.elide_single_split = bool(elide_single_split)
         self.partial_type = Float32 if fp32_partials else cutlass.BFloat16
         self.partial_bytes = 4 if fp32_partials else 2
         self.heads, self.topk, self.qk = g.heads, _topk(g), _qk(g)
@@ -244,11 +245,14 @@ class _Decode:
                 valid_hpb=hpb, head_block_offset=0, per_token_len=True, native_glm_h8=False,
                 native_dsv4_h8=False, native_dsv4_h16=False, native_dsv41_fp8=False, vector_q=True,
                 zero_masked_v=zero_masked_v,
+                single_split_partial_bf16=(not fp32_partials) if self.elide_single_split and splits == 1 else None,
             ))
             self.merges.append(SparseMLASplitDecodeMergeKernel(static_num_chunks=splits))
         self.key = ("decode", self.buckets, "fp32") if fp32_partials else ("decode", self.buckets)
         if zero_masked_v:
             self.key += ("zero_masked_v",)
+        if self.elide_single_split and any(s == 1 for _, s, _ in self.buckets):
+            self.key += ("elide_single_split",)
 
     @cute.jit
     def _run(self, b: cutlass.Constexpr, q: cute.Pointer, kv_cache: cute.Pointer,
@@ -269,6 +273,13 @@ class _Decode:
         idx = cute.make_tensor(indices, cute.make_layout((m, self.topk), stride=(self.topk, 1)))
         lens = cute.make_tensor(lengths, cute.make_layout((m,)))
         scale = Float32(float(self.g.softmax_scale) * LOG2_E)
+        if cutlass.const_expr(self.elide_single_split and s == 1):
+            # Strides coincide with the one-split partial layout; only the
+            # destination and rounding-preserving epilogue change.
+            direct = cute.make_tensor(out, cute.make_layout((m, n, 1, _DV), stride=(n * _DV, _DV, _DV, 1)))
+            self.kernels[b].call_pertok(qt, kv, idx, direct, partial_lse, scale, Float32(1.0), lens,
+                                      Int64(self.g.kv_page_bytes), rows, stream)
+            return
         self.kernels[b].call_pertok(qt, kv, idx, partials, partial_lse, scale, Float32(1.0), lens,
                                     Int64(self.g.kv_page_bytes), rows, stream)
         # Static split count: the merge never reads its count operand.
@@ -300,7 +311,8 @@ class _Decode:
 def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill", max_rows: int = 1,
                                name: str = "glm_sparse_mla", fp32_partials: bool = False,
                                full_launch_splits: int | None = None, sm_count: int | None = None,
-                               plan_capacity_rows: int | None = None, zero_masked_v: bool = True):
+                               plan_capacity_rows: int | None = None, zero_masked_v: bool = True,
+                               elide_single_split: bool = True):
     """GLM latent sparse MLA; see the module docstring for the ABI. A GLM 5.3
     Flash geometry (``GLMFGeometry``) selects the 512-wide query, 528-byte
     records (``ModelType.GLM_NEXT``) and its 2112-slot index rows. The opt-in
@@ -328,7 +340,7 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         buckets = ()
     elif route == "decode":
         launch = _Decode(g, int(max_rows), fp32_partials, full_launch_splits, sm_count,
-                         plan_capacity_rows, zero_masked_v=zero_masked_v)
+                         plan_capacity_rows, zero_masked_v=zero_masked_v, elide_single_split=elide_single_split)
         buckets = launch.buckets
     else:
         raise ValueError("route must be 'prefill' or 'decode'")
@@ -352,6 +364,8 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
                           g, route=route, rows=max_rows, buckets=buckets, fp32_partials=fp32_partials,
                           plan_rows=cap)} for cap, _, _ in buckets]} if route == "decode" else {}),
                   **({"partial_dtype": "float32"} if fp32_partials else {}),
+                  **({"elide_single_split": True} if route == "decode" and elide_single_split
+                     and any(s == 1 for _, s, _ in buckets) else {}),
                   **({"zero_masked_v": True} if zero_masked_v else {})},
         scratch={"scratch": lambda rows: sparse_mla_scratch_bytes(g, route=route, rows=rows, buckets=buckets,
                                                                fp32_partials=fp32_partials)},

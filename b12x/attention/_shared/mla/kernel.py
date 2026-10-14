@@ -410,7 +410,11 @@ class UnifiedDecodeKernel:
         native_dsv41_fp8=False,
         vector_q=False,
         zero_masked_v=False,
+        single_split_partial_bf16=None,
     ):
+        if single_split_partial_bf16 is not None and (num_splits != 1 or traits.v_has_rope):
+            raise ValueError("direct single-split output requires one split and no V RoPE")
+        self.single_split_partial_bf16 = single_split_partial_bf16
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -1234,6 +1238,12 @@ class UnifiedDecodeKernel:
         if active_chunks == Int32(0):
             if tid < Int32(self.valid_hpb):
                 mid_lse[token_idx, head_base + tid, split_idx] = Float32(-Float32.inf)
+            if cutlass.const_expr(self.single_split_partial_bf16 is not None):
+                # The separate merge used to zero empty rows; direct output
+                # must do so before this early exit bypasses the epilogue.
+                for index in cutlass.range(tid, self.valid_hpb * t.d_nope, self.block_threads):
+                    mid_out[token_idx, head_base + index // Int32(t.d_nope), split_idx,
+                            index % Int32(t.d_nope)] = cutlass.BFloat16(0)
             if cutlass.const_expr(self.speculative_first_chunk):
                 # A CTA must not retire with speculative copies in flight:
                 # supply the producer arrival the skipped loop would have made,
@@ -2017,6 +2027,7 @@ class UnifiedDecodeKernel:
                 valid_hpb=(8 if self.native_h16 else self.valid_hpb),
                 nt_per_warp_xv=t.nt_per_warp_xv,
                 v_has_rope=t.v_has_rope,
+                single_split_partial_bf16=self.single_split_partial_bf16,
                 rope_tiles_per_warp=(
                     2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 1
                 ),

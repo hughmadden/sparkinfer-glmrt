@@ -76,6 +76,8 @@ def main() -> None:
     parser.add_argument("--rows", default="64,96,120,126,127,128")
     parser.add_argument("--context", type=int, default=65536)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--single-split-elision", action="store_true", help="bitwise old/new one-split epilogue benchmark")
+    parser.add_argument("--heads", type=int, choices=(32, 64), default=64)
     args = parser.parse_args()
     # Every row selects SLOTS distinct slots of the cache: a shorter one would leave the selections
     # short of their lengths and the kernel reading past them.
@@ -92,6 +94,8 @@ def main() -> None:
     dev = "cuda"
     props = torch.cuda.get_device_properties(0)
     sms = props.multi_processor_count
+    from dataclasses import replace
+    g = replace(g, heads=args.heads)
     h_blocks = g.heads // 16
     rows_list = [int(r) for r in args.rows.split(",")]
     gen = torch.Generator(device=dev).manual_seed(0)
@@ -104,6 +108,32 @@ def main() -> None:
     q_all = (torch.randn((widest, g.heads, 512), generator=gen, device=dev) * 0.5).bfloat16()
     idx_all = torch.stack([torch.randperm(context, generator=gen, device=dev)[:SLOTS] for _ in range(widest)]).int()
     len_all = torch.full((widest,), SLOTS, dtype=torch.int32, device=dev)
+
+    if args.single_split_elision:
+        os.environ["B12X_MLA_SM120_NUM_SPLITS"] = "1"
+        programs = {elide: compile_glm_sparse_mla_aot(
+            g, route="decode", max_rows=128, fp32_partials=True,
+            plan_capacity_rows=64, elide_single_split=elide) for elide in (False, True)}
+        report = {"device": props.name, "sms": sms, "heads": g.heads,
+                  "context": context, "iters": args.iters, "timings": []}
+        for rows in rows_list:
+            q, idx, lens = q_all[:rows].contiguous(), idx_all[:rows].contiguous(), len_all[:rows].contiguous()
+            outputs, timings = {}, {}
+            for elide, program in programs.items():
+                out = torch.empty((rows, g.heads, 512), dtype=torch.bfloat16, device=dev)
+                scratch = torch.empty(program.scratch_bytes(128)["scratch"], dtype=torch.uint8, device=dev)
+                def launch(program=program, out=out, scratch=scratch):
+                    program.launch(q, cache, idx, lens, out, scratch, scalars=(rows, 64))
+                timings[elide] = warm_us(launch, args.iters)
+                outputs[elide] = out.clone()
+            assert torch.equal(outputs[False].view(torch.int16), outputs[True].view(torch.int16)), rows
+            entry = {"rows": rows, "old_us": timings[False], "new_us": timings[True],
+                     "ratio": timings[True] / timings[False]}
+            report["timings"].append(entry)
+            print(json.dumps(entry), flush=True)
+        if args.output:
+            args.output.write_text(json.dumps(report, indent=2) + "\n")
+        return
 
     def compile_(max_rows, splits):
         return compile_glm_sparse_mla_aot(g, route="decode", max_rows=max_rows, name="glmf_sparse_mla",
