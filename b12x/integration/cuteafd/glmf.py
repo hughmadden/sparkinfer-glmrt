@@ -288,7 +288,7 @@ def _w8_mode(fp8_only) -> bool | None:
 
 
 def _w8(n: int, k: int, prefill_rows: int | None, *, row_scales: bool = False, prefill_mask: int = 0xFF,
-        out_dtype=cutlass.BFloat16, wide_rows: int = 0):
+        out_dtype=cutlass.BFloat16, wide_rows: int = 0, decode_recipe: str = "mixed"):
     """An ``Fp8Projection`` with this family's GEMV tuning: over the checkpoint's 128x128 grid, or
     (``row_scales``) over per-row x 128-K scales stored K-block major in decode and prefill
     programs alike, so one resident scale copy serves both."""
@@ -297,7 +297,7 @@ def _w8(n: int, k: int, prefill_rows: int | None, *, row_scales: bool = False, p
     warps, groups = FP8_GEMV_CONFIG.get((n, k), (gemv_warps(k), 4))
     return Fp8Projection(n, k, prefill_rows=prefill_rows, gemv_rows=FP8_ROWS, warps=warps, groups=groups,
                          row_scales=row_scales, kmajor=row_scales, prefill_mask=prefill_mask, out_dtype=out_dtype,
-                         wide_rows=wide_rows, wide_warps=8, wide_groups=2)
+                         wide_rows=wide_rows, wide_warps=8, wide_groups=2, decode_recipe=decode_recipe)
 
 
 class _W8Run:
@@ -673,22 +673,23 @@ class _KdaW8(_Kda):
 
     def __init__(self, g: GLMFGeometry, max_rows: int, prefill: bool, out_dtype=cutlass.BFloat16,
                  prefill_expanded: bool = False, output_kind: str = "projection", state_dtype: str = "float32",
-                 state_rounding: str = "window", seq_ctas: int = 1):
+                 state_rounding: str = "window", seq_ctas: int = 1, decode_recipe: str = "mixed"):
         super().__init__(g, max_rows, False, state_dtype, state_rounding, decode=not prefill, seq_ctas=seq_ctas)
         self.output_norm = output_kind == "norm"
         prefill_rows = int(max_rows) if prefill else None
         self.prefill = bool(prefill)
         wide_rows = 32 if (g.hidden, g.kda_heads, g.kda_head_dim) == (4096, 32, 128) else 0
         self.in_proj = _W8Run(_w8(self.p, g.hidden, prefill_rows, row_scales=True,
-                                  prefill_mask=1, wide_rows=wide_rows))
+                                  prefill_mask=1, wide_rows=wide_rows, decode_recipe=decode_recipe))
         if wide_rows and not prefill:
             # Keep the full-head input GEMV's K reduction grouping after N slicing.
             from ._fp8_weights import Fp8Projection
             self.in_proj = _W8Run(Fp8Projection(self.p, g.hidden, row_scales=True, kmajor=True,
-                warps=8, groups=2, wide_rows=wide_rows, wide_warps=8, wide_groups=2))
+                warps=8, groups=2, wide_rows=wide_rows, wide_warps=8, wide_groups=2,
+                decode_recipe=decode_recipe))
         self.o_proj = _W8Run(_w8(g.hidden, self.d, prefill_rows, row_scales=True,
                                prefill_mask=2 if out_dtype == cutlass.BFloat16 else 0,
-                               out_dtype=out_dtype, wide_rows=wide_rows))
+                               out_dtype=out_dtype, wide_rows=wide_rows, decode_recipe=decode_recipe))
         if prefill_expanded:
             self.in_proj = _ExpandedW8Run(self.in_proj.proj, self.p, g.hidden)
             self.o_proj = _ExpandedW8Run(self.o_proj.proj, g.hidden, self.d, out_dtype)
@@ -721,7 +722,8 @@ class _KdaW8Prefill(_KdaW8):
 def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
                        output_dtype: str = "bfloat16", prefill_expanded: bool = False,
                        output_kind: str = "projection", state_dtype: str = "float32",
-                       state_rounding: str = "window", seq_ctas: int = 1) -> AotProgram:
+                       state_rounding: str = "window", seq_ctas: int = 1,
+                       decode_recipe: str = "mixed") -> AotProgram:
     prefill = _w8_mode(fp8_only)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
     types = {"bfloat16": (cutlass.BFloat16, torch.bfloat16),
@@ -737,7 +739,7 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
     cute_dtype, torch_dtype = types[output_dtype]
     launch = (_KdaW8Prefill if prefill else _KdaW8)(g, max_rows, prefill,
                                                 cute_dtype, prefill_expanded, output_kind,
-                                                state_dtype, state_rounding, seq_ctas)
+                                                state_dtype, state_rounding, seq_ctas, decode_recipe)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, d, p, heads = g.hidden, g.kda_width, g.kda_in_width, g.kda_heads
     from ._fp8_weights import fp8_only_operands
@@ -772,9 +774,11 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
         geometry={"hidden": h, "heads": heads, "head_dim": g.kda_head_dim, "max_rows": max_rows,
                   "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps, "fp8_weights": "only",
                   "output_dtype": output_dtype, "output_kind": output_kind, "prefill_expanded": prefill_expanded,
-                  "decode_gemv_rows": 32 if (h, heads, g.kda_head_dim) == (4096, 32, 128) else FP8_ROWS,
+                  "decode_gemv_rows": (0 if decode_recipe == "w8a16" else
+                                       32 if (h, heads, g.kda_head_dim) == (4096, 32, 128) else FP8_ROWS),
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
                   **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch),
+                  **({"decode_recipe": decode_recipe} if decode_recipe != "mixed" else {}),
                   **_seq_geometry(launch)},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill, prefill_expanded)},
         doc=__doc__,
@@ -785,7 +789,8 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
                          fp8_only: str | None = None, output_dtype: str = "bfloat16",
                          prefill_expanded: bool = False, output_kind: str = "projection",
                          state_dtype: str = "float32", state_rounding: str = "window",
-                         seq_ctas: int = 1, decode_tiles: bool = False) -> AotProgram:
+                         seq_ctas: int = 1, decode_tiles: bool = False,
+                         decode_recipe: str = "mixed") -> AotProgram:
     """One KDA layer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds ``w_in``/``w_o`` E4M3 copies with per-row scales and the ``fp8_rows``
     scalar (decode steps up to that many rows read them); ``fp8="prefill"``
@@ -798,7 +803,9 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
     up to ``fp8_rows`` (<= 32 for the GLM53 Flash half-head geometry, else <=16) on
     the FP8 GEMV and the W8A16 TMA GEMM above; prefill programs
     (``rows``, ``fp8_rows``) run W8A8 on ``fp8_rows`` bit 0 (in-projection) / 1 (o_proj), else
-    W8A16. One scale copy serves both. ``output_dtype`` optionally retains the final
+    W8A16. ``decode_recipe="w8a16"`` fixes decode to the TMA recipe at every M
+    regardless of the fp8_rows scalar, preserving row invariance across the GEMV boundary.
+    One scale copy serves both. ``output_dtype`` optionally retains the final
     dot product as float32 for a head-split peer sum, with W8A16-only
     o-projection; prefill bit 1 must remain clear in these modes. Half-head
     ``prefill_expanded`` widens weights once in scratch for rows >=512, preserving
@@ -836,7 +843,9 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
         if decode_tiles:
             raise ValueError("decode_tiles takes a decode KDA program over BF16 projections (fp8=True)")
         return _compile_glmf_kda_w8(g, max_rows, fp8_only, output_dtype, prefill_expanded, output_kind,
-                                    state_dtype, state_rounding, seq_ctas)
+                                    state_dtype, state_rounding, seq_ctas, decode_recipe)
+    if decode_recipe != "mixed":
+        raise ValueError("decode_recipe requires fp8_only decode projections")
     if output_dtype != "bfloat16" or prefill_expanded or output_kind != "projection":
         raise ValueError("KDA output_dtype/prefill_expanded/output_kind require fp8_only")
     fp8_on, prefill = _fp8_mode(fp8)

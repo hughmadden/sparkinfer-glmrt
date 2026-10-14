@@ -29,12 +29,12 @@ def _b12x():
     require_b12x()
 
 
-def P(**kw):
-    key = tuple(sorted(kw.items()))
+def P(geometry=None, **kw):
+    key = (repr(geometry), tuple(sorted(kw.items())))
     if key not in _PROGRAMS:
         from b12x.integration.cuteafd import GLM53_FLASH, glmf
 
-        _PROGRAMS[key] = glmf.compile_glmf_kda_aot(GLM53_FLASH, **kw)
+        _PROGRAMS[key] = glmf.compile_glmf_kda_aot(GLM53_FLASH if geometry is None else geometry, **kw)
     return _PROGRAMS[key]
 
 
@@ -51,26 +51,29 @@ def _quant_rows(w: torch.Tensor):
 _WEIGHTS: dict = {}
 
 
-def _weights():
-    if _WEIGHTS:
-        return _WEIGHTS
-    from b12x.integration.cuteafd import GLM53_FLASH as g
+def _weights(geometry=None):
+    from b12x.integration.cuteafd import GLM53_FLASH
+    g = GLM53_FLASH if geometry is None else geometry
+    if g.kda_heads in _WEIGHTS:
+        return _WEIGHTS[g.kda_heads]
 
     gen = torch.Generator(device="cuda").manual_seed(7)
     h, d, p = g.hidden, g.kda_width, g.kda_in_width
     r = lambda *shape, s=1.0: torch.randn(shape, generator=gen, device="cuda") * s  # noqa: E731
     w_in = r(p, h, s=0.02).bfloat16()
     w_o = r(h, d, s=0.01).bfloat16()
-    _WEIGHTS.update(
+    weights = dict(
         w_in=w_in, w_o=w_o, in_q=_quant_rows(w_in), o_q=_quant_rows(w_o),
         w_fg=r(2, d, g.kda_head_dim, s=0.05).bfloat16(), conv_w=r(3 * d, 4, s=0.3).float(),
         a_log=torch.log(torch.rand((g.kda_heads,), generator=gen, device="cuda") * 15 + 1).float(),
         dt_bias=r(d, s=0.1).float(), o_norm=(1 + r(g.kda_head_dim, s=0.1)).bfloat16())
-    return _WEIGHTS
+    _WEIGHTS[g.kda_heads] = weights
+    return weights
 
 
-def _state(rows: int, per_seq: int):
-    from b12x.integration.cuteafd import GLM53_FLASH as g
+def _state(rows: int, per_seq: int, geometry=None):
+    from b12x.integration.cuteafd import GLM53_FLASH
+    g = GLM53_FLASH if geometry is None else geometry
     from b12x.integration.cuteafd._glmf_kernels import kda_replay_layout
 
     gen = torch.Generator(device="cuda").manual_seed(rows * 31 + per_seq)
@@ -134,6 +137,162 @@ def _run(mode: str, cap: int, rows: int, fp8_rows: int, spec: int, bf16_in, bf16
 def _rel(a, b):
     a, b = a.float(), b.float()
     return float((a - b).norm() / b.norm().clamp_min(1e-30))
+
+
+@pytest.mark.parametrize("fp8_rows", (32, 0))
+@pytest.mark.parametrize("heads,dtype,kind", ((64, "bfloat16", "projection"),
+    (32, "bfloat16", "projection"), (32, "float32", "projection"), (32, "bfloat16", "norm")))
+def test_glmf_kda_w8_bf16_recipe_cross_width_bits(fp8_rows, heads, dtype, kind):
+    """Compare the new W8/S16 recipe with itself, not today's FP32 state.
+
+    The canonical option fixes W8A16 at every width even when the runtime
+    supplies the legacy GEMV threshold of 16. Every row has its own recurrent slot so widening
+    a batch cannot legitimately alter its projection, conv or recurrent state.
+    """
+    from b12x.integration.cuteafd import GLM53_FLASH as g
+    from b12x.integration.cuteafd._glmf_kernels import kda_replay_layout
+
+    from dataclasses import replace
+    g = replace(g, kda_heads=heads)
+    output_width = g.kda_width if kind == "norm" else g.hidden
+    width = 128
+    x, slots, first, state, conv, _ = _state(width, 1, g)
+    state = state.bfloat16()
+    weights = _weights(g)
+    shared = (weights["w_fg"], weights["conv_w"], weights["a_log"],
+              weights["dt_bias"], weights["o_norm"])
+    ins, outs = weights["in_q"], weights["o_q"]
+
+    def run(cap, rows, start=0, spec=0):
+        prog = P(g, max_rows=cap, fp8_only="decode", state_dtype="bfloat16",
+                 decode_recipe="w8a16", output_dtype=dtype, output_kind=kind)
+        ss, cc = state[start:start + rows].clone(), conv[start:start + rows].clone()
+        local_slots = torch.arange(rows, device="cuda", dtype=torch.int32)
+        out = torch.full((rows, output_width), float("nan"), device="cuda", dtype=getattr(torch, dtype))
+        replay_rows = max(64, cap)
+        replay = torch.zeros(kda_replay_layout(g.kda_heads, 3 * g.kda_width, replay_rows)[2] // 4,
+                             device="cuda")
+        size = prog.scratch_bytes(rows)["scratch"]
+        storage = torch.full((size + 1024,), 0xA5, device="cuda", dtype=torch.uint8)
+        prog.launch(x[start:start + rows], ins[0], ins[2], *shared, outs[0], outs[2],
+                    cc, ss, local_slots, local_slots, out, replay, storage[:size],
+                    scalars=(rows, fp8_rows, spec))
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(out).all())
+        assert bool((storage[size:] == 0xA5).all())
+        if spec:
+            assert torch.equal(ss.view(torch.int16), state[start:start + rows].view(torch.int16))
+            assert torch.equal(cc.view(torch.int16), conv[start:start + rows].view(torch.int16))
+        return out, ss, cc
+
+    serial = [run(64, 1, start=i) for i in range(width)]
+    reference = tuple(torch.cat([row[k] for row in serial]) for k in range(3))
+    failures = []
+    for cap in (64, 128):
+        for rows in (1, 2, 7, 8, 16, 17, 32, 33, 63, 64, 65, 96, 127, 128):
+            if rows > cap:
+                continue
+            got = run(cap, rows)
+            for name, actual, expected in zip(("out", "state", "conv"), got, reference):
+                bad = int((actual.view(torch.int16) != expected[:rows].view(torch.int16)).sum())
+                if bad:
+                    failures.append(f"cap={cap} M={rows} {name}: {bad} differing BF16 words")
+            verify = run(cap, rows, spec=1)[0]
+            if not torch.equal(verify.view(torch.int16), got[0].view(torch.int16)):
+                failures.append(f"cap={cap} M={rows}: verify output differs from plain step")
+    print(f"W8/S16 fp8_rows={fp8_rows}: " + ("; ".join(failures) if failures else "all widths byte-identical"))
+    assert not failures, "\n".join(failures)
+
+
+@pytest.mark.parametrize("heads,dtype,kind", ((64, "bfloat16", "projection"),
+    (32, "bfloat16", "projection"), (32, "float32", "projection"), (32, "bfloat16", "norm")))
+def test_glmf_kda_w8_bf16_canonical_sequence_commit_and_graph_bits(heads, dtype, kind):
+    from b12x.integration.cuteafd import GLM53_FLASH as g, glmf
+    from b12x.integration.cuteafd._glmf_kernels import kda_replay_layout
+
+    from dataclasses import replace
+    g = replace(g, kda_heads=heads)
+    output_width = g.kda_width if kind == "norm" else g.hidden
+    rows, per_seq = 128, 8
+    x, slots, first, initial, conv, _ = _state(rows, per_seq, g)
+    initial = initial.bfloat16()
+    weights = _weights(g)
+    ins, outs = weights["in_q"], weights["o_q"]
+    shared = (weights["w_fg"], weights["conv_w"], weights["a_log"],
+              weights["dt_bias"], weights["o_norm"])
+    prog = P(g, max_rows=128, fp8_only="decode", state_dtype="bfloat16",
+             decode_recipe="w8a16", output_dtype=dtype, output_kind=kind)
+    seqs = rows // per_seq
+
+    def buffers():
+        size = prog.scratch_bytes(rows)["scratch"]
+        return (initial.clone(), conv.clone(),
+                torch.full((rows, output_width), float("nan"), device="cuda", dtype=getattr(torch, dtype)),
+                torch.zeros(kda_replay_layout(g.kda_heads, 3 * g.kda_width, rows)[2] // 4, device="cuda"),
+                torch.full((size + 1024,), 0xA5, device="cuda", dtype=torch.uint8))
+
+    def launch(activation, buffers, n=rows, at=0, spec=0, serial=False):
+        ss, cc, out, replay, storage = buffers
+        local_first = first[at:at + n] if not serial else torch.zeros_like(first[at:at + n])
+        prog.launch(activation[at:at + n], ins[0], ins[2], *shared, outs[0], outs[2],
+                    cc, ss, slots[at:at + n], local_first, out[at:at + n], replay, storage[:-1024],
+                    scalars=(n, 0, spec))
+
+    def same(actual, expected, name):
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16)), name
+
+    serial = buffers()
+    after = []
+    for r in range(rows):
+        launch(x, serial, n=1, at=r, serial=True)
+        after.append((serial[0][r // per_seq].clone(), serial[1][r // per_seq].clone()))
+    torch.cuda.synchronize()
+    wide = buffers()
+    launch(x, wide)
+    torch.cuda.synchronize()
+    for name, a, b in zip(("state", "conv", "output"), wide, serial):
+        same(a, b, name)
+    assert bool(torch.isfinite(wide[2]).all())
+    assert bool((wide[4][-1024:] == 0xA5).all())
+
+    verify = buffers()
+    launch(x, verify, spec=1)
+    torch.cuda.synchronize()
+    same(verify[0], initial, "verify state mutated")
+    same(verify[1], conv, "verify conv mutated")
+    same(verify[2], serial[2], "verify output")
+    commit = glmf.compile_glmf_kda_commit_aot(g, state_dtype="bfloat16", replay_rows=rows)
+    for keep in (1, 7, 8):
+        ss, cc = initial.clone(), conv.clone()
+        tables = torch.stack((torch.arange(seqs, device="cuda", dtype=torch.int32),
+                              torch.arange(seqs, device="cuda", dtype=torch.int32) * per_seq,
+                              torch.full((seqs,), keep, device="cuda", dtype=torch.int32)))
+        commit.launch(ss, cc, verify[3], tables, scalars=(seqs, 1, seqs))
+        torch.cuda.synchronize()
+        for seq in range(seqs):
+            same(ss[seq], after[seq * per_seq + keep - 1][0], f"commit state {seq}/{keep}")
+            same(cc[seq], after[seq * per_seq + keep - 1][1], f"commit conv {seq}/{keep}")
+
+    captured = buffers()
+    activation = torch.zeros_like(x)
+    launch(activation, captured)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(activation, captured)
+    for fresh in (x, -x):
+        eager = buffers()
+        launch(fresh, eager)
+        activation.copy_(fresh)
+        captured[0].copy_(initial)
+        captured[1].copy_(conv)
+        captured[2].fill_(float("nan"))
+        captured[4].fill_(0xA5)
+        graph.replay()
+        torch.cuda.synchronize()
+        for name, a, b in zip(("state", "conv", "output"), captured, eager):
+            same(a, b, "graph " + name)
+        assert bool(torch.isfinite(captured[2]).all())
+        assert bool((captured[4][-1024:] == 0xA5).all())
 
 
 DECODE_ROWS = (1, 5, 16)

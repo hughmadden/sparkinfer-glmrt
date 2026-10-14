@@ -112,6 +112,9 @@ class Fp8Projection:
     gemv_rows)`` (a 16-row tile, plus a ``wide_rows`` multi-tile GEMV above 16 when given),
     ``TmaFp8Gemm`` above: W8A16, bitwise the BF16 programs over ``bf16(w * s)`` weights.
 
+    ``decode_recipe="w8a16"`` freezes TMA at every decode width, ignoring fp8_rows.
+    The mixed default and its cache key are unchanged.
+
     Prefill programs: W8A8 when ``fp8_rows & prefill_mask`` is nonzero (``BlockFp8Projection``:
     E4M3 activations per row and 128-K block with FP32 ``amax / 448`` scales, the official FP8
     releases' served numerics), else ``TmaFp8Gemm`` (W8A16). ``qscratch`` holds the quantized
@@ -120,7 +123,13 @@ class Fp8Projection:
     def __init__(self, n: int, k: int, *, prefill_rows: int | None = None, row_scales: bool = False,
                  kmajor: bool = False, gemv_rows: int = 16, wide_rows: int = 0, warps: int | None = None,
                  groups: int = 4, prefill_mask: int = 0xFF, out_dtype=cutlass.BFloat16,
-                 wide_warps: int | None = None, wide_groups: int | None = None):
+                 wide_warps: int | None = None, wide_groups: int | None = None,
+                 decode_recipe: str = "mixed"):
+        if decode_recipe not in ("mixed", "w8a16"):
+            raise ValueError("decode_recipe must be mixed or w8a16")
+        if prefill_rows is not None and decode_recipe != "mixed":
+            raise ValueError("decode_recipe applies only to decode projections")
+        self.decode_recipe = decode_recipe
         self.n, self.k = int(n), int(k)
         self.row_scales = bool(row_scales)
         # Per-row scales K-block major in decode programs too (one copy serves both).
@@ -158,10 +167,11 @@ class Fp8Projection:
                                     num_stages=4 if tile_n == 128 else 6, out_dtype=out_dtype)
 
     def key(self) -> tuple:
-        return (self.n, self.k, self.row_scales, self.kmajor, self.prefill_mask, self.max_gemv_rows,
+        key = (self.n, self.k, self.row_scales, self.kmajor, self.prefill_mask, self.max_gemv_rows,
                 None if self.gemv is None else self.gemv.key(),
                 None if self.gemv_wide is None else self.gemv_wide.key(),
                 None if self.w8a8 is None else self.w8a8.key(), self.w8a16.key())
+        return key if self.decode_recipe == "mixed" else key + ("decode_recipe", self.decode_recipe)
 
     def prefill_scratch_bytes(self, rows: int) -> int:
         from ._glmf_fp8 import quant_scratch_bytes
@@ -179,6 +189,9 @@ class Fp8Projection:
                     self.w8a8(x, w_fp8, scale, out, qscratch, rows, stream)
                 else:
                     self.w8a16(x, w_fp8, scale, out, rows, stream)
+        elif cutlass.const_expr(self.decode_recipe == "w8a16"):
+            # Freeze the reduction recipe across M1 and verification widths.
+            self.w8a16(x, w_fp8, scale, out, rows, stream)
         else:
             limit = fp8_rows
             if limit > Int32(self.max_gemv_rows):
