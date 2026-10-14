@@ -221,7 +221,7 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
     graph.reset()
 
 
-@pytest.mark.parametrize("h,n", [(4096, 512), (7168, 768)])
+@pytest.mark.parametrize("h,n", [(4096, 512), (7168, 768), (4096, 1024), (7168, 1536)])
 def test_dsv4_canonical_fc2_split_row_invariance(h, n):
     """Frozen input rows retain every FP32 route bit across capacity boundaries."""
     from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
