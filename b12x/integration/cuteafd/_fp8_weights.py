@@ -25,9 +25,13 @@ capacity is computed by ``MmaFp8Gemv`` tiles that walk K in one order -- a thin
 the thin tile's ``warps``/``groups``. ``m_tiles`` only decides which row tile an
 accumulator set belongs to; it does not change the K-blocks, the k-slot order or
 the warp reduction order, so a row's output bits do not move when the batch
-crosses the 16-row tile boundary. Only widths past the program's capacity (a
-prefill step, or ``decode_rows`` itself for a program exported wider) take the
-TMA GEMM, which reduces K in a different order.
+crosses the 16-row tile boundary. A capacity beyond one CTA's share of tiles
+(``gemv_cta_tiles``) is covered by the launch grid's M dimension, one CTA per
+``m_tiles``-row band, and the fold still sums the same warps in the same order,
+so splitting a wide batch across CTAs is not a reduction change either. Only
+widths past the program's capacity (a prefill step, or ``decode_rows`` itself for
+a program exported wider) take the TMA GEMM, which reduces K in a different
+order.
 """
 
 from __future__ import annotations
@@ -316,6 +320,13 @@ def gemv_warps(k: int) -> int:
     dense gate/up 98/98/100 vs 104/104/106), longer and shorter K take 4
     (o_proj 68/70/76 vs 76/76/80; dense down 53/57/63 vs 57/59/59)."""
     return 8 if int(k) == 6144 else 4
+
+
+def gemv_cta_tiles(n: int, k: int, *, groups: int, warps: int) -> int:
+    """Most 16-row M-tiles one ``MmaFp8Gemv`` CTA holds (its fragment registers), leaving the
+    rest to the launch grid's M dimension. Measured per shape at SM120/325 W, L2-cold, us
+    at 17/32/64 rows, 1/2/4 tiles per CTA (see the note in ``MmaFp8Gemv``)."""
+    return 2 if int(k) <= 2560 else 4
 
 
 # ---------------------------------------------------------------------------
@@ -627,8 +638,13 @@ def _e4m3x4_scaled_bf16x2x2(word, s, *, loc=None, ip=None):
 class MmaFp8Gemv:
     """Decode-row GEMM on tensor cores straight from global memory.
 
-    A CTA owns ``8 * groups`` output columns; its ``warps`` split K. Per
-    64-wide K chunk a warp runs four m16n8k16 BF16 MMAs per (16-row tile,
+    A CTA owns ``8 * groups`` output columns and ``m_tiles`` 16-row tiles of the
+    ``max_rows``-row capacity; its ``warps`` split K. A row's tile is the launch
+    grid's second dimension when the program's capacity needs more tiles than one
+    CTA holds (``tiles_by_rows``/``total_m_tiles`` are the program's; ``m_tiles``,
+    from ``gemv_cta_tiles``, is one CTA's share), so a wider batch adds CTAs over
+    the same rows and the same K order instead of lengthening one CTA's work.
+    Per 64-wide K chunk a warp runs four m16n8k16 BF16 MMAs per (16-row tile,
     8-column group). MMA k-slot ``s`` of step ``t`` holds logical ``k =
     16 * quad(s) + 4t + idx(s)`` (``idx`` of slots ``2j, 2j+1, 2j+8, 2j+9``
     is 0..3), so each lane reads one contiguous 16-byte weight run per group
@@ -636,7 +652,12 @@ class MmaFp8Gemv:
     reused by every group. Weights enter the MMA as ``bf16(w * s)`` (the BF16
     program's dequantized weight; one scale per 128-wide K block since a
     CTA's columns share a 128-row block), FP32 accumulation; warps reduce
-    through shared memory; output BF16 or FP32 ``[rows, N]``.
+    through shared memory (one tile at a time when a CTA holds more than two,
+    ``sync_threads`` between tiles, and the same ascending warp order either
+    way); output BF16 or FP32 ``[rows, N]``. Nothing here depends on the live
+    ``rows``: a row's K blocks, k-slots and cross-warp fold are fixed by
+    ``(n, k, warps, groups)``, so every width up to ``max_rows`` is bitwise one
+    launch per row.
 
     ``row_scales``: the scale grid is ``[N, K/128]`` FP32, one scale per
     output row and 128-wide K block (per-channel or row-block quantization of
@@ -653,7 +674,10 @@ class MmaFp8Gemv:
         self.n, self.k = int(n), int(k)
         self.warps, self.groups = int(warps), int(groups)
         self.cols = 8 * self.groups
-        self.m_tiles = (int(max_rows) + 15) // 16
+        self.total_m_tiles = (int(max_rows) + 15) // 16
+        self.m_tiles = min(self.total_m_tiles, gemv_cta_tiles(self.n, self.k, groups=self.groups,
+                                                             warps=self.warps))
+        self.multi_m_grid = self.total_m_tiles > self.m_tiles
         self.out_dtype = out_dtype
         if self.n % self.cols or 128 % self.cols or self.k % (128 * self.warps):
             raise ValueError("MMA FP8 GEMV needs N % (8*groups) == 0, 8*groups dividing 128 and "
@@ -661,26 +685,36 @@ class MmaFp8Gemv:
         self.k_per_warp = self.k // self.warps
         self.blocks = self.k_per_warp // 128
         self.k_blocks = self.k // 128
-        self.frags = self.m_tiles * self.groups * 4
+        self.tile_frags = self.groups * 4
+        self.frags = self.m_tiles * self.tile_frags
+        # One row tile's worth of partials when a CTA holds more than two (a 4-tile
+        # 8-warp CTA otherwise needs 32 KiB for a fold that reuses one tile anyway).
+        self.smem_frags = self.frags if self.m_tiles <= 2 else self.tile_frags
 
     def key(self) -> tuple:
-        return (self.n, self.k, self.warps, self.groups, self.m_tiles, str(self.out_dtype), self.row_scales,
-                self.kmajor)
+        return (self.n, self.k, self.warps, self.groups, self.total_m_tiles, self.m_tiles,
+                str(self.out_dtype), self.row_scales, self.kmajor)
 
     def _storage(self):
         class Storage:
             pass
 
         Storage.__annotations__ = {
-            "partial": cute.struct.Align[cute.struct.MemRange[Float32, self.warps * self.frags * 32], 16],
+            "partial": cute.struct.Align[cute.struct.MemRange[Float32, self.warps * self.smem_frags * 32], 16],
         }
         return cute.struct(Storage)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.kernel(x, w, scale, out, rows).launch(
-            grid=(self.n // self.cols, 1, 1), block=(32 * self.warps, 1, 1), stream=stream)
+        if const_expr(self.multi_m_grid):
+            cta_rows = 16 * self.m_tiles
+            grid_m = (rows + Int32(cta_rows - 1)) // Int32(cta_rows)
+            self.kernel(x, w, scale, out, rows).launch(
+                grid=(self.n // self.cols, grid_m, 1), block=(32 * self.warps, 1, 1), stream=stream)
+        else:
+            self.kernel(x, w, scale, out, rows).launch(
+                grid=(self.n // self.cols, 1, 1), block=(32 * self.warps, 1, 1), stream=stream)
 
     @cute.jit
     def _load_block(self, dest: cute.Tensor, w_row: Int64, k_off: Int64):
@@ -698,9 +732,11 @@ class MmaFp8Gemv:
         g = lane // Int32(4)
         j = lane % Int32(4)
         n0 = Int64(cute.arch.block_idx()[0]) * Int64(self.cols)
+        m0 = (Int32(cute.arch.block_idx()[1]) * Int32(16 * self.m_tiles)
+              if const_expr(self.multi_m_grid) else Int32(0))
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
-        partial = storage.partial.get_tensor(cute.make_layout((self.warps * self.frags * 32,)))
+        partial = storage.partial.get_tensor(cute.make_layout((self.warps * self.smem_frags * 32,)))
         acc = cute.make_rmem_tensor(cute.make_layout((self.frags,), stride=(1,)), Float32)
         for i in cutlass.range_constexpr(self.frags):
             acc[i] = Float32(0.0)
@@ -715,7 +751,8 @@ class MmaFp8Gemv:
         s_gi = Int64(8 * 4) if self.kmajor else Int64(8 * self.k_blocks * 4)
         s_row = Int64(scale.toint()) + s_first * (Int64(4) if self.kmajor else Int64(self.k_blocks * 4)) \
             + (k_begin // Int64(128)) * s_kb
-        live_tiles = (rows + Int32(15)) // Int32(16)
+        live_tiles = ((rows - m0 + Int32(15)) // Int32(16)
+                      if const_expr(self.multi_m_grid) else (rows + Int32(15)) // Int32(16))
         per_block = 2 * self.groups * 4
         # Register double buffer: block b+1's weights and scales load while b computes.
         cur = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
@@ -743,7 +780,7 @@ class MmaFp8Gemv:
                         bw[8 * gi + 2 * t + 1] = b1
                 for mt in cutlass.range_constexpr(self.m_tiles):
                     if Int32(mt) < live_tiles:
-                        r_lo = Int32(16 * mt) + g
+                        r_lo = m0 + Int32(16 * mt) + g
                         r_hi = r_lo + Int32(8)
                         xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
                         for i in cutlass.range_constexpr(16):
@@ -777,21 +814,46 @@ class MmaFp8Gemv:
                 cur[i] = nxt[i]
             for si in cutlass.range_constexpr(s_rows):
                 s_cur[si] = s_nxt[si]
-        for i in cutlass.range_constexpr(self.frags):
-            partial[(warp_id * Int32(self.frags) + Int32(i)) * Int32(32) + lane] = acc[i]
-        cute.arch.sync_threads()
         out_bytes = 2 if const_expr(self.out_dtype == cutlass.BFloat16) else 4
-        # Every warp stores a share of the fragments.
-        for i in cutlass.range_constexpr(self.frags):
-            if Int32(i % self.warps) == warp_id:
-                total = Float32(0.0)
-                for src in cutlass.range_constexpr(self.warps):
-                    total = total + partial[(Int32(src * self.frags + i)) * Int32(32) + lane]
-                mt = i // (4 * self.groups)
-                gi = (i // 4) % self.groups
-                row = Int32(16 * mt) + g + Int32(8 * ((i % 4) // 2))
-                col = n0 + Int64(8 * gi) + Int64(2) * Int64(j) + Int64(i % 2)
-                if row < rows:
-                    address = Int64(out.toint()) + (Int64(row) * Int64(self.n) + col) * Int64(out_bytes)
-                    target = cute.make_ptr(self.out_dtype, address, cute.AddressSpace.gmem, assumed_align=out_bytes)
-                    target[0] = total.to(self.out_dtype)
+        if const_expr(self.m_tiles <= 2):
+            for i in cutlass.range_constexpr(self.frags):
+                partial[(warp_id * Int32(self.frags) + Int32(i)) * Int32(32) + lane] = acc[i]
+            cute.arch.sync_threads()
+            # Every warp stores a share of the fragments.
+            for i in cutlass.range_constexpr(self.frags):
+                if Int32(i % self.warps) == warp_id:
+                    total = Float32(0.0)
+                    for src in cutlass.range_constexpr(self.warps):
+                        total = total + partial[(Int32(src * self.frags + i)) * Int32(32) + lane]
+                    mt = i // (4 * self.groups)
+                    gi = (i // 4) % self.groups
+                    row = m0 + Int32(16 * mt) + g + Int32(8 * ((i % 4) // 2))
+                    col = n0 + Int64(8 * gi) + Int64(2) * Int64(j) + Int64(i % 2)
+                    if row < rows:
+                        address = Int64(out.toint()) + (Int64(row) * Int64(self.n) + col) * Int64(out_bytes)
+                        target = cute.make_ptr(self.out_dtype, address, cute.AddressSpace.gmem,
+                                               assumed_align=out_bytes)
+                        target[0] = total.to(self.out_dtype)
+        else:
+            # One row tile's partials at a time through the tile-sized buffer, same order.
+            for mt in cutlass.range_constexpr(self.m_tiles):
+                if Int32(mt) < live_tiles:
+                    if const_expr(mt > 0):
+                        cute.arch.sync_threads()
+                    for i in cutlass.range_constexpr(self.tile_frags):
+                        partial[(warp_id * Int32(self.tile_frags) + Int32(i)) * Int32(32) + lane] = (
+                            acc[mt * self.tile_frags + i])
+                    cute.arch.sync_threads()
+                    for i in cutlass.range_constexpr(self.tile_frags):
+                        if Int32(i % self.warps) == warp_id:
+                            total = Float32(0.0)
+                            for src in cutlass.range_constexpr(self.warps):
+                                total = total + partial[(Int32(src * self.tile_frags + i)) * Int32(32) + lane]
+                            gi = i // 4
+                            row = m0 + Int32(16 * mt) + g + Int32(8 * ((i % 4) // 2))
+                            col = n0 + Int64(8 * gi) + Int64(2) * Int64(j) + Int64(i % 2)
+                            if row < rows:
+                                address = Int64(out.toint()) + (Int64(row) * Int64(self.n) + col) * Int64(out_bytes)
+                                target = cute.make_ptr(self.out_dtype, address, cute.AddressSpace.gmem,
+                                                       assumed_align=out_bytes)
+                                target[0] = total.to(self.out_dtype)

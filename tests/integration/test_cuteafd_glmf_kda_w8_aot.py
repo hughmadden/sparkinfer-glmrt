@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from ..conftest import require_b12x
+from b12x.integration.cuteafd._fp8_weights import FP8_DECODE_ROWS
 
 _PROGRAMS: dict = {}
 
@@ -139,14 +140,19 @@ def _rel(a, b):
     return float((a - b).norm() / b.norm().clamp_min(1e-30))
 
 
-@pytest.mark.parametrize("fp8_rows", (32, 0))
+@pytest.mark.parametrize("fp8_rows", (FP8_DECODE_ROWS, 0))
 @pytest.mark.parametrize("heads,dtype,kind", ((64, "bfloat16", "projection"),
     (32, "bfloat16", "projection"), (32, "float32", "projection"), (32, "bfloat16", "norm")))
 def test_glmf_kda_w8_bf16_recipe_cross_width_bits(fp8_rows, heads, dtype, kind):
-    """Compare the new W8/S16 recipe with itself, not today's FP32 state.
+    """One decode recipe per width, compared with itself, not today's FP32 state.
 
-    The canonical option fixes W8A16 at every width even when the runtime
-    supplies the legacy GEMV threshold of 16. Every row has its own recurrent slot so widening
+    ``fp8_rows`` is the projection's decode capacity as the engine launches it: the canonical
+    ``FP8_DECODE_ROWS`` (the GEMV route through the cap, W8A16 above it), or 0 to turn the FP8
+    route off (W8A16 at every width). Whichever route a width runs, a row's bits must not move
+    when its batch widens: the ``fp8_rows=0`` pass proves that for W8A16 through 128 rows, and
+    the ``FP8_DECODE_ROWS`` pass for the GEMV route through the cap. Past the cap the fallback
+    is that same W8A16 route, so the boundary is checked against the FP8-off launch at the same
+    width rather than against a third kernel. Every row has its own recurrent slot so widening
     a batch cannot legitimately alter its projection, conv or recurrent state.
     """
     from b12x.integration.cuteafd import GLM53_FLASH as g
@@ -163,7 +169,7 @@ def test_glmf_kda_w8_bf16_recipe_cross_width_bits(fp8_rows, heads, dtype, kind):
               weights["dt_bias"], weights["o_norm"])
     ins, outs = weights["in_q"], weights["o_q"]
 
-    def run(cap, rows, start=0, spec=0):
+    def run(cap, rows, start=0, spec=0, scalar=None):
         prog = P(g, max_rows=cap, fp8_only="decode", state_dtype="bfloat16",
                  output_dtype=dtype, output_kind=kind)
         ss, cc = state[start:start + rows].clone(), conv[start:start + rows].clone()
@@ -176,7 +182,7 @@ def test_glmf_kda_w8_bf16_recipe_cross_width_bits(fp8_rows, heads, dtype, kind):
         storage = torch.full((size + 1024,), 0xA5, device="cuda", dtype=torch.uint8)
         prog.launch(x[start:start + rows], ins[0], ins[2], *shared, outs[0], outs[2],
                     cc, ss, local_slots, local_slots, out, replay, storage[:size],
-                    scalars=(rows, fp8_rows, spec))
+                    scalars=(rows, fp8_rows if scalar is None else scalar, spec))
         torch.cuda.synchronize()
         assert bool(torch.isfinite(out).all())
         assert bool((storage[size:] == 0xA5).all())
@@ -185,18 +191,26 @@ def test_glmf_kda_w8_bf16_recipe_cross_width_bits(fp8_rows, heads, dtype, kind):
             assert torch.equal(cc.view(torch.int16), conv[start:start + rows].view(torch.int16))
         return out, ss, cc
 
-    serial = [run(64, 1, start=i) for i in range(width)]
+    serial = [run(FP8_DECODE_ROWS, 1, start=i) for i in range(width)]
     reference = tuple(torch.cat([row[k] for row in serial]) for k in range(3))
     failures = []
     for cap in (64, 128):
-        for rows in (1, 2, 7, 8, 16, 17, 32, 33, 63, 64, 65, 96, 127, 128):
+        for rows in (1, 2, 7, 8, 16, 17, 32, 33, 48, 63, 64, 65, 96, 127, 128):
             if rows > cap:
                 continue
             got = run(cap, rows)
-            for name, actual, expected in zip(("out", "state", "conv"), got, reference):
-                bad = int((actual.view(torch.int16) != expected[:rows].view(torch.int16)).sum())
-                if bad:
-                    failures.append(f"cap={cap} M={rows} {name}: {bad} differing BF16 words")
+            if rows <= fp8_rows:
+                for name, actual, expected in zip(("out", "state", "conv"), got, reference):
+                    bad = int((actual.view(torch.int16) != expected[:rows].view(torch.int16)).sum())
+                    if bad:
+                        failures.append(f"cap={cap} M={rows} {name}: {bad} differing BF16 words")
+            else:
+                # Past the runtime scalar this width runs the W8A16 route: the same launch with
+                # FP8 off must produce it, so the boundary adds no third reduction order.
+                off = run(cap, rows, scalar=0)
+                for name, actual, expected in zip(("out", "state", "conv"), got, off):
+                    if not torch.equal(actual.view(torch.int16), expected.view(torch.int16)):
+                        failures.append(f"cap={cap} M={rows} {name}: differs from the FP8-off route")
             verify = run(cap, rows, spec=1)[0]
             if not torch.equal(verify.view(torch.int16), got[0].view(torch.int16)):
                 failures.append(f"cap={cap} M={rows}: verify output differs from plain step")
