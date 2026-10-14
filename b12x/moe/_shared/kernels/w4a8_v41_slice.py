@@ -361,7 +361,9 @@ class V41FusedSliceKernel:
                 qs[row, block] = scale
             cute.arch.sync_threads()
             # Replicate FC1, but partition disjoint FC2 outputs without regrouping K.
-            output_begin = cute.arch.block_idx()[2] * (self.hidden_tiles // self.fc2_n_splits)
+            output_begin = Int32(0)
+            if cutlass.const_expr(self.fc2_n_splits > 1):
+                output_begin = cute.arch.block_idx()[2] * (self.hidden_tiles // self.fc2_n_splits)
             for local_ot in range(self.hidden_tiles // self.fc2_n_splits):
                 ot = output_begin + local_ot
                 if cutlass.const_expr(self.exact_storage):
