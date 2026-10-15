@@ -5,7 +5,7 @@ projections a and b. It writes BF16 recurrence output and FP32 final states
 using the shared delta-rule CuTe kernels with a compile-time GDN recipe.
 Projection, convolution, output RMSNorm, and output gating are external.
 
-Q/K heads are 128-wide; each has three 128-wide value heads. Q/K/V may be
+Q/K heads are 128-wide; each has an integral number of 128-wide value heads. Q/K/V may be
 row-contiguous views of a packed projection. State uses [slot, value_head,
 value_dim, key_dim] with a possibly padded slot stride, shared with GDN decode.
 Pool-scaled offsets use 64-bit arithmetic.
@@ -41,7 +41,7 @@ META = OpMeta(
                                  "b12x/sequence/gdn_decode/_cute_kernels.py")),
     test_path="tests/preparation/test_delta_prefill.py", since="1.4.0",
     notes=("BF16 activations, FP32 state, "
-           "head dim 128, three value heads per Q/K head, 16-token chunks."),
+           "head dim 128, integral value-to-key head ratio, 16-token chunks."),
 )
 
 if TYPE_CHECKING:

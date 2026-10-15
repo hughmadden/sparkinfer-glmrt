@@ -98,8 +98,8 @@ def _validate_query(query: GdnPrefillQuery, device) -> None:
     if not isinstance(query, GdnPrefillQuery):
         raise TypeError("query must be GdnPrefillQuery")
     validate_metadata_query(query)
-    if query.key_heads <= 0 or query.value_heads != 3 * query.key_heads:
-        raise ValueError("GDN prefill requires three value heads per key head")
+    if query.key_heads <= 0 or query.value_heads <= 0 or query.value_heads % query.key_heads:
+        raise ValueError("GDN prefill requires an integral value-to-key head ratio")
     if query.head_dim != 128:
         raise ValueError(f"sequence.gdn_prefill requires head_dim 128, got {query.head_dim}")
     if query.model_dtype != "bfloat16" or query.state_dtype != "float32":

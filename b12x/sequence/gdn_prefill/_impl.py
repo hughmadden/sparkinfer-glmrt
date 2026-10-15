@@ -51,8 +51,8 @@ class Caps:
         object.__setattr__(self, "device", device)
         for name in ("max_tokens", "max_seqs", "max_state_slots", "key_heads", "value_heads"):
             object.__setattr__(self, name, positive(name, getattr(self, name)))
-        if self.value_heads != 3 * self.key_heads:
-            raise ValueError("GDN prefill requires three value heads per key head")
+        if self.value_heads % self.key_heads:
+            raise ValueError("GDN prefill requires an integral value-to-key head ratio")
         if self.max_seqs > 4096:
             raise ValueError("max_seqs must be at most 4096")
         if int(self.head_dim) != HEAD_DIM:

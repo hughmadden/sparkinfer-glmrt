@@ -22,6 +22,73 @@ def _gpu():
     return require_b12x()
 
 
+@pytest.mark.parametrize("ratio", (2, 3))
+def test_gdn_prefill_head_ratio_matches_expanded_reference(ratio):
+    from b12x.sequence.gdn_prefill.reference import prepare_chunk, recurrent_gdn
+
+    case = PrefillCase("gdn", 2, 2 * ratio, (17,))
+    tensors = make_inputs(case, device="cpu")
+    q, k, v = (tensors[name] for name in ("q", "k", "v"))
+    args = (v, tensors["raw_g"], tensors["raw_beta"], tensors["A_log"], tensors["dt_bias"])
+    state = tensors["recurrent_state"][0]
+    actual = recurrent_gdn(q, k, *args, initial_state=state, checkpoint_offset=16)
+    expanded = recurrent_gdn(q.repeat_interleave(ratio, 1), k.repeat_interleave(ratio, 1),
+                             *args, initial_state=state, checkpoint_offset=16)
+    for got, expected in zip(actual, expanded):
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    scalars = (tensors["raw_g"][:16], tensors["raw_beta"][:16],
+               tensors["A_log"], tensors["dt_bias"])
+    actual_chunk = prepare_chunk(q[:16], k[:16], *scalars)
+    expanded_chunk = prepare_chunk(q[:16].repeat_interleave(ratio, 1),
+                                   k[:16].repeat_interleave(ratio, 1), *scalars)
+    for name in actual_chunk:
+        torch.testing.assert_close(actual_chunk[name], expanded_chunk[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("values", (2, 3))
+def test_gdn_prefill_accepts_integral_ratios(values):
+    from b12x.sequence.gdn_prefill._tuning import GdnPrefillQuery, _validate_query
+
+    gdn.Caps(device="cuda:0", max_tokens=65, max_seqs=1, max_state_slots=3,
+             key_heads=1, value_heads=values)
+    query = GdnPrefillQuery(key_heads=1, value_heads=values, head_dim=128,
+                           model_dtype="bfloat16", state_dtype="float32", qk_l2norm=True,
+                           checkpoint_export=False, max_tokens=65, max_seqs=1)
+    _validate_query(query, None)
+
+
+def test_gdn_prefill_rejects_fractional_head_ratio():
+    from b12x.sequence.gdn_prefill._tuning import GdnPrefillQuery, _validate_query
+    from b12x.sequence.gdn_prefill.reference import prepare_chunk, recurrent_gdn
+
+    with pytest.raises(ValueError, match="integral"):
+        gdn.Caps(device="cuda:0", max_tokens=65, max_seqs=1, max_state_slots=3,
+                 key_heads=2, value_heads=3)
+    query = GdnPrefillQuery(key_heads=2, value_heads=3, head_dim=128,
+                           model_dtype="bfloat16", state_dtype="float32", qk_l2norm=True,
+                           checkpoint_export=False, max_tokens=65, max_seqs=1)
+    with pytest.raises(ValueError, match="integral"):
+        _validate_query(query, None)
+    tensors = make_inputs(PrefillCase("gdn", 2, 3, (1,)), device="cpu")
+    q, k, v, a, b, log, bias = (tensors[name] for name in
+                               ("q", "k", "v", "raw_g", "raw_beta", "A_log", "dt_bias"))
+    with pytest.raises(ValueError, match="integral"):
+        recurrent_gdn(q, k, v, a, b, log, bias, initial_state=tensors["recurrent_state"][0])
+    with pytest.raises(ValueError, match="integral"):
+        prepare_chunk(q, k, a, b, log, bias)
+
+
+@pytest.mark.parametrize("ratio", (2, 3))
+def test_prepared_gdn_prefill_preserves_integral_head_ratios(ratio):
+    case = PrefillCase("gdn", 2, 2 * ratio, (65, 17))
+    tensors = make_inputs(case, device=_gpu())
+    initial = tensors["recurrent_state"].clone()
+    expected, state = oracle(case, tensors)
+    with prepared_binding(case, tensors) as binding:
+        gdn.run(binding)
+        check_binding(case, binding, expected, state, initial)
+
+
 @pytest.mark.parametrize("recipe", ("gdn", "kda"))
 @pytest.mark.parametrize("lengths", ((1,), (17,), (33, 0, 17), (128, 33)))
 def test_prepared_prefill_preserves_dynamic_lengths_and_slots(recipe, lengths) -> None:

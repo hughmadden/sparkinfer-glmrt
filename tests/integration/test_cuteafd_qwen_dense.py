@@ -59,13 +59,13 @@ def test_dense_ffn(hidden, intermediate):
 
 @pytest.mark.parametrize("hidden,heads,values,norm_dtype", [
     (4096, 16, 32, torch.float32), (5120, 24, 48, torch.bfloat16)])
-def test_dense_gdn_native_norm_and_silu(hidden, heads, values, norm_dtype):
+@pytest.mark.parametrize("rows", [3, 65])
+def test_dense_gdn_native_norm_and_silu(hidden, heads, values, norm_dtype, rows):
     require_b12x()
     from b12x.integration.cuteafd._common import QwenDenseGeometry
     from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_gdn_aot
     g = QwenDenseGeometry(hidden=hidden, heads=heads, gdn_value_heads=values)
-    program = compile_qwen_dense_gdn_aot(g, max_rows=64, norm_dtype=norm_dtype)
-    rows = 3
+    program = compile_qwen_dense_gdn_aot(g, max_rows=max(64, rows), norm_dtype=norm_dtype)
     x = torch.randn(rows, g.hidden, device="cuda", dtype=torch.bfloat16) * 0.1
     w_in = torch.randn(g.gdn_in_width, g.hidden, device="cuda", dtype=torch.bfloat16) * 0.01
     w_out = torch.randn(g.hidden, g.gdn_value_width, device="cuda", dtype=torch.bfloat16) * 0.01
@@ -79,8 +79,11 @@ def test_dense_gdn_native_norm_and_silu(hidden, heads, values, norm_dtype):
     first = torch.zeros_like(slots)
     out = torch.empty_like(x)
     scratch = torch.empty(program.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
-    program.launch(x, w_in, conv_w, a_log, dt_bias, norm_w, w_out, conv, state, slots, first,
-                   out, None, scratch, scalars=[rows, 0])
+    args = (x, w_in, conv_w, a_log, dt_bias, norm_w, w_out, conv, state, slots, first, out)
+    if rows <= 64:
+        program.launch(*args, None, scratch, scalars=[rows, 0])
+    else:
+        program.launch(*args, scratch, scalars=[rows])
     projected = torch.nn.functional.linear(x, w_in)
     c, v = g.gdn_conv_width, g.gdn_value_width
     qkv = projected[:, :c].T[None]
@@ -116,6 +119,9 @@ def test_dense_gdn_native_norm_and_silu(hidden, heads, values, norm_dtype):
     torch.testing.assert_close(out, expected, atol=2e-5, rtol=0.04)
     torch.testing.assert_close(conv[0], projected[-3:, :c], atol=0, rtol=0)
     assert next(op for op in program.operands if op.name == "norm_w").dtype == norm_dtype
+
+    if rows > 64:
+        return
 
     from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_gdn_commit_aot
     commit = compile_qwen_dense_gdn_commit_aot(g)

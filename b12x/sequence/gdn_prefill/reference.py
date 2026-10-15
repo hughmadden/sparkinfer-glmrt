@@ -38,11 +38,11 @@ def recurrent_gdn(
     """Return BF16 token outputs, FP32 final state, and an optional checkpoint."""
     scale = HEAD_DIM**-0.5 if scale is None else float(scale)
     heads = v.shape[1]
-    if heads != 3 * q.shape[1] or q.shape != k.shape:
-        raise ValueError("GDN requires matching Q/K and three value heads per key head")
+    if q.shape != k.shape or q.shape[1] <= 0 or heads <= 0 or heads % q.shape[1]:
+        raise ValueError("GDN requires matching Q/K and an integral value-to-key head ratio")
     qf = l2_normalize(q, eps) if qk_l2norm else q.float()
     kf = l2_normalize(k, eps) if qk_l2norm else k.float()
-    head_map = torch.arange(heads, device=q.device) // 3
+    head_map = torch.arange(heads, device=q.device) // (heads // q.shape[1])
     qf = qf[:, head_map] * scale
     kf = kf[:, head_map]
     decay = torch.exp(gdn_log_decay(a, dt_bias, A_log))
@@ -67,7 +67,9 @@ def prepare_chunk(q, k, a, b, A_log, dt_bias, *, scale=None, eps=1e-6, qk_l2norm
         raise ValueError("a chunk must contain 1..16 tokens")
     scale = HEAD_DIM**-0.5 if scale is None else float(scale)
     heads = a.shape[1]
-    head_map = torch.arange(heads, device=q.device) // 3
+    if q.shape != k.shape or q.shape[1] <= 0 or heads <= 0 or heads % q.shape[1]:
+        raise ValueError("GDN requires matching Q/K and an integral value-to-key head ratio")
+    head_map = torch.arange(heads, device=q.device) // (heads // q.shape[1])
     qf = l2_normalize(q, eps) if qk_l2norm else q.float()
     kf = l2_normalize(k, eps) if qk_l2norm else k.float()
     qn = torch.zeros((heads, CHUNK, HEAD_DIM), device=q.device)
