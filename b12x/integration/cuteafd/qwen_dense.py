@@ -110,10 +110,10 @@ class _FullAttention:
         self.attn = MimoGqaAttention(heads=g.heads, kv_heads=g.kv_heads, tokens=1,
             window=0, paged=True, sink=False, direct=False, softmax_scale=g.softmax_scale,
             page_rows=g.page_rows, head=g.head_dim, v_head=g.head_dim)
-        self.merge = MimoSplitMerge(heads=g.heads, v_head=g.head_dim)
+        self.merge = MimoSplitMerge(heads=g.heads, v_head=g.head_dim, empty_rows_zero=True)
 
     def key(self) -> tuple:
-        return (self.g, self.max_splits, self.attn.key())
+        return (self.g, self.max_splits, self.attn.key(), "empty_rows_zero")
 
     @cute.jit
     def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer,
@@ -134,7 +134,8 @@ def compile_qwen_dense_full_gqa_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_row
 
     positions is Int64 per physical query. page_table is Int32 [rows,stride],
     or a single shared row when table_stride=0. All page-scaled addresses are
-    Int64. Caller chooses 1 <= splits <= max_splits before capture.
+    Int64. A negative position is an inactive query with zero output and no KV
+    reads. Caller chooses 1 <= splits <= max_splits before capture.
     """
     max_rows = _rows(max_rows)
     if not 1 <= int(max_splits) <= MAX_SPLITS:
@@ -151,7 +152,8 @@ def compile_qwen_dense_full_gqa_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_row
         key=(max_rows, launch.key()),
         geometry={"heads": g.heads, "kv_heads": g.kv_heads, "head_dim": g.head_dim,
                   "page_rows": g.page_rows, "record_bytes": g.record_bytes, "max_rows": max_rows,
-                  "max_splits": int(max_splits), "causal": True, "indexed": False},
+                  "max_splits": int(max_splits), "causal": True, "indexed": False,
+                  "empty_rows_zero": True},
         scratch={"scratch": lambda rows: full_attention_scratch_bytes(g, rows, int(max_splits))})
 
 

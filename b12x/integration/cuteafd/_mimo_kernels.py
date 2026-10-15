@@ -899,10 +899,13 @@ class MimoKvWiden:
 class MimoSplitMerge:
     """Merge split partials: ``out = sum_s w_s o_s / (sum_s w_s + [exp(sink - M)])``
     with ``w_s = exp(lse_s - M)``, ``M`` the max over the splits (and the
-    sink). One CTA per (head, row), one thread per value dim."""
+    sink). With empty_rows_zero, an empty row produces zero without reading its
+    partials. One CTA per (head, row), one thread per value dim."""
 
-    def __init__(self, *, heads: int, v_head: int = 128, sink: bool = False):
+    def __init__(self, *, heads: int, v_head: int = 128, sink: bool = False,
+                 empty_rows_zero: bool = False):
         self.heads, self.v_head, self.sink = int(heads), int(v_head), bool(sink)
+        self.empty_rows_zero = bool(empty_rows_zero)
 
     @cute.jit
     def __call__(self, partial_out: cute.Pointer, partial_lse: cute.Pointer, sinks: cute.Pointer,
@@ -939,7 +942,13 @@ class MimoSplitMerge:
         if const_expr(self.sink):
             total = total + cute.math.exp2((sink - top) * Float32(LOG2_E), fastmath=False)
         o = cute.make_tensor(out, cute.make_layout((Int64(1) << Int64(40),)))
-        o[(row * Int64(self.heads) + head) * Int64(self.v_head) + dim] = BFloat16(acc / total)
+        if const_expr(self.empty_rows_zero):
+            result = Float32(0.0)
+            if total > Float32(0.0):
+                result = acc / total
+            o[(row * Int64(self.heads) + head) * Int64(self.v_head) + dim] = BFloat16(result)
+        else:
+            o[(row * Int64(self.heads) + head) * Int64(self.v_head) + dim] = BFloat16(acc / total)
 
 
 class MimoRingCommit:

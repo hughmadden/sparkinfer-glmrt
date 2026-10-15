@@ -217,6 +217,39 @@ def test_dense_attention_output_gate(heads):
     torch.testing.assert_close(out, expected, atol=0.002, rtol=0.04)
 
 
+@pytest.mark.parametrize("sink", [False, True])
+def test_shared_split_merge_empty_rows_zero_with_nan_partials(sink):
+    require_b12x()
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._mimo_kernels import MimoSplitMerge
+    rows, splits, heads, width = 3, 4, 2, 128
+    merge = MimoSplitMerge(heads=heads, v_head=width, sink=sink, empty_rows_zero=True)
+    program = compile_program(merge, name="test_empty_split_merge", operands=(
+        Operand("partial", torch.float32, "[rows,splits,heads,width]"),
+        Operand("lse", torch.float32, "[rows,splits,heads]"),
+        Operand("sink", torch.float32, "[heads]"),
+        Operand("out", torch.bfloat16, "[rows,heads,width]", "out")),
+        scalars=(Scalar("rows"), Scalar("splits")), key=(sink, "empty_rows_zero"))
+    partial = torch.randn(rows, splits, heads, width, device="cuda")
+    lse = torch.randn(rows, splits, heads, device="cuda")
+    sinks = torch.randn(heads, device="cuda")
+    lse[1].fill_(-torch.inf)
+    lse[2, 1:].fill_(-torch.inf)
+    partial[1].fill_(torch.nan)
+    partial[2, 1:].fill_(torch.nan)
+    out = torch.empty(rows, heads, width, device="cuda", dtype=torch.bfloat16)
+    program.launch(partial, lse, sinks, out, scalars=[rows, splits])
+    for row, live in ((0, splits), (2, 1)):
+        logits = lse[row, :live].T
+        if sink:
+            logits = torch.cat((logits, sinks[:, None]), dim=1)
+        weights = logits.softmax(-1)[:, :live].T
+        expected = (partial[row, :live] * weights[..., None]).sum(0).bfloat16()
+        torch.testing.assert_close(out[row], expected, atol=0.015625, rtol=0.008)
+    assert torch.equal(out[1], torch.zeros_like(out[1]))
+    assert torch.isfinite(out).all()
+
+
 @pytest.mark.parametrize("heads", [16, 24])
 def test_dense_full_gqa_is_unrestricted_and_causal(heads):
     require_b12x()
@@ -268,3 +301,15 @@ def test_dense_full_gqa_is_unrestricted_and_causal(heads):
     baseline = out.clone()
     program.launch(query, high_cache, positions, high_table, out, scratch, scalars=[rows, 0, 4])
     assert torch.equal(out, baseline)
+
+    # An inactive physical lane has no page table and may contain poisoned query
+    # and scratch values; it cannot leak NaNs into itself or adjacent lanes.
+    positions[1] = -1
+    query[1].fill_(float("nan"))
+    mixed_table = table.repeat(rows, 1)
+    mixed_table[1].fill_(-1)
+    scratch.fill_(255)
+    program.launch(query, cache, positions, mixed_table, out, scratch, scalars=[rows, pages, 4])
+    assert torch.equal(out[[0, 2]], baseline[[0, 2]])
+    assert torch.equal(out[1], torch.zeros_like(out[1]))
+    assert torch.isfinite(out).all()
