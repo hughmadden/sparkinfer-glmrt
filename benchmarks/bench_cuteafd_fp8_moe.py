@@ -10,6 +10,7 @@ old A16 ceiling; it is not a serving arithmetic override.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import statistics
@@ -39,6 +40,88 @@ def time_us(fn, iters: int, flush: torch.Tensor, prepare) -> float:
     return statistics.median(time_samples(fn, iters, flush, prepare))
 
 
+def exact_sweep(g, w, args):
+    """Compare exact BF16 bytes, including each row's width-one execution.
+
+    Run this same file against both revisions (separate processes/JIT caches).
+    Refuse different inputs/weights before comparing actual output bytes, not
+    merely rounded oracle metrics or their hashes.
+    """
+    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
+
+    widths = [int(r) for r in args.rows.split(",")]
+    if not widths or min(widths) < 1 or max(widths) > 64:
+        raise ValueError("exact sweep requires widths in 1..64")
+    if g.weights != "nvfp4" or g.activations != "a4" or args.input != "bf16":
+        raise ValueError("exact sweep requires NVFP4 W4A4 with BF16 input")
+
+    def raw(tensor):
+        return tensor.detach().contiguous().view(torch.uint8).cpu()
+
+    def digest(tensor):
+        return hashlib.sha256(memoryview(raw(tensor).numpy())).hexdigest()
+
+    gen = torch.Generator(device="cuda").manual_seed(args.seed)
+    capacity = max(widths)
+    x = torch.randn(capacity, g.hidden, device="cuda", generator=gen).bfloat16()
+    scores = torch.rand(capacity, g.experts, device="cuda", generator=gen)
+    ids = scores.topk(g.top_k, -1).indices.int().contiguous()
+    if args.routing == "hot":
+        ids.copy_(ids[:1].expand_as(ids))
+    weights = torch.rand(capacity, g.top_k, device="cuda", generator=gen)
+    inputs = {"x": raw(x), "ids": raw(ids), "weights": raw(weights)}
+    weight_hashes = [digest(t) for t in w]
+    config = {"geometry": g.name, "tp": g.tp, "rows": widths,
+              "routing": args.routing, "seed": args.seed, "route": args.route}
+    baseline = None
+    if args.exact_baseline:
+        baseline = torch.load(args.exact_baseline / "outputs.pt", weights_only=True, map_location="cpu")
+        assert config == baseline["config"], "baseline configuration differs"
+        assert weight_hashes == baseline["weight_sha256"], "baseline weights differ"
+        for name, value in inputs.items():
+            assert torch.equal(value, baseline["inputs"][name]), f"baseline input differs: {name}"
+
+    def execute(program, source, selected, mix, rows, scratch):
+        out = torch.full((rows, g.hidden), float("nan"), device="cuda", dtype=torch.bfloat16)
+        # Poison staging: an unstaged dead row must not affect live outputs.
+        scratch.fill_(0xA5)
+
+        def run():
+            program.launch(source, selected, mix, *w, out, scratch, scalars=(rows,))
+
+        run()
+        if args.graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all(), f"nonfinite output at width {rows}"
+        return raw(out)
+
+    single = compile_fp8_moe_aot(g, route=args.route, max_rows=1, wire=False)
+    scratch = torch.empty(fp8_moe_scratch_bytes(g, args.route, 1, False), device="cuda", dtype=torch.uint8)
+    alone = torch.cat([execute(single, x[r:r+1], ids[r:r+1], weights[r:r+1], 1, scratch)
+                       for r in range(capacity)])
+    outputs, results = {}, []
+    for width in widths:
+        program = compile_fp8_moe_aot(g, route=args.route, max_rows=width, wire=False)
+        scratch = torch.empty(fp8_moe_scratch_bytes(g, args.route, width, False), device="cuda", dtype=torch.uint8)
+        actual = execute(program, x[:width], ids[:width], weights[:width], width, scratch)
+        assert torch.equal(actual, alone[:width]), f"row invariance failed at width {width}"
+        if baseline is not None:
+            assert torch.equal(actual, baseline["outputs"][width]), f"baseline bytes differ at width {width}"
+        outputs[width] = actual
+        record = {"rows": width, "sha256": digest(actual), "row_invariant": True,
+                  "baseline_exact": baseline is not None}
+        results.append(record)
+        print(json.dumps(record), flush=True)
+    args.exact_sweep.mkdir(parents=True, exist_ok=True)
+    torch.save({"config": config, "inputs": inputs, "weight_sha256": weight_hashes,
+                "outputs": outputs, "alone": alone}, args.exact_sweep / "outputs.pt")
+    (args.exact_sweep / "summary.json").write_text(json.dumps({**config, "results": results}, indent=2) + "\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--geometry", default="mimo")
@@ -54,9 +137,14 @@ def main() -> None:
     parser.add_argument("--routing", choices=("random", "hot"), default="random")
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--exact-sweep", type=Path, help="correctness only: dump exact outputs and check row invariance (widths 1..64)")
+    parser.add_argument("--exact-baseline", type=Path, help="compare --exact-sweep byte for byte with this baseline dump")
     args = parser.parse_args()
     if args.iters <= 0:
         parser.error("iters must be positive")
+    if args.exact_baseline and not args.exact_sweep:
+        parser.error("--exact-baseline requires --exact-sweep")
     torch.backends.cuda.matmul.allow_tf32 = False
 
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, compile_fp8_moe_aot, fp8_moe_scratch_bytes
@@ -65,7 +153,7 @@ def main() -> None:
     if g.weights == "nvfp4" and args.input != "bf16":
         parser.error("NVFP4 requires original BF16 input")
     dev = "cuda"
-    gen = torch.Generator(device=dev).manual_seed(0)
+    gen = torch.Generator(device=dev).manual_seed(args.seed)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
 
     def fp8(shape):
@@ -87,6 +175,9 @@ def main() -> None:
         per_expert = 3 * i * h + 3 * (i // 128) * (h // 128) * 4
     else:
         parser.error("this benchmark currently supports FP8 and NVFP4 weights")
+    if args.exact_sweep:
+        exact_sweep(g, w, args)
+        return
     flush = torch.zeros(256 << 20, dtype=torch.uint8, device=dev)
     results = []
     for rows in [int(r) for r in args.rows.split(",")]:
