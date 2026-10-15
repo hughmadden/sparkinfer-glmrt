@@ -103,7 +103,7 @@ DECODE_MAX_ROWS = 64
 # 101,376-byte CTA ceiling, so the sparse class stages deeper than the wide one;
 # the extra stages are what keep more than one operand batch in flight at decode
 # occupancy.
-SMALL_GATE_STAGES = 2
+SMALL_GATE_STAGES = 3
 # CTAs per queried SM the sparsest valid routing (top_k experts) must reach for
 # the sparse gate/up N tile to be used; narrower tiles add CTAs, never K order.
 SMALL_GATE_CTAS_PER_SM = 4
