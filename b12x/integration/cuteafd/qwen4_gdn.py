@@ -66,7 +66,7 @@ from cutlass import Float32, Int32, Int64
 
 from ._fp8_weights import FP8_DECODE_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
     w8_scalars
-from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
+from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, QwenHybridGeometry, Scalar, compile_program
 from ._glm_kernels import glm_projection
 from ._glmf_kernels import GlmfKdaConvState
 from ._qwen4_gdn_kernels import (
@@ -106,7 +106,7 @@ class _GdnChunked:
     """One sequence's GDN recurrence through b12x's chunked delta-rule prefill
     (prologue, then prepare + recurrence per window of tiles on one stream)."""
 
-    def __init__(self, g: Qwen4Geometry, max_rows: int):
+    def __init__(self, g: QwenHybridGeometry, max_rows: int):
         from b12x.sequence._shared.delta_prefill import _cute_kernels as dk
         from b12x.sequence._shared.delta_prefill.contract import materialize_layout
         from b12x.sequence._shared.delta_prefill.workspace import default_window_tiles
@@ -199,7 +199,7 @@ class _PrefillW8A16:
         self.w8a16(x, w_fp8, scale, out, rows, stream)
 
 
-def gdn_scratch_bytes(g: Qwen4Geometry, rows: int, chunked: int = 0) -> int:
+def gdn_scratch_bytes(g: QwenHybridGeometry, rows: int, chunked: int = 0) -> int:
     """proj [rows,P], conv q|k|v [rows,C], o [rows,V], y [rows,V] (BF16), then the chunked
     recurrence's workspace (``chunked`` bytes, prefill capacities)."""
     rows = max(int(rows), 1)
@@ -208,8 +208,10 @@ def gdn_scratch_bytes(g: Qwen4Geometry, rows: int, chunked: int = 0) -> int:
 
 
 class _Gdn:
-    def __init__(self, g: Qwen4Geometry, max_rows: int = 64, fp8: bool = False, w8: str | None = None):
+    def __init__(self, g: QwenHybridGeometry, max_rows: int = 64, fp8: bool = False, w8: str | None = None,
+                 activation: str = "sigmoid"):
         self.g = g
+        self.activation = activation
         self.chunked = _GdnChunked(g, max_rows) if int(max_rows) > CHUNKED_MIN_ROWS else None
         c, v, p = g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width
         self.c, self.v, self.p = c, v, p
@@ -228,7 +230,8 @@ class _Gdn:
         self.conv = Qwen4GdnConv(channels=c, proj_width=p)
         self.conv_state = GlmfKdaConvState(channels=c, proj_width=p)
         self.recurrent = Qwen4GdnRecurrent(heads=g.gdn_value_heads, key_heads=g.gdn_key_heads, ab_stride=p)
-        self.norm = Qwen4GdnGatedNorm(heads=g.gdn_value_heads, eps=g.norm_eps, gate_stride=p)
+        self.norm = Qwen4GdnGatedNorm(heads=g.gdn_value_heads, eps=g.norm_eps, gate_stride=p,
+                                      activation=activation)
         self.replay = gdn_replay_layout(g.gdn_key_heads, g.gdn_value_heads, c)
         # Speculative steps (replay records) are decode-capacity programs only.
         self.spec = self.chunked is None
@@ -236,6 +239,8 @@ class _Gdn:
     def key(self) -> tuple:
         key = (self.in_proj.key(), self.o_proj.key(), self.g, self.fp8,
                None if self.chunked is None else self.chunked.key())
+        if self.activation != "sigmoid":
+            key = (*key, "gate", self.activation)
         return key if self.w8 is None else (*key, "w8", self.w8)
 
     def chunked_bytes(self) -> int:
@@ -325,8 +330,8 @@ class _GdnFp8(_Gdn):
     decode capacity read the E4M3 copies, more rows the BF16 weights) and the
     speculative replay record."""
 
-    def __init__(self, g: Qwen4Geometry, max_rows: int = 64):
-        super().__init__(g, max_rows, fp8=True)
+    def __init__(self, g: QwenHybridGeometry, max_rows: int = 64, activation: str = "sigmoid"):
+        super().__init__(g, max_rows, fp8=True, activation=activation)
         if not self.spec:
             raise ValueError("FP8 GDN programs are decode capacities (<= CHUNKED_MIN_ROWS rows)")
 
@@ -387,13 +392,14 @@ class _GdnW8Prefill(_GdnW8):
                      state, slots, seq_first, out, state, scratch, rows, Int32(0), fp8_rows, stream)
 
 
-def _compile_gdn_w8(g: Qwen4Geometry, max_rows: int, mode: str) -> AotProgram:
+def _compile_gdn_w8(g: QwenHybridGeometry, max_rows: int, mode: str,
+                    activation: str = "sigmoid", norm_dtype: torch.dtype = torch.bfloat16) -> AotProgram:
     prefill = check_w8_mode(mode) == "prefill"
     spec = max_rows <= CHUNKED_MIN_ROWS
     if prefill == spec:
         raise ValueError("FP8-only GDN programs: decode mode for capacities <= CHUNKED_MIN_ROWS (speculative "
                          "replay), prefill mode above")
-    launch = (_GdnW8Prefill if prefill else _GdnW8Decode)(g, max_rows, w8=mode)
+    launch = (_GdnW8Prefill if prefill else _GdnW8Decode)(g, max_rows, w8=mode, activation=activation)
     record = launch.replay["bytes"]
     h, c, v, p, heads = g.hidden, g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width, g.gdn_value_heads
     operands = (
@@ -402,7 +408,7 @@ def _compile_gdn_w8(g: Qwen4Geometry, max_rows: int, mode: str) -> AotProgram:
         Operand("conv_w", torch.float32, f"[{c},4]", align=4),
         Operand("a_log", torch.float32, f"[{heads}]", align=4),
         Operand("dt_bias", torch.float32, f"[{heads}]", align=4),
-        Operand("norm_w", torch.bfloat16, f"[{g.gdn_head_dim}]"),
+        Operand("norm_w", norm_dtype, f"[{g.gdn_head_dim}]"),
         *fp8_only_operands("w_out", h, v, prefill=prefill),
         Operand("conv_state", torch.bfloat16, f"[slots,3,{c}]", "inout", align=2),
         Operand("state", torch.float32, f"[slots,{heads},128,128]", "inout"),
@@ -415,7 +421,7 @@ def _compile_gdn_w8(g: Qwen4Geometry, max_rows: int, mode: str) -> AotProgram:
     )
     scalars = (Scalar("rows"), Scalar("spec")) if spec else w8_scalars(True)
     return compile_program(
-        launch, name="qwen4_gdn", operands=operands, scalars=scalars, key=(max_rows, mode, launch.key()),
+        launch, name="qwen4_gdn", operands=operands, scalars=scalars, key=(max_rows, mode, launch.key()) + (() if norm_dtype == torch.bfloat16 else (str(norm_dtype),)),
         geometry={"hidden": h, "key_heads": g.gdn_key_heads, "value_heads": heads, "head_dim": g.gdn_head_dim,
                   "max_rows": max_rows, "in_width": p, "eps": g.norm_eps, "fp8_weights": "only", "mode": mode,
                   "fp8_gemv_rows": FP8_DECODE_ROWS if not prefill else 0,
@@ -426,23 +432,28 @@ def _compile_gdn_w8(g: Qwen4Geometry, max_rows: int, mode: str) -> AotProgram:
     )
 
 
-def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int, fp8: bool = False,
-                          fp8_only: str | None = None) -> AotProgram:
+def compile_qwen4_gdn_aot(g: QwenHybridGeometry = QWEN38_FLASH_NEXT, *, max_rows: int, fp8: bool = False,
+                          fp8_only: str | None = None, activation: str = "sigmoid",
+                          norm_dtype: torch.dtype = torch.bfloat16) -> AotProgram:
     """One GDN layer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds ``w_in_fp8``/``w_in_scale`` and ``w_out_fp8``/``w_out_scale`` (E4M3 with
     FP32 128x128 block scales) after each BF16 weight for rows up to the program's
     decode capacity (``FP8_DECODE_ROWS``). ``fp8_only``
     (``"decode"`` for capacities <= 64, ``"prefill"`` above) takes those E4M3
     weights and scales in place of the BF16 ones (no BF16 weight operand)."""
+    if activation not in ("sigmoid", "silu"):
+        raise ValueError("GDN output activation must be sigmoid or silu")
+    if norm_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("GDN norm weights must be native BF16 or FP32")
     max_rows = int(max_rows)
     if max_rows <= 0:
         raise ValueError("max_rows must be positive")
     if fp8_only is not None:
         if fp8:
             raise ValueError("fp8 and fp8_only are exclusive")
-        return _compile_gdn_w8(g, max_rows, fp8_only)
+        return _compile_gdn_w8(g, max_rows, fp8_only, activation, norm_dtype)
     spec = max_rows <= CHUNKED_MIN_ROWS
-    launch = (_GdnFp8 if fp8 else _GdnSpec if spec else _Gdn)(g, max_rows)
+    launch = (_GdnFp8 if fp8 else _GdnSpec if spec else _Gdn)(g, max_rows, activation=activation)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     record = launch.replay["bytes"]
     h, c, v, p, heads = g.hidden, g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width, g.gdn_value_heads
@@ -454,7 +465,7 @@ def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int
         Operand("conv_w", torch.float32, f"[{c},4]", align=4),
         Operand("a_log", torch.float32, f"[{heads}]", align=4),
         Operand("dt_bias", torch.float32, f"[{heads}]", align=4),
-        Operand("norm_w", torch.bfloat16, f"[{g.gdn_head_dim}]"),
+        Operand("norm_w", norm_dtype, f"[{g.gdn_head_dim}]"),
         Operand("w_out", torch.bfloat16, f"[{h},{v}]"),
         *(fp8_operands("w_out", h, v) if fp8 else ()),
         Operand("conv_state", torch.bfloat16, f"[slots,3,{c}]", "inout", align=2),
@@ -469,7 +480,7 @@ def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int
     return compile_program(
         launch, name="qwen4_gdn", operands=operands,
         scalars=(Scalar("rows"), Scalar("spec")) if spec else (Scalar("rows"),),
-        key=(max_rows, launch.key()),
+        key=(max_rows, launch.key()) + (() if norm_dtype == torch.bfloat16 else (str(norm_dtype),)),
         geometry={"hidden": h, "key_heads": g.gdn_key_heads, "value_heads": heads, "head_dim": g.gdn_head_dim,
                   "max_rows": max_rows, "in_width": p, "eps": g.norm_eps, "fp8_weights": fp8,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
@@ -480,7 +491,7 @@ def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int
 
 
 class _GdnCommit:
-    def __init__(self, g: Qwen4Geometry):
+    def __init__(self, g: QwenHybridGeometry):
         self.g = g
         c = g.gdn_conv_width
         self.recurrent = Qwen4GdnCommit(heads=g.gdn_value_heads, key_heads=g.gdn_key_heads, channels=c)
@@ -493,7 +504,7 @@ class _GdnCommit:
         self.conv(conv_state, replay, tables, sequences, layers, slots, stream)
 
 
-def compile_qwen4_gdn_commit_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
+def compile_qwen4_gdn_commit_aot(g: QwenHybridGeometry = QWEN38_FLASH_NEXT) -> AotProgram:
     """Verify-by-replay for the GDN layers: after a speculative decode step
     (``qwen4_gdn`` with ``spec`` = 1, which records each row's replay inputs and
     leaves the state alone), apply each sequence's accepted rows to its

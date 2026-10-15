@@ -385,8 +385,62 @@ class GLMFGeometry:
 GLM53_FLASH = GLMFGeometry()
 
 
+class QwenHybridGeometry:
+    """Operator dimensions shared by dense Qwen and Flash Next; no mHC/MoE fields."""
+
+    # GDN
+    @property
+    def gdn_key_width(self) -> int:
+        return self.gdn_key_heads * self.gdn_head_dim
+
+    @property
+    def gdn_value_width(self) -> int:
+        return self.gdn_value_heads * self.gdn_head_dim
+
+    @property
+    def gdn_conv_width(self) -> int:
+        """Short-conv channels ``[q; k; v]``."""
+        return 2 * self.gdn_key_width + self.gdn_value_width
+
+    @property
+    def gdn_in_width(self) -> int:
+        """``[in_proj_qkv; in_proj_z; in_proj_b; in_proj_a]`` in-projection rows."""
+        return self.gdn_conv_width + self.gdn_value_width + 2 * self.gdn_value_heads
+
+    @property
+    def gdn_state_bytes(self) -> int:
+        """FP32 recurrent state of one sequence in one layer."""
+        return self.gdn_value_heads * self.gdn_head_dim * self.gdn_head_dim * 4
+
+    @property
+    def gdn_conv_state_bytes(self) -> int:
+        """BF16 short-conv state of one sequence in one layer: the last 3 q/k/v inputs."""
+        return (self.conv_kernel - 1) * self.gdn_conv_width * 2
+
+    @property
+    def record_bytes(self) -> int:
+        """BF16 KV record of one token: K ``[kv_heads, head_dim]`` then V."""
+        return 2 * self.kv_heads * self.head_dim * 2
+
+    @property
+    def kv_page_bytes(self) -> int:
+        return self.page_rows * self.record_bytes
+
+    def kv_record_bytes(self, kv_format: str = "bf16") -> int:
+        """K/V payload plus immutable per-token/per-head FP32 descales."""
+        if kv_format == "bf16":
+            return self.record_bytes
+        if kv_format == "fp8":
+            return 2 * self.kv_heads * (self.head_dim + 4)
+        raise ValueError(f"unsupported Qwen KV format: {kv_format}")
+
+    @property
+    def softmax_scale(self) -> float:
+        return self.head_dim ** -0.5
+
+
 @dataclass(frozen=True)
-class Qwen4Geometry:
+class Qwen4Geometry(QwenHybridGeometry):
     """Static Qwen 3.8 Flash Next (``qwen4_exp``) geometry baked into the ``qwen4_*`` programs.
 
     48 layers: Gated DeltaNet (GDN) linear attention with every fourth layer
@@ -455,58 +509,12 @@ class Qwen4Geometry:
         """Features of all streams of one row: ``hc_count * hidden``."""
         return self.hc_count * self.hidden
 
-    # GDN
-    @property
-    def gdn_key_width(self) -> int:
-        return self.gdn_key_heads * self.gdn_head_dim
-
-    @property
-    def gdn_value_width(self) -> int:
-        return self.gdn_value_heads * self.gdn_head_dim
-
-    @property
-    def gdn_conv_width(self) -> int:
-        """Short-conv channels ``[q; k; v]``."""
-        return 2 * self.gdn_key_width + self.gdn_value_width
-
-    @property
-    def gdn_in_width(self) -> int:
-        """``[in_proj_qkv; in_proj_z; in_proj_b; in_proj_a]`` in-projection rows."""
-        return self.gdn_conv_width + self.gdn_value_width + 2 * self.gdn_value_heads
-
-    @property
-    def gdn_state_bytes(self) -> int:
-        """FP32 recurrent state of one sequence in one layer."""
-        return self.gdn_value_heads * self.gdn_head_dim * self.gdn_head_dim * 4
-
-    @property
-    def gdn_conv_state_bytes(self) -> int:
-        """BF16 short-conv state of one sequence in one layer: the last 3 q/k/v inputs."""
-        return (self.conv_kernel - 1) * self.gdn_conv_width * 2
-
     # Full attention
     @property
     def attn_in_width(self) -> int:
         """``[q_proj (q|gate per head); k_proj; v_proj; indexer.index_qk_proj]`` rows."""
         return (2 * self.heads * self.head_dim + 2 * self.kv_heads * self.head_dim
                 + (self.index_heads + 1) * self.index_head_dim)
-
-    @property
-    def record_bytes(self) -> int:
-        """BF16 KV record of one token: K ``[kv_heads, head_dim]`` then V."""
-        return 2 * self.kv_heads * self.head_dim * 2
-
-    @property
-    def kv_page_bytes(self) -> int:
-        return self.page_rows * self.record_bytes
-
-    def kv_record_bytes(self, kv_format: str = "bf16") -> int:
-        """K/V payload plus immutable per-token/per-head FP32 descales."""
-        if kv_format == "bf16":
-            return self.record_bytes
-        if kv_format == "fp8":
-            return 2 * self.kv_heads * (self.head_dim + 4)
-        raise ValueError(f"unsupported Qwen KV format: {kv_format}")
 
     @property
     def index_blocks(self) -> int:
@@ -523,15 +531,51 @@ class Qwen4Geometry:
         """Selected slots per row: the budget plus the open tail, padded to 64."""
         return -(-self.dense_limit // 64) * 64
 
-    @property
-    def softmax_scale(self) -> float:
-        return self.head_dim ** -0.5
-
     # PLE
     @property
     def ple_state_rows(self) -> int:
         """Rows of the dilated PLE conv state: ``(ple_conv - 1) * ngram_size``."""
         return (self.ple_conv - 1) * self.ngram_size
+
+
+@dataclass(frozen=True)
+class QwenDenseGeometry(QwenHybridGeometry):
+    """Dense Qwen3.5/3.8 operators with unrestricted full GQA and no indexer."""
+
+    name: str = "qwen35_9b"
+    hidden: int = 4096
+    intermediate: int = 12288
+    heads: int = 16
+    kv_heads: int = 4
+    head_dim: int = 256
+    rope_dim: int = 64
+    rope_theta: float = 10_000_000.0
+    gdn_key_heads: int = 16
+    gdn_value_heads: int = 32
+    gdn_head_dim: int = 128
+    conv_kernel: int = 4
+    norm_eps: float = 1.0e-6
+    vocab: int = 248320
+    page_rows: int = 64
+
+    def __post_init__(self) -> None:
+        if (self.gdn_head_dim, self.conv_kernel, self.head_dim, self.rope_dim) != (128, 4, 256, 64):
+            raise ValueError("dense Qwen requires GDN128/conv4/GQA256/RoPE64")
+        if min(self.hidden, self.intermediate, self.heads, self.kv_heads,
+               self.gdn_key_heads, self.gdn_value_heads) <= 0:
+            raise ValueError("dense Qwen operator dimensions must be positive")
+        if self.gdn_value_heads % self.gdn_key_heads or self.heads % self.kv_heads:
+            raise ValueError("GDN value heads and attention heads must group evenly")
+
+    @property
+    def attn_in_width(self) -> int:
+        """Per-head [query | gate], followed by K and V; no index projections."""
+        return 2 * (self.heads + self.kv_heads) * self.head_dim
+
+
+QWEN35_9B = QwenDenseGeometry()
+QWEN38_27B = QwenDenseGeometry(name="qwen38_27b", hidden=5120, intermediate=17408,
+                              heads=24, gdn_value_heads=48)
 
 
 QWEN38_FLASH_NEXT = Qwen4Geometry()

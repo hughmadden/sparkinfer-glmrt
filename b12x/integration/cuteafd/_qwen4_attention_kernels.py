@@ -95,18 +95,18 @@ class Qwen4AttnPost:
     the cache writes.
     """
 
-    def __init__(self, g, kv_format: str = "bf16"):
+    def __init__(self, g, kv_format: str = "bf16", indexed: bool = True):
         self.g = g
         self.kv_format = kv_format
         self.record_bytes = g.kv_record_bytes(kv_format)
         self.heads, self.kv_heads, self.d = g.heads, g.kv_heads, g.head_dim
-        self.ih, self.id = g.index_heads, g.index_head_dim
+        self.ih, self.id = (g.index_heads, g.index_head_dim) if indexed else (0, 128)
         self.width = g.attn_in_width
         self.k_off = 2 * self.heads * self.d
         self.v_off = self.k_off + self.kv_heads * self.d
         self.iq_off = self.v_off + self.kv_heads * self.d
         self.ik_off = self.iq_off + self.ih * self.id
-        self.items = self.heads + self.kv_heads + self.ih + 1
+        self.items = self.heads + self.kv_heads + (self.ih + 1 if indexed else 0)
         self.eps = float(g.norm_eps)
         self.rope = _Rope(g.rope_dim, g.rope_theta)
         if self.d != 256 or self.id != 128 or g.rope_dim != 64:
