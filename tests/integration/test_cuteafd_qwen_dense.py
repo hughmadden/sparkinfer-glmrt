@@ -183,6 +183,25 @@ def test_dense_producer(heads):
 
 
 @pytest.mark.parametrize("heads", [16, 24])
+def test_dense_attention_output_gate(heads):
+    require_b12x()
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_attn_o_aot
+    g = QwenDenseGeometry(heads=heads)
+    program = compile_qwen_dense_attn_o_aot(g, max_rows=64)
+    width = heads * 256
+    attn = torch.randn(3, width, device="cuda", dtype=torch.bfloat16) * 0.1
+    gate = torch.randn_like(attn)
+    weight = torch.randn(g.hidden, width, device="cuda", dtype=torch.bfloat16) * 0.01
+    out = torch.empty(3, g.hidden, device="cuda", dtype=torch.bfloat16)
+    scratch = torch.empty(program.scratch_bytes(64)["scratch"], device="cuda", dtype=torch.uint8)
+    program.launch(attn, gate, weight, out, scratch, scalars=[3])
+    # Full-attention gate is sigmoid, not the GDN's SiLU.
+    expected = torch.nn.functional.linear(attn * gate.sigmoid(), weight)
+    torch.testing.assert_close(out, expected, atol=0.002, rtol=0.04)
+
+
+@pytest.mark.parametrize("heads", [16, 24])
 def test_dense_full_gqa_is_unrestricted_and_causal(heads):
     require_b12x()
     from b12x.integration.cuteafd._common import QwenDenseGeometry
