@@ -98,6 +98,15 @@ __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot
 _ALIGN = 1024
 TILE_M = 64
 DECODE_MAX_ROWS = 64
+# Sparse gate/up cp.async ring depth. The sparse tile's SMEM (16 x 128 B of
+# activations + tile_n x 128 B of weights per K256 stage) is far below the
+# 101,376-byte CTA ceiling, so the sparse class stages deeper than the wide one;
+# the extra stages are what keep more than one operand batch in flight at decode
+# occupancy.
+SMALL_GATE_STAGES = 2
+# CTAs per queried SM the sparsest valid routing (top_k experts) must reach for
+# the sparse gate/up N tile to be used; narrower tiles add CTAs, never K order.
+SMALL_GATE_CTAS_PER_SM = 4
 # Live rows above which ``auto`` takes the grouped GEMM (RTX PRO 6000, MiMo
 # TP4 slice, us: 1024 rows GEMV 1753 / GEMM 2059; 4096 rows 5728 / 5374).
 # W8A16 programs (``prefill="w8a16"``, and BF16 input under "auto") keep
@@ -593,7 +602,8 @@ class _StreamNvfp4A4Route:
                                                live_min=17)
             self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e, live_min=17)
             self.small_gate = tuple(StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
-                                                        tile_m=16, tile_n=n, live_max=16) for n in (32, 64, 128))
+                                                        tile_m=16, tile_n=n, live_max=16, stages=SMALL_GATE_STAGES)
+                                    for n in (32, 64, 128))
             self.small_down = tuple(StreamNvfp4LinearA4(n=h, k=i, experts=e, tile_m=16, tile_n=n,
                                                         live_max=16) for n in (32, 64, 128))
         self.combine = MoeCombine(hidden=h, top_k=k)
@@ -638,12 +648,18 @@ class _StreamNvfp4A4Route:
         self.rows_in(x, pair_row, meta, s1, xq, xs, pairs, stream)
         if cutlass.const_expr(self.fused):
             sms = runtime_num_sm()
-            # The sparsest valid routing has top_k experts. Narrow N until its
-            # grid fills the queried device; sparse M keeps CTA SMEM small.
-            if Int32(g.top_k * (g.slice // 32)) >= sms * Int32(2):
+            # The sparsest valid routing has top_k experts, one tile each, so the
+            # sparse grid is row-count independent and at one row sits far below
+            # this device's warp capacity. Take the narrowest N tile whose grid
+            # reaches the target CTAs per queried SM: halving N doubles the CTAs
+            # and splits only output columns, never an output's K order.
+            target = sms * Int32(SMALL_GATE_CTAS_PER_SM)
+            if Int32(g.top_k * (g.slice // 16)) >= target:
+                self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
+            elif Int32(g.top_k * (g.slice // 32)) >= target:
                 self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
             else:
-                self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
+                self.small_gate[2](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
             # Bound by pairs, so duplicate expert ids cannot bypass the wide path.
             if pairs > Int32(16):
                 self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)

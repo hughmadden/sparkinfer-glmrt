@@ -437,22 +437,18 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
     x_stride = 2 * 64 * 2 + 16
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, k_block: int | None = None,
-                 stages: int | None = None, tile_m: int = 128, tile_n: int = 128,
+                 stages: int = 2, tile_m: int = 128, tile_n: int = 128,
                  live_min: int = 1, live_max: int = 128):
         super().__init__(n=2 * int(inter), k=hidden, experts=experts, tile_m=tile_m, tile_n=tile_n,
                          live_min=live_min, live_max=live_max)
         self.half_n = self.tile_n // 2
         self.x_stride = 2 * self.tile_n + 16
         self.inter, self.limit = int(inter), float(limit)
-        import os
-
         if k_block is None:
-            k_block = int(os.environ.get("B12X_NVFP4_A4_KBLOCK", "0")) or self.k_block
+            k_block = self.k_block
         if self.k % k_block or k_block % 64:
             raise ValueError(f"K {self.k} is not a multiple of the {k_block}-wide K block")
         self._set_k_block(k_block)
-        if stages is None:
-            stages = int(os.environ.get("B12X_NVFP4_A4_STAGES", "0")) or 2
         self.stages = int(stages)
         if self.inter % self.half_n:
             raise ValueError("the fused NVFP4 A4 gate/up needs I % 64 == 0")
