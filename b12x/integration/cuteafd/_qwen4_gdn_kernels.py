@@ -111,16 +111,21 @@ class Qwen4GdnConv:
 
 
 class Qwen4GdnGatedNorm:
-    """``y = bf16(bf16(w * bf16(rmsnorm(o))) * sigmoid(z))`` per 128-wide value head.
+    """Gated RMSNorm per 128-wide value head, shared by Flash Next and dense Qwen.
 
+    Flash Next uses sigmoid (the unchanged default); dense Qwen uses FP32 SiLU.
     ``o`` BF16 ``[rows, D]``, ``gate`` BF16 rows of stride ``gate_stride``,
-    ``weight`` BF16 ``[128]``, ``y`` BF16 ``[rows, D]``. A warp per (row,
-    head), grid ``(rows, heads / 8)``.
+    ``weight`` BF16 or FP32 ``[128]``, ``y`` BF16 ``[rows, D]``. Normalize
+    in FP32, round to BF16, multiply by the native weight dtype, then gate
+    in FP32. A warp per (row, head), grid ``(rows, heads / 8)``.
     """
 
     threads = 256
 
-    def __init__(self, *, heads: int, eps: float, gate_stride: int):
+    def __init__(self, *, heads: int, eps: float, gate_stride: int, activation: str = "sigmoid"):
+        if activation not in ("sigmoid", "silu"):
+            raise ValueError("GDN output activation must be sigmoid or silu")
+        self.activation = activation
         self.heads, self.eps, self.gate_stride = int(heads), float(eps), int(gate_stride)
         self.width = self.heads * HEAD
         if self.heads % 8:
@@ -153,8 +158,13 @@ class Qwen4GdnGatedNorm:
         for i in cutlass.range_constexpr(4):
             d = lane * Int64(4) + Int64(i)
             g = Float32(gate[row, head * Int64(HEAD) + d])
-            v = _bf16(Float32(weight[d]) * _bf16(x[i] * inv))
-            y[row, head * Int64(HEAD) + d] = (v * _sigmoid(g)).to(BFloat16)
+            v = Float32(weight[d]) * _bf16(x[i] * inv)
+            if cutlass.const_expr(weight.element_type == BFloat16):
+                v = _bf16(v)
+            gate_value = _sigmoid(g)
+            if cutlass.const_expr(self.activation == "silu"):
+                gate_value = div_rn_f32(g, Float32(1.0) + cute.math.exp(-g, fastmath=False))
+            y[row, head * Int64(HEAD) + d] = (v * gate_value).to(BFloat16)
 
 
 class Qwen4GdnRecurrent:
