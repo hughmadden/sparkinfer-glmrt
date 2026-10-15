@@ -234,8 +234,10 @@ class StreamNvfp4LinearA4:
         self.k_block = 256 if self.k % 256 == 0 else 128
         self.blocks = self.k // self.k_block
         self.row_bytes = self.k_block // 2
-        # Padded rows (bytes): fragment loads of 8 rows x 4 lanes hit distinct banks.
-        self.stride = self.row_bytes + 16
+        # Unpadded rows with a 32B-sector-preserving XOR swizzle on 16B pieces:
+        # both cp.async.cg.128 and ldmatrix.x4 hit all 32 banks without splitting
+        # odd rows across 32-byte L2 sectors.
+        self.stride = self.row_bytes
         self.s_bytes = self.k_block // 16
         self.s_stride = self.s_bytes + 4
         self.tile_bytes = self.tile_m * self.stride
@@ -247,7 +249,7 @@ class StreamNvfp4LinearA4:
         self.in_offset = nvfp4_input_scale_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("stream_linear_nvfp4_a4", 4, self.n, self.k, self.experts, self.k_block,
+        return ("stream_linear_nvfp4_a4", 5, self.n, self.k, self.experts, self.k_block,
                 self.tile_m, self.tile_n, self.live_min, self.live_max)
 
     def _storage(self):
@@ -264,6 +266,12 @@ class StreamNvfp4LinearA4:
                  y: cute.Pointer, max_tiles: Int32, stream: cuda.CUstream):
         self.kernel(aq, a_s, meta, w, s, y).launch(grid=(self.n // self.tile_n, max_tiles, 1),
                                                    block=(self.threads, 1, 1), stream=stream, min_blocks_per_mp=1)
+
+    @cute.jit
+    def _swizzle(self, row):
+        if const_expr(self.row_bytes >= 128):
+            return ((row & Int32(3)) << Int32(1)) | ((row >> Int32(2)) & Int32(1))
+        return (row >> Int32(1)) & Int32(3)
 
     @cute.jit
     def _load(self, block, ring, a_rows: Int64, as_rows: Int64, w_rows: Int64, s_rows: Int64, live: Int32, tidx):
@@ -287,15 +295,19 @@ class StreamNvfp4LinearA4:
         of the ring is bit-exact for every output the kernel writes. Weight rows
         (and their scales) always stage in full -- every one of them is read."""
         chunks = self.row_bytes // 16
+        r0 = tidx // Int32(chunks)
+        piece = tidx % Int32(chunks)
+        smem_piece = piece ^ self._swizzle(r0)
+        row_step = self.threads // chunks
         rows = row_limit
         for q in cutlass.range_constexpr(_ceil(count * chunks, self.threads)):
-            c = tidx + Int32(q * self.threads)
-            if c < rows * Int32(chunks):
-                row = c // Int32(chunks)
-                piece = c % Int32(chunks)
-                cp_async4_shared_global(stage + Int32(packed_offset) + row * Int32(self.stride) + piece * Int32(16),
-                                        rows_at + Int64(row) * Int64(self.k // 2) + Int64(block) * Int64(self.row_bytes)
-                                        + Int64(piece) * Int64(16))
+            row = r0 + Int32(q * row_step)
+            if row < rows:
+                cp_async4_shared_global(
+                    stage + Int32(packed_offset + q * row_step * self.stride)
+                    + r0 * Int32(self.stride) + smem_piece * Int32(16),
+                    rows_at + Int64(row) * Int64(self.k // 2) + Int64(block) * Int64(self.row_bytes)
+                    + Int64(piece) * Int64(16))
         words = self.s_bytes // 4
         for q in cutlass.range_constexpr(_ceil(count * words, self.threads)):
             c = tidx + Int32(q * self.threads)
@@ -315,8 +327,10 @@ class StreamNvfp4LinearA4:
         sw = stage + Int32(self.tile_bytes)
         ssa = stage + Int32(self.tile_bytes + self.weight_bytes)
         ssb = ssa + Int32(self.sc_bytes)
+        swz = self._swizzle(mrow)
         for step in cutlass.range_constexpr(self.k_block // 64):
-            k_byte = 32 * step
+            apiece = ((Int32(2 * step) + (mat >> Int32(1))) ^ swz) * Int32(16)
+            bpiece = ((Int32(2 * step) + (mat & Int32(1))) ^ swz) * Int32(16)
             sfa = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Uint32)
             a = cute.make_rmem_tensor(cute.make_layout((4 * self.m_tiles,), stride=(1,)), Uint32)
             for mt in cutlass.range_constexpr(self.m_tiles):
@@ -325,8 +339,7 @@ class StreamNvfp4LinearA4:
                                         + Int32(4 * step))
                 # ldmatrix x4: lane t addresses row t % 8 of matrix t / 8 (rows +8, then K +16 B).
                 arow = warp_m * Int32(self.warp_rows) + Int32(16 * mt) + Int32(8) * (mat & Int32(1)) + mrow
-                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sa + arow * Int32(self.stride) + Int32(k_byte)
-                                                     + Int32(16) * (mat >> Int32(1)))
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sa + arow * Int32(self.stride) + apiece)
                 a[4 * mt] = a0
                 a[4 * mt + 1] = a1
                 a[4 * mt + 2] = a2
@@ -335,8 +348,7 @@ class StreamNvfp4LinearA4:
             for pair in cutlass.range_constexpr(self.n_tiles // 2):
                 # Matrices: b0, b1 of column block 2 * pair, then of 2 * pair + 1.
                 bcol = warp_n * Int32(self.warp_cols) + Int32(16 * pair) + Int32(8) * (mat >> Int32(1)) + mrow
-                b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(sw + bcol * Int32(self.stride) + Int32(k_byte)
-                                                     + Int32(16) * (mat & Int32(1)))
+                b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(sw + bcol * Int32(self.stride) + bpiece)
                 bw[4 * pair] = b0
                 bw[4 * pair + 1] = b1
                 bw[4 * pair + 2] = b2
@@ -473,7 +485,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.k_block = int(k_block)
         self.blocks = self.k // self.k_block
         self.row_bytes = self.k_block // 2
-        self.stride = self.row_bytes + 16
+        self.stride = self.row_bytes
         self.s_bytes = self.k_block // 16
         self.s_stride = self.s_bytes + 4
         self.tile_bytes = self.tile_m * self.stride
@@ -483,7 +495,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.stage_bytes = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_a4", 4, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_a4", 5, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.live_min, self.live_max)
 
     def _storage(self):
