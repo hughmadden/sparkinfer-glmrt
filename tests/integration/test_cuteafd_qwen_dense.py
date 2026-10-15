@@ -132,7 +132,8 @@ def test_dense_gdn_native_norm_and_silu(hidden, heads, values, norm_dtype):
     conv.zero_()
     # Match live row count and projected scratch layout for exact replay math.
     program.launch(x, w_in, conv_w, a_log, dt_bias, norm_w, w_out, conv, state,
-                   torch.tensor([0, 0, -1], device="cuda", dtype=torch.int32), first,
+                   torch.tensor([0, 0, -1], device="cuda", dtype=torch.int32),
+                   torch.tensor([0, 0, 2], device="cuda", dtype=torch.int32),
                    out, None, scratch, scalars=[rows, 0])
     assert torch.equal(state, accepted_state)
     assert torch.equal(conv, accepted_conv)
