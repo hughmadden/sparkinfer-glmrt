@@ -20,6 +20,43 @@ def test_dense_geometry_has_no_fabricated_moe_or_hc():
     assert g.hc_width == 10240 and g.sparse_topk == 2112
 
 
+@pytest.mark.parametrize("hidden", [4096, 5120])
+def test_dense_norm_and_residual(hidden):
+    require_b12x()
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_add_aot, compile_qwen_dense_norm_aot
+    g = QwenDenseGeometry(hidden=hidden)
+    norm, add = compile_qwen_dense_norm_aot(g), compile_qwen_dense_add_aot(g)
+    x = torch.randn(7, hidden, device="cuda", dtype=torch.bfloat16)
+    weight = (0.1 * torch.randn(hidden, device="cuda")).bfloat16()
+    delta = torch.randn_like(x)
+    residual, out = torch.empty_like(x), torch.empty_like(x)
+    add.launch(x, delta, residual, scalars=[7])
+    assert torch.equal(residual, x + delta)
+    norm.launch(residual, weight, out, scalars=[7])
+    expected = (residual.float() * torch.rsqrt(residual.float().square().mean(-1, keepdim=True) + 1e-6)
+                * (1 + weight.float())).bfloat16()
+    torch.testing.assert_close(out, expected, atol=0.015625, rtol=0.008)
+
+
+@pytest.mark.parametrize("hidden,intermediate", [(4096, 12288), (5120, 17408)])
+def test_dense_ffn(hidden, intermediate):
+    require_b12x()
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_ffn_aot
+    g = QwenDenseGeometry(hidden=hidden, intermediate=intermediate)
+    program = compile_qwen_dense_ffn_aot(g, max_rows=64)
+    x = torch.randn(3, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
+    up = torch.randn(2 * intermediate, hidden, device="cuda", dtype=torch.bfloat16) * 0.01
+    down = torch.randn(hidden, intermediate, device="cuda", dtype=torch.bfloat16) * 0.01
+    out = torch.empty_like(x)
+    scratch = torch.empty(program.scratch_bytes(64)["scratch"], device="cuda", dtype=torch.uint8)
+    program.launch(x, up, down, out, scratch, scalars=[3])
+    gate, value = torch.nn.functional.linear(x, up).chunk(2, -1)
+    expected = torch.nn.functional.linear(torch.nn.functional.silu(gate) * value, down)
+    torch.testing.assert_close(out, expected, atol=0.002, rtol=0.04)
+
+
 @pytest.mark.parametrize("hidden,heads,values,norm_dtype", [
     (4096, 16, 32, torch.float32), (5120, 24, 48, torch.bfloat16)])
 def test_dense_gdn_native_norm_and_silu(hidden, heads, values, norm_dtype):
@@ -99,6 +136,49 @@ def test_dense_gdn_native_norm_and_silu(hidden, heads, values, norm_dtype):
                    out, None, scratch, scalars=[rows, 0])
     assert torch.equal(state, accepted_state)
     assert torch.equal(conv, accepted_conv)
+
+
+@pytest.mark.parametrize("heads", [16, 24])
+def test_dense_producer(heads):
+    require_b12x()
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_producer_aot
+    g = QwenDenseGeometry(heads=heads)
+    program = compile_qwen_dense_producer_aot(g, max_rows=64)
+    x = torch.randn(3, g.hidden, device="cuda", dtype=torch.bfloat16) * 0.1
+    weight = torch.randn(g.attn_in_width, g.hidden, device="cuda", dtype=torch.bfloat16) * 0.01
+    qw = (0.1 * torch.randn(256, device="cuda")).bfloat16()
+    kw = (0.1 * torch.randn(256, device="cuda")).bfloat16()
+    positions = torch.tensor([[0, 0, 0], [7, 8, 9], [100, 200, 300]], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([0, 2, -1], device="cuda", dtype=torch.int64)
+    cache = torch.full((4, 2, g.kv_heads, 256), 123, device="cuda", dtype=torch.bfloat16)
+    query = torch.empty(3, heads, 256, device="cuda", dtype=torch.bfloat16)
+    gate = torch.empty_like(query)
+    scratch = torch.empty(program.scratch_bytes(64)["scratch"], device="cuda", dtype=torch.uint8)
+    program.launch(x, weight, qw, kw, positions, slots, cache, query, gate, scratch, scalars=[3])
+    projected = torch.nn.functional.linear(x, weight)
+    qg = projected[:, :2 * heads * 256].reshape(3, heads, 512)
+    k, v = projected[:, 2 * heads * 256:].reshape(3, 2, g.kv_heads, 256).unbind(1)
+    inv = 1 / (g.rope_theta ** (torch.arange(0, 64, 2, device="cuda").float() / 64))
+    axes = torch.zeros(32, device="cuda", dtype=torch.long)
+    axes[1:32:3] = 1
+    axes[2:30:3] = 2
+    frequency = positions[:, axes].float() * inv
+    cos, sin = frequency.cos().bfloat16()[:, None], frequency.sin().bfloat16()[:, None]
+
+    def norm_rope(t, w):
+        t = (t.float() * torch.rsqrt(t.float().square().mean(-1, keepdim=True) + 1e-6)
+             * (1 + w.float())).bfloat16()
+        left, right = t[..., :32], t[..., 32:64]
+        rotated = torch.cat([left * cos - right * sin, right * cos + left * sin], -1)
+        return torch.cat([rotated, t[..., 64:]], -1)
+
+    torch.testing.assert_close(gate, qg[..., 256:], atol=0.002, rtol=0.02)
+    torch.testing.assert_close(query, norm_rope(qg[..., :256], qw), atol=0.03125, rtol=0.02)
+    expected_k = norm_rope(k, kw)
+    torch.testing.assert_close(cache[[0, 2], 0], expected_k[:2], atol=0.03125, rtol=0.02)
+    torch.testing.assert_close(cache[[0, 2], 1], v[:2], atol=0.002, rtol=0.02)
+    assert torch.all(cache[[1, 3]] == 123)
 
 
 @pytest.mark.parametrize("heads", [16, 24])

@@ -18,6 +18,7 @@ from ._common import QWEN35_9B, QwenDenseGeometry, Operand, Scalar, compile_prog
 from ._fp8_weights import projection
 from ._mimo_kernels import MAX_SPLITS, MimoGqaAttention, MimoSplitMerge
 from ._qwen4_attention_kernels import Qwen4AttnPost
+from ._qwen4_kernels import Qwen4Add, Qwen4HcNorm, Qwen4SwiGLU
 from .qwen4_attention import compile_qwen4_attn_o_aot
 from .qwen4_gdn import compile_qwen4_gdn_aot, compile_qwen4_gdn_commit_aot
 
@@ -158,3 +159,72 @@ def compile_qwen_dense_attn_o_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_rows:
     """Reuse the same BF16 sigmoid output gate and output projection as Flash Next."""
     program = compile_qwen4_attn_o_aot(g, max_rows=max_rows)
     return replace(program, name="qwen_dense_attn_o")
+
+
+class _Norm:
+    def __init__(self, g: QwenDenseGeometry):
+        self.g = g
+        # One ordinary residual stream; no hyper-connection mix/injection.
+        self.norm = Qwen4HcNorm(g.hidden, 1, g.norm_eps, False)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        self.norm(x, x, x, weight, out, out, rows, stream)
+
+
+def compile_qwen_dense_norm_aot(g: QwenDenseGeometry = QWEN35_9B):
+    """Zero-centered RMSNorm, including final norm; FP32 (1+w) before BF16 cast."""
+    return compile_program(_Norm(g), name="qwen_dense_norm", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{g.hidden}]"),
+        Operand("weight", torch.bfloat16, f"[{g.hidden}]"),
+        Operand("out", torch.bfloat16, f"[rows,{g.hidden}]", "out")),
+        scalars=(Scalar("rows"),), key=(g,),
+        geometry={"hidden": g.hidden, "eps": g.norm_eps, "zero_centered": True})
+
+
+def compile_qwen_dense_add_aot(g: QwenDenseGeometry = QWEN35_9B):
+    return compile_program(Qwen4Add(g.hidden), name="qwen_dense_add", operands=(
+        Operand("a", torch.bfloat16, f"[rows,{g.hidden}]"),
+        Operand("b", torch.bfloat16, f"[rows,{g.hidden}]"),
+        Operand("out", torch.bfloat16, f"[rows,{g.hidden}]", "out")),
+        scalars=(Scalar("rows"),), key=(g.hidden,), geometry={"hidden": g.hidden})
+
+
+class _Ffn:
+    def __init__(self, g: QwenDenseGeometry):
+        self.g = g
+        self.up = projection(2 * g.intermediate, g.hidden, False)
+        self.act = Qwen4SwiGLU(g.intermediate, 2 * g.intermediate)
+        self.down = projection(g.hidden, g.intermediate, False)
+
+    def key(self):
+        return (self.g, self.up.key(), self.down.key())
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_gate_up: cute.Pointer, w_down: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        base = Int64(scratch.toint())
+        size = Int64(rows) * Int64(4 * self.g.intermediate)
+        hidden = cute.make_ptr(cutlass.BFloat16,
+            base + (size + Int64(1023)) // Int64(1024) * Int64(1024),
+            cute.AddressSpace.gmem, assumed_align=16)
+        gate_up = cute.make_ptr(cutlass.BFloat16, base, cute.AddressSpace.gmem, assumed_align=16)
+        self.up(x, w_gate_up, w_gate_up, w_gate_up, gate_up, rows, stream)
+        self.act(gate_up, hidden, rows, stream)
+        self.down(hidden, w_down, w_down, w_down, out, rows, stream)
+
+
+def compile_qwen_dense_ffn_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_rows: int):
+    max_rows = _rows(max_rows)
+    launch = _Ffn(g)
+    return compile_program(launch, name="qwen_dense_ffn", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{g.hidden}]"),
+        Operand("w_gate_up", torch.bfloat16, f"[{2 * g.intermediate},{g.hidden}]"),
+        Operand("w_down", torch.bfloat16, f"[{g.hidden},{g.intermediate}]"),
+        Operand("out", torch.bfloat16, f"[rows,{g.hidden}]", "out"),
+        Operand("scratch", torch.uint8, "[ffn_scratch_bytes]", "scratch")),
+        scalars=(Scalar("rows"),), key=(max_rows, launch.key()),
+        geometry={"hidden": g.hidden, "intermediate": g.intermediate, "max_rows": max_rows},
+        scratch={"scratch": lambda rows: _align(max(1, rows) * g.intermediate * 4)
+                 + _align(max(1, rows) * g.intermediate * 2)})
