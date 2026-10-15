@@ -117,7 +117,11 @@ def test_dense_gdn_native_norm_and_silu(hidden, heads, values, norm_dtype, rows)
     expected = torch.nn.functional.linear(gated.reshape(rows, v), w_out)
     torch.testing.assert_close(state[0], expected_state, atol=2e-5, rtol=0.04)
     torch.testing.assert_close(out, expected, atol=2e-5, rtol=0.04)
-    torch.testing.assert_close(conv[0], projected[-3:, :c], atol=0, rtol=0)
+    # GEMM reduction order may differ from Torch; state must retain our exact
+    # projected BF16 rows, not a separately reduced approximation of them.
+    actual_projection = scratch[:rows * g.gdn_in_width * 2].view(torch.bfloat16).reshape(rows, g.gdn_in_width)
+    torch.testing.assert_close(actual_projection, projected, atol=0.002, rtol=0.02)
+    assert torch.equal(conv[0], actual_projection[-3:, :c])
     assert next(op for op in program.operands if op.name == "norm_w").dtype == norm_dtype
 
     if rows > 64:
@@ -186,6 +190,12 @@ def test_dense_producer(heads):
     torch.testing.assert_close(cache[[0, 2], 0], expected_k[:2], atol=0.03125, rtol=0.02)
     torch.testing.assert_close(cache[[0, 2], 1], v[:2], atol=0.002, rtol=0.02)
     assert torch.all(cache[[1, 3]] == 123)
+    high_slot = (1 << 31) // g.record_bytes + 1
+    high_cache = torch.empty(high_slot + 4, 2, g.kv_heads, 256, device="cuda", dtype=torch.bfloat16)
+    high_cache[high_slot:].fill_(123)
+    high_slots = torch.tensor([high_slot, high_slot + 2, -1], device="cuda", dtype=torch.int64)
+    program.launch(x, weight, qw, kw, positions, high_slots, high_cache, query, gate, scratch, scalars=[3])
+    assert torch.equal(high_cache[high_slot:], cache)
 
 
 @pytest.mark.parametrize("heads", [16, 24])
