@@ -266,13 +266,14 @@ def compile_qwen4_head_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
 
 
 def compile_qwen4_head_fp8_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
-    """FP32 logits of up to 16 rows over an E4M3 copy of ``lm_head`` with per-row
+    """FP32 logits of up to 64 rows over an E4M3 copy of ``lm_head`` with per-row
     x 128-K scales (the MTP drafts' head; the target keeps the BF16 head): x bf16
     [rows,H], w_fp8 [V,H], scale f32 [V,H/128], logits f32 [rows,V]."""
-    from .glmf import FP8_ROWS, _HeadFp8
+    from ._fp8_weights import FP8_DECODE_ROWS
+    from .glmf import _HeadFp8
 
     h, vocab = g.hidden, g.vocab
-    launch = _HeadFp8(vocab, h)
+    launch = _HeadFp8(vocab, h, max_rows=FP8_DECODE_ROWS)
     return compile_program(
         launch, name="qwen4_head_fp8",
         operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
@@ -280,7 +281,7 @@ def compile_qwen4_head_fp8_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgr
                   Operand("scale", torch.float32, f"[{vocab},{h // 128}]", align=4),
                   Operand("logits", torch.float32, f"[rows,{vocab}]", "out")),
         scalars=(Scalar("rows"),), key=(vocab, launch.key()),
-        geometry={"hidden": h, "vocab": vocab, "max_rows": FP8_ROWS},
+        geometry={"hidden": h, "vocab": vocab, "max_rows": FP8_DECODE_ROWS},
         doc=compile_qwen4_head_fp8_aot.__doc__,
     )
 

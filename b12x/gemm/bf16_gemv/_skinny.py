@@ -21,7 +21,18 @@ from cutlass import Float32, Int32, Int64, Uint32, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-__all__ = ["RoutedBf16Projection", "RowTiledBf16Projection", "SkinnyBf16Gemv", "TmaBf16Projection", "prefill_config", "skinny_config", "skinny_max_rows"]
+__all__ = [
+    "DECODE_TMA_TILES",
+    "RoutedBf16Projection",
+    "RowTiledBf16Projection",
+    "RowTiledSkinnyBf16Gemv",
+    "SKINNY_TILES_BY_ROWS",
+    "SkinnyBf16Gemv",
+    "TmaBf16Projection",
+    "prefill_config",
+    "skinny_config",
+    "skinny_max_rows",
+]
 
 
 @dsl_user_op
@@ -108,17 +119,34 @@ class SkinnyBf16Gemv:
             acc[i] = Float32(0.0)
         w_base = Int64(w.toint()) + col0 * Int64(self.k * 2) + Int64(tidx) * Int64(16)
         x_base = Int64(x.toint()) + Int64(row0) * Int64(self.k * 2) + Int64(tidx) * Int64(16)
-        for step in cutlass.range_constexpr(self.steps):
-            offset = step * self.threads * 16
-            wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
-            for c in cutlass.range_constexpr(self.cols):
-                words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
-                for j in cutlass.range_constexpr(4):
-                    wv[8 * c + 2 * j] = _bf16_lo(words[j])
-                    wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])
-            for m in cutlass.range_constexpr(self.rows_per_tile):
-                if Int32(m) < live:
-                    self._accumulate(acc, wv, x_base + Int64(m * self.k * 2 + offset), m)
+        if live >= Int32(self.rows_per_tile):
+            self._loop_fixed(acc, w_base, x_base, self.rows_per_tile)
+        else:
+            handled = Int32(0)
+            if cutlass.const_expr(self.rows_per_tile > 4):
+                if live == Int32(4):
+                    self._loop_fixed(acc, w_base, x_base, 4)
+                    handled = Int32(1)
+            if cutlass.const_expr(self.rows_per_tile > 2):
+                if live == Int32(2):
+                    self._loop_fixed(acc, w_base, x_base, 2)
+                    handled = Int32(1)
+            if cutlass.const_expr(self.rows_per_tile > 1):
+                if live == Int32(1):
+                    self._loop_fixed(acc, w_base, x_base, 1)
+                    handled = Int32(1)
+            if handled == Int32(0):
+                for step in cutlass.range_constexpr(self.steps):
+                    offset = step * self.threads * 16
+                    wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
+                    for c in cutlass.range_constexpr(self.cols):
+                        words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
+                        for j in cutlass.range_constexpr(4):
+                            wv[8 * c + 2 * j] = _bf16_lo(words[j])
+                            wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])
+                    for m in cutlass.range_constexpr(self.rows_per_tile):
+                        if Int32(m) < live:
+                            self._accumulate(acc, wv, x_base + Int64(m * self.k * 2 + offset), m)
         for i in cutlass.range_constexpr(self.outputs):
             value = acc[i]
             for shift in cutlass.range_constexpr(5):
@@ -130,6 +158,20 @@ class SkinnyBf16Gemv:
         cute.arch.sync_threads()
         if tidx < Int32(self.outputs):
             self._store(partial, out, col0, row0, live, tidx)
+
+    @cute.jit
+    def _loop_fixed(self, acc: cute.Tensor, w_base: Int64, x_base: Int64,
+                    live_rows: cutlass.Constexpr):
+        for step in cutlass.range_constexpr(self.steps):
+            offset = step * self.threads * 16
+            wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
+            for c in cutlass.range_constexpr(self.cols):
+                words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
+                for j in cutlass.range_constexpr(4):
+                    wv[8 * c + 2 * j] = _bf16_lo(words[j])
+                    wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])
+            for m in cutlass.range_constexpr(live_rows):
+                self._accumulate(acc, wv, x_base + Int64(m * self.k * 2 + offset), m)
 
     @cute.jit
     def _accumulate(self, acc: cute.Tensor, wv: cute.Tensor, x_address: Int64,
@@ -190,12 +232,70 @@ def skinny_max_rows(n: int, k: int) -> int:
     return 160
 
 
+# Measured SM120 skinny GEMV tiles by live rows, per weight shape [N, K]:
+# (rows, cols, rows_per_tile, threads) in ascending rows. Every entry for a
+# shape shares the same CTA thread count, so each thread sums the same K vectors
+# in the same order and the warp/CTA fold is bitwise identical across row counts.
+SKINNY_TILES_BY_ROWS = {
+    (324, 10240): ((4, 1, 4, 128), (16, 4, 8, 128), (160, 4, 16, 128)),
+    (320, 10240): ((4, 1, 4, 128), (16, 4, 8, 128), (160, 4, 16, 128)),
+    (1296, 2560): ((4, 1, 8, 64), (64, 2, 8, 64)),
+    (512, 2560): ((4, 1, 4, 64), (64, 4, 8, 64)),
+}
+
+
+class RowTiledSkinnyBf16Gemv:
+    """``SkinnyBf16Gemv`` with ``(cols, rows_per_tile)`` picked by live rows.
+
+    All entries share one ``threads`` count, so the K reduction order is
+    invariant across row counts and matches a single-row launch bit for bit.
+    """
+
+    def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16):
+        self.n, self.k = int(n), int(k)
+        self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
+        if not self.tiles_by_rows or any(len(entry) != 4 for entry in self.tiles_by_rows):
+            raise ValueError("skinny_tiles_by_rows entries are (rows, cols, rows_per_tile, threads)")
+        if len({entry[3] for entry in self.tiles_by_rows}) != 1:
+            raise ValueError("skinny_tiles_by_rows entries must share one CTA thread count")
+        self.limits = tuple(entry[0] for entry in self.tiles_by_rows)
+        self.floors = (0,) + self.limits[:-1]
+        if any(limit <= floor for floor, limit in zip(self.floors, self.limits)):
+            raise ValueError("skinny_tiles_by_rows rows must be positive and ascending")
+        self.cols, self.rows_per_tile, self.threads = self.tiles_by_rows[0][1:]
+        self.tiled = [SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, cols=c, rows_per_tile=r,
+                                     threads=t) for _, c, r, t in self.tiles_by_rows]
+        self.default = self.tiled[-1]
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        for i in cutlass.range_constexpr(len(self.tiled)):
+            if rows > Int32(self.floors[i]):
+                if rows <= Int32(self.limits[i]):
+                    self.tiled[i](x, w, out, rows, stream)
+        if rows > Int32(self.limits[-1]):
+            self.default(x, w, out, rows, stream)
+
+
 # 2 x 2 MMA warps on 128 x 128 tiles, two stages: the same per-element K
 # order as prefill_config's, 17-21% faster from 512 rows on SM120 (4096 rows:
 # 4096x8192 0.83 -> 0.69 ms, 16384x1536 0.69 -> 0.55, 24576x4096 2.55 -> 2.05),
 # slower on narrow outputs below that (4096x8192 at 100 rows 0.056 -> 0.101 ms).
 WIDE_PREFILL_CONFIG = dict(warp_layout=(2, 2), tile_m=128, tile_n=128, num_stages=2, compensated=False)
 WIDE_PREFILL_MIN_ROWS = 512
+
+# Measured SM120 TMA tensor-core decode tiles by live rows, per weight shape [N, K]:
+# (rows, warp_m, warp_n, tile_n, num_stages) in ascending rows. Each entry retiles
+# the same uncompensated m16n8k16 MMA K-reduction as prefill_config and produces
+# bitwise-identical outputs at every decode/verify width.
+DECODE_TMA_TILES = {
+    (2560, 6144): ((32, 1, 2, 32, 7), (64, 1, 4, 64, 6)),
+    (16480, 2560): ((32, 1, 4, 64, 6),),
+    (13952, 2560): ((16, 1, 4, 128, 4), (32, 1, 4, 64, 5)),
+    (2560, 640): ((32, 1, 4, 64, 5), (64, 2, 1, 32, 5)),
+    (10240, 320): ((16, 1, 4, 64, 5), (32, 1, 4, 128, 5), (64, 4, 1, 64, 5)),
+}
 
 
 def prefill_config(n: int, k: int) -> dict:
@@ -208,27 +308,46 @@ def prefill_config(n: int, k: int) -> dict:
 class TmaBf16Projection:
     """Pointer ABI over ``Bf16PrefillKernel`` (TMA pipeline, FP32 MMA accumulation)."""
 
-    def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, **config):
+    def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, tiles_by_rows: tuple | None = None,
+                 **config):
         from ._prefill import Bf16PrefillKernel
 
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
-        self.config = dict(prefill_config(n, k), **config)
-        self.kernel = Bf16PrefillKernel(self.n, self.k, **self.config)
+        if tiles_by_rows is None:
+            tiles_by_rows = DECODE_TMA_TILES.get((self.n, self.k), ()) if not config else ()
+        if tiles_by_rows:
+            self.row_tiled = RowTiledBf16Projection(self.n, self.k, tiles_by_rows, out_dtype=out_dtype)
+            self.tiles_by_rows = self.row_tiled.tiles_by_rows
+            self.config = self.row_tiled.config
+            self.kernel = self.row_tiled.default.kernel
+        else:
+            self.row_tiled = None
+            self.tiles_by_rows = ()
+            self.config = dict(prefill_config(n, k), **config)
+            self.kernel = Bf16PrefillKernel(self.n, self.k, **self.config)
+
+    def key(self) -> tuple:
+        return (self.n, self.k, tuple(sorted(self.config.items()))) \
+            + ((("tiles_by_rows", self.tiles_by_rows),) if self.tiles_by_rows else ())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
                  stream: cuda.CUstream):
-        xt = cute.make_tensor(x, cute.make_layout((rows, self.k), stride=(self.k, 1)))
-        wt = cute.make_tensor(w, cute.make_layout((self.n, self.k), stride=(self.k, 1)))
-        ot = cute.make_tensor(out, cute.make_layout((rows, self.n), stride=(self.n, 1)))
-        self.kernel(xt, wt, ot, rows, stream)
+        if cutlass.const_expr(self.row_tiled is not None):
+            self.row_tiled(x, w, out, rows, stream)
+        else:
+            xt = cute.make_tensor(x, cute.make_layout((rows, self.k), stride=(self.k, 1)))
+            wt = cute.make_tensor(w, cute.make_layout((self.n, self.k), stride=(self.k, 1)))
+            ot = cute.make_tensor(out, cute.make_layout((rows, self.n), stride=(self.n, 1)))
+            self.kernel(xt, wt, ot, rows, stream)
 
 
 class RowTiledBf16Projection:
     """``TmaBf16Projection`` with its tiles picked by the live rows of a launch.
 
-    ``tiles_by_rows`` entries are ``(rows, compute_warps, tile_n, num_stages)`` in
+    ``tiles_by_rows`` entries are ``(rows, compute_warps, tile_n, num_stages)`` or
+    ``(rows, warp_m, warp_n, tile_n, num_stages)`` in
     ascending ``rows``: a launch runs the first entry whose ``rows`` it does
     not exceed (``16 * compute_warps`` x ``tile_n`` tiles, ``prefill_config``'s
     other settings; ``ceil(rows / (16 * compute_warps))`` row tiles) and
@@ -242,17 +361,28 @@ class RowTiledBf16Projection:
     def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16):
         self.n, self.k = int(n), int(k)
         self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
-        if not self.tiles_by_rows or any(len(entry) != 4 for entry in self.tiles_by_rows):
-            raise ValueError("tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages)")
+        if not self.tiles_by_rows or any(len(entry) not in (4, 5) for entry in self.tiles_by_rows):
+            raise ValueError(
+                "tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages) "
+                "or (rows, warp_m, warp_n, tile_n, num_stages)")
         self.limits = tuple(entry[0] for entry in self.tiles_by_rows)
         # Entry i serves floors[i] < rows <= limits[i].
         self.floors = (0,) + self.limits[:-1]
         if any(limit <= floor for floor, limit in zip(self.floors, self.limits)):
             raise ValueError("tiles_by_rows rows must be positive and ascending")
-        self.default = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype)
+        self.default = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=())
         self.config = self.default.config
-        self.tiled = [TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, compute_warps=warps, tile_n=tile_n,
-                                        num_stages=stages) for _, warps, tile_n, stages in self.tiles_by_rows]
+        self.tiled = []
+        for entry in self.tiles_by_rows:
+            if len(entry) == 4:
+                _, warps, tile_n, stages = entry
+                self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(),
+                                                    compute_warps=warps, tile_n=tile_n, num_stages=stages))
+            else:
+                _, warp_m, warp_n, tile_n, stages = entry
+                self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(),
+                                                    warp_layout=(warp_m, warp_n), tile_m=16 * warp_m,
+                                                    tile_n=tile_n, num_stages=stages))
         capacity = cutlass_utils.get_smem_capacity_in_bytes("sm_120")
         for entry, launch in zip(self.tiles_by_rows, self.tiled):
             kernel = launch.kernel
@@ -282,25 +412,34 @@ class RoutedBf16Projection:
     """
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, max_skinny_rows: int | None = None,
-                 wide: bool = False, tiles_by_rows: tuple = ()):
+                 wide: bool = False, tiles_by_rows: tuple = (), skinny_tiles_by_rows: tuple = ()):
         """``wide`` adds the ``WIDE_PREFILL_CONFIG`` TMA route from
         ``WIDE_PREFILL_MIN_ROWS`` live rows (prefill capacities).
 
         ``tiles_by_rows`` (default none) picks the TMA route's tiles by live rows
         below that (``RowTiledBf16Projection``; its first entry's rows exceed
-        the skinny GEMV's). The skinny route and its row limit are unchanged."""
+        the skinny GEMV's)."""
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
         self.max_skinny_rows = int(skinny_max_rows(n, k) if max_skinny_rows is None else max_skinny_rows)
-        self.skinny = SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, **skinny_config(n, k, out_dtype))
+        if self.max_skinny_rows > 0 and not skinny_tiles_by_rows:
+            skinny_tiles_by_rows = SKINNY_TILES_BY_ROWS.get((self.n, self.k), ())
+        if skinny_tiles_by_rows and self.max_skinny_rows > 0:
+            self.skinny = RowTiledSkinnyBf16Gemv(self.n, self.k, skinny_tiles_by_rows, out_dtype=out_dtype)
+            self.skinny_tiles_by_rows = self.skinny.tiles_by_rows
+        else:
+            self.skinny = SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, **skinny_config(n, k, out_dtype))
+            self.skinny_tiles_by_rows = ()
+        if not tiles_by_rows and self.max_skinny_rows == 0:
+            tiles_by_rows = DECODE_TMA_TILES.get((self.n, self.k), ())
         if tiles_by_rows:
             self.large = RowTiledBf16Projection(self.n, self.k, tiles_by_rows, out_dtype=out_dtype)
             if self.large.limits[0] <= self.max_skinny_rows:
                 raise ValueError("tiles_by_rows serves rows past max_skinny_rows")
         else:
-            self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype)
+            self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=())
         self.tiles_by_rows = self.large.tiles_by_rows if tiles_by_rows else ()
-        self.wide = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, **WIDE_PREFILL_CONFIG) \
+        self.wide = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(), **WIDE_PREFILL_CONFIG) \
             if wide and self.n % 2 == 0 else None
 
     def key(self) -> tuple:
@@ -308,7 +447,8 @@ class RoutedBf16Projection:
         # tiles_by_rows extends the key; projections without it keep theirs.
         return (self.n, self.k, str(self.out_dtype), self.max_skinny_rows, s.cols, s.rows_per_tile,
                 s.threads, tuple(sorted(self.large.config.items())), self.wide is not None) \
-            + ((("tiles_by_rows", self.tiles_by_rows),) if self.tiles_by_rows else ())
+            + ((("tiles_by_rows", self.tiles_by_rows),) if self.tiles_by_rows else ()) \
+            + ((("skinny_tiles_by_rows", self.skinny_tiles_by_rows),) if self.skinny_tiles_by_rows else ())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,

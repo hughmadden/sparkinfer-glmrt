@@ -1598,20 +1598,29 @@ def compile_glmf_o_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fals
 
 
 class _HeadFp8:
-    def __init__(self, vocab: int, hidden: int):
+    def __init__(self, vocab: int, hidden: int, *, max_rows: int = FP8_ROWS):
         from ._fp8_weights import MmaFp8Gemv
 
+        self.max_rows = int(max_rows)
         warps, groups = FP8_GEMV_CONFIG.get((vocab, hidden), (4, 4))
         self.gemv = MmaFp8Gemv(vocab, hidden, max_rows=FP8_ROWS, warps=warps, groups=groups,
                                out_dtype=cutlass.Float32, row_scales=True)
+        self.gemv_wide = MmaFp8Gemv(vocab, hidden, max_rows=self.max_rows, warps=warps, groups=groups,
+                                    out_dtype=cutlass.Float32, row_scales=True) if self.max_rows > FP8_ROWS else None
 
     def key(self) -> tuple:
-        return self.gemv.key()
+        return self.gemv.key() if self.gemv_wide is None else (self.gemv.key(), self.gemv_wide.key())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, logits: cute.Pointer, rows: Int32,
                  stream: cuda.CUstream):
-        self.gemv(x, w_fp8, scale, logits, rows, stream)
+        if cutlass.const_expr(self.gemv_wide is None):
+            self.gemv(x, w_fp8, scale, logits, rows, stream)
+        else:
+            if rows <= Int32(FP8_ROWS):
+                self.gemv(x, w_fp8, scale, logits, rows, stream)
+            else:
+                self.gemv_wide(x, w_fp8, scale, logits, rows, stream)
 
 
 def compile_glmf_head_fp8_aot(g: GLMFGeometry = GLM53_FLASH, *, vocab: int = 154880) -> AotProgram:

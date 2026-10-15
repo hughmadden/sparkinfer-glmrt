@@ -100,7 +100,7 @@ class RoutedFp8Projection:
         self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=self.decode_rows, warps=warps,
                                    out_dtype=out_dtype) if self.decode_rows > FP8_GEMV_ROWS else None
         self.max_fp8_rows = self.decode_rows
-        self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype)
+        self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=())
 
     def key(self) -> tuple:
         return (None if self.fp8_wide is None else self.fp8_wide.key(), self.max_fp8_rows,
@@ -329,12 +329,14 @@ def gemv_cta_tiles(n: int, k: int, *, groups: int, warps: int) -> int:
 
     Requalified per shape (engine #210): two tiles pay only where the doubled M grid fills
     the machine -- the k=2560 tall-N projections (16480x2560 and 13952x2560, 0.73-0.94 of
-    four tiles at every width, 0.71-0.87 of the one-CTA route). k=2048 stays four: its two
+    four tiles at every width, 0.71-0.87 of the one-CTA route). Vocab-wide heads (n > 16480)
+    keep four tiles so a 64-row decode step reads the 606 MiB head weights once instead of
+    twice. k=2048 stays four: its two
     16384-wide consumers build the same kernel key yet split on the arm (0.85 with two
     tiles for the plain one against 1.06-1.12 at 48/64 rows for the routed one), and a
     thinner K loses outright (16384x1536 at 1.18/1.40 of four at 48/64 rows)."""
     k = int(k)
-    return 2 if 2048 < k <= 2560 else 4
+    return 2 if 2048 < k <= 2560 and int(n) <= 16480 else 4
 
 
 # ---------------------------------------------------------------------------

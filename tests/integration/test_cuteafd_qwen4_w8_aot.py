@@ -357,6 +357,9 @@ def test_qwen4_head_fp8_spans(rows):
     scale = (torch.rand((vocab, h // 128), generator=gen, device="cuda") + 0.5) * 0.02
     x = torch.randn((rows, h), generator=gen, device="cuda").bfloat16()
     program = P("head_fp8")
+    assert program.geometry["max_rows"] == 64
+    full = torch.empty((rows, vocab), dtype=torch.float32, device="cuda")
+    program.launch(x, w8, scale, full, scalars=(rows,))
     spans = torch.empty((rows, vocab), dtype=torch.float32, device="cuda")
     for first in range(0, rows, 16):
         n = min(16, rows - first)
@@ -365,7 +368,7 @@ def test_qwen4_head_fp8_spans(rows):
     for r in range(rows):
         program.launch(x[r:r + 1], w8, scale, alone[r:r + 1], scalars=(1,))
     torch.cuda.synchronize()
-    assert torch.equal(spans, alone), "a row's logits depend on its span"
+    assert torch.equal(full, alone) and torch.equal(spans, alone), "a row's logits depend on its span"
     wd = (w8.float() * scale.repeat_interleave(128, 1)).bfloat16().float()
     reference = x.float() @ wd.t()
     err = (spans - reference).abs().max().item() / reference.abs().max().item()
