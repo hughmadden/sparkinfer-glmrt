@@ -148,3 +148,53 @@ def test_gpu_native_bf16(tp, route, capacity, rows):
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected, rtol=0.025, atol=0.015)
+
+
+@pytest.mark.parametrize("fused", ["0", "1"])
+@pytest.mark.parametrize("limit", [2.0, 7.0])
+def test_gpu_nvfp4_post_silu(fused, limit, monkeypatch):
+    require_b12x()
+    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_scratch_bytes
+    from .test_cuteafd_nvfp4_moe_aot import _weights, reference
+
+    monkeypatch.setenv("B12X_NVFP4_A4_FUSED", fused)
+    g = Fp8MoeGeometry("post_nvfp4_test", 256, 8, 2, 256, swiglu_limit=limit,
+                      weights="nvfp4", activations="a4", activation=POST)
+    w = _weights(g, g.slice)
+    gen = torch.Generator(device="cuda").manual_seed(73)
+    x = (torch.randn(41, g.hidden, generator=gen, device="cuda") * 2).bfloat16()
+    ids = torch.zeros(41, 2, dtype=torch.int32, device="cuda")
+    ids[:, 1] = torch.arange(41, device="cuda", dtype=torch.int32) % g.experts
+    weights = torch.full((41, 2), 0.5, device="cuda")
+    out = torch.empty_like(x)
+    scratch = torch.empty(fp8_moe_scratch_bytes(g, "auto", 64, False), device="cuda", dtype=torch.uint8)
+    program = compile_fp8_moe_aot(g, route="auto", max_rows=64, wire=False)
+    program.launch(x, ids, weights, *w, out, scratch, scalars=(41,))
+    expected = reference(g, x, ids, weights, *w, a4=True)
+    torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
+    assert torch.nn.functional.cosine_similarity(out.float().flatten(), expected.float().flatten(), dim=0) > 0.9999
+
+
+@pytest.mark.parametrize("route", ["decode", "prefill", "stream"])
+def test_gpu_fp8_post_silu(route):
+    require_b12x()
+    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_scratch_bytes
+    from .test_cuteafd_fp8_moe_aot import wire_rows
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    g = Fp8MoeGeometry("post_fp8_test", 512, 8, 2, 256, swiglu_limit=7.0, activation=POST)
+    gen = torch.Generator(device="cuda").manual_seed(77)
+    x = torch.randn(39, g.hidden, device="cuda", generator=gen).bfloat16()
+    ids = torch.randint(0, 8, (39, 2), device="cuda", generator=gen, dtype=torch.int32)
+    weights = torch.rand(39, 2, device="cuda", generator=gen) / 2
+    shapes = [(8, g.slice, g.hidden), (8, g.slice, g.hidden), (8, g.hidden, g.slice)]
+    w = [(torch.randn(shape, device="cuda", generator=gen) * 0.1).to(torch.float8_e4m3fn) for shape in shapes]
+    scales = [torch.ones(e, n // 128, k // 128, device="cuda") for e, n, k in shapes]
+    out = torch.empty_like(x)
+    scratch = torch.empty(fp8_moe_scratch_bytes(g, route, 64, False), device="cuda", dtype=torch.uint8)
+    program = compile_fp8_moe_aot(g, route=route, max_rows=64, wire=False)
+    program.launch(x, ids, weights, w[0], scales[0], w[1], scales[1], w[2], scales[2], out, scratch, scalars=(39,))
+    source = wire_rows(x)[1] if route == "stream" else x
+    expected = bf16_reference(source, ids, weights, *(v.bfloat16() for v in w), 7.0, POST)
+    torch.testing.assert_close(out, expected, atol=0.02, rtol=0.025)
+    assert torch.nn.functional.cosine_similarity(out.float().flatten(), expected.float().flatten(), dim=0) > 0.9999

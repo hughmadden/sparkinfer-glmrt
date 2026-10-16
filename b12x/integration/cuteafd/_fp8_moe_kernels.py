@@ -530,7 +530,10 @@ class GroupedFp8Gemv:
             w_base = w_base + Int64(e) * part * Int64(self.k * weight_bytes)
             s_base = s_base + Int64(e) * (part // Int64(128)) * Int64(self.k_blocks * 4)
             k_begin = Int64(warp_id) * Int64(self.k_per_warp)
-            w_row = w_base + ((local + Int64(g)) * Int64(self.k) + k_begin + Int64(16) * Int64(j)) * Int64(weight_bytes)
+            if const_expr(self.native_bf16):
+                w_row = w_base + ((local + Int64(g)) * Int64(self.k) + k_begin + Int64(16) * Int64(j)) * Int64(2)
+            else:
+                w_row = w_base + (local + Int64(g)) * Int64(self.k) + k_begin + Int64(16) * Int64(j)
             s_row = s_base + (local // Int64(128)) * Int64(self.k_blocks * 4) + (k_begin // Int64(128)) * Int64(4)
             x_off = (k_begin + Int64(16) * Int64(j)) * Int64(2)
             # Groups past the compiled M tiles run in chunks (the weights stream again).
