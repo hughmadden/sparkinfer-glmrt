@@ -7,6 +7,8 @@ from ..conftest import require_b12x
 
 @pytest.mark.parametrize("capacity", [64, 4096])
 def test_official_27b_fp8_checkpoint_geometries_fit_exported_projections(capacity):
+    if capacity > 64:
+        require_b12x()  # Prefill GEMM launch planning queries the device SM count.
     from b12x.integration.cuteafd._common import QWEN38_27B as g
     from b12x.integration.cuteafd.qwen4_attention import _AttnOW8
     from b12x.integration.cuteafd.qwen_dense_fp8 import _Ffn, _MixedGdn, _Producer, _projection
