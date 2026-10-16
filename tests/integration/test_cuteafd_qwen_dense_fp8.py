@@ -20,7 +20,7 @@ def test_native_dense_fp8_gdn_preserves_bf16_gates(rows):
     from b12x.integration.cuteafd._common import QwenDenseGeometry
     from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_gdn_aot
     from b12x.integration.cuteafd.qwen_dense_fp8 import compile_qwen_dense_gdn_fp8_aot
-    g = QwenDenseGeometry(hidden=256, intermediate=256, gdn_key_heads=1, gdn_value_heads=2)
+    g = QwenDenseGeometry(hidden=512, intermediate=512, gdn_key_heads=4, gdn_value_heads=8)
     capacity = 64 if rows <= 64 else 128
     native = compile_qwen_dense_gdn_fp8_aot(g, max_rows=capacity)
     reference = compile_qwen_dense_gdn_aot(g, max_rows=capacity, norm_dtype=torch.bfloat16)
@@ -72,7 +72,7 @@ def test_native_dense_fp8_ffn(rows):
     require_b12x()
     from b12x.integration.cuteafd._common import QwenDenseGeometry
     from b12x.integration.cuteafd.qwen_dense_fp8 import compile_qwen_dense_ffn_fp8_aot
-    g = QwenDenseGeometry(hidden=256, intermediate=256)
+    g = QwenDenseGeometry(hidden=512, intermediate=512)
     program = compile_qwen_dense_ffn_fp8_aot(g, max_rows=64 if rows <= 64 else 128)
     x = torch.randn(rows, g.hidden, device="cuda", dtype=torch.bfloat16) * 0.1
     up, up_scale, restored_up = _weight(2 * g.intermediate, g.hidden)
