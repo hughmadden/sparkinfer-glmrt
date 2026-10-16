@@ -377,7 +377,7 @@ class MoeSwiGLU:
                 silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
                 product = silu * up
             dst = cute.make_tensor(act, cute.make_layout((Int64(1) << Int64(40),)))
-            dst[Int64(row) * Int64(self.inter) + Int64(col)] = product.to(BFloat16)
+            dst[Int64(row) * Int64(self.inter) + Int64(col)] = Float32(product).to(BFloat16)
 
 
 class MoeCombine:
@@ -562,12 +562,12 @@ class GroupedFp8Gemv:
                         bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
                         for gi in cutlass.range_constexpr(self.groups):
                             if const_expr(self.native_bf16):
-                                at = w_row + Int64(gi * 8 * self.k * 2) + k_off
-                                lo = _ld_stream(at)
-                                hi = _ld_stream(at + Int64(16))
+                                weight_at = w_row + Int64(gi * 8 * self.k * 2) + k_off
+                                bf16_lo = _ld_stream(weight_at)
+                                bf16_hi = _ld_stream(weight_at + Int64(16))
                                 for t in cutlass.range_constexpr(4):
-                                    bw[8 * gi + t] = lo[t]
-                                    bw[8 * gi + 4 + t] = hi[t]
+                                    bw[8 * gi + t] = bf16_lo[t]
+                                    bw[8 * gi + 4 + t] = bf16_hi[t]
                             else:
                                 for t in cutlass.range_constexpr(4):
                                     b0, b1 = _e4m3x4_scaled_bf16x2x2(cur[(chunk * self.groups + gi) * 4 + t], s_cur)
