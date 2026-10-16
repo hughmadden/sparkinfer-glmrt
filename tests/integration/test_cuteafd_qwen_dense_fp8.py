@@ -9,7 +9,7 @@ from ..conftest import require_b12x
 def test_official_27b_fp8_checkpoint_geometries_fit_exported_projections(capacity):
     from b12x.integration.cuteafd._common import QWEN38_27B as g
     from b12x.integration.cuteafd.qwen4_attention import _AttnOW8
-    from b12x.integration.cuteafd.qwen_dense_fp8 import _Ffn, _MixedGdn, _Producer
+    from b12x.integration.cuteafd.qwen_dense_fp8 import _Ffn, _MixedGdn, _Producer, _projection
 
     # Shapes from the official checkpoint headers, not the reduced GPU fixtures.
     assert (g.hidden, g.intermediate, g.gdn_key_heads, g.gdn_value_heads) == (5120, 17408, 16, 48)
@@ -28,9 +28,16 @@ def test_official_27b_fp8_checkpoint_geometries_fit_exported_projections(capacit
                       "gdn_out": (5120, 6144), "attn_q": (12288, 5120),
                       "attn_kv": (1024, 5120), "attn_out": (5120, 6144),
                       "ffn_gate_up": (17408, 5120), "ffn_down": (5120, 17408)}
-    gdn, producer, ffn = _MixedGdn(g, capacity), _Producer(g, capacity), _Ffn(g, capacity)
+    producer, ffn = _Producer(g, capacity), _Ffn(g, capacity)
     attention_out = _AttnOW8(g, capacity, capacity > 64)
-    projections = [gdn.qkvz, gdn.o_proj, producer.proj, attention_out.o_proj, ffn.up, ffn.down]
+    # The chunked recurrence queries CUDA capabilities; projection admission does not.
+    if capacity <= 64:
+        gdn = _MixedGdn(g, capacity)
+        gdn_projections = [gdn.qkvz, gdn.o_proj]
+    else:
+        gdn_projections = [_projection(g.gdn_conv_width + g.gdn_value_width, g.hidden, capacity),
+                           _projection(g.hidden, g.gdn_value_width, capacity)]
+    projections = [*gdn_projections, producer.proj, attention_out.o_proj, ffn.up, ffn.down]
     assert [(p.n, p.k) for p in projections] == [(16384, 5120), (5120, 6144),
         (14336, 5120), (5120, 6144), (34816, 5120), (5120, 17408)]
     for projection in projections:
