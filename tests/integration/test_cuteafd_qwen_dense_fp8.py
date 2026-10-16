@@ -5,6 +5,47 @@ import torch
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize("capacity", [64, 4096])
+def test_official_27b_fp8_checkpoint_geometries_fit_exported_projections(capacity):
+    from b12x.integration.cuteafd._common import QWEN38_27B as g
+    from b12x.integration.cuteafd.qwen4_attention import _AttnOW8
+    from b12x.integration.cuteafd.qwen_dense_fp8 import _Ffn, _MixedGdn, _Producer
+
+    # Shapes from the official checkpoint headers, not the reduced GPU fixtures.
+    assert (g.hidden, g.intermediate, g.gdn_key_heads, g.gdn_value_heads) == (5120, 17408, 16, 48)
+    assert g.gdn_value_heads % 8 == 0
+    shapes = {
+        "gdn_qkv": (g.gdn_conv_width, g.hidden),
+        "gdn_z": (g.gdn_value_width, g.hidden),
+        "gdn_out": (g.hidden, g.gdn_value_width),
+        "attn_q": (2 * g.heads * g.head_dim, g.hidden),
+        "attn_kv": (g.kv_heads * g.head_dim, g.hidden),
+        "attn_out": (g.hidden, g.heads * g.head_dim),
+        "ffn_gate_up": (g.intermediate, g.hidden),
+        "ffn_down": (g.hidden, g.intermediate),
+    }
+    assert shapes == {"gdn_qkv": (10240, 5120), "gdn_z": (6144, 5120),
+                      "gdn_out": (5120, 6144), "attn_q": (12288, 5120),
+                      "attn_kv": (1024, 5120), "attn_out": (5120, 6144),
+                      "ffn_gate_up": (17408, 5120), "ffn_down": (5120, 17408)}
+    gdn, producer, ffn = _MixedGdn(g, capacity), _Producer(g, capacity), _Ffn(g, capacity)
+    attention_out = _AttnOW8(g, capacity, capacity > 64)
+    projections = [gdn.qkvz, gdn.o_proj, producer.proj, attention_out.o_proj, ffn.up, ffn.down]
+    assert [(p.n, p.k) for p in projections] == [(16384, 5120), (5120, 6144),
+        (14336, 5120), (5120, 6144), (34816, 5120), (5120, 17408)]
+    for projection in projections:
+        for gemv in (projection.gemv, projection.gemv_wide):
+            if gemv is not None:
+                assert projection.k % (128 * gemv.warps) == 0
+                assert projection.n % (8 * gemv.groups) == 0
+                assert 128 % (8 * gemv.groups) == 0
+                assert gemv.warps == (8 if projection.k == 6144 else 4)
+        if capacity <= 64:
+            assert projection.max_gemv_rows >= capacity
+        else:
+            assert projection.prefill and projection.w8a8 is not None
+
+
 def _weight(rows, cols):
     weight = (torch.randn(rows, cols, device="cuda") * 0.02).bfloat16()
     blocks = weight.float().reshape(rows // 128, 128, cols // 128, 128)
