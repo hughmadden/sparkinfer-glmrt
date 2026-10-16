@@ -662,7 +662,8 @@ class GroupedFp8Gemm:
         self.producer_warp = self.num_compute_warps
         self.num_threads = 32 * (self.num_compute_warps + 1)
         self.tile_m = 16 * self.num_compute_warps
-        self.num_stages = int(num_stages)
+        # BF16 doubles staged weights; three stages fit the SM12x 99 KiB CTA limit.
+        self.num_stages = min(int(num_stages), 3) if self.native_bf16 else int(num_stages)
         if self.k % 128 or self.n % 128:
             raise ValueError("grouped FP8 GEMM needs N and K multiples of 128")
         self.k_tiles = self.k // self.tile_k

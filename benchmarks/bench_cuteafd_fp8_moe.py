@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Time cuteafd FP8/NVFP4 expert programs with L2-cold weights.
+"""Time cuteafd FP8/NVFP4/BF16 expert programs with L2-cold weights.
 
 Use --graph for the serving replay path, --routing hot to put the requested
 row count in each selected expert, and --profile-dir for launch/stage traces.
-NVFP4 requires --input bf16. A historical checkout may be used to measure the
+NVFP4 and native BF16 require --input bf16. A historical checkout may be used to measure the
 old A16 ceiling; it is not a serving arithmetic override.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -126,6 +127,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--geometry", default="mimo")
     parser.add_argument("--tp", type=int, default=4)
+    parser.add_argument("--activation", choices=("silu_bf16_product", "silu_post_clamp_fp32_product"),
+                        help="explicit activation contract; defaults to the geometry contract")
     parser.add_argument("--rows", default="1,16,80,1024,4096")
     parser.add_argument("--route", default="auto")
     parser.add_argument("--iters", type=int, default=20)
@@ -150,8 +153,10 @@ def main() -> None:
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, compile_fp8_moe_aot, fp8_moe_scratch_bytes
 
     g = GEOMETRIES[args.geometry].with_tp(args.tp)
-    if g.weights == "nvfp4" and args.input != "bf16":
-        parser.error("NVFP4 requires original BF16 input")
+    if args.activation is not None:
+        g = replace(g, activation=args.activation)
+    if g.weights in ("nvfp4", "bf16") and args.input != "bf16":
+        parser.error("NVFP4 and native BF16 require original BF16 input")
     dev = "cuda"
     gen = torch.Generator(device=dev).manual_seed(args.seed)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
@@ -173,8 +178,14 @@ def main() -> None:
         w = (fp8((e, i, h)), scales((e, i // 128, h // 128)), fp8((e, i, h)), scales((e, i // 128, h // 128)),
              fp8((e, h, i)), scales((e, h // 128, i // 128)))
         per_expert = 3 * i * h + 3 * (i // 128) * (h // 128) * 4
+    elif g.weights == "bf16":
+        unused = torch.empty(0, device=dev, dtype=torch.uint8)
+        def bf16(shape):
+            return (torch.randn(shape, device=dev, generator=gen) * 0.03).bfloat16()
+        w = (bf16((e, i, h)), unused, bf16((e, i, h)), unused, bf16((e, h, i)), unused)
+        per_expert = 3 * i * h * 2
     else:
-        parser.error("this benchmark currently supports FP8 and NVFP4 weights")
+        parser.error("this benchmark supports FP8, NVFP4 and native BF16 weights")
     if args.exact_sweep:
         exact_sweep(g, w, args)
         return
@@ -217,7 +228,13 @@ def main() -> None:
             assert torch.isfinite(out).all() and out.count_nonzero() > 0
             if g.weights == "nvfp4":
                 ref = reference(g, x_exact, ids, weights, *w, a4=g.activations == "a4")
+            elif g.weights == "bf16":
+                from tests.integration.test_cuteafd_expert_contract import bf16_reference
+
+                ref = bf16_reference(x_exact, ids, weights, w[0], w[2], w[4], g.swiglu_limit, g.activation)
             else:
+                from tests.integration.test_cuteafd_expert_contract import activation
+
                 def dequant(wt, s):
                     return (wt.float() * s.repeat_interleave(128, 0).repeat_interleave(128, 1)).bfloat16()
 
@@ -226,9 +243,7 @@ def main() -> None:
                     r, slots = torch.where(ids == expert)
                     gate = x_exact[r] @ dequant(w[0][expert], w[1][expert]).T
                     up = x_exact[r] @ dequant(w[2][expert], w[3][expert]).T
-                    if g.swiglu_limit > 0:
-                        gate, up = gate.clamp(max=g.swiglu_limit), up.clamp(-g.swiglu_limit, g.swiglu_limit)
-                    y = (torch.nn.functional.silu(gate) * up) @ dequant(w[4][expert], w[5][expert]).T
+                    y = activation(gate, up, g.swiglu_limit, g.activation) @ dequant(w[4][expert], w[5][expert]).T
                     ref.index_add_(0, r, y.float() * weights[r, slots][:, None])
                 ref = ref.bfloat16()
             a, b = out.float(), ref.float()
@@ -255,6 +270,7 @@ def main() -> None:
         us = statistics.median(samples)
         experts = statistics.mean(unique)
         record = {"geometry": g.name, "tp": g.tp, "input": args.input, "arithmetic": g.activations,
+                  "activation": g.activation, "projection": g.projection, "weight_format": g.weights,
                   "route": args.route, "routing": args.routing, "graph": args.graph, "rows": rows,
                   "us": us, "samples_us": samples, "scratch_bytes": scratch.numel(),
                   "experts": experts, "gbps": experts * per_expert / us / 1e3,

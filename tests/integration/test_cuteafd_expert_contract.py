@@ -50,6 +50,12 @@ def test_cpu_geometry_contract(tp, width):
         assert (g.hidden, g.experts, g.top_k, g.slice) == (4096, 352, 8, width)
         assert (g.activation, g.projection, g.swiglu_limit) == (POST, "bf16", 7.0)
     g = GEOMETRIES["step5_bf16"].with_tp(tp)
+    from b12x.integration.cuteafd._fp8_moe_kernels import GroupedFp8Gemm
+
+    grouped = GroupedFp8Gemm(n=width, k=g.hidden, experts=g.experts, native_bf16=True)
+    staging_bytes = (grouped.tile_m * 2 + grouped.tile_n * 2) * grouped.tile_k * grouped.num_stages
+    expanded_bytes = grouped.tile_n * grouped.tile_k * 2
+    assert staging_bytes + expanded_bytes + 1024 <= 99 * 1024
     assert fp8_moe_scratch_bytes(g, "decode", 16, False) > 0
     assert fp8_moe_scratch_bytes(g, "prefill", 129, False) > fp8_moe_scratch_bytes(g, "decode", 16, False)
     with pytest.raises(ValueError, match="BF16 input"):
@@ -141,12 +147,21 @@ def test_gpu_native_bf16(tp, route, capacity, rows):
     assert torch.count_nonzero(out) > 0
     if rows > 1:
         assert torch.count_nonzero(out[-1]) == 0
-    # Capture once with fixed pointers/scratch; replay must neither resolve nor allocate kernels.
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        program.launch(x, ids, weights, w1, unused, w3, unused, w2, unused, out, scratch, scalars=(rows,))
-    graph.replay()
-    torch.cuda.synchronize()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    tensors = (x, ids, weights, w1, unused, w3, unused, w2, unused, out, scratch)
+    pointers = tuple(t.data_ptr() for t in tensors)
+    with kernel_resolution_guard("native BF16 live-count reuse and graph replay"):
+        # Reuse installed capacity and storage after shrinking the live prefix.
+        live = max(1, rows // 2)
+        program.launch(*tensors, scalars=(live,))
+        torch.testing.assert_close(out[:live], expected[:live], rtol=0.025, atol=0.015)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            program.launch(*tensors, scalars=(rows,))
+        graph.replay()
+        torch.cuda.synchronize()
+    assert tuple(t.data_ptr() for t in tensors) == pointers
     torch.testing.assert_close(out, expected, rtol=0.025, atol=0.015)
 
 
