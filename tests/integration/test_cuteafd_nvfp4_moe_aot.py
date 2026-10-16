@@ -144,9 +144,16 @@ def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
             (alpha * inscale if a4 else alpha)).bfloat16().to(dtype)
         gate = project(xr, operand(w1, q1), a1[expert], in1[expert])
         up = project(xr, operand(w3, q3), a3[expert], in1[expert])
-        if limit > 0:
-            gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
-        act = (torch.nn.functional.silu(gate.float()).bfloat16().to(dtype) * up).bfloat16().to(dtype)
+        if g.activation == "silu_post_clamp_fp32_product":
+            silu = torch.nn.functional.silu(gate.float())
+            up32 = up.float()
+            if limit > 0:
+                silu, up32 = silu.clamp(max=limit), up32.clamp(-limit, limit)
+            act = (silu * up32).bfloat16().to(dtype)
+        else:
+            if limit > 0:
+                gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+            act = (torch.nn.functional.silu(gate.float()).bfloat16().to(dtype) * up).bfloat16().to(dtype)
         if a4:
             act = quantize_nvfp4(act, float(in2[expert]), include_input_scale=False).to(dtype)
         y = project(act, operand(w2, q2), a2[expert], in2[expert]).bfloat16()
