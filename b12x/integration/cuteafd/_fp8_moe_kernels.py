@@ -74,6 +74,16 @@ def _round_bf16(value: Float32) -> Float32:
     return _bf16_lo(pack_f32x2_to_bfloat2(value, value))
 
 
+@cute.jit
+def _post_silu_product(gate: Float32, up: Float32, limit: cutlass.Constexpr) -> Float32:
+    silu = div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False))
+    if const_expr(limit > 0.0):
+        silu = cutlass.select_(silu > Float32(limit), Float32(limit), silu)
+        up = cutlass.select_(up > Float32(limit), Float32(limit), up)
+        up = cutlass.select_(up < Float32(-limit), Float32(-limit), up)
+    return silu * up
+
+
 def meta_words(experts: int, max_tiles: int) -> int:
     return META_HEAD + 3 * int(experts) + int(max_tiles)
 
@@ -335,11 +345,12 @@ class MoeSwiGLU:
 
     threads = 256
 
-    def __init__(self, *, inter: int, limit: float = 0.0):
+    def __init__(self, *, inter: int, limit: float = 0.0, activation: str = "silu_bf16_product"):
         self.inter, self.limit = int(inter), float(limit)
+        self.post_silu = activation == "silu_post_clamp_fp32_product"
 
     def key(self) -> tuple:
-        return (self.inter, self.limit)
+        return (self.inter, self.limit) + (("silu_post_clamp_fp32_product",) if self.post_silu else ())
 
     @cute.jit
     def __call__(self, gu: cute.Pointer, meta: cute.Pointer, act: cute.Pointer, max_rows: Int32,
@@ -356,13 +367,17 @@ class MoeSwiGLU:
             base = Int64(row) * Int64(2 * self.inter)
             gate = Float32(src[base + Int64(col)])
             up = Float32(src[base + Int64(self.inter) + Int64(col)])
-            if const_expr(self.limit > 0.0):
-                gate = cutlass.select_(gate > Float32(self.limit), Float32(self.limit), gate)
-                up = cutlass.select_(up > Float32(self.limit), Float32(self.limit), up)
-                up = cutlass.select_(up < Float32(-self.limit), Float32(-self.limit), up)
-            silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
+            if const_expr(self.post_silu):
+                product = _post_silu_product(gate, up, self.limit)
+            else:
+                if const_expr(self.limit > 0.0):
+                    gate = cutlass.select_(gate > Float32(self.limit), Float32(self.limit), gate)
+                    up = cutlass.select_(up > Float32(self.limit), Float32(self.limit), up)
+                    up = cutlass.select_(up < Float32(-self.limit), Float32(-self.limit), up)
+                silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
+                product = silu * up
             dst = cute.make_tensor(act, cute.make_layout((Int64(1) << Int64(40),)))
-            dst[Int64(row) * Int64(self.inter) + Int64(col)] = (silu * up).to(BFloat16)
+            dst[Int64(row) * Int64(self.inter) + Int64(col)] = product.to(BFloat16)
 
 
 class MoeCombine:
@@ -432,8 +447,9 @@ class GroupedFp8Gemv:
     BF16 MMAs with FP32 accumulation."""
 
     def __init__(self, *, n: int, k: int, experts: int, split: int | None = None, max_rows: int = 64,
-                 warps: int = 4, groups: int = 4, gather: bool = False):
+                 warps: int = 4, groups: int = 4, gather: bool = False, native_bf16: bool = False):
         self.n, self.k, self.experts = int(n), int(k), int(experts)
+        self.native_bf16 = bool(native_bf16)
         self.split = self.n if split is None else int(split)
         self.warps, self.groups = int(warps), int(groups)
         self.cols = 8 * self.groups
@@ -448,7 +464,8 @@ class GroupedFp8Gemv:
         self.frags = self.m_tiles * self.groups * 4
 
     def key(self) -> tuple:
-        return (self.n, self.k, self.experts, self.split, self.warps, self.groups, self.m_tiles, self.gather)
+        return (self.n, self.k, self.experts, self.split, self.warps, self.groups, self.m_tiles, self.gather) + (
+            ("bf16",) if self.native_bf16 else ())
 
     def _storage(self):
         class Storage:
@@ -509,10 +526,11 @@ class GroupedFp8Gemv:
                 s_base = Int64(s_b.toint())
                 part = Int64(self.n - self.split)
                 local = n0 - Int64(self.split)
-            w_base = w_base + Int64(e) * part * Int64(self.k)
+            weight_bytes = 2 if const_expr(self.native_bf16) else 1
+            w_base = w_base + Int64(e) * part * Int64(self.k * weight_bytes)
             s_base = s_base + Int64(e) * (part // Int64(128)) * Int64(self.k_blocks * 4)
             k_begin = Int64(warp_id) * Int64(self.k_per_warp)
-            w_row = w_base + (local + Int64(g)) * Int64(self.k) + k_begin + Int64(16) * Int64(j)
+            w_row = w_base + ((local + Int64(g)) * Int64(self.k) + k_begin + Int64(16) * Int64(j)) * Int64(weight_bytes)
             s_row = s_base + (local // Int64(128)) * Int64(self.k_blocks * 4) + (k_begin // Int64(128)) * Int64(4)
             x_off = (k_begin + Int64(16) * Int64(j)) * Int64(2)
             # Groups past the compiled M tiles run in chunks (the weights stream again).
@@ -529,21 +547,32 @@ class GroupedFp8Gemv:
                 per_block = 2 * self.groups * 4
                 cur = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
                 nxt = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
-                self._load_block(cur, w_row, Int64(0))
-                s_cur = _ld_f32(s_row)
+                s_cur = Float32(1.0)
+                if const_expr(not self.native_bf16):
+                    self._load_block(cur, w_row, Int64(0))
+                    s_cur = _ld_f32(s_row)
                 for block in cutlass.range(self.blocks, unroll=1):
                     s_nxt = s_cur
-                    if block + 1 < self.blocks:
-                        self._load_block(nxt, w_row, Int64(block + 1) * Int64(128))
-                        s_nxt = _ld_f32(s_row + Int64(block + 1) * Int64(4))
+                    if const_expr(not self.native_bf16):
+                        if block + 1 < self.blocks:
+                            self._load_block(nxt, w_row, Int64(block + 1) * Int64(128))
+                            s_nxt = _ld_f32(s_row + Int64(block + 1) * Int64(4))
                     for chunk in cutlass.range_constexpr(2):
                         k_off = (Int64(block) * Int64(128) + Int64(chunk * 64)) * Int64(2)
                         bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
                         for gi in cutlass.range_constexpr(self.groups):
-                            for t in cutlass.range_constexpr(4):
-                                b0, b1 = _e4m3x4_scaled_bf16x2x2(cur[(chunk * self.groups + gi) * 4 + t], s_cur)
-                                bw[8 * gi + 2 * t] = b0
-                                bw[8 * gi + 2 * t + 1] = b1
+                            if const_expr(self.native_bf16):
+                                at = w_row + Int64(gi * 8 * self.k * 2) + k_off
+                                lo = _ld_stream(at)
+                                hi = _ld_stream(at + Int64(16))
+                                for t in cutlass.range_constexpr(4):
+                                    bw[8 * gi + t] = lo[t]
+                                    bw[8 * gi + 4 + t] = hi[t]
+                            else:
+                                for t in cutlass.range_constexpr(4):
+                                    b0, b1 = _e4m3x4_scaled_bf16x2x2(cur[(chunk * self.groups + gi) * 4 + t], s_cur)
+                                    bw[8 * gi + 2 * t] = b0
+                                    bw[8 * gi + 2 * t + 1] = b1
                         for mt in cutlass.range_constexpr(self.m_tiles):
                             if Int32(mt) < live_tiles:
                                 r_lo = Int32(16 * mt) + g
@@ -576,9 +605,10 @@ class GroupedFp8Gemv:
                                         acc[f + 1] = d1
                                         acc[f + 2] = d2
                                         acc[f + 3] = d3
-                    for i in cutlass.range_constexpr(per_block):
-                        cur[i] = nxt[i]
-                    s_cur = s_nxt
+                    if const_expr(not self.native_bf16):
+                        for i in cutlass.range_constexpr(per_block):
+                            cur[i] = nxt[i]
+                        s_cur = s_nxt
                 for i in cutlass.range_constexpr(self.frags):
                     partial[(warp_id * Int32(self.frags) + Int32(i)) * Int32(32) + lane] = acc[i]
                 cute.arch.sync_threads()
@@ -619,7 +649,10 @@ class GroupedFp8Gemm:
     buffer_align_bytes = 1024
 
     def __init__(self, *, n: int, k: int, experts: int, halves: int = 1, compute_warps: int = 4,
-                 num_stages: int = 4):
+                 num_stages: int = 4, native_bf16: bool = False):
+        self.native_bf16 = bool(native_bf16)
+        self.weight_type = cutlass.BFloat16 if self.native_bf16 else cutlass.Uint8
+        self.weight_bytes = 2 if self.native_bf16 else 1
         self.n, self.k, self.experts, self.halves = int(n), int(k), int(experts), int(halves)
         self.num_compute_warps = int(compute_warps)
         self.compute_threads = 32 * self.num_compute_warps
@@ -636,7 +669,8 @@ class GroupedFp8Gemm:
         self.out_cols = self.n * self.halves
 
     def key(self) -> tuple:
-        return (self.n, self.k, self.experts, self.halves, self.num_compute_warps, self.num_stages)
+        return (self.n, self.k, self.experts, self.halves, self.num_compute_warps, self.num_stages) + (
+            ("bf16",) if self.native_bf16 else ())
 
     def _tiled_mma(self):
         return cute.make_tiled_mma(
@@ -663,7 +697,7 @@ class GroupedFp8Gemm:
             "mbar_ptr": cute.struct.MemRange[cutlass.Int64, self.num_stages * 2],
             "sA": cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, cute.cosize(s_a)], self.buffer_align_bytes],
             "sB": cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, cute.cosize(s_b)], self.buffer_align_bytes],
-            "sW": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, cute.cosize(s_w)], self.buffer_align_bytes],
+            "sW": cute.struct.Align[cute.struct.MemRange[self.weight_type, cute.cosize(s_w)], self.buffer_align_bytes],
         }
         return cute.struct(SharedStorage)
 
@@ -674,8 +708,8 @@ class GroupedFp8Gemm:
         a_rows = max_tiles * Int32(self.tile_m)
         a_t = cute.make_tensor(a, cute.make_layout((a_rows, self.k), stride=(self.k, 1)))
         rows_w = self.experts * self.n
-        wa8 = cute.make_ptr(cutlass.Uint8, Int64(w_a.toint()), cute.AddressSpace.gmem, assumed_align=16)
-        wb8 = cute.make_ptr(cutlass.Uint8, Int64(w_b.toint()), cute.AddressSpace.gmem, assumed_align=16)
+        wa8 = cute.make_ptr(self.weight_type, Int64(w_a.toint()), cute.AddressSpace.gmem, assumed_align=16)
+        wb8 = cute.make_ptr(self.weight_type, Int64(w_b.toint()), cute.AddressSpace.gmem, assumed_align=16)
         wa_t = cute.make_tensor(wa8, cute.make_layout((rows_w, self.k), stride=(self.k, 1)))
         wb_t = cute.make_tensor(wb8, cute.make_layout((rows_w, self.k), stride=(self.k, 1)))
         s_a_l, s_b_l, s_w_l = self._layouts()
@@ -718,7 +752,7 @@ class GroupedFp8Gemm:
             s_a = storage.sA.get_tensor(s_a_layout.outer, swizzle=s_a_layout.inner)
             s_b = storage.sB.get_tensor(s_b_layout.outer, swizzle=s_b_layout.inner)
             s_w = storage.sW.get_tensor(s_w_layout)
-            tma_bytes = (self.tile_m * 2 + self.tile_n) * self.tile_k
+            tma_bytes = (self.tile_m * 2 + self.tile_n * self.weight_bytes) * self.tile_k
             load_pipeline = pipeline.PipelineTmaAsync.create(
                 num_stages=self.num_stages,
                 producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
@@ -762,15 +796,22 @@ class GroupedFp8Gemm:
                     scale = Int64(scale_b.toint())
                 scale_row = scale + Int64(w_tile) * Int64(self.k_blocks * 4)
                 for k_tile in cutlass.range(self.k_tiles, unroll_full=False):
-                    s = _ld_f32(scale_row + Int64(k_tile // Int32(2)) * Int64(4))
+                    s = Float32(1.0)
+                    if const_expr(not self.native_bf16):
+                        s = _ld_f32(scale_row + Int64(k_tile // Int32(2)) * Int64(4))
                     load_pipeline.consumer_wait(consumer_state)
-                    stage = w_base + Int32(consumer_state.index) * Int32(self.tile_n * self.tile_k)
+                    stage = w_base + Int32(consumer_state.index) * Int32(self.tile_n * self.tile_k * self.weight_bytes)
                     for i in cutlass.range_constexpr(self.chunks):
                         chunk = Int32(i * self.compute_threads) + Int32(tidx)
                         n = chunk // Int32(self.tile_k // 8)
                         c = chunk % Int32(self.tile_k // 8)
-                        lo, hi = ld_shared_v2_u32(stage + n * Int32(self.tile_k) + c * Int32(8))
-                        v0, v1, v2, v3 = _e4m3x8_scaled_bf16(lo, hi, s)
+                        if const_expr(self.native_bf16):
+                            at = stage + n * Int32(self.tile_k * 2) + c * Int32(16)
+                            v0, v1 = ld_shared_v2_u32(at)
+                            v2, v3 = ld_shared_v2_u32(at + Int32(8))
+                        else:
+                            lo, hi = ld_shared_v2_u32(stage + n * Int32(self.tile_k) + c * Int32(8))
+                            v0, v1, v2, v3 = _e4m3x8_scaled_bf16(lo, hi, s)
                         st_shared_v4_u32(b_base + n * Int32(128) + ((c ^ (n % Int32(8))) * Int32(16)), v0, v1, v2, v3)
                     cute.arch.barrier(barrier_id=1, number_of_threads=self.compute_threads)
                     shared_a = t_ssa[None, None, None, consumer_state.index]

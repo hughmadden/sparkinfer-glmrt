@@ -71,7 +71,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
 )
 
-from ._fp8_moe_kernels import META_HEAD, _i32_at, _round_bf16, _u32_as_f32
+from ._fp8_moe_kernels import META_HEAD, _i32_at, _round_bf16, _u32_as_f32, _post_silu_product
 from ._fp8_weights import _e4m3x4_scaled_bf16x2x2, _e4m3x8_scaled_bf16
 
 __all__ = ["STREAM_TILE_M", "StreamFp8Down", "StreamFp8GateUp", "stream_max_tiles"]
@@ -100,15 +100,19 @@ def _chunk(meta: cute.Pointer, experts: cutlass.Constexpr, tile: Int32):
 
 
 @cute.jit
-def _swiglu(g: Float32, u: Float32, limit: cutlass.Constexpr) -> Float32:
+def _swiglu(g: Float32, u: Float32, limit: cutlass.Constexpr, post_silu: cutlass.Constexpr = False) -> Float32:
     gate = _round_bf16(g)
     up = _round_bf16(u)
-    if const_expr(limit > 0.0):
-        gate = cutlass.select_(gate > Float32(limit), Float32(limit), gate)
-        up = cutlass.select_(up > Float32(limit), Float32(limit), up)
-        up = cutlass.select_(up < Float32(-limit), Float32(-limit), up)
-    silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
-    return silu * up
+    if const_expr(post_silu):
+        result = _post_silu_product(gate, up, limit)
+    else:
+        if const_expr(limit > 0.0):
+            gate = cutlass.select_(gate > Float32(limit), Float32(limit), gate)
+            up = cutlass.select_(up > Float32(limit), Float32(limit), up)
+            up = cutlass.select_(up < Float32(-limit), Float32(-limit), up)
+        silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
+        result = silu * up
+    return result
 
 
 def _u8_weight(pointer: cute.Pointer, rows, cols: int) -> cute.Tensor:
@@ -133,10 +137,12 @@ class StreamFp8GateUp:
     a_ring = 4
     w_ring = 3
 
-    def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False):
+    def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False,
+                 activation: str = "silu_bf16_product"):
         self.inter, self.hidden, self.experts, self.limit = int(inter), int(hidden), int(experts), float(limit)
         # qmma: W8A8 block-scaled E4M3 x E4M3 MMAs (see the module docstring);
         # else both operands widen to BF16 (the reference's bf16(w * s)).
+        self.post_silu = activation == "silu_post_clamp_fp32_product"
         self.qmma = bool(qmma)
         if self.inter % self.inter_alignment or self.hidden % 128:
             raise ValueError(f"stream gate/up needs {self.inter_alignment}-aligned I and 128-aligned H")
@@ -150,7 +156,7 @@ class StreamFp8GateUp:
 
     def key(self) -> tuple:
         return ("stream_gate_up", 4, self.inter, self.hidden, self.experts, self.limit, self.a_ring, self.w_ring,
-                self.qmma)
+                self.qmma) + (("silu_post_clamp_fp32_product",) if self.post_silu else ())
 
     def _w_layout(self):
         atom = warpgroup.make_smem_layout_atom(
@@ -355,8 +361,8 @@ class StreamFp8GateUp:
                                 fg = 4 * (4 * mt + nt) + 2 * half
                                 fu = 4 * (4 * mt + nt + 2) + 2 * half
                                 col = n0 + warp_n * Int32(16) + Int32(8 * nt) + Int32(2) * j
-                                v0 = _swiglu(acc[fg], acc[fu], self.limit)
-                                v1 = _swiglu(acc[fg + 1], acc[fu + 1], self.limit)
+                                v0 = _swiglu(acc[fg], acc[fu], self.limit, self.post_silu)
+                                v1 = _swiglu(acc[fg + 1], acc[fu + 1], self.limit, self.post_silu)
                                 st_global_u32(Int64(act.toint()) + (Int64(tile * Int32(STREAM_TILE_M) + row)
                                                                     * Int64(i) + Int64(col)) * Int64(2),
                                               pack_f32x2_to_bfloat2(v0, v1))

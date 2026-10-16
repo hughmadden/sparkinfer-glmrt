@@ -251,14 +251,30 @@ class Fp8MoeGeometry:
     weights: str = "fp8"
     # NVFP4 requires A4 at every row count; a16 remains for other weight formats.
     activations: str = "a16"
+    activation: str = "silu_bf16_product"
+    projection: str = "bf16"
 
     def __post_init__(self) -> None:
+        import math
+
+        if self.activation not in ("silu_bf16_product", "silu_post_clamp_fp32_product"):
+            raise ValueError("unknown expert activation contract")
+        if self.projection != "bf16":
+            raise ValueError("expert projections must round to BF16 before activation/route sum")
+        if not math.isfinite(self.swiglu_limit) or self.swiglu_limit < 0:
+            raise ValueError("SwiGLU limit must be finite and nonnegative")
+        if self.weights == "mxfp4" and self.activation != "silu_bf16_product":
+            raise ValueError("MXFP4 supports only the pre-SiLU BF16 product contract")
         if self.activations not in ("a16", "a4") or (self.activations == "a4" and self.weights != "nvfp4"):
             raise ValueError("activations is 'a16', or 'a4' with NVFP4 weights")
         if self.weights == "nvfp4" and self.activations != "a4":
             raise ValueError("declared NVFP4 experts require W4A4; W4A16 is not a serving mode")
-        if self.weights not in ("fp8", "mxfp4", "nvfp4"):
-            raise ValueError("weights is 'fp8', 'mxfp4' or 'nvfp4'")
+        if self.weights not in ("fp8", "mxfp4", "nvfp4", "bf16"):
+            raise ValueError("weights is fp8, mxfp4, nvfp4 or bf16")
+        if min(self.hidden, self.experts, self.intermediate, self.tp) <= 0:
+            raise ValueError("expert geometry dimensions must be positive")
+        if self.weights == "bf16" and (self.hidden % 128 or self.intermediate % 128 or self.intermediate // 128 < self.tp):
+            raise ValueError("BF16 experts need 128-aligned hidden/intermediate and a block per rank")
         if self.weights == "nvfp4" and (self.hidden % 128 or self.intermediate % 16 or self.intermediate // 16 < self.tp):
             raise ValueError("NVFP4 experts need a 128-aligned hidden and whole 16-blocks per rank")
         if self.weights == "fp8" and (self.hidden % 128 or self.intermediate % 128 or self.intermediate // 128 < self.tp):
@@ -290,11 +306,21 @@ class Fp8MoeGeometry:
 
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
         return Fp8MoeGeometry(self.name, self.hidden, self.experts, self.top_k, self.intermediate, int(tp),
-                              self.swiglu_limit, self.weights, self.activations)
+                              self.swiglu_limit, self.weights, self.activations, self.activation, self.projection)
 
 
 # MiMo V2 Flash (no SwiGLU clamp in its config) and the GLM 5.3 MTP layer.
 GEOMETRIES = {
+    "step5": Fp8MoeGeometry("step5", hidden=4096, experts=352, top_k=8, intermediate=1536,
+                              swiglu_limit=7.0, activation="silu_post_clamp_fp32_product"),
+    "step5_bf16": Fp8MoeGeometry("step5_bf16", hidden=4096, experts=352, top_k=8, intermediate=1536,
+                                   swiglu_limit=7.0, weights="bf16", activation="silu_post_clamp_fp32_product"),
+    "step5_nvfp4": Fp8MoeGeometry("step5_nvfp4", hidden=4096, experts=352, top_k=8, intermediate=1536,
+                                    swiglu_limit=7.0, weights="nvfp4", activations="a4",
+                                    activation="silu_post_clamp_fp32_product"),
+    "step5_nvfp4a4": Fp8MoeGeometry("step5_nvfp4a4", hidden=4096, experts=352, top_k=8, intermediate=1536,
+                                      swiglu_limit=7.0, weights="nvfp4", activations="a4",
+                                      activation="silu_post_clamp_fp32_product"),
     "mimo": Fp8MoeGeometry("mimo", hidden=4096, experts=256, top_k=8, intermediate=2048),
     "glm": Fp8MoeGeometry("glm", hidden=6144, experts=256, top_k=8, intermediate=2048),
     # GLM 5.3 Flash: 288 experts, SwiGLU clamped at 10 as its config says.
@@ -396,6 +422,9 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8",
         if wire:
             raise ValueError("calibrated NVFP4 A4 requires original BF16 input")
         return "stream"
+    if weights == "bf16":
+        if wire or route == "stream":
+            raise ValueError("native BF16 experts require BF16 input and decode/prefill/auto route")
     if weights == "mxfp4":
         if route == "prefill":
             raise ValueError("MXFP4 experts have no prefill route (use stream)")
@@ -432,18 +461,19 @@ class _Route:
             tile_rows = min(int(max_rows), DECODE_MAX_ROWS)
             warps_h = 8 if h >= 6144 else 4
             gemv = GroupedMxfp4Gemv if g.weights == "mxfp4" else GroupedFp8Gemv
+            native = {"native_bf16": True} if g.weights == "bf16" else {}
             self.gate_up = gemv(n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
-                                groups=_gate_up_groups(tile_rows), gather=True)
+                                groups=_gate_up_groups(tile_rows), gather=True, **native)
             # K split over warps in whole 128 blocks: 4 where they divide evenly,
             # else the largest divisor <= 8 of the blocks (Qwen's 640: 5 warps).
             warps_i = 4 if i % 512 == 0 else max(d for d in range(1, 9) if (i // 128) % d == 0)
             if g.weights == "mxfp4" and i % 128:
                 warps_i = min(4, (i + 127) // 128)
-            self.down = gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=warps_i)
+            self.down = gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=warps_i, **native)
         else:
-            self.gate_up = GroupedFp8Gemm(n=i, k=h, experts=e, halves=2)
-            self.down = GroupedFp8Gemm(n=h, k=i, experts=e, halves=1)
-        self.swiglu = MoeSwiGLU(inter=i, limit=g.swiglu_limit)
+            self.gate_up = GroupedFp8Gemm(n=i, k=h, experts=e, halves=2, native_bf16=g.weights == "bf16")
+            self.down = GroupedFp8Gemm(n=h, k=i, experts=e, halves=1, native_bf16=g.weights == "bf16")
+        self.swiglu = MoeSwiGLU(inter=i, limit=g.swiglu_limit, activation=g.activation)
         self.combine = MoeCombine(hidden=h, top_k=k)
 
     def key(self) -> tuple:
@@ -524,7 +554,7 @@ class _StreamRoute:
                                              act_mxfp8=self.mxfp4_down_a8, wire=wire)
             self.down = (StreamMxfp4DownA8 if self.mxfp4_down_a8 else StreamMxfp4Down)(hidden=h, inter=i, experts=e)
         else:
-            self.gate_up = StreamFp8GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+            self.gate_up = StreamFp8GateUp(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
                                            qmma=FP8_STREAM_QMMA and prefill != "w8a16")
             self.down = StreamFp8Down(hidden=h, inter=i, experts=e)
         self.combine = MoeCombine(hidden=h, top_k=k)
@@ -587,21 +617,21 @@ class _StreamNvfp4A4Route:
         self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i)
         self.fused = nvfp4_a4_fused()
         if self.fused:
-            self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
+            self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation)
             self.swiglu = None
         else:
             self.gate_up = StreamNvfp4LinearA4(n=i, k=h, experts=e)
-            self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
+            self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation)
         self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e)
         self.small_gate = ()
         self.small_down = ()
         if self.fused:
             # Separate kernels keep the wide tile's SMEM reservation out of the
             # sparse-expert launch. Every specialization is planned before capture.
-            self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+            self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
                                                live_min=17)
             self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e, live_min=17)
-            self.small_gate = tuple(StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+            self.small_gate = tuple(StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
                                                         tile_m=16, tile_n=n, live_max=16, stages=SMALL_GATE_STAGES)
                                     for n in (32, 64, 128))
             self.small_down = tuple(StreamNvfp4LinearA4(n=h, k=i, experts=e, tile_m=16, tile_n=n,
@@ -781,6 +811,15 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
             Operand("s2", torch.uint8, f"[{down_scales}]", align=4,
                     note=f"E4M3 [{e},{h},{i // 16}] then FP32 alpha [{e}] and input_scale [{e}]"),
         )
+    elif g.weights == "bf16":
+        weights = (
+            Operand("w1", torch.bfloat16, f"[{e},{i},{h}]"),
+            Operand("s1", torch.uint8, "[0]", note="unused; zero scale storage"),
+            Operand("w3", torch.bfloat16, f"[{e},{i},{h}]"),
+            Operand("s3", torch.uint8, "[0]", note="unused; zero scale storage"),
+            Operand("w2", torch.bfloat16, f"[{e},{h},{i}]"),
+            Operand("s2", torch.uint8, "[0]", note="unused; zero scale storage"),
+        )
     elif g.weights == "mxfp4":
         weights = (
             Operand("w1", torch.uint8, f"[{e},{i},{h // 2}]", note="packed E2M1 (even element low)"),
@@ -814,6 +853,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         geometry={"requested_route": requested, "hidden": h, "experts": e, "top_k": k, "intermediate": g.intermediate, "tp": g.tp,
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
                   "wire": bool(wire), "weights": g.weights, "activations": g.activations,
+                  "activation": g.activation, "projection": g.projection,
                   "prefill": prefill, "mxfp4_down_a8": bool(mxfp4_down_a8),
                   "weight_read_grouping": launch.weight_read_grouping(g.weights, max_rows)},
         scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire, prefill, mxfp4_down_a8)},
