@@ -318,9 +318,6 @@ GEOMETRIES = {
     "step5_nvfp4": Fp8MoeGeometry("step5_nvfp4", hidden=4096, experts=352, top_k=8, intermediate=1536,
                                     swiglu_limit=7.0, weights="nvfp4", activations="a4",
                                     activation="silu_post_clamp_fp32_product"),
-    "step5_nvfp4a4": Fp8MoeGeometry("step5_nvfp4a4", hidden=4096, experts=352, top_k=8, intermediate=1536,
-                                      swiglu_limit=7.0, weights="nvfp4", activations="a4",
-                                      activation="silu_post_clamp_fp32_product"),
     "mimo": Fp8MoeGeometry("mimo", hidden=4096, experts=256, top_k=8, intermediate=2048),
     "glm": Fp8MoeGeometry("glm", hidden=6144, experts=256, top_k=8, intermediate=2048),
     # GLM 5.3 Flash: 288 experts, SwiGLU clamped at 10 as its config says.
