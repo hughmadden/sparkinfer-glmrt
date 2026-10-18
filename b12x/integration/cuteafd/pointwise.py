@@ -285,6 +285,28 @@ def compile_post_silu_aot(*, width, limit):
         scalars=(Scalar("rows"),), key=(width, limit), geometry=dict(width=width, limit=limit))
 
 
+def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16):
+    """Canonical BF16 MMA projection, with one explicit output boundary.
+
+    FP32 output preserves the accumulator (router/partial sums); BF16 output
+    materializes projection rows before norm, activation or residual updates.
+    """
+    from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
+
+    if width <= 0 or outputs <= 0 or width % 8 or outputs % 8:
+        raise ValueError("projection dimensions must be positive multiples of eight")
+    if output_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("projection output is BF16 or FP32")
+    dtype = BFloat16 if output_dtype == torch.bfloat16 else Float32
+    launch = RoutedBf16Projection(outputs, width, out_dtype=dtype, max_skinny_rows=0)
+    return compile_program(launch, name="bf16_projection", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{width}]"),
+        Operand("weight", torch.bfloat16, f"[{outputs},{width}]"),
+        Operand("out", output_dtype, f"[rows,{outputs}]", "out")),
+        scalars=(Scalar("rows"),), key=(width, outputs, str(output_dtype), launch.key()),
+        geometry=dict(width=width, outputs=outputs, output_dtype=str(output_dtype), skinny_rows=0))
+
+
 def compile_bf16_scaled_projection_aot(*, width, outputs, prescale):
     if width <= 0 or outputs <= 0:
         raise ValueError("projection dimensions must be positive")
