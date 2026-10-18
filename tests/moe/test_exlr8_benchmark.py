@@ -28,7 +28,7 @@ def test_control_cache_tracks_exact_source_bytes(tmp_path, monkeypatch):
     assert bench.compile_control(path) == "A1"
     assert keys[-1][-1] == hashlib.sha256(source.encode()).hexdigest()
     # Same path and length also catch stale Python bytecode, not only JIT reuse.
-    source = source.replace("A1", "B2")
+    source = source.replace("'A1'", "'B2'")
     path.write_text(source)
     assert bench.compile_control(path) == "B2"
     assert keys[-1][-1] == hashlib.sha256(source.encode()).hexdigest()
