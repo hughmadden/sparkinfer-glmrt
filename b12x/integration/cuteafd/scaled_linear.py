@@ -34,25 +34,39 @@ def geometry(input_features, output_features, *, encoding="mxfp8", sharded_side=
         raise ValueError("native linear grid indexing exceeds int32")
     if max_rows*splits*output_features*4 > 2**63-1:
         raise ValueError("native linear scratch exceeds int64")
+    # Tile core: one K chain per output, no split-K partials (``partial`` unused, may be null).
+    core = "tile" if encoding == "fp8_row" else "split"
     return dict(abi_version=ABI_VERSION,input_features=input_features,output_features=output_features,
-                encoding=encoding,sharded_side=sharded_side,max_rows=max_rows,splits=splits,
-                split_k=1024,ctas_per_sm=4)
+                encoding=encoding,sharded_side=sharded_side,max_rows=max_rows,
+                splits=1 if core == "tile" else splits,split_k=input_features if core == "tile" else 1024,
+                ctas_per_sm=4,core=core)
 
 
 class _Pointers:
     def __init__(self, g):
-        from b12x.gemm.native_scaled_linear import NativeScaledLinear
-        self.core = NativeScaledLinear(g)
+        if g["core"] == "tile":
+            from b12x.gemm.native_tile_linear import NativeTileLinear
+            self.core = NativeTileLinear(g)
+        else:
+            from b12x.gemm.native_scaled_linear import NativeScaledLinear
+            self.core = NativeScaledLinear(g)
+        self.tile = g["core"] == "tile"
 
     @cute.jit
     def __call__(self, x: cute.Pointer, payload: cute.Pointer, scales: cute.Pointer,
                  partial: cute.Pointer, output: cute.Pointer, rows: cutlass.Int32,
                  cta_limit: cutlass.Int32, stream: cuda.CUstream):
-        self.core(cute.make_tensor(x,cute.make_layout(1,stride=1)),
-                  cute.make_tensor(payload,cute.make_layout(1,stride=1)),
-                  cute.make_tensor(scales,cute.make_layout(1,stride=1)),
-                  cute.make_tensor(partial,cute.make_layout(1,stride=1)),
-                  cute.make_tensor(output,cute.make_layout(1,stride=1)),rows,cta_limit,stream)
+        if cutlass.const_expr(self.tile):
+            self.core(cute.make_tensor(x,cute.make_layout(1,stride=1)),
+                      cute.make_tensor(payload,cute.make_layout(1,stride=1)),
+                      cute.make_tensor(scales,cute.make_layout(1,stride=1)),
+                      cute.make_tensor(output,cute.make_layout(1,stride=1)),rows,cta_limit,stream)
+        else:
+            self.core(cute.make_tensor(x,cute.make_layout(1,stride=1)),
+                      cute.make_tensor(payload,cute.make_layout(1,stride=1)),
+                      cute.make_tensor(scales,cute.make_layout(1,stride=1)),
+                      cute.make_tensor(partial,cute.make_layout(1,stride=1)),
+                      cute.make_tensor(output,cute.make_layout(1,stride=1)),rows,cta_limit,stream)
 
 
 def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp8", sharded_side=1, max_rows=4096):
@@ -68,4 +82,5 @@ def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp
                 Operand("output",torch.float32,f"[rows,{n}]","out"))
     return compile_program(_Pointers(g),name="scaled_linear",operands=operands,
                            scalars=tuple(Scalar(n) for n in SCALARS),key=tuple(g.values()),geometry=g,
-                           scratch={"partial":lambda rows:rows*s*n*4},doc=__doc__)
+                           scratch={"partial":(lambda rows:0) if g["core"] == "tile" else (lambda rows:rows*s*n*4)},
+                           doc=__doc__)

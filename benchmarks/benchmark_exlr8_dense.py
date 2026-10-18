@@ -46,26 +46,31 @@ SHAPES = (
 
 
 class BlockFp8:
-    def __init__(self, k, n, prefill):
+    """Serving block-FP8 projection. ``fp8_rows`` 255 selects W8A8 prefill, 0 W8A16
+    (TmaFp8Gemm: BF16 activations, the A16 comparator for native operands)."""
+
+    def __init__(self, k, n, prefill, fp8_rows=255):
         self.projection = Fp8Projection(n, k, prefill_rows=4096 if prefill else None)
+        self.fp8_rows = fp8_rows
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, scales: cute.Pointer,
                  scratch: cute.Pointer, output: cute.Pointer, rows: cutlass.Int32,
                  stream: cuda.CUstream):
-        self.projection(x, w, scales, output, rows, cutlass.Int32(255),
+        self.projection(x, w, scales, output, rows, cutlass.Int32(self.fp8_rows),
                         cutlass.Int64(scratch.toint()), stream)
 
 
-def baseline(k, n, rows):
-    core = BlockFp8(k, n, rows > 64)
+def baseline(k, n, rows, a16=False):
+    # Decode programs keep their GEMV to 64 rows either way; prefill W8A16 on fp8_rows 0.
+    core = BlockFp8(k, n, rows > 64, 0 if a16 and rows > 64 else 255)
     ops = (Operand("x", torch.bfloat16, "[rows,K]"),
            Operand("w", torch.float8_e4m3fn, "[N,K]"),
            Operand("scales", torch.float32, "[ceil(N/128),K/128]"),
            Operand("scratch", torch.uint8, "[bytes]", "scratch"),
            Operand("output", torch.bfloat16, "[rows,N]", "out"))
     program = compile_program(core, name="bench_dense_block_fp8", operands=ops,
-                              scalars=(Scalar("rows"),), key=(k, n, rows > 64))
+                              scalars=(Scalar("rows"),), key=(k, n, rows > 64, core.fp8_rows))
     x = torch.randn((rows, k), device="cuda", dtype=torch.bfloat16) * .1
     weight = torch.randint(-16, 17, (n, k), device="cuda").to(torch.float8_e4m3fn)
     scales = torch.full(((n+127)//128, k//128), .01, device="cuda")
@@ -100,7 +105,7 @@ def compile_native(fmt, k, n, side, control=False):
         module.compile_program = original
 
 
-def native_tensors(fmt, k, n, rows):
+def native_tensors(fmt, k, n, rows, splits=None):
     if fmt == "embedding":
         ids = torch.arange(rows, dtype=torch.int32, device="cuda") % n
         payload = torch.randint(-16, 17, (n, k), device="cuda").to(torch.float8_e4m3fn).view(torch.uint8)
@@ -122,7 +127,9 @@ def native_tensors(fmt, k, n, rows):
             payload = torch.randint(-16, 17, (n, k), device="cuda").to(torch.float8_e4m3fn).view(torch.uint8)
             scales = (torch.full((n*k//32,), 120, dtype=torch.uint8, device="cuda") if fmt == "mxfp8"
                       else torch.full((n,), .01, device="cuda"))
-    partial = torch.empty((rows, (k+1023)//1024, n), dtype=torch.float32, device="cuda")
+    # The tile core takes no split-K partials (splits 0: a 4-byte placeholder).
+    splits = (k+1023)//1024 if splits is None else splits
+    partial = torch.empty((rows, splits, n) if splits else (1,), dtype=torch.float32, device="cuda")
     output = torch.empty((rows, n), dtype=torch.float32, device="cuda")
     # Keep x alive even when the ABI receives only the pointer table.
     return (inputs, payload, scales, partial, output, x), payload.numel()+scales.numel()*scales.element_size()
@@ -208,7 +215,8 @@ def main():
         spill = spill_check(program, args.output.parent / "cubins" / f"{fmt}-{name}")
         control = compile_native(fmt, k, n, side, control=True)
         for rows in missing:
-            storage, read_bytes = native_tensors(fmt, k, n, rows)
+            storage, read_bytes = native_tensors(
+                fmt, k, n, rows, 0 if program.geometry.get("core") == "tile" else None)
             tensors = storage if fmt == "embedding" else storage[:5]
             scalars = (rows, 2, cta_limit) if fmt == "trellis" else (rows, cta_limit)
             graph = capture(lambda: program.launch(*tensors, scalars=scalars))
@@ -236,6 +244,16 @@ def main():
                 else:
                     fp8_us = timing(fp8_graph, replays)
                     del fp8_graph, fp8_storage
+            a16_us = None
+            if fmt != "embedding" and rows > 64:
+                try:
+                    a16_graph, a16_storage = baseline(k, n, rows, a16=True)
+                except TypeError as error:
+                    if "dense_gemm launch is unsupported" not in str(error):
+                        raise
+                else:
+                    a16_us = timing(a16_graph, replays)
+                    del a16_graph, a16_storage
             gbps = read_bytes/native_us/1000
             row = dict(format=fmt, projection=name, k=k, n=n, sharded_side=side,
                        rows=rows, read_bytes=read_bytes, native_us=native_us,
@@ -244,7 +262,9 @@ def main():
                        session_id=session_id, read_ceiling_gbps=ceiling,
                        control_us=control_us, control_bitwise_equal=True, cubin_spill_check=spill,
                        block_fp8_status=fp8_status, block_fp8_error=fp8_error,
-                       block_fp8_us=fp8_us, speedup_vs_block_fp8=fp8_us/native_us if fp8_us else None)
+                       block_fp8_us=fp8_us, speedup_vs_block_fp8=fp8_us/native_us if fp8_us else None,
+                       block_fp8_w8a16_us=a16_us,
+                       speedup_vs_block_fp8_w8a16=a16_us/native_us if a16_us else None)
             report["measurements"].append(row)
             args.output.write_text(json.dumps(report, indent=2)+"\n")
             print(json.dumps(row), flush=True)
