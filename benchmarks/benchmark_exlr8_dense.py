@@ -250,7 +250,9 @@ def main():
             if not torch.equal(expected.view(torch.int16), tensors[-1].view(torch.int16)):
                 raise RuntimeError(f"{fmt}/{name}/rows{rows}: same-session control mismatch")
             replays = 1 if rows > 64 else args.replays
-            n_copies = copies_for(read_bytes, args.cold_l2 and rows <= 64)
+            # Copies by stored weight size (the embedding gathers only a few rows of it).
+            stored = tensors[1].numel()*tensors[1].element_size()+tensors[2].numel()*tensors[2].element_size()
+            n_copies = copies_for(stored, args.cold_l2 and rows <= 64)
             if n_copies > 1:
                 extra = [(tensors[1].clone(), tensors[2].clone()) for _ in range(n_copies-1)]
                 launches = [lambda: program.launch(*tensors, scalars=scalars)]
