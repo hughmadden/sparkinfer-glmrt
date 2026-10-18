@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from exlr8_oracle import Case
+from .exlr8_oracle import Case
 
 pytestmark = pytest.mark.skipif(not os.environ.get("CUTEAFD_EXLR8_SNAPSHOT"),
                                 reason="EXLR8 component gate requires checkpoint and E1 reference")
