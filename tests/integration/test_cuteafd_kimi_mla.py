@@ -19,8 +19,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-SNAPSHOT = Path(os.environ.get("CUTEAFD_KIMI_SNAPSHOT",
-    "/mnt/sparknest/hf-home/hub/models--moonshotai--Kimi-K3/snapshots/f831ab66814297da540d832a5235f8e904f29d06"))
+HF_HOME = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
+SNAPSHOT = Path(os.environ.get("CUTEAFD_KIMI_SNAPSHOT", HF_HOME / "hub" /
+    "models--moonshotai--Kimi-K3/snapshots/f831ab66814297da540d832a5235f8e904f29d06"))
 
 
 @lru_cache(maxsize=1)
@@ -53,10 +54,11 @@ def weight(name):
 
 
 def module(device, *, heads=48, rank=0):
+    definitions = official()
     cfg = json.loads((SNAPSHOT / "config.json").read_text())["text_config"]
     cfg.update(num_attention_heads=heads, num_key_value_heads=heads, _attn_implementation="eager")
     with torch.device("meta"):
-        model = official()["KimiMLAAttention"](types.SimpleNamespace(**cfg), 3)
+        model = definitions["KimiMLAAttention"](types.SimpleNamespace(**cfg), 3)
     model.to_empty(device=device)
     h = slice(rank * heads, (rank + 1) * heads)
     with torch.no_grad():
@@ -221,3 +223,38 @@ def test_real_mla_gpu_and_graph_replay(heads, rank, mode, rows):
     producer.launch(live, slots, w, packed["q_a_layernorm.weight"], packed["kv_a_layernorm.weight"],
                     packed["q_b_proj.weight"], uk, cache, q, qr, scratch[0], scalars=(rows,))
     assert torch.equal(cache.view(torch.uint8), before.view(torch.uint8))
+
+
+@pytest.mark.parametrize("heads", [48, 96])
+@pytest.mark.parametrize("context", [64, 256])
+def test_ragged_mla_gpu_attention_and_merged_lse(heads, context):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_dense_mla_aot
+    g = KimiMlaGeometry(heads=heads)
+    program = compile_kimi_dense_mla_aot(g, max_rows=16, max_context=context, mode="verify")
+    counts = [1, 3, 12]
+    lengths = [17, 33, 63] if context == 64 else [65, 129, 200]
+    width = (context + 63) // 64
+    gen = torch.Generator(device="cuda").manual_seed(3273)
+    cache = (torch.randn(3 * width, 64, 576, generator=gen, device="cuda") * 0.1).bfloat16()
+    q = (torch.randn(sum(counts), heads, 576, generator=gen, device="cuda") * 0.1).bfloat16()
+    # Each request's physical pages are interleaved, with reversed allocation.
+    table = torch.arange(3 * width - 1, -1, -1, dtype=torch.int32, device="cuda").reshape(width, 3).T.contiguous()
+    offsets = [0, 1, 4, 16]
+    cu = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    out = torch.empty(16, heads, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty(16, heads, device="cuda")
+    scratch = torch.empty(max(1, program.scratch_bytes(16)["scratch"]), dtype=torch.uint8, device="cuda")
+    program.launch(q, cache, table, lens, cu, out, lse, scratch,
+                   scalars=(16, 3, width, program.geometry["num_splits"]))
+    for request, (count, length) in enumerate(zip(counts, lengths)):
+        query = q[offsets[request]:offsets[request + 1]].float()
+        records = cache[table[request].long()].flatten(0, 1)[:length].float()
+        scores = torch.einsum("thd,sd->hts", query, records) * g.softmax_scale
+        scores += mask(count, length, "cuda", torch.float32)[0]
+        expected_lse = scores.logsumexp(-1).T
+        expected = torch.einsum("hts,sd->thd", scores.softmax(-1), records[:, :512])
+        metrics(out[offsets[request]:offsets[request + 1]], expected)
+        torch.testing.assert_close(lse[offsets[request]:offsets[request + 1]], expected_lse, atol=2e-4, rtol=2e-5)
