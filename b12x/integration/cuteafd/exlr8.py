@@ -66,7 +66,35 @@ class _Exlr8Pointers:
                   cute.make_tensor(output, cute.make_layout(1, stride=1)), rows, groups, cta_limit, stream)
 
 
-def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512):
+class _Exlr8ServingPointers:
+    def __init__(self, g):
+        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
+        self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"],
+                                  g["max_groups"], device_count=True)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
+                 group_expert: cute.Pointer, route_slots: cute.Pointer,
+                 route_group_lane: cute.Pointer, route_weights: cute.Pointer,
+                 fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
+                 output: cute.Pointer, group_count: cute.Pointer,
+                 rows: cutlass.Int32, cta_limit: cutlass.Int32, stream: cuda.CUstream):
+        self.core.serving(cute.make_tensor(x, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(bits, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(group_expert, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_slots, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_group_lane, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_weights, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(output, cute.make_layout(1, stride=1)), rows,
+                  cute.make_tensor(group_count, cute.make_layout(1, stride=1)), cta_limit, stream)
+
+
+def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
+                         device_count=False):
     g = geometry(hidden, units, top_k, max_groups)
     h, u, t, m, s = (g[k] for k in ("hidden", "units", "top_k", "max_groups", "fc1_splits"))
     operands = (
@@ -83,8 +111,13 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512):
         Operand("output", torch.float32, f"[rows,{h}]", "out"),
     )
     sizes = scratch_bytes(g)
-    return compile_program(_Exlr8Pointers(g), name="exlr8_a16_decode", operands=operands,
-                           scalars=tuple(Scalar(n) for n in ("rows", "groups", "cta_limit")),
-                           key=(h, u, t, m, ABI_VERSION), geometry=g,
+    if device_count:
+        g["abi_version"] = 2
+        operands += (Operand("group_count", torch.int32, "[1]"),)
+    return compile_program(_Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
+                           name="exlr8_a16_serving" if device_count else "exlr8_a16_decode", operands=operands,
+                           scalars=tuple(Scalar(n) for n in (("rows", "cta_limit") if device_count
+                                                            else ("rows", "groups", "cta_limit"))),
+                           key=(h, u, t, m, g["abi_version"]), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)

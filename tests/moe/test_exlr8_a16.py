@@ -16,15 +16,59 @@ def case(request):
     return Case(os.environ["CUTEAFD_EXLR8_SNAPSHOT"], layer=request.param)
 
 
-def program(case):
+def program(case, device_count=False):
     from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
     return compile_exlr8_a16_aot(hidden=case.h, units=case.u, top_k=case.topk,
-                                 max_groups=case.max_groups)
+                                 max_groups=case.max_groups, device_count=device_count)
 
 
 def launch(case, compiled, rows, cta_limit=96):
     compiled.launch(*(t.flatten() for t in case.tensors()),
                     scalars=(rows, case.groups, cta_limit))
+
+
+def test_serving_device_count_rows_and_graph_invariance(case):
+    compiled = program(case, device_count=True)
+    baseline = program(case)
+    count = torch.empty(1, dtype=torch.int32, device=case.device)
+    case.routing(64)
+    launch(case, baseline, 64)
+    expected = case.output.clone()
+
+    def serving(rows, limit=96):
+        compiled.launch(*(t.flatten() for t in case.tensors()), count,
+                        scalars=(rows, limit))
+
+    for rows in (1, 2, 8, 16, 32, 64):
+        case.routing(rows, chunk=1 if rows % 3 else 7, reverse=bool(rows % 2))
+        count.fill_(case.groups)
+        for limit in (1, 96, 188):
+            case.output.fill_(float("nan"))
+            serving(rows, limit)
+            assert torch.equal(case.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
+            assert torch.isnan(case.output[rows:]).all()
+
+    case.routing(16)
+    count.fill_(case.groups)
+    serving(16)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        serving(16)
+    # Same graph, changed live count and packing, including zero and malformed
+    # counts. Invalid counts must not read poisoned descriptor/scratch memory.
+    for chunk in (1, 7, 16):
+        case.routing(16, chunk=chunk, reverse=bool(chunk % 2))
+        count.fill_(case.groups)
+        case.output.fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(case.output[:16].view(torch.int32), expected[:16].view(torch.int32))
+    for invalid in (0, -1, case.max_groups + 1):
+        count.fill_(invalid)
+        case.group_expert.fill_(-1)
+        case.fc2.fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(case.output[:16], torch.zeros_like(case.output[:16]))
 
 
 def relative(actual, expected):

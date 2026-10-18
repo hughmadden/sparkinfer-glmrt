@@ -77,7 +77,7 @@ class Exlr8A16Kernel:
     CTAS_PER_SM = 4
 
     def __init__(self, hidden_size: int, units_per_expert: int, top_k: int,
-                 max_groups: int, fast_math: bool = True):
+                 max_groups: int, fast_math: bool = True, device_count: bool = False):
         if hidden_size <= 0 or hidden_size % 128:
             raise ValueError("EXLR8 hidden_size must be a positive multiple of 128")
         if min(units_per_expert, top_k, max_groups) < 1:
@@ -87,13 +87,14 @@ class Exlr8A16Kernel:
         self.top_k = int(top_k)
         self.max_groups = int(max_groups)
         self.fast_math = bool(fast_math)
+        self.device_count = bool(device_count)
         self.blocks = hidden_size // 128
         self.splits = (self.blocks + 7) // 8
 
     @property
     def __cache_key__(self):
         return ("exlr8_a16", self.ABI_VERSION, self.CODE_VERSION, self.hidden_size, self.units,
-                self.top_k, self.max_groups, self.fast_math)
+                self.top_k, self.max_groups, self.fast_math, self.device_count)
 
     @cute.jit
     def __call__(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -118,6 +119,33 @@ class Exlr8A16Kernel:
                     block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
             self.reduce_kernel(route_group_lane, route_weights, fc2, output,
                                rows, groups).launch(
+                grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1),
+                block=(128, 1, 1), stream=stream)
+
+    @cute.jit
+    def serving(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
+                group_expert: cute.Tensor, route_slots: cute.Tensor,
+                route_group_lane: cute.Tensor, route_weights: cute.Tensor,
+                fc1: cute.Tensor, intermediate: cute.Tensor, fc2: cute.Tensor,
+                output: cute.Tensor, rows: Int32, group_count: cute.Tensor,
+                cta_limit: Int32, stream: cuda.CUstream):
+        # Grids and launch count are independent of route data, including zero
+        # groups. Each kernel bounds its tasks with the device-resident count.
+        if rows > Int32(0) and rows <= Int32(64) and cta_limit > Int32(0):
+            self.fc1_kernel(x, pointers, bits, group_expert, route_slots,
+                            fc1, rows, group_count).launch(
+                grid=(min(Int32(self.max_groups * self.units * 2 * self.splits), cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+            self.activation_kernel(pointers, bits, group_expert, route_slots,
+                                   fc1, intermediate, rows, group_count).launch(
+                grid=(min(Int32(self.max_groups * self.units), cta_limit), 1, 1),
+                block=(128, 1, 1), stream=stream)
+            self.fc2_kernel(pointers, bits, group_expert, route_slots, intermediate,
+                            fc2, rows, group_count).launch(
+                grid=(min(Int32(self.max_groups * self.blocks), cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+            self.reduce_kernel(route_group_lane, route_weights, fc2, output,
+                               rows, group_count).launch(
                 grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1),
                 block=(128, 1, 1), stream=stream)
 
@@ -175,7 +203,12 @@ class Exlr8A16Kernel:
     @cute.kernel
     def fc1_kernel(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
                    group_expert: cute.Tensor, route_slots: cute.Tensor,
-                   fc1: cute.Tensor, rows: Int32, groups: Int32):
+                   fc1: cute.Tensor, rows: Int32, groups):
+        if cutlass.const_expr(self.device_count):
+            groups = groups[0]
+            # Invalid counts never index descriptor or scratch storage.
+            if groups < Int32(0) or groups > Int32(self.max_groups):
+                groups = Int32(0)
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
@@ -227,7 +260,12 @@ class Exlr8A16Kernel:
     def activation_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
                           group_expert: cute.Tensor, route_slots: cute.Tensor,
                           fc1: cute.Tensor, intermediate: cute.Tensor,
-                          rows: Int32, groups: Int32):
+                          rows: Int32, groups):
+        if cutlass.const_expr(self.device_count):
+            groups = groups[0]
+            # Invalid counts never index descriptor or scratch storage.
+            if groups < Int32(0) or groups > Int32(self.max_groups):
+                groups = Int32(0)
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
@@ -270,7 +308,12 @@ class Exlr8A16Kernel:
     def fc2_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
                    group_expert: cute.Tensor, route_slots: cute.Tensor,
                    intermediate: cute.Tensor, fc2: cute.Tensor,
-                   rows: Int32, groups: Int32):
+                   rows: Int32, groups):
+        if cutlass.const_expr(self.device_count):
+            groups = groups[0]
+            # Invalid counts never index descriptor or scratch storage.
+            if groups < Int32(0) or groups > Int32(self.max_groups):
+                groups = Int32(0)
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
@@ -315,7 +358,12 @@ class Exlr8A16Kernel:
 
     @cute.kernel
     def reduce_kernel(self, route_group_lane: cute.Tensor, route_weights: cute.Tensor,
-                      fc2: cute.Tensor, output: cute.Tensor, rows: Int32, groups: Int32):
+                      fc2: cute.Tensor, output: cute.Tensor, rows: Int32, groups):
+        if cutlass.const_expr(self.device_count):
+            groups = groups[0]
+            # Invalid counts never index descriptor or scratch storage.
+            if groups < Int32(0) or groups > Int32(self.max_groups):
+                groups = Int32(0)
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
