@@ -323,6 +323,7 @@ class _V41RouterScores:
                     copy_b,
                 )
                 total_accumulator.store(total_accumulator.load() + accumulator.load())
+                cute.arch.fence_view_async_shared()
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 

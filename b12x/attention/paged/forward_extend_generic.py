@@ -6494,6 +6494,7 @@ class PagedForwardKernel:
                 if const_expr(
                     self.use_paged_k_tma and not self.use_paged_kv_tma_fp8_raw_issue
                 ):
+                    cute.arch.fence_view_async_shared()
                     pipeline_k.consumer_release(kv_consumer_state)
 
                 next_tile_base = prefetch_base
@@ -6945,6 +6946,7 @@ class PagedForwardKernel:
                 if const_expr(
                     self.use_paged_v_tma and not self.use_paged_kv_tma_fp8_raw_issue
                 ):
+                    cute.arch.fence_view_async_shared()
                     pipeline_v.consumer_release(kv_consumer_state)
                 if const_expr(self.use_paged_k_tma or self.use_paged_v_tma):
                     kv_consumer_state.advance()

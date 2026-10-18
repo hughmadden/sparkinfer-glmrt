@@ -828,6 +828,7 @@ class GroupedFp8Gemm:
                             cute.copy(copy_a, shared_a[None, None, kk + 1], target_a[None, None, kk + 1])
                             cute.copy(copy_b, t_ssb[None, None, kk + 1], target_b[None, None, kk + 1])
                         cute.gemm(thr_mma, acc, t_cra[None, None, kk], t_crb[None, None, kk], acc)
+                    cute.arch.fence_view_async_shared()
                     load_pipeline.consumer_release(consumer_state)
                     consumer_state.advance()
                     cute.arch.barrier(barrier_id=1, number_of_threads=self.compute_threads)
