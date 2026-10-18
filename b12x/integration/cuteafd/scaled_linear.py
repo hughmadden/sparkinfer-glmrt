@@ -38,9 +38,9 @@ def geometry(input_features, output_features, *, encoding="mxfp8", sharded_side=
     # partials; ``partial`` stays in the pointer list for ABI v1 and is never touched.
     # Segments come from the weight shape only (never the device): enough parallel
     # decode chains for small-N projections, each a power of two dividing K/128.
-    groups = 2 if encoding == "fp8_row" or output_features >= 8192 else 1
+    groups = 2 if encoding == "fp8_row" else 1
     segments = 1
-    while (output_features//(8*groups)*segments < 2048 and segments < 16
+    while (output_features//(8*groups)*segments < 2048 and segments < 8
            and (input_features//128) % (segments*2) == 0):
         segments *= 2
     return dict(abi_version=ABI_VERSION,input_features=input_features,output_features=output_features,

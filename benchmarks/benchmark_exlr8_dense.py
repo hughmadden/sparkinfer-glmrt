@@ -61,7 +61,23 @@ class BlockFp8:
                         cutlass.Int64(scratch.toint()), stream)
 
 
-def baseline(k, n, rows, a16=False):
+L2_SPAN = 256 << 20  # 2x the SM120 L2: rotated weight copies arrive DRAM-cold
+
+
+def copies_for(weight_bytes, cold_l2):
+    """Distinct weight copies a cold-L2 graph rotates through (consecutive layers)."""
+    return max(1, min(64, -(-L2_SPAN // max(1, weight_bytes)))) if cold_l2 else 1
+
+
+def rotated(launches):
+    """One graph launching each copy in turn; ``timing`` divides by ``len(launches)``."""
+    def run():
+        for launch in launches:
+            launch()
+    return run
+
+
+def baseline(k, n, rows, a16=False, cold_l2=False):
     # Decode programs keep their GEMV to 64 rows either way; prefill W8A16 on fp8_rows 0.
     core = BlockFp8(k, n, rows > 64, 0 if a16 and rows > 64 else 255)
     ops = (Operand("x", torch.bfloat16, "[rows,K]"),
@@ -74,13 +90,16 @@ def baseline(k, n, rows, a16=False):
     x = torch.randn((rows, k), device="cuda", dtype=torch.bfloat16) * .1
     weight = torch.randint(-16, 17, (n, k), device="cuda").to(torch.float8_e4m3fn)
     scales = torch.full(((n+127)//128, k//128), .01, device="cuda")
+    extra = [(weight.clone(), scales.clone()) for _ in range(copies_for(n*k, cold_l2 and rows <= 64)-1)]
     scratch = torch.empty(max(1024, core.projection.prefill_scratch_bytes(rows)),
                           dtype=torch.uint8, device="cuda")
     output = torch.empty((rows, n), dtype=torch.bfloat16, device="cuda")
     tensors = (x, weight, scales, scratch, output)
-    graph = capture(lambda: program.launch(*tensors, scalars=(rows,)))
+    launches = [lambda: program.launch(*tensors, scalars=(rows,))]
+    launches += [lambda w=w, s=s: program.launch(x, w, s, scratch, output, scalars=(rows,)) for w, s in extra]
+    graph = capture(rotated(launches))
     finite_nonzero(output, "block-FP8")
-    return graph, tensors
+    return graph, (tensors, extra), len(launches)
 
 
 def compile_native(fmt, k, n, side, control=False):
@@ -170,6 +189,8 @@ def main():
     parser.add_argument("--shapes", help="comma-separated projection names")
     parser.add_argument("--rows", default="1,4,16,64,4096")
     parser.add_argument("--replays", type=int, default=20)
+    parser.add_argument("--cold-l2", action="store_true",
+                        help="rotate distinct weight copies (>=2x L2) in each graph, both arms")
     parser.add_argument("--resume", action="store_true", help="retain completed measurements and run only missing rows")
     args = parser.parse_args()
     rows_list = [int(v) for v in args.rows.split(",")]
@@ -229,30 +250,37 @@ def main():
             if not torch.equal(expected.view(torch.int16), tensors[-1].view(torch.int16)):
                 raise RuntimeError(f"{fmt}/{name}/rows{rows}: same-session control mismatch")
             replays = 1 if rows > 64 else args.replays
-            native_us = timing(graph, replays)
+            n_copies = copies_for(read_bytes, args.cold_l2 and rows <= 64)
+            if n_copies > 1:
+                extra = [(tensors[1].clone(), tensors[2].clone()) for _ in range(n_copies-1)]
+                launches = [lambda: program.launch(*tensors, scalars=scalars)]
+                launches += [lambda p=p, q=q: program.launch(tensors[0], p, q, *tensors[3:], scalars=scalars)
+                             for p, q in extra]
+                graph = capture(rotated(launches))
+            native_us = timing(graph, replays)/n_copies
             control_us = timing(control_graph, replays)
             fp8_us = None
             fp8_status = "not_applicable" if fmt == "embedding" else "ok"
             fp8_error = None
             if fmt != "embedding":
                 try:
-                    fp8_graph, fp8_storage = baseline(k, n, rows)
+                    fp8_graph, fp8_storage, fp8_copies = baseline(k, n, rows, cold_l2=args.cold_l2)
                 except TypeError as error:
                     if "dense_gemm launch is unsupported" not in str(error):
                         raise
                     fp8_status, fp8_error = "unsupported", str(error)
                 else:
-                    fp8_us = timing(fp8_graph, replays)
+                    fp8_us = timing(fp8_graph, replays)/fp8_copies
                     del fp8_graph, fp8_storage
             a16_us = None
             if fmt != "embedding" and rows > 64:
                 try:
-                    a16_graph, a16_storage = baseline(k, n, rows, a16=True)
+                    a16_graph, a16_storage, a16_copies = baseline(k, n, rows, a16=True, cold_l2=args.cold_l2)
                 except TypeError as error:
                     if "dense_gemm launch is unsupported" not in str(error):
                         raise
                 else:
-                    a16_us = timing(a16_graph, replays)
+                    a16_us = timing(a16_graph, replays)/a16_copies
                     del a16_graph, a16_storage
             gbps = read_bytes/native_us/1000
             row = dict(format=fmt, projection=name, k=k, n=n, sharded_side=side,
@@ -260,6 +288,7 @@ def main():
                        gbps=gbps, read_ceiling_percent=100*gbps/ceiling,
                        target_met=gbps >= .95*ceiling,
                        session_id=session_id, read_ceiling_gbps=ceiling,
+                       cold_l2=args.cold_l2, weight_copies=n_copies,
                        control_us=control_us, control_bitwise_equal=True, cubin_spill_check=spill,
                        block_fp8_status=fp8_status, block_fp8_error=fp8_error,
                        block_fp8_us=fp8_us, speedup_vs_block_fp8=fp8_us/native_us if fp8_us else None,
