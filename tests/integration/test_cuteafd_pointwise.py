@@ -149,6 +149,56 @@ def test_indexer_weight_projection_is_bf16_then_f32_prescale(outputs):
     torch.testing.assert_close(out, torch.nn.functional.linear(x, w).float() * 0.5, atol=0.5, rtol=0.008)
 
 
+@pytest.mark.parametrize("outputs,width", [(352, 4096), (768, 4096), (4096, 1536)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_canonical_projection_dynamic_rows_and_graph(outputs, width, dtype):
+    require_b12x()
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+    gen = torch.Generator(device="cuda").manual_seed(274)
+    x = torch.randn(64, width, generator=gen, device="cuda").bfloat16()
+    # Repeat a row to prove serving-width invariance independently of torch GEMM.
+    x[1:] = x[:1]
+    weight = (torch.randn(outputs, width, generator=gen, device="cuda") * 0.01).bfloat16()
+    out = torch.empty(64, outputs, dtype=dtype, device="cuda")
+    program = compile_bf16_projection_aot(width=width, outputs=outputs, output_dtype=dtype)
+    program.launch(x, weight, out, scalars=[64])
+    torch.cuda.synchronize()
+    expected = out.clone()
+    reference = (x[:1].double() @ weight.double().t()).to(dtype)
+    relative = torch.linalg.vector_norm(expected[:1].double() - reference.double()) / torch.linalg.vector_norm(reference.double())
+    assert float(relative) < (0.004 if dtype == torch.bfloat16 else 2e-5)
+    assert bool(torch.isfinite(expected).all()) and bool(expected.abs().max() > 0)
+    assert torch.equal(expected, expected[:1].expand_as(expected))
+    for live in [1, 16, 17, 64]:
+        out.fill_(float("nan"))
+        program.launch(x, weight, out, scalars=[live])
+        torch.cuda.synchronize()
+        assert torch.equal(out[:live], expected[:live])
+        assert bool(out[live:].isnan().all())
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        program.launch(x, weight, out, scalars=[64])
+    torch.cuda.current_stream().wait_stream(stream)
+    for _ in range(3):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_canonical_projection_export_abi(tmp_path, dtype):
+    require_b12x()
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+    from ._cuteafd import check_export
+    with exportable_compilation():
+        program = compile_bf16_projection_aot(width=4096, outputs=352, output_dtype=dtype)
+    check_export(program, tmp_path, "bf16_projection_" + str(dtype).split(".")[-1])
+
+
 def test_pointwise_export_abi(tmp_path):
     require_b12x()
     from b12x.integration.cuteafd import exportable_compilation
