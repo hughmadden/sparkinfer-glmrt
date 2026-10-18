@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 from pathlib import Path
 import statistics
@@ -145,6 +146,9 @@ def main():
     candidate = compile_exlr8_a16_aot(units=4)
     # This is the existing EXL3 uniform-K4 implementation, not a proxy GEMM.
     tier = exl3._prepared(4,256,408,torch.device("cuda"))
+    # The legacy helper predates the compiler's codebook default change.
+    exl3.compile_w4a16_fused_moe = functools.partial(
+        exl3.compile_w4a16_fused_moe, trellis_codebook=tier.trellis_codebook)
     expert_map = torch.arange(256,dtype=torch.int32,device="cuda")
     records = []
     for rows in map(int,args.rows.split(",")):
