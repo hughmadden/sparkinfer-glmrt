@@ -12,6 +12,8 @@ import tempfile
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmarks import benchmark_mixed_trellis as exl3
@@ -59,6 +61,36 @@ def copy_roofline():
         values.append(2 * size * 10 / (start.elapsed_time(end) * 1e6))
     return dict(buffer_bytes=size, gbps=max(values), repeats_gbps=values,
                 convention="2N bytes per copy (read plus write); expert payload uses N read bytes")
+
+
+@triton.jit
+def _read_stream(src, sums, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(src + offsets)
+    # Keep every vectorized global load live with only one 4-byte store per CTA.
+    tl.store(sums + tl.program_id(0), tl.sum(values, axis=0))
+
+
+def read_roofline():
+    size = 256 * 1024 * 1024
+    block = 4096
+    src = torch.full((size // 4,), 17.0, dtype=torch.float32, device="cuda")
+    sums = torch.empty((src.numel() // block,), device="cuda")
+    graph = capture(lambda: _read_stream[(sums.numel(),)](src, sums, BLOCK=block))
+    if not bool((sums == 17 * block).all()):
+        raise RuntimeError("read-only stream did not consume the full buffer")
+    values = []
+    for _ in range(5):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(10):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        values.append(size * 10 / (start.elapsed_time(end) * 1e6))
+    return dict(buffer_bytes=size, gbps=max(values), repeats_gbps=values,
+                checksum_bytes=sums.numel() * 4,
+                convention="N global-load bytes; one checksum float store per 16 KiB read")
 
 
 def finite_nonzero(tensor, label):
@@ -150,6 +182,7 @@ def main():
     if not args.profile:
         args.output.parent.mkdir(parents=True,exist_ok=True)
     roofline = None if args.profile else copy_roofline()
+    read_only = None if args.profile else read_roofline()
     tensors, owners = make_candidate()
     candidate = compile_exlr8_a16_aot(units=4)
     # This is the existing EXL3 uniform-K4 implementation, not a proxy GEMM.
@@ -201,6 +234,8 @@ def main():
                             exl3_gbps=payload_bytes/baseline_us/1000,
                             exlr8_gbps=payload_bytes/candidate_us/1000,
                             roofline_percent=100*payload_bytes/candidate_us/1000/roofline["gbps"],
+                            read_roofline_percent=100*payload_bytes/candidate_us/1000/read_only["gbps"],
+                            exl3_read_roofline_percent=100*payload_bytes/baseline_us/1000/read_only["gbps"],
                             optimization_target=0.97,target_met=ratio>=0.97,cta_mult=mults[0],**extra,
                             **stage_profile(candidate_graph,args.output.parent)))
     if args.profile:
@@ -208,7 +243,7 @@ def main():
     result = dict(schema=1,kind="exlr8_up1_vs_exl3_k4",device=props.name,
                   sm_count=props.multi_processor_count,l2_bytes=getattr(props,"L2_cache_size",None),
                   hidden=6144,units_per_rank=4,top_k=8,experts=256,
-                  measured_copy_roofline=roofline,
+                  measured_copy_roofline=roofline,measured_read_roofline=read_only,
                   conditions="TP4 synthetic K4 payloads, graph replay, one untimed warm batch per rows; profiler separate",
                   rows=records,target_met=all(r["target_met"] for r in records))
     with args.output.open("x") as stream:
