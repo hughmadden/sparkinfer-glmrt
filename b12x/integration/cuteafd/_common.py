@@ -35,6 +35,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
+from ._kda_contract import KDAGeometry
+
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
@@ -46,6 +48,7 @@ __all__ = [
     "GLM53",
     "GLM53_FLASH",
     "GLMFGeometry",
+    "KDAGeometry",
     "GLMGeometry",
     "MIMO_V2_FLASH",
     "MIMO_V26_FLASH",

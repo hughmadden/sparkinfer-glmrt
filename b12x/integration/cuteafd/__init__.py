@@ -58,6 +58,7 @@ from ._common import (  # noqa: F401
     GLM53,
     GLM53_FLASH,
     GLMFGeometry,
+    KDAGeometry,
     PRO,
     AotProgram,
     DSV4Geometry,

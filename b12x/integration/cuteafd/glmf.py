@@ -77,6 +77,7 @@ import torch
 from cutlass import Float32, Int32, Int64
 
 from ._common import FLASH, GLM53_FLASH, AotProgram, GLMFGeometry, Operand, Scalar, compile_program
+from ._kda_contract import KDAGeometry, kda_layout
 from ._glm_kernels import BatchedBf16Gemm, GlmRankNormPackKV, GlmSwiGLU, glm_projection
 from ._glmf_kernels import (
     GlmfAdd,
@@ -535,6 +536,13 @@ def _seq_geometry(launch) -> dict:
     return {} if launch.seq_ctas == 1 else {"seq_ctas": launch.seq_ctas}
 
 
+def _kda_geometry(g) -> dict:
+    if not isinstance(g, KDAGeometry):
+        return {}
+    return {"output_gate": g.output_gate, "o_norm_dtype": g.o_norm_dtype,
+            "beta_sigmoid_dtype": "float32", "use_gate_in_kernel": True, "safe_gate": True}
+
+
 # TMA tiles of the BF16 KDA projections by live rows, per weight shape [N, K] (``decode_tiles``;
 # ``RowTiledBf16Projection`` entries: rows up to, MMA warps of 16 tile rows each, tile columns,
 # stages; rows past the last entry keep ``prefill_config``, whose 64 x 128 x 3-stage tile is 195
@@ -581,6 +589,12 @@ class _Kda:
         self.chunked = _KdaChunked(g, max_rows, state, round_tiles) if structure > CHUNKED_MIN_ROWS else None
         d, p = g.kda_width, g.kda_in_width
         self.d, self.p = d, p
+        layout = kda_layout(g)
+        self.full_rank_gate = layout["full_rank_gate"]
+        self.fg_stride = layout["fg_stride"]
+        self.gate_offset, self.gate_stride = layout["gate_offset"], layout["gate_stride"]
+        self.beta_offset = layout["beta_offset"]
+        self.f32_norm = layout["o_norm_dtype"] == "float32"
         prefill_rows = int(max_rows) if prefill else None
         self.chunked_bytes = 0 if self.chunked is None else self.chunked.nbytes
         # decode_tiles: the BF16 projections whose shape has a table pick their TMA tiles by live
@@ -591,17 +605,18 @@ class _Kda:
         # Prefill: fp8_rows bit 0 turns the in-projection's FP8 GEMM on, bit 1 o_proj's.
         self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=1,
                                   tiles_by_rows=self.decode_tiles.get("in", ()))
-        # f_b(f_a) and g_b(g_a): two 128 -> D products off the in-projection row.
-        self.fg = BatchedBf16Gemm(n=d, k=g.kda_head_dim, batch=2, a_row=p, a_batch=g.kda_head_dim,
-                                  o_row=2 * d, o_batch=d, compute_warps=_batched_warps(structure))
+        # f_b(f_a), and g_b(g_a) only for a low-rank output gate.
+        self.fg = BatchedBf16Gemm(n=d, k=g.kda_head_dim, batch=layout["fg_batch"], a_row=p,
+                                  a_batch=g.kda_head_dim, o_row=self.fg_stride, o_batch=d,
+                                  compute_warps=_batched_warps(structure))
         # Prefill capacities: the row-blocked conv and the scanning conv-state update.
         wide = structure > CHUNKED_MIN_ROWS
         self.conv = (GlmfKdaConvRows if wide else GlmfKdaConv)(channels=3 * d, proj_width=p)
         self.conv_state = GlmfKdaConvState(channels=3 * d, proj_width=p, row_block=64 if wide else 0)
         self.recurrent = GlmfKdaRecurrent(heads=g.kda_heads, lower_bound=g.gate_lower_bound, qkv_width=3 * d,
-                                          g_stride=2 * d, b_stride=p, state_dtype=state, replay_rows=self.replay_rows,
-                                          seq_ctas=self.seq_ctas)
-        self.norm = GlmfKdaGatedNorm(heads=g.kda_heads, eps=g.norm_eps, gate_stride=2 * d)
+                                          g_stride=self.fg_stride, b_stride=p, state_dtype=state, replay_rows=self.replay_rows,
+                                          seq_ctas=self.seq_ctas, round_beta=layout["round_recurrent_beta"])
+        self.norm = GlmfKdaGatedNorm(heads=g.kda_heads, eps=g.norm_eps, gate_stride=self.gate_stride)
         self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=2,
                                  tiles_by_rows=self.decode_tiles.get("out", ()))
 
@@ -642,22 +657,40 @@ class _Kda:
         _, proj_off, _ = kda_replay_layout(self.g.kda_heads, 3 * d, self.replay_rows)
         self.conv_state(proj, conv_state, slots, seq_first, _ptr(bf16, Int64(replay.toint()) + Int64(proj_off)), spec,
                         rows, stream)
-        b_raw = _ptr(bf16, base + Int64((3 * d + 256) * 2), 2)
+        b_raw = _ptr(bf16, base + Int64(self.beta_offset * 2), 2)
         if cutlass.const_expr(self.chunked is None):
             self.recurrent(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
                            _ptr(bf16, o_off), replay, spec, rows, stream)
         else:
             if rows > Int32(CHUNKED_MIN_ROWS):
                 self.chunked(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
-                             _ptr(bf16, o_off), y_off + _align_i64(m * Int64(2 * d)), 3 * d, 2 * d, p, rows, stream)
+                             _ptr(bf16, o_off), y_off + _align_i64(m * Int64(2 * d)), 3 * d,
+                             self.fg_stride, p, rows, stream)
             else:
                 self.recurrent(_ptr(bf16, qkv_off), _ptr(bf16, fg_off), b_raw, a_log, dt_bias, state, slots,
                                _ptr(bf16, o_off), replay, spec, rows, stream)
+        gate = _ptr(bf16, fg_off + Int64(self.gate_offset * 2))
+        if cutlass.const_expr(self.full_rank_gate):
+            gate = _ptr(bf16, base + Int64(self.gate_offset * 2))
+        norm_weight = o_norm
+        if cutlass.const_expr(self.f32_norm):
+            norm_weight = _ptr(Float32, Int64(o_norm.toint()), 4)
         if cutlass.const_expr(self.output_norm):
-            self.norm(_ptr(bf16, o_off), _ptr(bf16, fg_off + Int64(d * 2)), o_norm, out, rows, stream)
+            self.norm(_ptr(bf16, o_off), gate, norm_weight, out, rows, stream)
         else:
-            self.norm(_ptr(bf16, o_off), _ptr(bf16, fg_off + Int64(d * 2)), o_norm, _ptr(bf16, y_off), rows, stream)
+            self.norm(_ptr(bf16, o_off), gate, norm_weight, _ptr(bf16, y_off), rows, stream)
             self.o_proj.run(_ptr(bf16, y_off), w_o, w_o_fp8, w_o_scale, out, rows, fp8_rows, qscratch, stream)
+
+
+class _KdaBf16Decode(_Kda):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_in: cute.Pointer, w_fg: cute.Pointer, conv_w: cute.Pointer,
+                 a_log: cute.Pointer, dt_bias: cute.Pointer, o_norm: cute.Pointer, w_o: cute.Pointer,
+                 conv_state: cute.Pointer, state: cute.Pointer, slots: cute.Pointer, seq_first: cute.Pointer,
+                 out: cute.Pointer, replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, spec: Int32,
+                 stream: cuda.CUstream):
+        self.body(x, w_in, w_in, w_in, w_fg, conv_w, a_log, dt_bias, o_norm, w_o, w_o, w_o, conv_state, state,
+                  slots, seq_first, out, replay, scratch, rows, Int32(0), spec, stream)
 
 
 class _KdaFp8(_Kda):
@@ -767,11 +800,11 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         *fp8_only_operands("w_in", p, h, row_scales=True, prefill=prefill, kmajor=True),
-        Operand("w_fg", torch.bfloat16, f"[2,{d},{g.kda_head_dim}]"),
+        Operand("w_fg", torch.bfloat16, f"[{kda_layout(g)['fg_batch']},{d},{g.kda_head_dim}]"),
         Operand("conv_w", torch.float32, f"[{3 * d},4]", align=4),
         Operand("a_log", torch.float32, f"[{heads}]", align=4),
         Operand("dt_bias", torch.float32, f"[{d}]", align=4),
-        Operand("o_norm", torch.bfloat16, f"[{g.kda_head_dim}]"),
+        Operand("o_norm", getattr(torch, kda_layout(g)["o_norm_dtype"]), f"[{g.kda_head_dim}]"),
         *fp8_only_operands("w_o", h, d, row_scales=True, prefill=prefill, kmajor=True),
         Operand("conv_state", torch.bfloat16, f"[slots,3,{3 * d}]", "inout", align=2),
         Operand("state", state_torch, f"[slots,{heads},128,128]", "inout"),
@@ -798,7 +831,7 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
                   "decode_gemv_rows": FP8_DECODE_ROWS,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
                   **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch),
-                  **_seq_geometry(launch)},
+                  **_seq_geometry(launch), **_kda_geometry(g)},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill, prefill_expanded)},
         doc=__doc__,
     )
@@ -808,8 +841,12 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
                          fp8_only: str | None = None, output_dtype: str = "bfloat16",
                          prefill_expanded: bool = False, output_kind: str = "projection",
                          state_dtype: str = "float32", state_rounding: str = "window",
-                         seq_ctas: int = 1, decode_tiles: bool = False) -> AotProgram:
-    """One KDA layer for ``rows <= max_rows``; see the module docstring. ``fp8``
+                         seq_ctas: int = 1, decode_tiles: bool = False, decode: bool = False) -> AotProgram:
+    """One shared KDA layer for GLMFGeometry or KDAGeometry.
+
+    ``decode=True`` exposes BF16-only replay and the ``rows, spec`` scalars.
+    ``output_kind="norm"`` also works with BF16 projections for TP head exchange.
+    One KDA layer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds ``w_in``/``w_o`` E4M3 copies with per-row scales and the ``fp8_rows``
     scalar (decode steps up to that many rows read them); ``fp8="prefill"``
     adds them with K-block-major scales (``w_in_kscale``/``w_o_kscale``) and
@@ -853,6 +890,8 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
     extends the key and geometry."""
     max_rows = _check_rows(max_rows)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
+    if decode and (fp8 is not False or fp8_only is not None):
+        raise ValueError("decode=True is for BF16-only KDA; FP8 decode already supplies replay")
     if fp8_only is not None:
         if fp8 is not False:
             raise ValueError("fp8_only takes no fp8 copies")
@@ -860,45 +899,48 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
             raise ValueError("decode_tiles takes a decode KDA program over BF16 projections (fp8=True)")
         return _compile_glmf_kda_w8(g, max_rows, fp8_only, output_dtype, prefill_expanded, output_kind,
                                     state_dtype, state_rounding, seq_ctas)
-    if output_dtype != "bfloat16" or prefill_expanded or output_kind != "projection":
-        raise ValueError("KDA output_dtype/prefill_expanded/output_kind require fp8_only")
+    if output_dtype != "bfloat16" or prefill_expanded or output_kind not in ("projection", "norm"):
+        raise ValueError("BF16 KDA supports projection or norm output, without prefill_expanded")
     fp8_on, prefill = _fp8_mode(fp8)
-    launch = (_KdaFp8Prefill if prefill else _KdaFp8 if fp8_on else _Kda)(g, max_rows, fp8, state_dtype,
-                                                                           state_rounding, seq_ctas=seq_ctas,
-                                                                           decode_tiles=decode_tiles)
+    launch = (_KdaBf16Decode if decode else _KdaFp8Prefill if prefill else _KdaFp8 if fp8_on else _Kda)(
+        g, max_rows, fp8, state_dtype, state_rounding, seq_ctas=seq_ctas,
+        decode_tiles=decode_tiles, **({"decode": True} if decode else {}))
+    launch.output_norm = output_kind == "norm"
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, d, p, heads = g.hidden, g.kda_width, g.kda_in_width, g.kda_heads
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         Operand("w_in", torch.bfloat16, f"[{p},{h}]"),
         *(fp8_ops("w_in", p, h, True, prefill) if fp8_on else ()),
-        Operand("w_fg", torch.bfloat16, f"[2,{d},{g.kda_head_dim}]"),
+        Operand("w_fg", torch.bfloat16, f"[{kda_layout(g)['fg_batch']},{d},{g.kda_head_dim}]"),
         Operand("conv_w", torch.float32, f"[{3 * d},4]", align=4),
         Operand("a_log", torch.float32, f"[{heads}]", align=4),
         Operand("dt_bias", torch.float32, f"[{d}]", align=4),
-        Operand("o_norm", torch.bfloat16, f"[{g.kda_head_dim}]"),
+        Operand("o_norm", getattr(torch, kda_layout(g)["o_norm_dtype"]), f"[{g.kda_head_dim}]"),
         Operand("w_o", torch.bfloat16, f"[{h},{d}]"),
         *(fp8_ops("w_o", h, d, True, prefill) if fp8_on else ()),
         Operand("conv_state", torch.bfloat16, f"[slots,3,{3 * d}]", "inout", align=2),
         Operand("state", state_torch, f"[slots,{heads},128,128]", "inout"),
         Operand("slots", torch.int32, "[rows]", align=4),
         Operand("seq_first", torch.int32, "[rows]", align=4),
-        Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
+        Operand("out", torch.bfloat16, f"[rows,{d if output_kind == 'norm' else h}]", "out"),
         *((Operand("replay", torch.float32, f"[{kda_replay_layout(heads, 3 * d, launch.replay_rows)[2] // 4}]",
                    "inout"),)
-          if fp8_on and not prefill else ()),
+          if (fp8_on and not prefill) or decode else ()),
         Operand("scratch", torch.uint8, "[kda_scratch_bytes]", "scratch"),
     )
-    scalars = (_fp8_scalars(fp8, True) if prefill else
+    scalars = ((Scalar("rows"), Scalar("spec")) if decode else _fp8_scalars(fp8, True) if prefill else
                (Scalar("rows"), Scalar("fp8_rows"), Scalar("spec")) if fp8_on else (Scalar("rows"),))
     return compile_program(
         launch, name="glmf_kda", operands=operands, scalars=scalars,
-        key=(max_rows, fp8, launch.key()),
+        key=(max_rows, fp8, launch.key()) + (("bf16_decode",) if decode else ()),
         geometry={"hidden": h, "heads": heads, "head_dim": g.kda_head_dim, "max_rows": max_rows,
                   "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
                   **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch),
-                  **_seq_geometry(launch), **_tile_geometry(launch)},
+                  **_seq_geometry(launch), **_tile_geometry(launch), **_kda_geometry(g),
+                  **({"output_kind": output_kind} if output_kind != "projection" else {}),
+                  **({"bf16_decode": True} if decode else {})},
         scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, chunked, prefill)},
         doc=__doc__,
     )
