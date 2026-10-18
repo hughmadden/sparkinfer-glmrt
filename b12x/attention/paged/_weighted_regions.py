@@ -17,10 +17,11 @@ from cutlass import BFloat16, Float32, Float8E4M3FN, Int32, Int64, Uint32
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute, run_compiled
 from b12x._lib.intrinsics import (
     block_reduce, cvt_bf16x2x2_to_e4m3x4, fmax_f32,
-    mma_m16n8k32_f32_e4m3, warp_reduce,
+    mma_m16n8k32_f32_e4m3, shared_ptr_to_u32, warp_reduce,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from ._selected_forward import _cp_async_load_128b_zfill, _pointer_as_int64
 
 
 class _CompressRegions:
@@ -80,74 +81,127 @@ class _WeightedRegionScore:
                  positions: cute.Pointer, scores: cute.Pointer,
                  rows: Int32, limit: Int64, stream: cuda.CUstream):
         self.kernel(query, weights, summaries, requests, positions, scores, limit).launch(
-            grid=((self.capacity + 63) // 64, rows, self.groups),
+            grid=(rows, (self.capacity + 127) // 128, 1),
             block=(128, 1, 1), stream=stream)
 
     @cute.jit
     def packed_query(self, pointer: cute.Pointer, offset: Int64):
-        # Round Q once per packed fragment, without widening the stored FP8 K.
         words = cute.recast_ptr((pointer + offset).align(4), dtype=Uint32)
         return cvt_bf16x2x2_to_e4m3x4(words[0], words[1])
 
     @cute.jit
-    def packed_summary(self, pointer: cute.Pointer, offset: Int64):
-        return cute.recast_ptr((pointer + offset).align(4), dtype=Uint32)[0].to(Uint32)
+    def stage_summary(self, shared: cute.Pointer, summaries: cute.Pointer,
+                      request: Int64, visible: Int64, start: Int32, thread: Int32):
+        lane = thread % Int32(32)
+        warp = thread // Int32(32)
+        for step in cutlass.range_constexpr(8):
+            local = warp * Int32(16) + Int32(step * 2) + lane // Int32(16)
+            vector = lane % Int32(16)
+            region = start + local
+            valid = (region < self.capacity) & (region.to(Int64) < visible)
+            base = (request * Int64(self.capacity) + region.to(Int64)) * Int64(256)
+            base = cutlass.select_(valid, base, Int64(0))
+            destination = local * Int32(64) + (vector ^ (local & Int32(7))) * Int32(4)
+            _cp_async_load_128b_zfill(
+                shared_ptr_to_u32(shared + destination),
+                _pointer_as_int64(summaries, base + vector.to(Int64) * Int64(16)),
+                cutlass.select_(valid, Int32(16), Int32(0)))
+        cute.arch.cp_async_commit_group()
 
     @cute.kernel
     def kernel(self, query: cute.Pointer, weights: cute.Pointer,
                summaries: cute.Pointer, requests: cute.Pointer,
                positions: cute.Pointer, scores: cute.Pointer, limit: Int64):
-        tile, row, group = cute.arch.block_idx()
+        row, tile, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
         lane = Int32(thread) % Int32(32)
         warp = Int32(thread) // Int32(32)
         matrix_row = lane // Int32(4)
         matrix_pair = lane % Int32(4)
-        start = Int32(tile) * Int32(64) + warp * Int32(16)
+        start = Int32(tile) * Int32(128)
         request = requests[row].to(Int64)
         visible = positions[row].to(Int64) // Int64(8)
-        base = cute.make_rmem_tensor((2,), Int64)
-        valid = cute.make_rmem_tensor((2,), Int32)
-        for part in cutlass.range_constexpr(2):
-            region = start + matrix_row + Int32(part * 8)
-            valid[part] = Int32(0)
-            base[part] = Int64(0)
-            if (request >= Int64(0)) & (request < limit) & (region < self.capacity) & (region.to(Int64) < visible):
-                valid[part] = Int32(1)
-                base[part] = (request * Int64(self.capacity) + region.to(Int64)) * Int64(256)
-        d0, d1, d2, d3 = Float32(0), Float32(0), Float32(0), Float32(0)
-        for tile_d in cutlass.range_constexpr(8):
-            dim = Int64(tile_d * 32) + matrix_pair.to(Int64) * Int64(4)
-            a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-            if valid[0] != 0:
-                a0 = self.packed_summary(summaries, base[0] + dim)
-                a2 = self.packed_summary(summaries, base[0] + dim + Int64(16))
-            if valid[1] != 0:
-                a1 = self.packed_summary(summaries, base[1] + dim)
-                a3 = self.packed_summary(summaries, base[1] + dim + Int64(16))
-            b0, b1 = Uint32(0), Uint32(0)
-            if matrix_row < Int32(4):
-                qbase = ((Int64(row) * Int64(self.groups) + Int64(group)) * Int64(4)
-                         + matrix_row.to(Int64)) * Int64(256) + dim
-                b0 = self.packed_query(query, qbase)
-                b1 = self.packed_query(query, qbase + Int64(16))
-            d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
-                d0, d1, d2, d3, a0, a1, a2, a3, b0, b1)
-        for part in cutlass.range_constexpr(2):
-            first = cutlass.max(d0 if part == 0 else d2, Float32(0))
-            second = cutlass.max(d1 if part == 0 else d3, Float32(0))
-            score = Float32(0)
-            for head in cutlass.range_constexpr(4):
-                value = first if head % 2 == 0 else second
-                value = cute.arch.shuffle_sync(value, (lane // Int32(4)) * Int32(4) + Int32(head // 2))
-                weight = weights[(Int64(row) * Int64(self.groups) + Int64(group)) * Int64(4) + Int64(head)]
-                score = score + value * Float32(weight)
-            if valid[part] == 0:
-                score = Float32(-float("inf"))
-            region = start + matrix_row + Int32(part * 8)
-            if (matrix_pair == Int32(0)) & (region < self.capacity):
-                offset = (Int64(row) * Int64(self.groups) + Int64(group)) * Int64(self.capacity) + region.to(Int64)
-                scores[offset] = score
+        if (request < Int64(0)) | (request >= limit) | (start.to(Int64) >= visible):
+            for group in cutlass.range_constexpr(self.groups):
+                region = start + Int32(thread)
+                if region < self.capacity:
+                    offset = (Int64(row) * Int64(self.groups) + Int64(group)) * Int64(self.capacity)
+                    scores[offset + region.to(Int64)] = Float32(-float("inf"))
+        else:
+            allocator = cutlass.utils.SmemAllocator()
+            staged = allocator.allocate_tensor(Uint32, cute.make_layout((8192,)), byte_alignment=128)
+            rounded = allocator.allocate_tensor(
+                Uint32, cute.make_layout((self.groups * 256,)), byte_alignment=16)
+            result = allocator.allocate_tensor(
+                Float32, cute.make_layout((self.groups * 64,)), byte_alignment=16)
+            self.stage_summary(staged.iterator, summaries, request, visible, start, Int32(thread))
+            # Convert every Q element once; all four warps retain B fragments.
+            for chunk in cutlass.range_constexpr(self.groups * 2):
+                word = Int32(thread) + Int32(chunk * 128)
+                qbase = Int64(row) * Int64(self.groups * 1024) + word.to(Int64) * Int64(4)
+                rounded[word] = self.packed_query(query, qbase)
+            cute.arch.sync_threads()
+            b = cute.make_rmem_tensor(((self.groups + 1) // 2, 8, 2), Uint32)
+            w = cute.make_rmem_tensor(((self.groups + 1) // 2, 2), Float32)
+            for pair in cutlass.range_constexpr((self.groups + 1) // 2):
+                qhead = Int32(pair * 8) + matrix_row
+                for tile_d in cutlass.range_constexpr(8):
+                    for part in cutlass.range_constexpr(2):
+                        b[pair, tile_d, part] = Uint32(0)
+                        if qhead < Int32(self.groups * 4):
+                            b[pair, tile_d, part] = rounded[
+                                qhead * Int32(64) + Int32(tile_d * 8 + part * 4) + matrix_pair]
+                for part in cutlass.range_constexpr(2):
+                    head = Int32(pair * 8 + part) + matrix_pair * Int32(2)
+                    w[pair, part] = Float32(0)
+                    if head < Int32(self.groups * 4):
+                        w[pair, part] = weights[Int64(row) * Int64(self.groups * 4) + head.to(Int64)]
+            self.stage_summary(staged.iterator + 4096, summaries, request, visible,
+                               start + Int32(64), Int32(thread))
+            for stage in cutlass.range_constexpr(2):
+                cute.arch.cp_async_wait_group(1 - stage)
+                cute.arch.sync_threads()
+                d = cute.make_rmem_tensor(((self.groups + 1) // 2, 4), Float32)
+                d.fill(Float32(0))
+                for tile_d in cutlass.range_constexpr(8):
+                    local = warp * Int32(16) + matrix_row
+                    v0 = Int32(tile_d * 2) ^ (matrix_row & Int32(7))
+                    v1 = Int32(tile_d * 2 + 1) ^ (matrix_row & Int32(7))
+                    base = Int32(stage * 4096) + local * Int32(64) + matrix_pair
+                    a0 = staged[base + v0 * Int32(4)]
+                    a1 = staged[base + Int32(8 * 64) + v0 * Int32(4)]
+                    a2 = staged[base + v1 * Int32(4)]
+                    a3 = staged[base + Int32(8 * 64) + v1 * Int32(4)]
+                    for pair in cutlass.range_constexpr((self.groups + 1) // 2):
+                        d[pair, 0], d[pair, 1], d[pair, 2], d[pair, 3] = mma_m16n8k32_f32_e4m3(
+                            d[pair, 0], d[pair, 1], d[pair, 2], d[pair, 3],
+                            a0, a1, a2, a3, b[pair, tile_d, 0], b[pair, tile_d, 1])
+                for group in cutlass.range_constexpr(self.groups):
+                    for part in cutlass.range_constexpr(2):
+                        first = cutlass.max(d[group // 2, part * 2], Float32(0))
+                        second = cutlass.max(d[group // 2, part * 2 + 1], Float32(0))
+                        score = Float32(0)
+                        # Preserve sequential FP32 multiply-adds, including signed zero.
+                        for head in cutlass.range_constexpr(4):
+                            source = matrix_row * Int32(4) + Int32((group % 2) * 2 + head // 2)
+                            value = cute.arch.shuffle_sync(first if head % 2 == 0 else second, source)
+                            weight = cute.arch.shuffle_sync(w[group // 2, head % 2], source)
+                            score = score + value * weight
+                        local = warp * Int32(16) + matrix_row + Int32(part * 8)
+                        region = start + Int32(stage * 64) + local
+                        if region.to(Int64) >= visible:
+                            score = Float32(-float("inf"))
+                        if matrix_pair == Int32(0):
+                            result[Int32(group * 64) + local] = score
+                cute.arch.sync_threads()
+                for chunk in cutlass.range_constexpr((self.groups + 1) // 2):
+                    index = Int32(chunk * 128) + Int32(thread)
+                    group = index // Int32(64)
+                    region = start + Int32(stage * 64) + index % Int32(64)
+                    if (group < self.groups) & (region < self.capacity):
+                        offset = (Int64(row) * Int64(self.groups) + group.to(Int64)) * Int64(self.capacity)
+                        scores[offset + region.to(Int64)] = result[index]
+                cute.arch.sync_threads()
 
 
 _TYPES = {torch.bfloat16: BFloat16, torch.float8_e4m3fn: Float8E4M3FN,
@@ -174,7 +228,7 @@ def _compile(operation, groups, capacity, device):
     with torch.cuda.device(device):
         return compile_cute(kernel, *fake, Int32(1), Int64(1), current_cuda_stream(),
                             compile_spec=KernelCompileSpec.from_key(
-                                "attention.weighted_regions", 3, key))
+                                "attention.weighted_regions", 4, key))
 
 
 def compress_regions(*, keys, logits, starts, counts, output, unrounded):
