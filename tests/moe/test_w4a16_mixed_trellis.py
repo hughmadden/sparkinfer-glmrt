@@ -2134,3 +2134,188 @@ def test_mixed_a8_prefill_oracle_live_rows_and_graph(input_format, bits, tiles, 
         assert tuple(t.data_ptr() for b in buffers for t in (b.fc1, b.activated, b.fc2, b.output)) == addresses
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("experts,bits", [(288, 9), (512, 9), (513, 10), (896, 10), (1024, 10)])
+def test_projection_descriptor_width_follows_routed_geometry(experts, bits):
+    route, descriptor = build_projection_tiered_maps(
+        [0] * experts, [1] * experts, [1] * experts,
+        tier_slots=(experts, experts), device=torch.device("cpu"),
+    )
+    rows = descriptor.view(3, 2 * experts)
+    assert route.tolist() == list(range(experts))
+    assert rows[0, experts - 1] == experts - 1
+    assert rows[1, experts - 1] == (1 << bits) | (experts - 1)
+    assert torch.all(rows[:, experts:] == -1)
+    # A raw tensor from another producer must decode with the same width.
+    _check_descriptor_projection_counts(
+        descriptor.clone(), 2 * experts, gate_counts=(experts, 0),
+        up_counts=(0, experts), descriptor_bits=bits,
+    )
+    if experts == 896:
+        for index in (511, 512, 895):
+            assert int(rows[1, index]) & ((1 << bits) - 1) == index
+            assert int(rows[1, index]) >> bits == 1
+
+
+def test_kimi_partitioned_descriptor_uses_full_expert_geometry():
+    _, descriptor = build_tiered_maps(range(448), range(448, 896), device=torch.device("cpu"))
+    assert descriptor[448] == 1 << 10
+    assert descriptor[895] == (1 << 10) | 447
+
+
+def test_descriptor_width_rejects_overflow():
+    with pytest.raises(ValueError, match="routed expert count"):
+        mixed_trellis_module._descriptor_bits(1025)
+
+
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_mixed_compile_threads_activation_before_cuda(monkeypatch, activation):
+    class ReachedKernel(Exception):
+        pass
+
+    def capture(**kwargs):
+        assert kwargs["activation"] == activation
+        assert kwargs["swiglu_limit"] is None
+        raise ReachedKernel
+
+    monkeypatch.setattr(mixed_trellis_module, "W4A16FusedMoeKernel", capture)
+    with pytest.raises(ReachedKernel):
+        compile_mixed_trellis(
+            size_m=16, hidden_size=3584, intermediate_size=512,
+            tier0_num_experts=896, tier1_num_experts=896, route_num_experts=896,
+            top_k=16, max_m_blocks=256, sms=188, max_shared_mem=101376,
+            force_tile_config=(64, 128, 64, 128), tier0_bits=2, tier1_bits=3,
+            activation=activation,
+        )
+
+
+@pytest.fixture(scope="module")
+def kimi_exl3_checkpoint():
+    """Opt-in, bounded reads: no download and no full-layer materialization."""
+    import importlib.util
+    import json
+    import os
+    from pathlib import Path
+    import struct
+    import numpy as np
+
+    snapshot = os.environ.get("B12X_KIMI_EXL3_SNAPSHOT")
+    reference = os.environ.get("B12X_EXL3_CPU_REFERENCE")
+    if not snapshot or not reference:
+        pytest.skip("set B12X_KIMI_EXL3_SNAPSHOT and B12X_EXL3_CPU_REFERENCE")
+    snapshot = Path(snapshot)
+    if not (snapshot / "model.safetensors.index.json").is_file():
+        pytest.skip("Kimi EXL3 snapshot is absent")
+    spec = importlib.util.spec_from_file_location("independent_exl3_reference", reference)
+    oracle = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oracle)
+    index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
+    headers = {}
+    tensors = {}
+    for expert in (0, 511, 512, 895):
+        row = {}
+        for projection in ("w1", "w3", "w2"):
+            for suffix in ("trellis", "suh", "svh", "mcg"):
+                name = f"language_model.model.layers.1.block_sparse_moe.experts.{expert}.{projection}.{suffix}"
+                path = snapshot / index[name]
+                with path.open("rb") as stream:
+                    if path not in headers:
+                        size = struct.unpack("<Q", stream.read(8))[0]
+                        assert size <= 512 * 1024 * 1024
+                        headers[path] = (8 + size, json.loads(stream.read(size)))
+                    base, header = headers[path]
+                    meta = header[name]
+                    start, stop = meta["data_offsets"]
+                    stream.seek(base + start)
+                    raw = stream.read(stop - start)
+                assert len(raw) == stop - start
+                dtype = {"I16": "<i2", "F16": "<f2", "I32": "<i4"}[meta["dtype"]]
+                row[projection, suffix] = np.frombuffer(raw, dtype=dtype).reshape(meta["shape"]).copy()
+            assert row[projection, "trellis"].shape[-1] == 32
+        tensors[expert] = row
+    return tensors, oracle
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("width", [512, 3072])
+@pytest.mark.parametrize("direct", [False, True])
+def test_kimi_real_experts_e896_situ_cpu_reference(kimi_exl3_checkpoint, width, direct):
+    """Native K2 weights, real high local IDs, K16, TP6/full width and graph replay."""
+    import numpy as np
+
+    tensors, oracle = kimi_exl3_checkpoint
+    device = torch.device("cuda", torch.cuda.current_device())
+    hidden, experts, rows, topk = 3584, 896, 4, 16
+    # Unrouted payload slots are never read. Keep their actual E896 strides so
+    # this catches truncation of local IDs >=512, not just large global routes.
+    w13 = torch.empty((2, experts, hidden // 16, width // 16, 32), dtype=torch.int16, device=device)
+    w2 = torch.empty((experts, width // 16, hidden // 16, 32), dtype=torch.int16, device=device)
+    gate_suh = torch.ones((experts, hidden), dtype=torch.float16, device=device)
+    up_suh = torch.ones_like(gate_suh)
+    down_svh = torch.ones_like(gate_suh)
+    intermediate = torch.ones((experts, 3 * width), dtype=torch.float16, device=device)
+    sliced = {}
+    for expert, original in tensors.items():
+        payload = {}
+        for (projection, suffix), value in original.items():
+            if suffix == "trellis":
+                value = value[:width // 16] if projection == "w2" else value[:, :width // 16]
+            elif (projection == "w2" and suffix == "suh") or (projection != "w2" and suffix == "svh"):
+                value = value[:width]
+            payload[projection, suffix] = np.ascontiguousarray(value)
+        sliced[expert] = payload
+        for position, projection in enumerate(("w1", "w3")):
+            w13[position, expert].copy_(torch.from_numpy(payload[projection, "trellis"]))
+        w2[expert].copy_(torch.from_numpy(payload["w2", "trellis"]))
+        gate_suh[expert].copy_(torch.from_numpy(payload["w1", "suh"]))
+        up_suh[expert].copy_(torch.from_numpy(payload["w3", "suh"]))
+        down_svh[expert].copy_(torch.from_numpy(payload["w2", "svh"]))
+        intermediate[expert].copy_(torch.from_numpy(np.concatenate([
+            payload["w1", "svh"], payload["w3", "svh"], payload["w2", "suh"]])))
+    tile = (64, 128, 64, 128) if direct else (128, 128, 128, 128)
+    tier0 = prepare_trellis256_moe_weights(
+        w13, w2, hidden_size=hidden, intermediate_size=width, num_experts=experts,
+        activation="situ", fc1_tile_n=128, fc2_tile_n=128, params_dtype=torch.float16,
+        w13_layout="trellis_t256_proj", trellis_bits=2, codebook="mcg",
+        gate_suh=gate_suh, up_suh=up_suh, intermediate_rotations=intermediate,
+        down_svh=down_svh, tile_config=tile)
+    tier1 = _prepared(experts=1, hidden=hidden, intermediate=width, bits=3, seed=273, device=device)
+    props = torch.cuda.get_device_properties(device)
+    launch = compile_mixed_trellis(
+        size_m=rows, hidden_size=hidden, intermediate_size=width,
+        tier0_num_experts=experts, tier1_num_experts=1, route_num_experts=experts,
+        top_k=topk, max_m_blocks=rows * topk + experts, sms=props.multi_processor_count,
+        max_shared_mem=props.shared_memory_per_block_optin, force_tile_config=tile,
+        tier0_bits=2, tier1_bits=3, activation="situ", swiglu_limit=None,
+        route_ids_dtype=torch.int32, direct_topk_routes=direct,
+        full_rotation_output_dtype="fp32")
+    route_map = torch.arange(experts, dtype=torch.int32, device=device)
+    descriptor_row = torch.cat((route_map, torch.tensor([1 << 10], dtype=torch.int32, device=device)))
+    descriptor = descriptor_row.repeat(3)
+    rotations = combine_trellis_rotations(tier0, tier1)
+    binding = bind_mixed_trellis(tier0, tier1, route_map, descriptor, rotations, launch)
+    buffers = make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
+    generator = torch.Generator(device="cpu").manual_seed(273)
+    x = torch.randn(rows, hidden, generator=generator).to(torch.bfloat16).to(device)
+    ids = torch.full((rows, topk), -1, dtype=torch.int32, device=device)
+    ids[:, 0] = torch.tensor(list(tensors), dtype=torch.int32, device=device)
+    weights = torch.zeros((rows, topk), dtype=torch.float32, device=device)
+    weights[:, 0] = 1
+    expected = np.concatenate([oracle.expert_output(sliced[expert], x[row:row+1].float().cpu().numpy(),
+                                                    None, activation="situ")
+                               for row, expert in enumerate(tensors)])
+    eager = run_bound_mixed_trellis(x, weights, ids, binding, buffers).clone()
+    torch.cuda.synchronize()
+    for row, expert in enumerate(tensors):
+        metrics = oracle.comparison(eager[row].float().cpu().numpy(), expected[row])
+        print(dict(expert=expert, width=width, direct=direct, **metrics), flush=True)
+        assert metrics["passed"], metrics
+    repeat = run_bound_mixed_trellis(x, weights, ids, binding, buffers)
+    assert torch.equal(eager, repeat)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay = run_bound_mixed_trellis(x, weights, ids, binding, buffers)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(eager, replay)

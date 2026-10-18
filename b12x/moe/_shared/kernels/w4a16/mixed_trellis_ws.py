@@ -112,8 +112,6 @@ from .ws_a8 import (
 )
 from .mixed_trellis import (
     W4A16MixedTrellisKernel,
-    _TIER_DESCRIPTOR_BITS,
-    _TIER_DESCRIPTOR_MASK,
 )
 
 _PRODUCER_WARPS = 4
@@ -370,13 +368,14 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tier0,
         tier1,
         max_shared_mem: int,
+        descriptor_bits: int = 9,
         input_format: str = "bf16",
         ws_tile_n: int | None = None,
         input_stages: int | None = None,
         dynamic_tiles: bool = False,
         activations: str = "a16",
     ):
-        super().__init__(driver=driver, tier0=tier0, tier1=tier1)
+        super().__init__(driver=driver, tier0=tier0, tier1=tier1, descriptor_bits=descriptor_bits)
         d = driver
         if activations not in ("a16", "a8"):
             raise ValueError(f"unsupported EXL3 activations {activations!r}")
@@ -987,8 +986,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         if combined >= Int32(0) and combined < total:
             descriptor = descriptor_map[row * total + combined].to(Int32)
             if descriptor >= Int32(0):
-                d_tier = descriptor >> Int32(_TIER_DESCRIPTOR_BITS)
-                d_local = descriptor & Int32(_TIER_DESCRIPTOR_MASK)
+                d_tier = descriptor >> Int32(self.descriptor_bits)
+                d_local = descriptor & Int32((1 << self.descriptor_bits) - 1)
                 if d_tier == Int32(0) and d_local < bound0:
                     tier = Int32(0)
                     local = d_local
