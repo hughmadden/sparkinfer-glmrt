@@ -336,3 +336,71 @@ def test_graph_replay_and_dynamic_live_rows():
         for actual, reference in zip(outputs, expected):
             assert torch.equal(actual[:live], reference[:live])
             assert bool(actual[live:].isnan().all())
+
+
+@pytest.mark.parametrize("kind", ["hidden", "final", "qk_swa", "qk_csa", "index_q", "index_k"])
+def test_runtime_norm_epsilon_reuses_callable_and_graph(kind):
+    require_b12x()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.pointwise import compile_affine_norm_aot
+    gen = torch.Generator(device="cuda").manual_seed(274)
+    index = kind.startswith("index_")
+    qk = kind.startswith("qk_")
+    width = 256 if index else 192 if qk else 4096
+    heads = 1 if kind in ("hidden", "final", "index_k") else 2
+    rotary = 32 if index else (192 if kind == "qk_swa" else 64) if qk else 0
+    subtract = kind == "index_k"
+    dtype = torch.float32 if kind == "hidden" else torch.bfloat16
+    parameter_dtype = torch.bfloat16 if index else torch.float32
+    x = (torch.randn(17, heads, width, generator=gen, device="cuda") * 0.003).to(dtype)
+    x[1:] = x[:1]
+    w = (torch.randn(width, generator=gen, device="cuda") * 0.1).to(parameter_dtype)
+    bias = (torch.randn(width, generator=gen, device="cuda") * 0.1).to(parameter_dtype)
+    cos = torch.randn(32, max(1, rotary // 2), generator=gen, device="cuda").bfloat16()
+    sin = torch.randn(cos.shape, generator=gen, device="cuda").bfloat16()
+    pos = torch.zeros(17, dtype=torch.int64, device="cuda")
+    out = torch.empty_like(x, dtype=torch.bfloat16)
+    kwargs = dict(width=width, heads=heads, rotary=rotary, zero_centered=not subtract,
+        subtract_mean=subtract, bias=subtract, input_dtype=dtype, parameter_dtype=parameter_dtype)
+    program = compile_affine_norm_aot(**kwargs, eps=None)
+    assert program.abi["scalars"] == [("rows", "int32"), ("epsilon", "float32")]
+    assert program.geometry["epsilon"] == "runtime_float32" and "eps" not in program.geometry
+    expected = {}
+    for epsilon in (1e-6, 1e-5):
+        legacy = compile_affine_norm_aot(**kwargs, eps=epsilon)
+        legacy.launch(x, w, bias, cos, sin, pos, out, scalars=[17])
+        torch.cuda.synchronize()
+        expected[epsilon] = out.clone()
+    assert not torch.equal(expected[1e-6], expected[1e-5]), "epsilon-sensitive fixture required"
+    with kernel_resolution_guard("runtime norm epsilon qualification"):
+        for epsilon in (1e-6, 1e-5):
+            for rows in (1, 7, 17):
+                out.fill_(float("nan"))
+                program.launch(x, w, bias, cos, sin, pos, out, scalars=[rows, epsilon])
+                torch.cuda.synchronize()
+                assert torch.equal(out[:rows], expected[epsilon][:rows])
+                assert bool(out[rows:].isnan().all())
+                assert torch.equal(out[:rows], out[:1].expand_as(out[:rows]))
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            program.launch(x, w, bias, cos, sin, pos, out, scalars=[17, 1e-5])
+        torch.cuda.current_stream().wait_stream(stream)
+        for _ in range(3):
+            out.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, expected[1e-5])
+
+
+def test_runtime_norm_epsilon_export_abi(tmp_path):
+    require_b12x()
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd.pointwise import compile_affine_norm_aot
+    from ._cuteafd import check_export
+    with exportable_compilation():
+        program = compile_affine_norm_aot(width=4096, zero_centered=True,
+            input_dtype=torch.bfloat16, eps=None)
+    assert program.abi["scalars"] == [("rows", "int32"), ("epsilon", "float32")]
+    check_export(program, tmp_path, "norm_runtime_eps")
