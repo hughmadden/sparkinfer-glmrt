@@ -5563,6 +5563,7 @@ class MoEDynamicKernelBackend:
                                                 tCrB_sw[None, _nt, _kb],
                                                 sw_gate[None, _mt, _nt, _s],
                                             )
+                            cute.arch.fence_view_async_shared()
                             ml_pipeline.consumer_release(cons_state)
                             cons_state.advance()
                         self.pass_gate_barrier.arrive_unaligned()
@@ -5629,6 +5630,7 @@ class MoEDynamicKernelBackend:
                                                 tCrB_sw[None, _nt, _kb],
                                                 sw_up[None, _mt, _nt, _s],
                                             )
+                            cute.arch.fence_view_async_shared()
                             up_pipeline.consumer_release(up_cons_state)
                             up_cons_state.advance()
 
@@ -7011,6 +7013,7 @@ class MoEDynamicKernelBackend:
                                     else k_block_idx + 1
                                 )
                                 if k_block_idx == num_k_blocks - 1:
+                                    cute.arch.fence_view_async_shared()
                                     ml_pipeline.consumer_release(cons_state)
                                     cons_state.advance()
                                     if cutlass.const_expr(self.w4a4_fc1_fused):
@@ -7165,6 +7168,7 @@ class MoEDynamicKernelBackend:
                                 else k_block_idx + 1
                             )
                             if k_block_idx == num_k_blocks - 1:
+                                cute.arch.fence_view_async_shared()
                                 ml_pipeline.consumer_release(cons_state)
                                 cons_state.advance()
                                 if cutlass.const_expr(self.w4a4_fc1_fused):
@@ -7329,6 +7333,7 @@ class MoEDynamicKernelBackend:
                                         else k_block_idx + 1
                                     )
                                     if k_block_idx == num_k_blocks - 1:
+                                        cute.arch.fence_view_async_shared()
                                         up_pipeline.consumer_release(up_cons_state)
                                         up_cons_state.advance()
                                         peek = up_pipeline.consumer_try_wait(
@@ -7424,6 +7429,7 @@ class MoEDynamicKernelBackend:
                                     else k_block_idx + 1
                                 )
                                 if k_block_idx == num_k_blocks - 1:
+                                    cute.arch.fence_view_async_shared()
                                     up_pipeline.consumer_release(up_cons_state)
                                     up_cons_state.advance()
                                 if k_next > 0 and fc1_k_tile_cnt > Int32(0):
@@ -8289,6 +8295,7 @@ class MoEDynamicKernelBackend:
                                     else k_block_idx + 1
                                 )
                                 if k_block_idx == num_k_blocks - 1:
+                                    cute.arch.fence_view_async_shared()
                                     phase2_pipeline.consumer_release(phase2_cons_state)
                                     phase2_cons_state.advance()
                                 if k_next > 0:

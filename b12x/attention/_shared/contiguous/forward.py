@@ -1095,6 +1095,7 @@ class ContiguousAttentionForwardKernel:
             smem_thr_copy_Q,
             smem_thr_copy_K,
         )
+        cute.arch.fence_view_async_shared()
         pipeline_k.consumer_release(kv_consumer_state)
 
         mask_fn(acc_S, n_block=n_block)
@@ -1127,6 +1128,7 @@ class ContiguousAttentionForwardKernel:
             ) if const_expr(is_first_n_block) else None,
             valid_k=seqlen.seqlen_k - n_block * self.tile_n,
         )
+        cute.arch.fence_view_async_shared()
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
         return kv_consumer_state

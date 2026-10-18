@@ -6476,6 +6476,7 @@ class PagedForwardKernel:
 
                 next_tile_base = prefetch_base
                 if const_expr(decode_row0_k_release_fastpath):
+                    cute.arch.fence_view_async_shared()
                     pipeline_k.consumer_release(k_consumer_state)
                     if const_expr(not self.role_specialized_decode):
                         if next_tile_base < chunk_end:
@@ -6631,6 +6632,7 @@ class PagedForwardKernel:
                         d_frag[mma_q, 0] = d0
                         d_frag[mma_q, 1] = d1
                 if const_expr(not decode_row0_k_release_fastpath):
+                    cute.arch.fence_view_async_shared()
                     pipeline_k.consumer_release(k_consumer_state)
                     if const_expr(not self.role_specialized_decode):
                         if next_tile_base < chunk_end:
@@ -7057,6 +7059,7 @@ class PagedForwardKernel:
                             v_scale,
                         )
 
+                cute.arch.fence_view_async_shared()
                 pipeline_v.consumer_release(v_consumer_state)
                 v_consumer_state.advance()
                 if const_expr(not self.role_specialized_decode):

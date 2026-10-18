@@ -372,6 +372,7 @@ class MTPPrefillBf16GemmKernel:
                     copy_a,
                     copy_b,
                 )
+                cute.arch.fence_view_async_shared()
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 
