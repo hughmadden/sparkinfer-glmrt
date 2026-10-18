@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -124,9 +125,11 @@ def stage_profile(graph, directory):
 def compile_control(path):
     """Compile the supplied current-head core under a distinct bench-only key."""
     from b12x.integration.cuteafd import exlr8 as adapter
+    source = path.read_bytes()
+    digest = hashlib.sha256(source).hexdigest()
     spec = importlib.util.spec_from_file_location("exlr8_control_core", path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    exec(compile(source, str(path), "exec"), module.__dict__)
     original_pointers, original_compile = adapter._Exlr8Pointers, adapter.compile_program
 
     class ControlPointers(original_pointers):
@@ -135,6 +138,7 @@ def compile_control(path):
 
     def control_compile(*args, **kwargs):
         kwargs["name"] += "_control"
+        kwargs["key"] = (*kwargs["key"], digest)
         return original_compile(*args, **kwargs)
 
     try:
@@ -142,6 +146,15 @@ def compile_control(path):
         return adapter.compile_exlr8_a16_aot(units=4)
     finally:
         adapter._Exlr8Pointers, adapter.compile_program = original_pointers, original_compile
+
+
+def validate_control(graph, tensors, expected, rows):
+    # A replay must produce its own values, never inherit candidate writes.
+    for tensor in tensors[7:]:
+        tensor.fill_(float("nan"))
+    graph.replay()
+    if not torch.equal(expected.view(torch.int32), tensors[-1][:rows].view(torch.int32)):
+        raise RuntimeError(f"rows={rows}: candidate differs bitwise from current-head control")
 
 
 def make_candidate(experts=256, hidden=6144, units=4, topk=8):
@@ -260,9 +273,7 @@ def main():
         if control_launch:
             expected = tensors[-1][:rows].clone()
             control_graph = capture(control_launch)
-            control_graph.replay()
-            if not torch.equal(expected.view(torch.int32), tensors[-1][:rows].view(torch.int32)):
-                raise RuntimeError(f"rows={rows}: candidate differs bitwise from current-head control")
+            validate_control(control_graph,tensors,expected,rows)
             control_us = timing(control_graph,args.replays)
             extra.update(control_exlr8_us=control_us,control_speedup=control_us/candidate_us,
                          control_read_roofline_percent=100*payload_bytes/control_us/1000/read_only["gbps"])
