@@ -230,3 +230,58 @@ def test_empty_routes_do_not_read_poison(case):
     launch(case, compiled, 8, 1)
     assert torch.equal(case.output[:8], torch.zeros_like(case.output[:8]))
     assert torch.isnan(case.output[8:]).all()
+
+
+def test_shared_expert_grouping_serving_reference_and_graph(case):
+    from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
+    from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
+
+    shared = compile_exlr8_a16_aot(hidden=case.h, units=case.u, top_k=1,
+                                  max_groups=4, device_count=True, shared_expert=True)
+    group = compile_exlr8_group_aot(experts=1, top_k=1, max_groups=4, shared_expert=True)
+    ids = torch.zeros((64, 1), dtype=torch.int32, device=case.device)
+    experts = torch.empty(4, dtype=torch.int32, device=case.device)
+    slots = torch.empty((4, 16), dtype=torch.int32, device=case.device)
+    inverse = torch.empty_like(ids)
+    count = torch.empty(1, dtype=torch.int32, device=case.device)
+    gates = torch.ones((64, 1), device=case.device)
+    scratch = [torch.empty_like(case.fc1[:4]), torch.empty_like(case.intermediate[:4]),
+               torch.empty_like(case.fc2[:4])]
+    output = torch.empty_like(case.output)
+
+    def run(rows, limit=96):
+        group.launch(ids, experts, slots, inverse, count, scalars=(rows,))
+        shared.launch(case.x, case.pointers[3:4], case.bits[3:4], experts, slots, inverse,
+                      gates, *scratch, output, count, scalars=(rows, limit))
+
+    # The fixture's fourth expert is the checkpoint's real shared expert. Its
+    # independent decoder includes K3/K4 payloads and the calibrated side data.
+    previous_topk, previous_weights = case.topk, case.weights
+    try:
+        case.topk, case.weights = 1, gates
+        reference = case.oracle(2, expert=3)
+    finally:
+        case.topk, case.weights = previous_topk, previous_weights
+    run(64)
+    expected = output.clone()
+    assert relative(expected[:2], reference) <= 5e-4
+    for rows in (1, 2, 16, 32, 63, 64):
+        for limit in (1, 7, 188):
+            output.fill_(float("nan"))
+            run(rows, limit)
+            assert torch.equal(output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
+            assert torch.isnan(output[rows:]).all()
+            assert count.item() == (rows + 15) // 16
+    run(64)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(64)
+    for scale in (0.25, 1.0, 0.5):
+        gates.fill_(scale)
+        graph.replay()
+        assert torch.equal(output.view(torch.int32), (expected * scale).view(torch.int32))
+    ids[0, 0] = 1
+    graph.replay()
+    assert count.item() == -1
+    assert torch.equal(output, torch.zeros_like(output))

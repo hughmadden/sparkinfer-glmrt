@@ -113,13 +113,13 @@ class Case:
         return (self.x, self.pointers, self.bits, self.group_expert, self.route_slots,
                 self.inverse, self.weights, self.fc1, self.intermediate, self.fc2, self.output)
 
-    def oracle(self, rows, *, fp64=False, round_intermediate=True):
+    def oracle(self, rows, *, fp64=False, round_intermediate=True, expert=None):
         # Single-row products intentionally avoid batch-size dependent BLAS choices.
         dtype = torch.float64 if fp64 else torch.float32
         output = torch.zeros((rows, self.h), dtype=dtype, device=self.device)
         for r in range(rows):
             for slot in range(self.topk):
-                e = (r+slot) % 4
+                e = (r+slot) % 4 if expert is None else expert
                 route = torch.zeros(self.h, dtype=dtype, device=self.device)
                 for u in range(self.u):
                     if not self.host_bits[e, u, 0]:
