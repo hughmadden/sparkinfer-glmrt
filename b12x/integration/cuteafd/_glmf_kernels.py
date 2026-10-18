@@ -522,7 +522,8 @@ class GlmfKdaRecurrent:
     v_block = 32
 
     def __init__(self, *, heads: int, lower_bound: float, qkv_width: int, g_stride: int, b_stride: int,
-                 eps: float = 1.0e-6, state_dtype=Float32, replay_rows: int = REPLAY_ROWS, seq_ctas: int = 1):
+                 eps: float = 1.0e-6, state_dtype=Float32, replay_rows: int = REPLAY_ROWS, seq_ctas: int = 1,
+                 round_beta: bool = True):
         self.heads = int(heads)
         self.width = self.heads * KDA_HEAD
         self.lower_bound = float(lower_bound)
@@ -532,6 +533,7 @@ class GlmfKdaRecurrent:
         self.state_dtype, self.state_bytes = _state_type(state_dtype)
         self.replay_rows = int(replay_rows)
         self.seq_ctas = int(seq_ctas)
+        self.round_beta = bool(round_beta)
         if not 1 <= self.seq_ctas <= 65535:
             raise ValueError("seq_ctas is a grid dimension, 1 to 65535")
 
@@ -659,7 +661,9 @@ class GlmfKdaRecurrent:
             for i in cutlass.range_constexpr(4):
                 q[i] = div_rn_f32(q[i], q_norm) * Float32(self.scale)
                 k[i] = div_rn_f32(k[i], k_norm)
-            beta = _bf16(_sigmoid(Float32(b_raw[row, head])))
+            beta = _sigmoid(Float32(b_raw[row, head]))
+            if cutlass.const_expr(self.round_beta):
+                beta = _bf16(beta)
             if spec != Int32(0):
                 if recorder:
                     for i in cutlass.range_constexpr(4):
