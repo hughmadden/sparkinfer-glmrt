@@ -361,6 +361,7 @@ class TestKernel:
                     st_global_u8(get_ptr_as_int64(mSFA, sf_offset), sbyte)
                     blk += Int32(self.num_mma_warps * 32)
 
+                cute.arch.fence_view_async_shared()
                 load_pipeline.consumer_release(cs)
                 cs.advance()
 

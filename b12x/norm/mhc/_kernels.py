@@ -2623,6 +2623,7 @@ class MHCPrefillBf16ProjectTmaKernel:
                     smem_thr_copy_A,
                     smem_thr_copy_B,
                 )
+                cute.arch.fence_view_async_shared()
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 
@@ -3102,6 +3103,7 @@ class MHCPrefillTf32ProjectTmaKernel:
                                 )
                                 acc[warp_mma_n, column] = Float32(0)
                                 acc_low[warp_mma_n, column] = Float32(0)
+                cute.arch.fence_view_async_shared()
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 
