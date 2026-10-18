@@ -4,6 +4,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 import torch
+from cuda.bindings import driver as cuda
 
 from ._common import Operand, Scalar, compile_program
 
@@ -42,7 +43,7 @@ class _Exlr8Pointers:
                  route_group_lane: cute.Pointer, route_weights: cute.Pointer,
                  fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
                  output: cute.Pointer, rows: cutlass.Int32, groups: cutlass.Int32,
-                 cta_limit: cutlass.Int32, stream):
+                 cta_limit: cutlass.Int32, stream: cuda.CUstream):
         # Flat views are address carriers; the core computes all runtime offsets.
         self.core(cute.make_tensor(x, cute.make_layout(1)),
                   cute.make_tensor(pointers, cute.make_layout(1)),
