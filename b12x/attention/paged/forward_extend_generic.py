@@ -3229,6 +3229,8 @@ class PagedForwardKernel:
         key_strides: tuple[int, int, int],
         value_strides: tuple[int, int, int],
         selection_width: int = SELECTION_WIDTH,
+        head_dim: int = 256,
+        selection_groups: int = 1,
         inline_scale_offsets: tuple[int, int] | None = None,
     ):
         """Build the selected-position ABI of the paged forward engine.
@@ -3251,6 +3253,8 @@ class PagedForwardKernel:
             key_strides=key_strides,
             value_strides=value_strides,
             selection_width=selection_width,
+            head_dim=head_dim,
+            selection_groups=selection_groups,
             inline_scale_offsets=inline_scale_offsets,
         )
 
