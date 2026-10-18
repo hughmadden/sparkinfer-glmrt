@@ -136,6 +136,8 @@ def main():
     parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64")
     parser.add_argument("--replays",type=int,default=100)
     parser.add_argument("--output",type=Path)
+    parser.add_argument("--cta-mult",default="2",
+                        help="EXLR8 cta_limit = SMs * mult; a comma list times extra arms (first is the verdict arm)")
     parser.add_argument("--profile",action="store_true",
                         help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
     args = parser.parse_args()
@@ -160,7 +162,8 @@ def main():
         gen = torch.Generator().manual_seed(408+rows)
         ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(rows)]).cuda().int()
         groups = pack(tensors,ids)
-        cta_limit = props.multi_processor_count*2
+        mults = [int(m) for m in args.cta_mult.split(",")]
+        cta_limit = props.multi_processor_count*mults[0]
         # L2 is recorded, never compiled in. Launch limiting changes assignment only.
         launch = lambda: candidate.launch(*(t.flatten() for t in tensors),scalars=(rows,groups,cta_limit))
         state = (tier,*exl3._serial_state(rows,tier,expert_map,props,torch.device("cuda")))
@@ -185,6 +188,11 @@ def main():
         finite_nonzero(tensors[-1][:rows], "EXLR8")
         finite_nonzero(state[1].output, "EXL3")
         baseline_us, candidate_us = timing(baseline_graph,args.replays), timing(candidate_graph,args.replays)
+        extra = {}
+        for mult in mults[1:]:
+            limit = props.multi_processor_count*mult
+            g = capture(lambda: candidate.launch(*(t.flatten() for t in tensors),scalars=(rows,groups,limit)))
+            extra[f"exlr8_us_cta{mult}x"] = timing(g,args.replays)
         payload_bytes = int(ids.unique().numel())*3*6144*512*4//8
         ratio = baseline_us/candidate_us
         records.append(dict(rows=rows,groups=groups,payload_bytes=payload_bytes,
@@ -192,7 +200,7 @@ def main():
                             exl3_gbps=payload_bytes/baseline_us/1000,
                             exlr8_gbps=payload_bytes/candidate_us/1000,
                             roofline_percent=100*payload_bytes/candidate_us/1000/roofline["gbps"],
-                            optimization_target=0.97,target_met=ratio>=0.97,
+                            optimization_target=0.97,target_met=ratio>=0.97,cta_mult=mults[0],**extra,
                             **stage_profile(candidate_graph,args.output.parent)))
     if args.profile:
         return
