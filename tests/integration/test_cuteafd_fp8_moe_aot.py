@@ -43,8 +43,16 @@ def _weights(g):
         def scales(shape):
             return torch.rand(shape, device="cuda", generator=gen) * 2e-4 + 1e-4
 
-        _WEIGHTS[key] = (fp8((e, i, h)), scales((e, i // 128, h // 128)), fp8((e, i, h)),
-                         scales((e, i // 128, h // 128)), fp8((e, h, i)), scales((e, h // 128, i // 128)))
+        if g.weights == "bf16":
+            def bf16(shape):
+                return (torch.randn(shape, device="cuda", generator=gen) * 0.02).bfloat16()
+
+            unused = torch.empty(0, device="cuda")
+            _WEIGHTS[key] = (bf16((e, i, h)), unused, bf16((e, i, h)), unused,
+                             bf16((e, h, i)), unused)
+        else:
+            _WEIGHTS[key] = (fp8((e, i, h)), scales((e, i // 128, h // 128)), fp8((e, i, h)),
+                             scales((e, i // 128, h // 128)), fp8((e, h, i)), scales((e, h // 128, i // 128)))
     return _WEIGHTS[key]
 
 
@@ -77,7 +85,11 @@ def wire_rows(x: torch.Tensor):
     return wire, (q.float() * torch.exp2(exponent)[..., None]).view(rows, h).bfloat16()
 
 
-def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, limit=0.0, exact=False):
+def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, limit=0.0, exact=False,
+              activation="silu_bf16_product", native_bf16=False):
+    if activation == "silu_post_clamp_fp32_product":
+        return post_silu_reference(x, ids, weights, w1, s1, w3, s3, w2, s2,
+                                   limit=limit, native_bf16=native_bf16)
     def dequant(w, s):
         d = w.double() * s.double().repeat_interleave(128, 0).repeat_interleave(128, 1)
         return d if exact else d.float().bfloat16()
@@ -108,6 +120,31 @@ def reference(x, ids, weights, w1, s1, w3, s3, w2, s2, limit=0.0, exact=False):
     return out.bfloat16()
 
 
+def post_silu_reference(x, ids, weights, w1, s1, w3, s3, w2, s2, *, limit, native_bf16):
+    """Independent CPU FP64 products; explicit BF16 stores and slot-order FP32 sum."""
+    x, ids, weights = x.cpu(), ids.cpu(), weights.cpu()
+    routes = torch.zeros((*ids.shape, x.shape[1]), dtype=torch.float32)
+
+    def operand(w, s, expert):
+        value = w[expert].cpu().float()
+        if not native_bf16:
+            value *= s[expert].cpu().repeat_interleave(128, 0).repeat_interleave(128, 1)
+        return value.bfloat16().double()
+
+    for expert in ids.unique().tolist():
+        rows, slots = torch.where(ids == expert)
+        gate = (x[rows].double() @ operand(w1, s1, expert).T).float().bfloat16().float()
+        up = (x[rows].double() @ operand(w3, s3, expert).T).float().bfloat16().float()
+        silu = torch.nn.functional.silu(gate).clamp(max=limit)
+        act = (silu * up.clamp(-limit, limit)).bfloat16()
+        y = (act.double() @ operand(w2, s2, expert).T).float().bfloat16()
+        routes[rows, slots] = y.float()
+    out = torch.zeros(x.shape, dtype=torch.float32)
+    for slot in range(ids.shape[1]):
+        out += routes[:, slot] * weights[:, slot, None]
+    return out.bfloat16()
+
+
 def _run(g, route, capacity, rows, wire=True, seed=1, hot=0, prefill="auto", exact=False):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     w = _weights(g)
@@ -128,7 +165,8 @@ def _run(g, route, capacity, rows, wire=True, seed=1, hot=0, prefill="auto", exa
                           device="cuda")
     program.launch(source, ids, weights, *w, out, scratch, scalars=(rows,))
     torch.cuda.synchronize()
-    expected = reference(x_exact, ids, weights, *w, limit=g.swiglu_limit, exact=exact)
+    expected = reference(x_exact, ids, weights, *w, limit=g.swiglu_limit, exact=exact,
+                         activation=g.activation, native_bf16=g.weights == "bf16").to(out.device)
     a, b = out.float(), expected.float()
     c = float((a * b).sum() / (a.norm() * b.norm()))
     worst = float(torch.nn.functional.cosine_similarity(a, b, dim=1).min())
@@ -257,3 +295,65 @@ def test_fp8_moe_tp6_zero_padding_is_exact(route, capacity, rows):
     c = float((a * b).sum() / (a.norm() * b.norm()))
     print(f"fp8_moe glm tp6 padded {route} rows={rows}: cosine {c:.7f}")
     assert c >= COS
+
+
+@pytest.mark.parametrize("tp", [4, 6])
+def test_step5_mixed_native_groups_post_silu_and_graph(tp, monkeypatch):
+    """Keep all native format owners live and alternate them within one graph."""
+    from b12x.integration.cuteafd import fp8_moe
+    from .test_cuteafd_nvfp4_moe_aot import _weights as nvfp4_weights, reference as nvfp4_reference
+
+    groups = []
+    for name in ("step5", "step5_bf16", "step5_nvfp4"):
+        g = _geometry(name, tp)
+        operands = nvfp4_weights(g, g.slice) if g.weights == "nvfp4" else _weights(g)
+        program = _program(g, "auto", 64, False)
+        scratch = torch.empty(fp8_moe.fp8_moe_scratch_bytes(g, "auto", 64, False),
+                              dtype=torch.uint8, device="cuda")
+        out = torch.empty(64, g.hidden, dtype=torch.bfloat16, device="cuda")
+        groups.append((g, operands, program, scratch, out))
+
+    def no_compile(*args, **kwargs):
+        raise AssertionError("live rows must reuse planned kernels")
+
+    monkeypatch.setattr(fp8_moe, "compile_fp8_moe_aot", no_compile)
+    gen = torch.Generator(device="cuda").manual_seed(274)
+    # Larger inputs exercise both post-SiLU and symmetric up clamps.
+    x = (torch.randn(64, groups[0][0].hidden, device="cuda", generator=gen) * 8).bfloat16()
+    ids = ((torch.arange(64, device="cuda")[:, None] + torch.arange(8, device="cuda")) % 8).int()
+    weights = torch.rand(64, 8, device="cuda", generator=gen)
+    weights /= weights.sum(-1, keepdim=True)
+
+    for rows in (1, 16, 64):
+        def launch():
+            for _, operands, program, scratch, out in groups:
+                program.launch(x, ids, weights, *operands, out, scratch, scalars=(rows,))
+
+        launch()
+        torch.cuda.synchronize()
+        expected = []
+        eager = []
+        for g, operands, _, _, out in groups:
+            if g.weights == "nvfp4":
+                oracle = nvfp4_reference(g, x[:rows], ids[:rows], weights[:rows], *operands, a4=True)
+            else:
+                oracle = post_silu_reference(x[:rows], ids[:rows], weights[:rows], *operands,
+                    limit=g.swiglu_limit, native_bf16=g.weights == "bf16")
+            expected.append(oracle.cpu().float())
+            eager.append(out[:rows].clone())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        for _ in range(3):
+            for _, _, _, _, out in groups:
+                out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            for (g, _, _, _, out), baseline, oracle in zip(groups, eager, expected):
+                assert torch.equal(out[:rows], baseline), f"{g.name} rows={rows}: replay changed bytes"
+                actual = out[:rows].cpu().float()
+                assert torch.isfinite(actual).all() and oracle.norm() > 0
+                worst = torch.nn.functional.cosine_similarity(actual, oracle, dim=1).min().item()
+                relative = (actual - oracle).norm() / oracle.norm()
+                print(f"{g.name} tp{tp} rows={rows}: worst cosine={worst:.7f} rel_l2={relative:.7f}")
+                assert worst >= 0.9999 and relative <= 0.02
