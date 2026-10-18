@@ -1,0 +1,81 @@
+"""EXLR8 A16 unit-expert ABI v1; all tables and scratch belong to the caller."""
+from __future__ import annotations
+
+import cutlass
+import cutlass.cute as cute
+import torch
+
+from ._common import Operand, Scalar, compile_program
+
+ABI_VERSION = 1
+POINTERS = ("x", "pointers", "bits", "group_expert", "route_slots",
+            "route_group_lane", "route_weights", "fc1", "intermediate", "fc2", "output")
+
+
+def geometry(hidden=6144, units=16, top_k=8, max_groups=512):
+    values = (hidden, units, top_k, max_groups)
+    if any(type(v) is not int or v <= 0 or v > 2**31 - 1 for v in values) or hidden % 128:
+        raise ValueError("EXLR8 requires positive int32 geometry and hidden % 128 == 0")
+    result = dict(abi_version=ABI_VERSION, hidden=hidden, units=units, top_k=top_k,
+                  max_groups=max_groups, max_rows=64, split_k_blocks=8,
+                  fc1_splits=(hidden + 1023) // 1024)
+    if max(scratch_bytes(result).values()) > 2**63 - 1:
+        raise ValueError("EXLR8 scratch exceeds signed 64-bit addressing")
+    return result
+
+
+def scratch_bytes(g):
+    groups, units, hidden = g["max_groups"], g["units"], g["hidden"]
+    return dict(fc1=groups * units * 2 * g["fc1_splits"] * 16 * 128 * 4,
+                intermediate=groups * units * 16 * 128 * 2,
+                fc2=groups * 16 * hidden * 4)
+
+
+class _Exlr8Pointers:
+    def __init__(self, g):
+        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
+        self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"], g["max_groups"])
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
+                 group_expert: cute.Pointer, route_slots: cute.Pointer,
+                 route_group_lane: cute.Pointer, route_weights: cute.Pointer,
+                 fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
+                 output: cute.Pointer, rows: cutlass.Int32, groups: cutlass.Int32,
+                 cta_limit: cutlass.Int32, stream):
+        # Flat views are address carriers; the core computes all runtime offsets.
+        self.core(cute.make_tensor(x, cute.make_layout(1)),
+                  cute.make_tensor(pointers, cute.make_layout(1)),
+                  cute.make_tensor(bits, cute.make_layout(1)),
+                  cute.make_tensor(group_expert, cute.make_layout(1)),
+                  cute.make_tensor(route_slots, cute.make_layout(1)),
+                  cute.make_tensor(route_group_lane, cute.make_layout(1)),
+                  cute.make_tensor(route_weights, cute.make_layout(1)),
+                  cute.make_tensor(fc1, cute.make_layout(1)),
+                  cute.make_tensor(intermediate, cute.make_layout(1)),
+                  cute.make_tensor(fc2, cute.make_layout(1)),
+                  cute.make_tensor(output, cute.make_layout(1)), rows, groups, cta_limit, stream)
+
+
+def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512):
+    g = geometry(hidden, units, top_k, max_groups)
+    h, u, t, m, s = (g[k] for k in ("hidden", "units", "top_k", "max_groups", "fc1_splits"))
+    operands = (
+        Operand("x", torch.float16, f"[rows,{h}]"),
+        Operand("pointers", torch.int64, f"[E,{u},3,3]"),
+        Operand("bits", torch.int32, f"[E,{u},3]"),
+        Operand("group_expert", torch.int32, f"[{m}]"),
+        Operand("route_slots", torch.int32, f"[{m},16]"),
+        Operand("route_group_lane", torch.int32, f"[rows,{t}]"),
+        Operand("route_weights", torch.float32, f"[rows,{t}]"),
+        Operand("fc1", torch.float32, f"[{m},{u},2,{s},16,128]", "scratch"),
+        Operand("intermediate", torch.float16, f"[{m},{u},16,128]", "scratch"),
+        Operand("fc2", torch.float32, f"[{m},16,{h}]", "scratch"),
+        Operand("output", torch.float32, f"[rows,{h}]", "out"),
+    )
+    sizes = scratch_bytes(g)
+    return compile_program(_Exlr8Pointers(g), name="exlr8_a16_decode", operands=operands,
+                           scalars=tuple(Scalar(n) for n in ("rows", "groups", "cta_limit")),
+                           key=(h, u, t, m, ABI_VERSION), geometry=g,
+                           scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
+                           doc=__doc__)
