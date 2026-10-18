@@ -65,6 +65,9 @@ def test_rows_groups_packing_cta_invariance(case):
         # Both live group count and each row's group/lane assignment change.
         case.routing(rows, chunk=7 if rows % 2 else 16, reverse=bool(rows % 3))
         for limit in (1, 48, 188):
+            case.fc1.fill_(float("nan"))
+            case.intermediate.fill_(float("nan"))
+            case.fc2.fill_(float("nan"))
             case.output.fill_(float("nan"))
             launch(case, compiled, rows, limit)
             assert torch.equal(case.output[:rows].view(torch.int32),
@@ -124,3 +127,17 @@ def test_exact_trellis_decode(case):
                          (r,c+8),(r+1,c+8),(r+8,c+8),(r+9,c+8))
             for j, (r, c) in enumerate(positions):
                 np.testing.assert_array_equal(pairs[:, lane, j], reference[:, r, c])
+
+
+def test_empty_routes_do_not_read_poison(case):
+    compiled = program(case)
+    case.routing(8)
+    case.groups = 0
+    case.inverse.fill_(-1)
+    case.fc1.fill_(float("nan"))
+    case.intermediate.fill_(float("nan"))
+    case.fc2.fill_(float("nan"))
+    case.output.fill_(float("nan"))
+    launch(case, compiled, 8, 1)
+    assert torch.equal(case.output[:8], torch.zeros_like(case.output[:8]))
+    assert torch.isnan(case.output[8:]).all()

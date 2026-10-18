@@ -39,12 +39,13 @@ class Case:
         index = self.ref.Tensors(Path(snapshot) / "experts" / f"exlr8-layer-{layer:03}.index.safetensors")
         self.checksums = []
         for e, source in enumerate((7, 11, 23, 256)):
-            for u, width in enumerate(widths):
+            for u, base_width in enumerate(widths):
                 if e == 1 and u == 1:  # All three projections of one unit are nonresident.
                     continue
-                if source == 256 and width == 2:
-                    width = 3  # This checkpoint ships no K2 shared expert.
                 for p, projection in enumerate(("gate", "up", "down")):
+                    width = widths[(widths.index(base_width) + p) % len(widths)]
+                    if source == 256 and width == 2:
+                        width = 3  # This checkpoint ships no K2 shared expert.
                     prefix = ("shared." if source == 256 else "") + f"k{width}."
                     source_e, source_u = (0 if source == 256 else source), 5 + u
                     offset, length = index.array(prefix + "index")[source_e, p, source_u]

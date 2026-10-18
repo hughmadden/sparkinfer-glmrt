@@ -40,6 +40,31 @@ def timing(graph, replays):
     return statistics.median(values)
 
 
+def copy_roofline():
+    # Count both the read and write; expert payload throughput counts reads only.
+    size = 256 * 1024 * 1024
+    src = torch.empty(size, dtype=torch.uint8, device="cuda")
+    dst = torch.empty_like(src)
+    src.fill_(17)
+    graph = capture(lambda: dst.copy_(src))
+    values = []
+    for _ in range(5):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(10):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        values.append(2 * size * 10 / (start.elapsed_time(end) * 1e6))
+    return dict(buffer_bytes=size, gbps=max(values), repeats_gbps=values,
+                convention="2N bytes per copy (read plus write); expert payload uses N read bytes")
+
+
+def finite_nonzero(tensor, label):
+    if not bool(torch.isfinite(tensor).all()) or not bool(torch.count_nonzero(tensor)):
+        raise RuntimeError(f"{label} output must be finite and nonzero")
+
+
 def stage_profile(graph, directory):
     # Profiling is a separate replay: it never supplies the performance verdict.
     from torch.profiler import profile, ProfilerActivity
@@ -70,7 +95,7 @@ def make_candidate(experts=256, hidden=6144, units=4, topk=8):
             for p in range(3):
                 tensors = (torch.randint(0, 256, (hidden*16*4,), dtype=torch.uint8, device="cuda"),
                            torch.ones(128, dtype=torch.float16, device="cuda"),
-                           torch.ones(hidden//128, dtype=torch.float16, device="cuda"))
+                           torch.full((hidden//128,), 1 / hidden**0.5, dtype=torch.float16, device="cuda"))
                 owners.extend(tensors)
                 pointers[e,u,p] = torch.tensor([t.data_ptr() for t in tensors])
     groups = 64*topk
@@ -110,13 +135,12 @@ def main():
     parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64")
     parser.add_argument("--replays",type=int,default=100)
     parser.add_argument("--output",type=Path,required=True)
-    parser.add_argument("--copy-roofline-gbps",type=float,required=True,
-                        help="measured GB10 streaming-copy bytes/s ceiling, not a datasheet rate")
     args = parser.parse_args()
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
     args.output.parent.mkdir(parents=True,exist_ok=True)
     props = torch.cuda.get_device_properties(0)
+    roofline = copy_roofline()
     tensors, owners = make_candidate()
     candidate = compile_exlr8_a16_aot(units=4)
     # This is the existing EXL3 uniform-K4 implementation, not a proxy GEMM.
@@ -134,6 +158,10 @@ def main():
         baseline_x = tensors[0][:rows].to(torch.bfloat16)
         baseline = lambda: exl3._run_serial(state,baseline_x,tensors[6][:rows],ids)
         baseline_graph, candidate_graph = capture(baseline), capture(launch)
+        candidate_graph.replay()
+        baseline_graph.replay()
+        finite_nonzero(tensors[-1][:rows], "EXLR8")
+        finite_nonzero(state[1].output, "EXL3")
         baseline_us, candidate_us = timing(baseline_graph,args.replays), timing(candidate_graph,args.replays)
         payload_bytes = int(ids.unique().numel())*3*6144*512*4//8
         ratio = baseline_us/candidate_us
@@ -141,15 +169,15 @@ def main():
                             exl3_k4_us=baseline_us,exlr8_up1_us=candidate_us,speedup=ratio,
                             exl3_gbps=payload_bytes/baseline_us/1000,
                             exlr8_gbps=payload_bytes/candidate_us/1000,
-                            roofline_percent=100*payload_bytes/candidate_us/1000/args.copy_roofline_gbps,
-                            pass_bar=0.97,verdict="PASS" if ratio>=0.97 else "FAIL",
+                            roofline_percent=100*payload_bytes/candidate_us/1000/roofline["gbps"],
+                            optimization_target=0.97,target_met=ratio>=0.97,
                             **stage_profile(candidate_graph,args.output.parent)))
     result = dict(schema=1,kind="exlr8_up1_vs_exl3_k4",device=props.name,
-                  sm_count=props.multi_processor_count,l2_bytes=props.L2_cache_size,
+                  sm_count=props.multi_processor_count,l2_bytes=getattr(props,"L2_cache_size",None),
                   hidden=6144,units_per_rank=4,top_k=8,experts=256,
-                  measured_copy_roofline_gbps=args.copy_roofline_gbps,
+                  measured_copy_roofline=roofline,
                   conditions="TP4 synthetic K4 payloads, graph replay, one untimed warm batch per rows; profiler separate",
-                  rows=records,verdict="PASS" if all(r["verdict"]=="PASS" for r in records) else "FAIL")
+                  rows=records,target_met=all(r["target_met"] for r in records))
     with args.output.open("x") as stream:
         json.dump(result,stream,indent=2)
     print(json.dumps(result,indent=2))
