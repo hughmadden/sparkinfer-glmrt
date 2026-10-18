@@ -135,13 +135,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64")
     parser.add_argument("--replays",type=int,default=100)
-    parser.add_argument("--output",type=Path,required=True)
+    parser.add_argument("--output",type=Path)
+    parser.add_argument("--profile",action="store_true",
+                        help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
     args = parser.parse_args()
+    if not args.profile and args.output is None:
+        parser.error("--output is required unless --profile")
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
-    args.output.parent.mkdir(parents=True,exist_ok=True)
     props = torch.cuda.get_device_properties(0)
-    roofline = copy_roofline()
+    if not args.profile:
+        args.output.parent.mkdir(parents=True,exist_ok=True)
+    roofline = None if args.profile else copy_roofline()
     tensors, owners = make_candidate()
     candidate = compile_exlr8_a16_aot(units=4)
     # This is the existing EXL3 uniform-K4 implementation, not a proxy GEMM.
@@ -161,6 +166,19 @@ def main():
         state = (tier,*exl3._serial_state(rows,tier,expert_map,props,torch.device("cuda")))
         baseline_x = tensors[0][:rows].to(torch.bfloat16)
         baseline = lambda: exl3._run_serial(state,baseline_x,tensors[6][:rows],ids)
+        if args.profile:
+            for _ in range(3):
+                baseline()
+                launch()
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
+            baseline()
+            launch()
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
+            finite_nonzero(tensors[-1][:rows], "EXLR8")
+            print(f"profiled rows={rows} groups={groups} unique={int(ids.unique().numel())}", flush=True)
+            continue
         baseline_graph, candidate_graph = capture(baseline), capture(launch)
         candidate_graph.replay()
         baseline_graph.replay()
@@ -176,6 +194,8 @@ def main():
                             roofline_percent=100*payload_bytes/candidate_us/1000/roofline["gbps"],
                             optimization_target=0.97,target_met=ratio>=0.97,
                             **stage_profile(candidate_graph,args.output.parent)))
+    if args.profile:
+        return
     result = dict(schema=1,kind="exlr8_up1_vs_exl3_k4",device=props.name,
                   sm_count=props.multi_processor_count,l2_bytes=getattr(props,"L2_cache_size",None),
                   hidden=6144,units_per_rank=4,top_k=8,experts=256,
