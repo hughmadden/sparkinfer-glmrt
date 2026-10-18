@@ -301,7 +301,7 @@ def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16):
     launch = RoutedBf16Projection(outputs, width, out_dtype=dtype, max_skinny_rows=0)
     return compile_program(launch, name="bf16_projection", operands=(
         Operand("x", torch.bfloat16, f"[rows,{width}]"),
-        Operand("weight", torch.bfloat16, f"[{outputs},{width}]"),
+        Operand("w", torch.bfloat16, f"[{outputs},{width}]"),
         Operand("out", output_dtype, f"[rows,{outputs}]", "out")),
         scalars=(Scalar("rows"),), key=(width, outputs, str(output_dtype), launch.key()),
         geometry=dict(width=width, outputs=outputs, output_dtype=str(output_dtype), skinny_rows=0))
