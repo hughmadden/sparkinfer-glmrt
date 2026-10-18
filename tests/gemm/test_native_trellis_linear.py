@@ -8,20 +8,23 @@ import pytest
 import torch
 
 
-def reference():
+def reference(codebook="e4m3"):
     path = Path(os.environ.get("CUTEAFD_EXLR8_REFERENCE", "/workspace/cuteafd/python/reference/exlr8.py"))
     spec = importlib.util.spec_from_file_location("e1_reference", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if codebook == "f16":
+        # E1 already rounds the MCG half sum; omit only the E4M3 conversion.
+        module.e4m3_round = lambda values: np.asarray(values, dtype=np.float32)
     return module
 
 
 class Case:
-    def __init__(self, k=1152, n=256, side=1, bits=4, rows=4096):
+    def __init__(self, k=1152, n=256, side=1, bits=4, rows=4096, codebook="e4m3"):
         from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
         rng = np.random.default_rng(408)
         raw = rng.integers(0, 256, k*n*bits//8, dtype=np.uint8)
-        ref = reference()
+        ref = reference(codebook)
         if side == 1:
             weight = np.concatenate([ref.decode_unit(chunk.tobytes(), bits, "gate", k)
                                      for chunk in raw.reshape(n//128, -1)], axis=1)
@@ -29,14 +32,15 @@ class Case:
             weight = np.concatenate([ref.decode_unit(chunk.tobytes(), bits, "down", n)
                                      for chunk in raw.reshape(k//128, -1)], axis=0)
         self.x = torch.tensor(rng.normal(0, .1, (rows, k)), device="cuda", dtype=torch.float16)
-        self.inputs = torch.tensor([self.x.data_ptr(), self.x.data_ptr()], dtype=torch.int64, device="cuda")
+        self.other_x = torch.tensor(rng.normal(0, .1, (rows, k)), device="cuda", dtype=torch.float16)
+        self.inputs = torch.tensor([self.other_x.data_ptr(), self.x.data_ptr()], dtype=torch.int64, device="cuda")
         self.payload = torch.tensor(raw, dtype=torch.uint8, device="cuda")
         self.scales = torch.tensor(rng.uniform(.5, 2, k//128), dtype=torch.float16, device="cuda")
         self.weight = torch.tensor(weight, device="cuda") * self.scales.float().repeat_interleave(128)[:, None]
         self.partial = torch.empty((rows, (k+1023)//1024, n), dtype=torch.float32, device="cuda")
         self.output = torch.empty((rows, n), dtype=torch.float32, device="cuda")
         self.program = compile_trellis_linear_aot(input_features=k, output_features=n,
-                           sharded_side=side, bits=bits, rotation_count=2, max_rows=rows)
+                           sharded_side=side, bits=bits, codebook=codebook, rotation_count=2, max_rows=rows)
 
     def launch(self, rows, limit=188*4, rotation=1):
         self.program.launch(self.inputs, self.payload, self.scales,
@@ -44,11 +48,17 @@ class Case:
                             scalars=(rows, rotation, limit))
 
 
-@pytest.mark.parametrize("side,bits", [(1, 4), (2, 4), (1, 2), (2, 3)])
-def test_accuracy_rows_and_cta_invariance(side, bits):
-    c = Case(side=side, bits=bits)
+@pytest.mark.parametrize("side,bits,codebook", [(1, 4, "e4m3"), (2, 4, "e4m3"), (1, 2, "e4m3"), (2, 3, "e4m3"), (1, 4, "f16"), (2, 3, "f16")])
+def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
+    c = Case(side=side, bits=bits, codebook=codebook)
+    c.launch(64, rotation=0)
+    other_expected = c.output[:64].clone()
+    other_ref = c.other_x[:64].double() @ c.weight.double()
+    other_baseline = (c.other_x[:64].bfloat16() @ c.weight.bfloat16()).double()
+    assert torch.linalg.vector_norm(other_expected.double()-other_ref) <= 1.01*torch.linalg.vector_norm(other_baseline-other_ref)
     c.launch(64)
     expected = c.output[:64].clone()
+    assert not torch.equal(other_expected, expected)
     ref = c.x[:64].double() @ c.weight.double()
     baseline = (c.x[:64].bfloat16() @ c.weight.bfloat16()).double()
     error = torch.linalg.vector_norm(expected.double()-ref)
@@ -59,7 +69,8 @@ def test_accuracy_rows_and_cta_invariance(side, bits):
             c.partial.fill_(float("nan"))
             c.output.fill_(float("nan"))
             c.launch(rows, limit, rotation=rows % 2)
-            assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
+            selected = expected if rows % 2 else other_expected
+            assert torch.equal(c.output[:rows].view(torch.int32), selected[:rows].view(torch.int32))
             assert torch.isnan(c.output[rows:]).all()
     c.launch(4096)
     ref = c.x.double() @ c.weight.double()
@@ -89,7 +100,8 @@ def test_graph_replay_and_invalid_launch():
 
 
 @pytest.mark.parametrize("bits", [2, 3, 4])
-def test_bit_exact_decode(bits):
+@pytest.mark.parametrize("codebook", ["e4m3", "f16"])
+def test_bit_exact_decode(bits, codebook):
     import cutlass
     import cutlass.cute as cute
     from cutlass import Int32, Int64
@@ -101,7 +113,7 @@ def test_bit_exact_decode(bits):
     def decode(payload: cute.Tensor, output: cute.Tensor):
         lane, _, _ = cute.arch.thread_idx()
         tile, _, _ = cute.arch.block_idx()
-        values = decode_tile(Int64(payload.iterator.toint()), Int32(tile), Int32(lane), bits, True)
+        values = decode_tile(Int64(payload.iterator.toint()), Int32(tile), Int32(lane), bits, codebook == "e4m3")
         for j in cutlass.range_constexpr(4):
             output[tile*128+lane*4+j] = values[j]
 
@@ -116,7 +128,7 @@ def test_bit_exact_decode(bits):
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     program = cute.compile(probe, pv, ov, stream)
     program(pv, ov, stream)
-    expected = reference().decode_tiles(raw.tobytes(), bits)
+    expected = reference(codebook).decode_tiles(raw.tobytes(), bits)
     values = out.view(torch.float16).cpu().numpy().reshape(32, 32, 8)
     for lane in range(32):
         r, c = 2*(lane % 4), lane//4

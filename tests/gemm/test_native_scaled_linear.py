@@ -75,6 +75,21 @@ def test_scaled_graph_and_invalid_launch():
         assert torch.isnan(c.output).all()
 
 
+@pytest.mark.parametrize("side", [1, 2])
+def test_ue8m0_edge_exponents(side):
+    c = Case("mxfp8",side,k=256,n=32,rows=1)
+    # Each K32 sum is 32, making even scale zero's 2^-127 contribution normal.
+    c.x.fill_(1)
+    c.payload.fill_(0x38)  # E4M3 1.0
+    c.scales.zero_()
+    c.launch(1)
+    expected = torch.full_like(c.output,256.0*2.0**-127)
+    assert torch.equal(c.output.view(torch.int32),expected.view(torch.int32))
+    c.scales.fill_(255)
+    c.launch(1)
+    assert torch.isnan(c.output).all()
+
+
 def test_fp8_embedding_gather():
     from b12x.integration.cuteafd.fp8_row_embedding import compile_fp8_row_embedding_aot
     torch.manual_seed(408)
