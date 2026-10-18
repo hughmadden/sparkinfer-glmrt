@@ -1,6 +1,4 @@
 """Real-checkpoint K1 component gates; opt in with EXLR8 snapshot/reference paths."""
-from __future__ import annotations
-
 import os
 
 import numpy as np
@@ -41,12 +39,21 @@ def test_reference_a16_fp64_accuracy(case):
     assert relative(a16, fp64) <= 1e-3
 
 
-def test_kernel_accuracy(case):
-    case.routing(8)
-    compiled = program(case)
-    launch(case, compiled, 8)
-    reference = case.oracle(8)
-    assert relative(case.output[:8], reference) <= 1e-3
+@pytest.mark.parametrize("amplitude", [1.0, 0.02])
+def test_kernel_accuracy(case, amplitude):
+    original = case.x
+    try:
+        case.x = (original.float()*amplitude).half()
+        case.routing(8)
+        compiled = program(case)
+        case.fc1.fill_(float("nan"))
+        case.intermediate.fill_(float("nan"))
+        case.fc2.fill_(float("nan"))
+        launch(case, compiled, 8)
+        reference = case.oracle(8)
+        assert relative(case.output[:8], reference) <= 1e-3
+    finally:
+        case.x = original
 
 
 def test_rows_groups_packing_cta_invariance(case):

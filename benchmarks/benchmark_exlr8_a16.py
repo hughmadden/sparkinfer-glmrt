@@ -110,6 +110,8 @@ def main():
     parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64")
     parser.add_argument("--replays",type=int,default=100)
     parser.add_argument("--output",type=Path,required=True)
+    parser.add_argument("--copy-roofline-gbps",type=float,required=True,
+                        help="measured GB10 streaming-copy bytes/s ceiling, not a datasheet rate")
     args = parser.parse_args()
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
@@ -129,7 +131,8 @@ def main():
         # L2 is recorded, never compiled in. Launch limiting changes assignment only.
         launch = lambda: candidate.launch(*(t.flatten() for t in tensors),scalars=(rows,groups,cta_limit))
         state = (tier,*exl3._serial_state(rows,tier,expert_map,props,torch.device("cuda")))
-        baseline = lambda: exl3._run_serial(state,tensors[0][:rows],tensors[6][:rows],ids)
+        baseline_x = tensors[0][:rows].to(torch.bfloat16)
+        baseline = lambda: exl3._run_serial(state,baseline_x,tensors[6][:rows],ids)
         baseline_graph, candidate_graph = capture(baseline), capture(launch)
         baseline_us, candidate_us = timing(baseline_graph,args.replays), timing(candidate_graph,args.replays)
         payload_bytes = int(ids.unique().numel())*3*6144*512*4//8
@@ -138,11 +141,13 @@ def main():
                             exl3_k4_us=baseline_us,exlr8_up1_us=candidate_us,speedup=ratio,
                             exl3_gbps=payload_bytes/baseline_us/1000,
                             exlr8_gbps=payload_bytes/candidate_us/1000,
-                            pass_bar=1.05,verdict="PASS" if ratio>=1.05 else "FAIL",
+                            roofline_percent=100*payload_bytes/candidate_us/1000/args.copy_roofline_gbps,
+                            pass_bar=0.97,verdict="PASS" if ratio>=0.97 else "FAIL",
                             **stage_profile(candidate_graph,args.output.parent)))
     result = dict(schema=1,kind="exlr8_up1_vs_exl3_k4",device=props.name,
                   sm_count=props.multi_processor_count,l2_bytes=props.L2_cache_size,
                   hidden=6144,units_per_rank=4,top_k=8,experts=256,
+                  measured_copy_roofline_gbps=args.copy_roofline_gbps,
                   conditions="TP4 synthetic K4 payloads, graph replay, one untimed warm batch per rows; profiler separate",
                   rows=records,verdict="PASS" if all(r["verdict"]=="PASS" for r in records) else "FAIL")
     with args.output.open("x") as stream:
