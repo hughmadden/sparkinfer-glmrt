@@ -11,16 +11,20 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from b12x._lib.intrinsics import (
+    cp_async4_shared_global,
     f16_mma_m16n8k16_f32,
     half2_to_float2_scaled,
     ld_global_b16,
     ld_global_nc_u32,
+    ld_shared_u32,
     packed_dequant_trellis_to_half2x4,
+    shared_ptr_to_u32,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
@@ -69,7 +73,7 @@ def _side_value(address: Int64, index: Int32):
 
 class Exlr8A16Kernel:
     ABI_VERSION = 1
-    CODE_VERSION = 3
+    CODE_VERSION = 4
     # Resident CTAs per SM the stream kernels are built for (<=128 registers at
     # 128 threads). GB10 decode is latency-bound on dependent weight loads, so
     # the caller's cta_limit should be sm_count * CTAS_PER_SM (cudaDevAttr at
@@ -89,6 +93,22 @@ class Exlr8A16Kernel:
         self.fast_math = bool(fast_math)
         self.blocks = hidden_size // 128
         self.splits = (self.blocks + 7) // 8
+        # FC2 runs one CTA per run of adjacent output blocks so a task streams
+        # a contiguous weight slab per unit; the whole group intermediate is
+        # staged once per task in shared memory. Below the task-count knee a
+        # narrow form (one block per task) fills the device better; both forms
+        # share one per-output arithmetic order, so the choice cannot change a
+        # result.
+        self.fc2_run = 4 if self.blocks % 4 == 0 else (2 if self.blocks % 2 == 0 else 1)
+        self.fc2_runs = (self.blocks + self.fc2_run - 1) // self.fc2_run
+        # Measured task-granularity knee; no device SM count is compiled in.
+        self.fc2_wide_min_groups = 24
+        self.smem_row_bytes = 272  # 128 f16 + 16 B pad: conflict-free, 16 B aligned
+        self.stage_unit_bytes = 16 * self.smem_row_bytes
+        self.stage_units = min(self.units, 4)
+        self.stage_chunks = (self.units + self.stage_units - 1) // self.stage_units
+        self.smem_words = self.stage_units * self.stage_unit_bytes // 4
+
 
     @property
     def __cache_key__(self):
@@ -112,10 +132,16 @@ class Exlr8A16Kernel:
                                        fc1, intermediate, rows, groups).launch(
                     grid=(min(groups * Int32(self.units), cta_limit), 1, 1),
                     block=(128, 1, 1), stream=stream)
-                self.fc2_kernel(pointers, bits, group_expert, route_slots, intermediate,
-                                fc2, rows, groups).launch(
-                    grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+                if groups >= Int32(self.fc2_wide_min_groups):
+                    self.fc2_kernel(pointers, bits, group_expert, route_slots, intermediate,
+                                    fc2, rows, groups).launch(
+                        grid=(min(groups * Int32(self.fc2_runs), cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+                else:
+                    self.fc2_kernel_single(pointers, bits, group_expert, route_slots, intermediate,
+                                           fc2, rows, groups).launch(
+                        grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
             self.reduce_kernel(route_group_lane, route_weights, fc2, output,
                                rows, groups).launch(
                 grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1),
@@ -266,11 +292,157 @@ class Exlr8A16Kernel:
                         intermediate[base + Int64(v)] = g[v].to(cutlass.Float16)
             task += step
 
+    @cute.jit
+    def _fc2_unit(self, total: cute.Tensor, payload: Int64, scales: Int64,
+                  abase: Int32, lane: Int32, warp: Int32, run: Int32,
+                  width: cutlass.Constexpr):
+        """One down-projection unit over a run of output blocks.
+
+        A fragments come from the staged intermediate in shared memory;
+        weights stream once per unit for all blocks of the run. Each block's
+        K128 accumulation is finished before it is scaled into ``total`` so
+        the per-unit reduction order is one block at a time whatever the run
+        width, which keeps results bitwise identical between the wide and the
+        narrow launch forms.
+        """
+        acc = cute.make_rmem_tensor(self.fc2_run * 16, Float32)
+        acc.fill(Float32(0.0))
+        r = lane // Int32(4)
+        row0 = abase + r * Int32(self.smem_row_bytes)
+        row1 = row0 + Int32(8 * self.smem_row_bytes)
+        for k16 in cutlass.range_constexpr(8):
+            ka = row0 + Int32(k16 * 32) + (lane & Int32(3)) * Int32(4)
+            kb = row1 + Int32(k16 * 32) + (lane & Int32(3)) * Int32(4)
+            a0 = ld_shared_u32(ka)
+            a1 = ld_shared_u32(kb)
+            a2 = ld_shared_u32(ka + Int32(16))
+            a3 = ld_shared_u32(kb + Int32(16))
+            for b in cutlass.range_constexpr(self.fc2_run):
+                block = run * Int32(self.fc2_run) + Int32(b)
+                if block < Int32(self.blocks):
+                    for n16 in cutlass.range_constexpr(2):
+                        tile = block * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
+                        b0, b1, b2, b3 = exlr8_decode_tile(payload, tile, lane, width)
+                        o = b * 16 + 8 * n16
+                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            acc[o], acc[o + 1], acc[o + 2], acc[o + 3],
+                            a0, a1, a2, a3, b0, b1)
+                        acc[o], acc[o + 1] = d0, d1
+                        acc[o + 2], acc[o + 3] = d2, d3
+                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            acc[o + 4], acc[o + 5], acc[o + 6], acc[o + 7],
+                            a0, a1, a2, a3, b2, b3)
+                        acc[o + 4], acc[o + 5] = d0, d1
+                        acc[o + 6], acc[o + 7] = d2, d3
+        for b in cutlass.range_constexpr(self.fc2_run):
+            block = run * Int32(self.fc2_run) + Int32(b)
+            if block < Int32(self.blocks):
+                scale = _side_value(scales, block)
+                for n in cutlass.range_constexpr(16):
+                    slot = b * 16 + n
+                    total[slot] = total[slot] + acc[slot] * scale
+
+    @cute.jit
+    def _fc2_body(self, pointers: cute.Tensor, bits: cute.Tensor,
+                  group_expert: cute.Tensor, route_slots: cute.Tensor,
+                  intermediate: cute.Tensor, fc2: cute.Tensor,
+                  rows: Int32, groups: Int32, smem_base: Int32,
+                  lane: Int32, warp: Int32, tid: Int32,
+                  task: Int32, step: Int32):
+        runs = self.fc2_runs
+        ibase = intermediate.iterator.toint()
+        while task < groups * Int32(runs):
+            group, run = task // Int32(runs), task % Int32(runs)
+            expert = group_expert[group]
+            r = lane // Int32(4)
+            total = cute.make_rmem_tensor(self.fc2_run * 16, Float32)
+            total.fill(Float32(0.0))
+            slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
+            slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+            row0, row1 = Int32(-1), Int32(-1)
+            if slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k):
+                row0 = r
+            if slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k):
+                row1 = r + Int32(8)
+            for chunk in cutlass.range_constexpr(self.stage_chunks):
+                nunits = min(self.units - chunk * self.stage_units, self.stage_units)
+                gbase = (group.to(Int64) * Int64(self.units)
+                         + Int64(chunk * self.stage_units))
+                for c in cutlass.range_constexpr(nunits * 2):
+                    piece = Int32(tid) + Int32(c * 128)
+                    u = piece // Int32(256)
+                    rem = piece % Int32(256)
+                    rr = rem // Int32(16)
+                    xx = rem % Int32(16)
+                    src = (ibase + (gbase + u.to(Int64)) * Int64(16 * 128 * 2)
+                           + rr.to(Int64) * Int64(256) + xx.to(Int64) * Int64(16))
+                    dst = (smem_base + u * Int32(self.stage_unit_bytes)
+                           + rr * Int32(self.smem_row_bytes) + xx * Int32(16))
+                    cp_async4_shared_global(dst, src)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+                for uu in cutlass.range(nunits):
+                    unit = Int32(chunk * self.stage_units) + uu
+                    desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
+                    width = bits[desc]
+                    if width != Int32(0):
+                        payload = pointers[desc * Int64(3)]
+                        scales = pointers[desc * Int64(3) + Int64(2)]
+                        abase = smem_base + uu * Int32(self.stage_unit_bytes)
+                        if width == Int32(2):
+                            self._fc2_unit(total, payload, scales, abase, lane, warp, run, 2)
+                        elif width == Int32(3):
+                            self._fc2_unit(total, payload, scales, abase, lane, warp, run, 3)
+                        elif width == Int32(4):
+                            self._fc2_unit(total, payload, scales, abase, lane, warp, run, 4)
+                cute.arch.sync_threads()
+            for b in cutlass.range_constexpr(self.fc2_run):
+                block = run * Int32(self.fc2_run) + Int32(b)
+                if block < Int32(self.blocks):
+                    for n in cutlass.range_constexpr(4):
+                        col = block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
+                        base = (group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)
+                        if row0 >= Int32(0):
+                            fc2[base], fc2[base + Int64(1)] = total[b * 16 + n * 4], total[b * 16 + n * 4 + 1]
+                        if row1 >= Int32(0):
+                            fc2[base + Int64(8 * self.hidden_size)], fc2[base + Int64(8 * self.hidden_size + 1)] = total[b * 16 + n * 4 + 2], total[b * 16 + n * 4 + 3]
+            task += step
+
     @cute.kernel
     def fc2_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
                    group_expert: cute.Tensor, route_slots: cute.Tensor,
                    intermediate: cute.Tensor, fc2: cute.Tensor,
                    rows: Int32, groups: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.smem_words], 1024
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        self._fc2_body(pointers, bits, group_expert, route_slots, intermediate, fc2,
+                       rows, groups, smem_base, lane, warp, Int32(tid), task, step)
+
+    @cute.kernel
+    def fc2_kernel_single(self, pointers: cute.Tensor, bits: cute.Tensor,
+                          group_expert: cute.Tensor, route_slots: cute.Tensor,
+                          intermediate: cute.Tensor, fc2: cute.Tensor,
+                          rows: Int32, groups: Int32):
+        """One output block per task, A read straight from global memory.
+
+        This is the engine's original single-block shape, kept for small group
+        counts where the wide form's grid is a single wave: same per-block
+        accumulation order, so it is bitwise interchangeable with the wide
+        kernel and no shared-memory stage is paid.
+        """
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()

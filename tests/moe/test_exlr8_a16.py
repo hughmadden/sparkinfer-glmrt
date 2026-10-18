@@ -63,7 +63,9 @@ def test_rows_groups_packing_cta_invariance(case):
     expected = case.output.clone()
     for rows in range(1, 65):
         # Both live group count and each row's group/lane assignment change.
-        case.routing(rows, chunk=7 if rows % 2 else 16, reverse=bool(rows % 3))
+        # Single-route groups cross the 24-group wide-FC2 threshold.
+        chunk = 1 if rows % 3 == 0 else (7 if rows % 2 else 16)
+        case.routing(rows, chunk=chunk, reverse=bool(rows % 3))
         for limit in (1, 48, 188):
             case.fc1.fill_(float("nan"))
             case.intermediate.fill_(float("nan"))

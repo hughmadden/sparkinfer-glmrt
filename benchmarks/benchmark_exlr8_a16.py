@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import importlib.util
 import json
 from pathlib import Path
 import statistics
@@ -120,6 +121,29 @@ def stage_profile(graph, directory):
     return stages
 
 
+def compile_control(path):
+    """Compile the supplied current-head core under a distinct bench-only key."""
+    from b12x.integration.cuteafd import exlr8 as adapter
+    spec = importlib.util.spec_from_file_location("exlr8_control_core", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original_pointers, original_compile = adapter._Exlr8Pointers, adapter.compile_program
+
+    class ControlPointers(original_pointers):
+        def __init__(self, g):
+            self.core = module.Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"], g["max_groups"])
+
+    def control_compile(*args, **kwargs):
+        kwargs["name"] += "_control"
+        return original_compile(*args, **kwargs)
+
+    try:
+        adapter._Exlr8Pointers, adapter.compile_program = ControlPointers, control_compile
+        return adapter.compile_exlr8_a16_aot(units=4)
+    finally:
+        adapter._Exlr8Pointers, adapter.compile_program = original_pointers, original_compile
+
+
 def make_candidate(experts=256, hidden=6144, units=4, topk=8):
     owners = []
     pointers = torch.empty((experts, units, 3, 3), dtype=torch.int64)
@@ -171,6 +195,8 @@ def main():
     parser.add_argument("--cta-mult",default="",
                         help="EXLR8 cta_limit = SMs * mult (default: the program's ctas_per_sm); "
                              "a comma list times extra arms, the first is the verdict arm")
+    parser.add_argument("--control-core",type=Path,
+                        help="current-head core source for an in-session EXLR8 control")
     parser.add_argument("--profile",action="store_true",
                         help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
     args = parser.parse_args()
@@ -185,6 +211,7 @@ def main():
     read_only = None if args.profile else read_roofline()
     tensors, owners = make_candidate()
     candidate = compile_exlr8_a16_aot(units=4)
+    control = compile_control(args.control_core) if args.control_core else None
     # This is the existing EXL3 uniform-K4 implementation, not a proxy GEMM.
     tier = exl3._prepared(4,256,408,torch.device("cuda"))
     # The legacy helper predates the compiler's codebook default change.
@@ -200,16 +227,22 @@ def main():
         cta_limit = props.multi_processor_count*mults[0]
         # L2 is recorded, never compiled in. Launch limiting changes assignment only.
         launch = lambda: candidate.launch(*(t.flatten() for t in tensors),scalars=(rows,groups,cta_limit))
+        control_launch = (lambda: control.launch(*(t.flatten() for t in tensors),
+                                                 scalars=(rows,groups,cta_limit))) if control else None
         state = (tier,*exl3._serial_state(rows,tier,expert_map,props,torch.device("cuda")))
         baseline_x = tensors[0][:rows].to(torch.bfloat16)
         baseline = lambda: exl3._run_serial(state,baseline_x,tensors[6][:rows],ids)
         if args.profile:
             for _ in range(3):
                 baseline()
+                if control_launch:
+                    control_launch()
                 launch()
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStart()
             baseline()
+            if control_launch:
+                control_launch()
             launch()
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStop()
@@ -222,12 +255,22 @@ def main():
         finite_nonzero(tensors[-1][:rows], "EXLR8")
         finite_nonzero(state[1].output, "EXL3")
         baseline_us, candidate_us = timing(baseline_graph,args.replays), timing(candidate_graph,args.replays)
+        payload_bytes = int(ids.unique().numel())*3*6144*512*4//8
         extra = {}
+        if control_launch:
+            expected = tensors[-1][:rows].clone()
+            control_graph = capture(control_launch)
+            control_graph.replay()
+            if not torch.equal(expected.view(torch.int32), tensors[-1][:rows].view(torch.int32)):
+                raise RuntimeError(f"rows={rows}: candidate differs bitwise from current-head control")
+            control_us = timing(control_graph,args.replays)
+            extra.update(control_exlr8_us=control_us,control_speedup=control_us/candidate_us,
+                         control_read_roofline_percent=100*payload_bytes/control_us/1000/read_only["gbps"])
+            extra["control_stages"] = stage_profile(control_graph,args.output.parent)
         for mult in mults[1:]:
             limit = props.multi_processor_count*mult
             g = capture(lambda: candidate.launch(*(t.flatten() for t in tensors),scalars=(rows,groups,limit)))
             extra[f"exlr8_us_cta{mult}x"] = timing(g,args.replays)
-        payload_bytes = int(ids.unique().numel())*3*6144*512*4//8
         ratio = baseline_us/candidate_us
         records.append(dict(rows=rows,groups=groups,payload_bytes=payload_bytes,
                             exl3_k4_us=baseline_us,exlr8_up1_us=candidate_us,speedup=ratio,
