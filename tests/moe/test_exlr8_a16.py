@@ -248,10 +248,12 @@ def test_shared_expert_grouping_serving_reference_and_graph(case):
     scratch = [torch.empty_like(case.fc1[:4]), torch.empty_like(case.intermediate[:4]),
                torch.empty_like(case.fc2[:4])]
     output = torch.empty_like(case.output)
+    # Expert slices need dedicated aligned tables, retained across graph replays.
+    pointers, bits = case.pointers[3:4].clone(), case.bits[3:4].clone()
 
     def run(rows, limit=96):
         group.launch(ids, experts, slots, inverse, count, scalars=(rows,))
-        shared.launch(case.x, case.pointers[3:4], case.bits[3:4], experts, slots, inverse,
+        shared.launch(case.x, pointers, bits, experts, slots, inverse,
                       gates, *scratch, output, count, scalars=(rows, limit))
 
     # The fixture's fourth expert is the checkpoint's real shared expert. Its
