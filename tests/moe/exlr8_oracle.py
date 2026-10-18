@@ -97,11 +97,16 @@ class Case:
                 for lane, route in enumerate(lane_routes):
                     inverse.flat[route] = 16*g+lane
         self.groups = len(expert)
-        self.group_expert = torch.full((self.max_groups,), -1, dtype=torch.int32, device=self.device)
-        self.route_slots = torch.full((self.max_groups, 16), -1, dtype=torch.int32, device=self.device)
+        # Routing contents change between steps; graph-captured addresses do not.
+        if not hasattr(self, "group_expert"):
+            self.group_expert = torch.empty((self.max_groups,), dtype=torch.int32, device=self.device)
+            self.route_slots = torch.empty((self.max_groups, 16), dtype=torch.int32, device=self.device)
+            self.inverse = torch.empty((64, self.topk), dtype=torch.int32, device=self.device)
+        self.group_expert.fill_(-1)
+        self.route_slots.fill_(-1)
         self.group_expert[:self.groups] = torch.tensor(expert, dtype=torch.int32, device=self.device)
         self.route_slots[:self.groups] = torch.tensor(slots, dtype=torch.int32, device=self.device)
-        self.inverse = torch.from_numpy(inverse).to(self.device)
+        self.inverse.copy_(torch.from_numpy(inverse))
         return self.groups
 
     def tensors(self):
