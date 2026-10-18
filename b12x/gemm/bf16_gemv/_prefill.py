@@ -381,6 +381,7 @@ class Bf16PrefillKernel:
                         smem_thr_copy_A,
                         smem_thr_copy_B,
                     )
+                cute.arch.fence_view_async_shared()
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 
