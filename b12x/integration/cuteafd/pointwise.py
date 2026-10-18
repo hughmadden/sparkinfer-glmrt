@@ -163,6 +163,74 @@ class AffineNorm:
                 out[base + Int64(dim)] = value.to(BFloat16)
 
 
+class RuntimeAffineNorm(AffineNorm):
+    """Runtime epsilon ABI; keep the legacy constant kernel unchanged for AOT users."""
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, bias: cute.Pointer,
+                 cos: cute.Pointer, sin: cute.Pointer, positions: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, epsilon: Float32, stream: cuda.CUstream):
+        self.kernel(x, weight, bias, cos, sin, positions, out, epsilon).launch(
+            grid=(rows, self.heads, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, x: cute.Pointer, weight: cute.Pointer, bias: cute.Pointer,
+               cos: cute.Pointer, sin: cute.Pointer, positions: cute.Pointer, out: cute.Pointer, epsilon: Float32):
+        x, weight, bias = _view(x), _view(weight), _view(bias)
+        cos, sin, positions, out = _view(cos), _view(sin), _view(positions), _view(out)
+        row = Int64(cute.arch.block_idx()[0])
+        head = Int64(cute.arch.block_idx()[1])
+        lane = Int32(cute.arch.thread_idx()[0])
+        base = (row * Int64(self.heads) + head) * Int64(self.width)
+        squares, total = Float32(0.0), Float32(0.0)
+        if cutlass.const_expr(self.width == 192 and self.rotary == 64):
+            if lane < Int32(16):
+                for block in cutlass.range_constexpr(3):
+                    for element in cutlass.range_constexpr(4):
+                        dim = Int64(block * 64 + element) + Int64(lane) * Int64(4)
+                        v = Float32(x[base + dim])
+                        squares = _fma(v, v, squares)
+        elif cutlass.const_expr(self.width == 192 and self.rotary == 192):
+            for element in cutlass.range_constexpr(8):
+                dim = lane * Int32(8) + Int32(element)
+                v = Float32(0.0)
+                if dim < Int32(192):
+                    v = Float32(x[base + Int64(dim)])
+                squares = _fma(v, v, squares)
+        else:
+            for chunk in cutlass.range_constexpr((self.width + 31) // 32):
+                dim = Int32(chunk * 32) + lane
+                if dim < Int32(self.width):
+                    v = Float32(x[base + Int64(dim)])
+                    squares = _add(squares, _mul(v, v))
+                    total = _add(total, v)
+        squares = _warp_sum(squares)
+        mean = Float32(0.0)
+        variance = div_rn_f32(squares, Float32(self.width))
+        if cutlass.const_expr(self.subtract_mean):
+            mean = div_rn_f32(_warp_sum(total), Float32(self.width))
+            variance = _sub(variance, _mul(mean, mean))
+        inv = rsqrt_approx_ftz_f32(_add(variance, epsilon))
+        for chunk in cutlass.range_constexpr((self.width + 31) // 32):
+            dim = Int32(chunk * 32) + lane
+            if dim < Int32(self.width):
+                value = self._normalized(x, weight, bias, base, dim, mean, inv)
+                if cutlass.const_expr(self.rotary > 0):
+                    half = Int32(self.rotary // 2)
+                    if dim < Int32(self.rotary):
+                        pair = dim % half
+                        real = self._normalized(x, weight, bias, base, pair, mean, inv)
+                        imag = self._normalized(x, weight, bias, base, pair + half, mean, inv)
+                        position = Int64(positions[row])
+                        cache_at = position * Int64(self.rotary // 2) + Int64(pair)
+                        c, s = Float32(cos[cache_at]), Float32(sin[cache_at])
+                        if dim < half:
+                            value = _sub(_mul(real, c), _mul(imag, s))
+                        else:
+                            value = _fma(real, s, _mul(imag, c))
+                out[base + Int64(dim)] = value.to(BFloat16)
+
+
 class ResidualAdd:
     def __init__(self, width):
         self.width = int(width)
@@ -325,7 +393,10 @@ def compile_bf16_scaled_projection_aot(*, width, outputs, prescale):
 def compile_affine_norm_aot(*, width, heads=1, eps=1e-5, zero_centered=False,
                             subtract_mean=False, bias=False, rotary=0,
                             input_dtype=torch.float32, parameter_dtype=torch.float32):
-    launch = AffineNorm(width, heads, eps, zero_centered, subtract_mean, bias, rotary)
+    # None explicitly selects the scalar ABI; the historical default stays constant.
+    launch = (RuntimeAffineNorm(width, heads, 1.0, zero_centered, subtract_mean, bias, rotary)
+              if eps is None else
+              AffineNorm(width, heads, eps, zero_centered, subtract_mean, bias, rotary))
     if width == 192 and rotary and (subtract_mean or bias):
         raise ValueError("fixed D192 Q/K reduction requires RMSNorm without bias")
     operands = (Operand("x", _dtype(input_dtype), f"[rows,{heads},{width}]"),
@@ -335,6 +406,12 @@ def compile_affine_norm_aot(*, width, heads=1, eps=1e-5, zero_centered=False,
         Operand("sin", torch.bfloat16, f"[positions,{rotary // 2}] (ignored unless rotary)"),
         Operand("positions", torch.int64, "[rows] (ignored unless rotary)"),
         Operand("out", torch.bfloat16, f"[rows,{heads},{width}]", "out"))
+    if eps is None:
+        return compile_program(launch, name="affine_norm_runtime_eps", operands=operands,
+            scalars=(Scalar("rows"), Scalar("epsilon", "float32")),
+            key=(width, heads, zero_centered, subtract_mean, bias, rotary, input_dtype, parameter_dtype),
+            geometry=dict(width=width, heads=heads, epsilon="runtime_float32", zero_centered=zero_centered,
+                subtract_mean=subtract_mean, bias=bias, rotary=rotary))
     return compile_program(launch, name="affine_norm", operands=operands, scalars=(Scalar("rows"),),
         key=(width, heads, eps, zero_centered, subtract_mean, bias, rotary, input_dtype, parameter_dtype),
         geometry=dict(width=width, heads=heads, eps=eps, zero_centered=zero_centered,
