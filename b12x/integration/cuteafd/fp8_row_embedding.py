@@ -6,8 +6,20 @@ import cutlass.cute as cute
 import torch
 from cuda.bindings import driver as cuda
 from ._common import Operand, Scalar, compile_program
+from cutlass import Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 from b12x._lib.intrinsics import ld_global_b16, u32_as_f32
-from b12x.gemm.native_scaled_linear import _fp8_pair
+
+
+@dsl_user_op
+def _fp8_pair(packed: Uint32, *, loc=None, ip=None):
+    """Exact bf16x2 of two packed E4M3 (low byte first)."""
+    return Uint32(llvm.inline_asm(
+        T.i32(), [packed.ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 q; cvt.u16.u32 q, $1; cvt.rn.bf16x2.e4m3x2 $0, q; }",
+        "=r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
 
 
 class _Gather:

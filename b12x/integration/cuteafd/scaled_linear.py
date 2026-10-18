@@ -1,7 +1,8 @@
 """Shared native MXFP8/int4-g32/row-FP8 linear ABI v1.
 
-Pointer order: x BF16[rows,K], payload U8, scales, partial (unused since the
-tile core: no scratch, may be any pointer), output F32[rows,N]. Scalars rows/cta_limit I32, then stream. Payload is native
+Pointer order: x BF16[rows,K], payload U8, scales, partial (unused by the tile
+core: zero scratch bytes, any pointer), output F32[rows,N]. Scalars rows and
+cta_limit I32, then stream. Payload is native
 [out,in] (int4 low nibble first, biased by 8), or side2 [in/128,out,128]
 (int4 last dimension 64 bytes). Group scales are [out,in/32], or
 [in/128,out,4]. MXFP8 uses UE8M0 bytes; int4 uses F16. Row-FP8 uses F32[out].
@@ -28,12 +29,12 @@ def geometry(input_features, output_features, *, encoding="mxfp8", sharded_side=
         raise ValueError("unsupported native encoding or shard side")
     if encoding == "fp8_row" and sharded_side != 1:
         raise ValueError("row-FP8 uses output-major storage")
-    splits = (input_features+1023)//1024
-    tasks = (max_rows+15)//16*(output_features//32)*splits
-    if max(tasks, max_rows*((output_features+127)//128)) > (2**31-1)//2:
+    # Prefill tiles (128 rows x 64 columns at the finest) and column indices stay int32;
+    # weights stay far inside 64-bit byte addressing.
+    if (max_rows+127)//128*((output_features+63)//64) > (2**31-1)//2 or output_features+128 > 2**31-1:
         raise ValueError("native linear grid indexing exceeds int32")
-    if max_rows*splits*output_features*4 > 2**63-1:
-        raise ValueError("native linear scratch exceeds int64")
+    if input_features*output_features > 2**40:
+        raise ValueError("native linear weight exceeds 2^40 elements")
     # Tile core (every encoding): fixed per-shape K segments folded in order, no split-K
     # partials; ``partial`` stays in the pointer list for ABI v1 and is never touched.
     # Segments come from the weight shape only (never the device): enough parallel
@@ -65,7 +66,7 @@ class _Pointers:
 
 def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp8", sharded_side=1, max_rows=4096):
     g = geometry(input_features,output_features,encoding=encoding,sharded_side=sharded_side,max_rows=max_rows)
-    k,n,s = input_features,output_features,g["splits"]
+    k,n = input_features,output_features
     scale_dtype = {"mxfp8":torch.uint8,"int4_g32":torch.float16,"fp8_row":torch.float32}[encoding]
     payload_size = k*n//(2 if encoding == "int4_g32" else 1)
     scale_size = n if encoding == "fp8_row" else n*k//32
