@@ -205,3 +205,129 @@ def test_sparse_gqa_d192_against_official_prefill():
     expected, _ = official.sparse_attention_prefill(q, k.view(-1, groups, 192), v.view(-1, groups, 192),
                                                    packed, counts, num_kv_groups=groups, block_regions=4)
     torch.testing.assert_close(output.float(), expected.float(), atol=0.006, rtol=0.006)
+
+
+# Frozen pre-fusion MMA oracle: keep its instruction and accumulation order.
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+from cutlass import Float32, Int32, Int64, Uint32
+from b12x._lib.intrinsics import cvt_bf16x2x2_to_e4m3x4, mma_m16n8k32_f32_e4m3
+
+
+class _UnfusedScoreReference:
+    def __init__(self, groups: int, capacity: int):
+        self.groups = groups
+        self.capacity = capacity
+
+    @cute.jit
+    def __call__(self, query: cute.Pointer, weights: cute.Pointer,
+                 summaries: cute.Pointer, requests: cute.Pointer,
+                 positions: cute.Pointer, scores: cute.Pointer,
+                 rows: Int32, limit: Int64, stream: cuda.CUstream):
+        self.kernel(query, weights, summaries, requests, positions, scores, limit).launch(
+            grid=((self.capacity + 63) // 64, rows, self.groups),
+            block=(128, 1, 1), stream=stream)
+
+    @cute.jit
+    def packed_query(self, pointer: cute.Pointer, offset: Int64):
+        # Round Q once per packed fragment, without widening the stored FP8 K.
+        words = cute.recast_ptr((pointer + offset).align(4), dtype=Uint32)
+        return cvt_bf16x2x2_to_e4m3x4(words[0], words[1])
+
+    @cute.jit
+    def packed_summary(self, pointer: cute.Pointer, offset: Int64):
+        return cute.recast_ptr((pointer + offset).align(4), dtype=Uint32)[0].to(Uint32)
+
+    @cute.kernel
+    def kernel(self, query: cute.Pointer, weights: cute.Pointer,
+               summaries: cute.Pointer, requests: cute.Pointer,
+               positions: cute.Pointer, scores: cute.Pointer, limit: Int64):
+        tile, row, group = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        lane = Int32(thread) % Int32(32)
+        warp = Int32(thread) // Int32(32)
+        matrix_row = lane // Int32(4)
+        matrix_pair = lane % Int32(4)
+        start = Int32(tile) * Int32(64) + warp * Int32(16)
+        request = requests[row].to(Int64)
+        visible = positions[row].to(Int64) // Int64(8)
+        base = cute.make_rmem_tensor((2,), Int64)
+        valid = cute.make_rmem_tensor((2,), Int32)
+        for part in cutlass.range_constexpr(2):
+            region = start + matrix_row + Int32(part * 8)
+            valid[part] = Int32(0)
+            base[part] = Int64(0)
+            if (request >= Int64(0)) & (request < limit) & (region < self.capacity) & (region.to(Int64) < visible):
+                valid[part] = Int32(1)
+                base[part] = (request * Int64(self.capacity) + region.to(Int64)) * Int64(256)
+        d0, d1, d2, d3 = Float32(0), Float32(0), Float32(0), Float32(0)
+        for tile_d in cutlass.range_constexpr(8):
+            dim = Int64(tile_d * 32) + matrix_pair.to(Int64) * Int64(4)
+            a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+            if valid[0] != 0:
+                a0 = self.packed_summary(summaries, base[0] + dim)
+                a2 = self.packed_summary(summaries, base[0] + dim + Int64(16))
+            if valid[1] != 0:
+                a1 = self.packed_summary(summaries, base[1] + dim)
+                a3 = self.packed_summary(summaries, base[1] + dim + Int64(16))
+            b0, b1 = Uint32(0), Uint32(0)
+            if matrix_row < Int32(4):
+                qbase = ((Int64(row) * Int64(self.groups) + Int64(group)) * Int64(4)
+                         + matrix_row.to(Int64)) * Int64(256) + dim
+                b0 = self.packed_query(query, qbase)
+                b1 = self.packed_query(query, qbase + Int64(16))
+            d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
+                d0, d1, d2, d3, a0, a1, a2, a3, b0, b1)
+        for part in cutlass.range_constexpr(2):
+            first = cutlass.max(d0 if part == 0 else d2, Float32(0))
+            second = cutlass.max(d1 if part == 0 else d3, Float32(0))
+            score = Float32(0)
+            for head in cutlass.range_constexpr(4):
+                value = first if head % 2 == 0 else second
+                value = cute.arch.shuffle_sync(value, (lane // Int32(4)) * Int32(4) + Int32(head // 2))
+                weight = weights[(Int64(row) * Int64(self.groups) + Int64(group)) * Int64(4) + Int64(head)]
+                score = score + value * Float32(weight)
+            if valid[part] == 0:
+                score = Float32(-float("inf"))
+            region = start + matrix_row + Int32(part * 8)
+            if (matrix_pair == Int32(0)) & (region < self.capacity):
+                offset = (Int64(row) * Int64(self.groups) + Int64(group)) * Int64(self.capacity) + region.to(Int64)
+                scores[offset] = score
+
+
+@pytest.mark.parametrize("groups", [1, 2, 3, 4])
+@pytest.mark.parametrize("capacity", [1, 63, 64, 65, 127, 128, 129, 513])
+def test_fused_scores_byte_exact_to_unfused(groups, capacity):
+    from b12x._lib.utils import current_cuda_stream
+    from b12x.attention.paged._weighted_regions import _ptr, score_regions
+    device = require_b12x()
+    rows = 8
+    query = torch.randn(rows, groups, 4, 256, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(rows, groups, 4, device=device)
+    summaries = torch.randn(2, capacity, 256, device=device).to(torch.float8_e4m3fn)
+    # Include exact cancellations, signed zeros, and identical-summary ties.
+    query[2].fill_(0)
+    query[3].fill_(1)
+    weights[2] = torch.tensor([-0.0, 0.0, -1.0, 1.0], device=device)
+    weights[3] = torch.tensor([1.0, -1.0, 1.0, -1.0], device=device)
+    summaries[:, ::2] = summaries[:, :1].clone().expand(-1, summaries[:, ::2].shape[1], -1)
+    requests = torch.tensor([0, 1, 0, 1, 0, -1, 2, 1], device=device, dtype=torch.int32)
+    positions = torch.tensor([0, 8, capacity*8, capacity*8+7, 65*8, 8, 8, 129*8],
+                             device=device, dtype=torch.int64)
+    expected = torch.empty(rows, groups, capacity, device=device)
+    output = torch.empty_like(expected)
+    tensors = (query, weights, summaries, requests, positions, expected)
+    reference = cute.compile(_UnfusedScoreReference(groups, capacity),
+                             *map(_ptr, tensors), Int32(rows), Int64(2), current_cuda_stream())
+    reference(*map(_ptr, tensors), rows, 2, current_cuda_stream())
+    kwargs = dict(query=query, weights=weights, summaries=summaries,
+                  requests=requests, positions=positions, output=output)
+    score_regions(**kwargs)
+    assert torch.equal(output.view(torch.int32), expected.view(torch.int32))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        score_regions(**kwargs)
+    output.fill_(float("nan"))
+    graph.replay()
+    assert torch.equal(output.view(torch.int32), expected.view(torch.int32))
