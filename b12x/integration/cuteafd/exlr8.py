@@ -94,7 +94,12 @@ class _Exlr8ServingPointers:
 
 
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
-                         device_count=False):
+                         device_count=False, shared_expert=False):
+    if shared_expert:
+        if not device_count:
+            raise ValueError("shared EXLR8 requires device-count serving ABI")
+        if top_k != 1 or max_groups != 4:
+            raise ValueError("shared EXLR8 requires top_k=1 and max_groups=4")
     g = geometry(hidden, units, top_k, max_groups)
     h, u, t, m, s = (g[k] for k in ("hidden", "units", "top_k", "max_groups", "fc1_splits"))
     operands = (
@@ -115,9 +120,10 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
         g["abi_version"] = 2
         operands += (Operand("group_count", torch.int32, "[1]"),)
     return compile_program(_Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
-                           name="exlr8_a16_serving" if device_count else "exlr8_a16_decode", operands=operands,
+                           name=("exlr8_shared_a16_serving" if shared_expert else
+                                 "exlr8_a16_serving" if device_count else "exlr8_a16_decode"), operands=operands,
                            scalars=tuple(Scalar(n) for n in (("rows", "cta_limit") if device_count
                                                             else ("rows", "groups", "cta_limit"))),
-                           key=(h, u, t, m, g["abi_version"]), geometry=g,
+                           key=(h, u, t, m, g["abi_version"], shared_expert), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)

@@ -148,18 +148,21 @@ class _Reduce:
             task += step
 
 
-def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512):
+def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, shared_expert=False):
+    if shared_expert and (experts, top_k, max_groups) != (1, 1, 4):
+        raise ValueError("shared EXLR8 grouping requires experts=1, top_k=1, max_groups=4")
     if (any(type(v) is not int for v in (experts, top_k, max_groups))
             or not (1 <= experts <= 256 and 1 <= top_k <= 32
                     and 0 < max_groups <= (2**31 - 1) // 16)):
         raise ValueError("EXLR8 grouping requires experts1..256, top_k1..32 and positive capacity")
-    return compile_program(_Group(experts, top_k, max_groups), name="exlr8_group",
+    return compile_program(_Group(experts, top_k, max_groups),
+        name="exlr8_shared_group" if shared_expert else "exlr8_group",
         operands=(Operand("ids", torch.int32, f"[rows,{top_k}]"),
                   Operand("group_expert", torch.int32, f"[{max_groups}]", "out"),
                   Operand("route_slots", torch.int32, f"[{max_groups},16]", "out"),
                   Operand("route_group_lane", torch.int32, f"[rows,{top_k}]", "out"),
                   Operand("group_count", torch.int32, "[1]", "out")),
-        scalars=(Scalar("rows"),), key=(experts, top_k, max_groups),
+        scalars=(Scalar("rows"),), key=(experts, top_k, max_groups, shared_expert),
         geometry=dict(abi_version=1, experts=experts, top_k=top_k, max_groups=max_groups, max_rows=64))
 
 
@@ -193,3 +196,33 @@ def compile_exlr8_reduce_aot(*, hidden=6144, max_ranks=6, max_rows=4096):
                   Operand("output", torch.bfloat16, f"[rows,{hidden}]", "out")),
         scalars=(Scalar("rows"), Scalar("ranks"), Scalar("cta_limit")), key=(hidden, max_ranks, max_rows),
         geometry=dict(abi_version=1, hidden=hidden, max_ranks=max_ranks, max_rows=max_rows, ctas_per_sm=4))
+
+
+def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_groups=512):
+    """Exporter tuples and role ownership; callers must not duplicate this list."""
+    from .exlr8 import compile_exlr8_a16_aot
+    if role not in ("all", "coordinator", "spark"):
+        raise ValueError(f"unknown EXLR8 export role {role!r}")
+    result = [
+        ("a16_decode", "exlr8_a16", {"max_rows": 64},
+         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k, max_groups=max_groups)),
+        ("a16_serving", "exlr8_a16", {"max_rows": 64},
+         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+                                      max_groups=max_groups, device_count=True)),
+        ("group", "exlr8_group", {"max_rows": 64},
+         lambda: compile_exlr8_group_aot(top_k=top_k, max_groups=max_groups)),
+        ("rotate", "exlr8_rotate", {"max_rows": 4096},
+         lambda: compile_exlr8_rotate_aot(hidden=hidden)),
+        ("reduce", "exlr8_reduce", {"max_rows": 4096},
+         lambda: compile_exlr8_reduce_aot(hidden=hidden)),
+        ("shared_a16_serving", "exlr8_a16", {"max_rows": 64},
+         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=1,
+                                      max_groups=4, device_count=True, shared_expert=True)),
+        ("shared_group", "exlr8_group", {"max_rows": 64},
+         lambda: compile_exlr8_group_aot(experts=1, top_k=1, max_groups=4, shared_expert=True)),
+    ]
+    if role == "spark":
+        return result[1:3]
+    if role == "coordinator":
+        return result[3:]
+    return result
