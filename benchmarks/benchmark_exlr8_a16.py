@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Graph-first matched-byte EXLR8 up1 versus EXL3 K4 Spark-step gate."""
+from __future__ import annotations
+
+import argparse
+import functools
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import statistics
+import sys
+import tempfile
+
+import numpy as np
+import torch
+import triton
+import triton.language as tl
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from benchmarks import benchmark_mixed_trellis as exl3
+from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
+
+
+def capture(fn):
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    return graph
+
+
+def timing(graph, replays):
+    values = []
+    for _ in range(5):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(replays):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        values.append(start.elapsed_time(end)*1000/replays)
+    return statistics.median(values)
+
+
+def copy_roofline():
+    # Count both the read and write; expert payload throughput counts reads only.
+    size = 256 * 1024 * 1024
+    src = torch.empty(size, dtype=torch.uint8, device="cuda")
+    dst = torch.empty_like(src)
+    src.fill_(17)
+    graph = capture(lambda: dst.copy_(src))
+    values = []
+    for _ in range(5):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(10):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        values.append(2 * size * 10 / (start.elapsed_time(end) * 1e6))
+    return dict(buffer_bytes=size, gbps=max(values), repeats_gbps=values,
+                convention="2N bytes per copy (read plus write); expert payload uses N read bytes")
+
+
+@triton.jit
+def _read_stream(src, sums, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(src + offsets)
+    # Keep every vectorized global load live with only one 4-byte store per CTA.
+    tl.store(sums + tl.program_id(0), tl.sum(values, axis=0))
+
+
+def read_roofline():
+    size = 256 * 1024 * 1024
+    block = 4096
+    src = torch.full((size // 4,), 17.0, dtype=torch.float32, device="cuda")
+    sums = torch.empty((src.numel() // block,), device="cuda")
+    graph = capture(lambda: _read_stream[(sums.numel(),)](src, sums, BLOCK=block))
+    if not bool((sums == 17 * block).all()):
+        raise RuntimeError("read-only stream did not consume the full buffer")
+    values = []
+    for _ in range(5):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(10):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        values.append(size * 10 / (start.elapsed_time(end) * 1e6))
+    return dict(buffer_bytes=size, gbps=max(values), repeats_gbps=values,
+                checksum_bytes=sums.numel() * 4,
+                convention="N global-load bytes; one checksum float store per 16 KiB read")
+
+
+def finite_nonzero(tensor, label):
+    if not bool(torch.isfinite(tensor).all()) or not bool(torch.count_nonzero(tensor)):
+        raise RuntimeError(f"{label} output must be finite and nonzero")
+
+
+def stage_profile(graph, directory):
+    # Profiling is a separate replay: it never supplies the performance verdict.
+    from torch.profiler import profile, ProfilerActivity
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        graph.replay()
+        torch.cuda.synchronize()
+    with tempfile.NamedTemporaryFile(suffix=".json", dir=directory) as stream:
+        prof.export_chrome_trace(stream.name)
+        events = json.loads(Path(stream.name).read_text())["traceEvents"]
+    kernels = [e for e in events if e.get("cat") == "kernel"]
+    stages = {}
+    for stage in ("fc1", "activation", "fc2", "reduce"):
+        matches = [e for e in kernels if stage+"_kernel" in e.get("name", "")]
+        if not matches:
+            raise RuntimeError(f"profiler did not identify {stage} kernel")
+        stages[stage+"_us"] = sum(e["dur"] for e in matches)
+    span = max(e["ts"]+e["dur"] for e in kernels)-min(e["ts"] for e in kernels)
+    stages["launch_gaps_us"] = max(0.0, span-sum(e["dur"] for e in kernels))
+    stages["profiled_span_us"] = span
+    return stages
+
+
+def compile_control(path):
+    """Compile the supplied current-head core under a distinct bench-only key."""
+    from b12x.integration.cuteafd import exlr8 as adapter
+    source = path.read_bytes()
+    digest = hashlib.sha256(source).hexdigest()
+    spec = importlib.util.spec_from_file_location("exlr8_control_core", path)
+    module = importlib.util.module_from_spec(spec)
+    exec(compile(source, str(path), "exec"), module.__dict__)
+    original_pointers, original_compile = adapter._Exlr8Pointers, adapter.compile_program
+
+    class ControlPointers(original_pointers):
+        def __init__(self, g):
+            self.core = module.Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"], g["max_groups"])
+
+    def control_compile(*args, **kwargs):
+        kwargs["name"] += "_control"
+        kwargs["key"] = (*kwargs["key"], digest)
+        return original_compile(*args, **kwargs)
+
+    try:
+        adapter._Exlr8Pointers, adapter.compile_program = ControlPointers, control_compile
+        return adapter.compile_exlr8_a16_aot(units=4)
+    finally:
+        adapter._Exlr8Pointers, adapter.compile_program = original_pointers, original_compile
+
+
+def validate_control(graph, tensors, expected, rows):
+    # A replay must produce its own values, never inherit candidate writes.
+    for tensor in tensors[7:]:
+        tensor.fill_(float("nan"))
+    graph.replay()
+    if not torch.equal(expected.view(torch.int32), tensors[-1][:rows].view(torch.int32)):
+        raise RuntimeError(f"rows={rows}: candidate differs bitwise from current-head control")
+
+
+def make_candidate(experts=256, hidden=6144, units=4, topk=8):
+    owners = []
+    pointers = torch.empty((experts, units, 3, 3), dtype=torch.int64)
+    for e in range(experts):
+        for u in range(units):
+            for p in range(3):
+                tensors = (torch.randint(0, 256, (hidden*16*4,), dtype=torch.uint8, device="cuda"),
+                           torch.ones(128, dtype=torch.float16, device="cuda"),
+                           torch.full((hidden//128,), 1 / hidden**0.5, dtype=torch.float16, device="cuda"))
+                owners.extend(tensors)
+                pointers[e,u,p] = torch.tensor([t.data_ptr() for t in tensors])
+    groups = 64*topk
+    tensors = [torch.randn((64,hidden), dtype=torch.float16, device="cuda")*.02,
+               pointers.to("cuda"), torch.full((experts,units,3),4,dtype=torch.int32,device="cuda"),
+               torch.full((groups,),-1,dtype=torch.int32,device="cuda"),
+               torch.full((groups,16),-1,dtype=torch.int32,device="cuda"),
+               torch.full((64,topk),-1,dtype=torch.int32,device="cuda"),
+               torch.full((64,topk),1/topk,device="cuda"),
+               torch.empty((groups,units,2,(hidden+1023)//1024,16,128),device="cuda"),
+               torch.empty((groups,units,16,128),dtype=torch.float16,device="cuda"),
+               torch.empty((groups,16,hidden),device="cuda"),
+               torch.empty((64,hidden),device="cuda")]
+    return tensors, owners
+
+
+def pack(tensors, ids):
+    slots = ids.cpu().numpy()
+    expert, routes = [], []
+    inverse = np.full(slots.shape,-1,dtype=np.int32)
+    for e in sorted(set(slots.flat)):
+        positions = np.flatnonzero(slots.ravel()==e)
+        for start in range(0,len(positions),16):
+            subset = positions[start:start+16]
+            g = len(expert)
+            expert.append(int(e))
+            routes.append(list(subset)+[-1]*(16-len(subset)))
+            inverse.flat[subset] = g*16+np.arange(len(subset))
+    tensors[3][:len(expert)] = torch.tensor(expert,dtype=torch.int32,device="cuda")
+    tensors[4][:len(expert)] = torch.tensor(routes,dtype=torch.int32,device="cuda")
+    tensors[5][:len(ids)] = torch.from_numpy(inverse).cuda()
+    return len(expert)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64")
+    parser.add_argument("--replays",type=int,default=100)
+    parser.add_argument("--output",type=Path)
+    parser.add_argument("--cta-mult",default="",
+                        help="EXLR8 cta_limit = SMs * mult (default: the program's ctas_per_sm); "
+                             "a comma list times extra arms, the first is the verdict arm")
+    parser.add_argument("--control-core",type=Path,
+                        help="current-head core source for an in-session EXLR8 control")
+    parser.add_argument("--profile",action="store_true",
+                        help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
+    args = parser.parse_args()
+    if not args.profile and args.output is None:
+        parser.error("--output is required unless --profile")
+    if torch.cuda.get_device_capability() != (12,1):
+        parser.error("this performance gate requires SM121")
+    props = torch.cuda.get_device_properties(0)
+    if not args.profile:
+        args.output.parent.mkdir(parents=True,exist_ok=True)
+    roofline = None if args.profile else copy_roofline()
+    read_only = None if args.profile else read_roofline()
+    tensors, owners = make_candidate()
+    candidate = compile_exlr8_a16_aot(units=4)
+    control = compile_control(args.control_core) if args.control_core else None
+    # This is the existing EXL3 uniform-K4 implementation, not a proxy GEMM.
+    tier = exl3._prepared(4,256,408,torch.device("cuda"))
+    # The legacy helper predates the compiler's codebook default change.
+    exl3.compile_w4a16_fused_moe = functools.partial(
+        exl3.compile_w4a16_fused_moe, trellis_codebook=tier.trellis_codebook)
+    expert_map = torch.arange(256,dtype=torch.int32,device="cuda")
+    records = []
+    for rows in map(int,args.rows.split(",")):
+        gen = torch.Generator().manual_seed(408+rows)
+        ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(rows)]).cuda().int()
+        groups = pack(tensors,ids)
+        mults = [int(m) for m in args.cta_mult.split(",")] if args.cta_mult else [candidate.geometry["ctas_per_sm"]]
+        cta_limit = props.multi_processor_count*mults[0]
+        # L2 is recorded, never compiled in. Launch limiting changes assignment only.
+        launch = lambda: candidate.launch(*(t.flatten() for t in tensors),scalars=(rows,groups,cta_limit))
+        control_launch = (lambda: control.launch(*(t.flatten() for t in tensors),
+                                                 scalars=(rows,groups,cta_limit))) if control else None
+        state = (tier,*exl3._serial_state(rows,tier,expert_map,props,torch.device("cuda")))
+        baseline_x = tensors[0][:rows].to(torch.bfloat16)
+        baseline = lambda: exl3._run_serial(state,baseline_x,tensors[6][:rows],ids)
+        if args.profile:
+            for _ in range(3):
+                baseline()
+                if control_launch:
+                    control_launch()
+                launch()
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
+            baseline()
+            if control_launch:
+                control_launch()
+            launch()
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
+            finite_nonzero(tensors[-1][:rows], "EXLR8")
+            print(f"profiled rows={rows} groups={groups} unique={int(ids.unique().numel())}", flush=True)
+            continue
+        baseline_graph, candidate_graph = capture(baseline), capture(launch)
+        candidate_graph.replay()
+        baseline_graph.replay()
+        finite_nonzero(tensors[-1][:rows], "EXLR8")
+        finite_nonzero(state[1].output, "EXL3")
+        baseline_us, candidate_us = timing(baseline_graph,args.replays), timing(candidate_graph,args.replays)
+        payload_bytes = int(ids.unique().numel())*3*6144*512*4//8
+        extra = {}
+        if control_launch:
+            expected = tensors[-1][:rows].clone()
+            control_graph = capture(control_launch)
+            validate_control(control_graph,tensors,expected,rows)
+            control_us = timing(control_graph,args.replays)
+            extra.update(control_exlr8_us=control_us,control_speedup=control_us/candidate_us,
+                         control_read_roofline_percent=100*payload_bytes/control_us/1000/read_only["gbps"])
+            extra["control_stages"] = stage_profile(control_graph,args.output.parent)
+        for mult in mults[1:]:
+            limit = props.multi_processor_count*mult
+            g = capture(lambda: candidate.launch(*(t.flatten() for t in tensors),scalars=(rows,groups,limit)))
+            extra[f"exlr8_us_cta{mult}x"] = timing(g,args.replays)
+        ratio = baseline_us/candidate_us
+        records.append(dict(rows=rows,groups=groups,payload_bytes=payload_bytes,
+                            exl3_k4_us=baseline_us,exlr8_up1_us=candidate_us,speedup=ratio,
+                            exl3_gbps=payload_bytes/baseline_us/1000,
+                            exlr8_gbps=payload_bytes/candidate_us/1000,
+                            roofline_percent=100*payload_bytes/candidate_us/1000/roofline["gbps"],
+                            read_roofline_percent=100*payload_bytes/candidate_us/1000/read_only["gbps"],
+                            exl3_read_roofline_percent=100*payload_bytes/baseline_us/1000/read_only["gbps"],
+                            optimization_target=0.97,target_met=ratio>=0.97,cta_mult=mults[0],**extra,
+                            **stage_profile(candidate_graph,args.output.parent)))
+    if args.profile:
+        return
+    result = dict(schema=1,kind="exlr8_up1_vs_exl3_k4",device=props.name,
+                  sm_count=props.multi_processor_count,l2_bytes=getattr(props,"L2_cache_size",None),
+                  hidden=6144,units_per_rank=4,top_k=8,experts=256,
+                  measured_copy_roofline=roofline,measured_read_roofline=read_only,
+                  conditions="TP4 synthetic K4 payloads, graph replay, one untimed warm batch per rows; profiler separate",
+                  rows=records,target_met=all(r["target_met"] for r in records))
+    with args.output.open("x") as stream:
+        json.dump(result,stream,indent=2)
+    print(json.dumps(result,indent=2))
+
+
+if __name__ == "__main__":
+    main()
