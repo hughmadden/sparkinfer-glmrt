@@ -135,9 +135,10 @@ class History:
         return key, value
 
 
-@pytest.mark.parametrize("heads", [48, 96])
-@pytest.mark.parametrize("mode,rows", [("decode", 1), ("decode", 16), ("verify", 64), ("extend", 4096)])
-def test_real_mla_gpu_and_graph_replay(heads, mode, rows):
+@pytest.mark.parametrize("heads,rank", [(48, 0), (48, 1), (96, 0)])
+@pytest.mark.parametrize("mode,rows", [(mode, rows) for mode in ("decode", "verify", "extend")
+                                     for rows in (1, 16, 64)] + [("extend", 4096)])
+def test_real_mla_gpu_and_graph_replay(heads, rank, mode, rows):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     from b12x.integration.cuteafd.kimi_mla import (KimiMlaGeometry, compile_kimi_mla_producer_aot,
@@ -145,21 +146,24 @@ def test_real_mla_gpu_and_graph_replay(heads, mode, rows):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     g = KimiMlaGeometry(heads=heads)
-    model = module("cuda", heads=heads)
+    model = module("cuda", heads=heads, rank=rank)
     packed = {name: param.detach().bfloat16().contiguous() for name, param in model.named_parameters()}
     w = torch.cat((packed["q_a_proj.weight"], packed["kv_a_proj_with_mqa.weight"])).contiguous()
     uk, uv = packed["kv_b_proj.weight"].reshape(heads, 256, 512).split(128, dim=1)
     uk = uk.transpose(1, 2).contiguous()
     uv = uv.contiguous()
-    capacity = 4096 if mode == "extend" else 64
-    context = 4352 if mode == "extend" else 256
+    capacity = 4096 if rows == 4096 else 64
+    context = 4352 if rows == 4096 else 256
     producer = compile_kimi_mla_producer_aot(g, max_rows=capacity)
     attention = compile_kimi_dense_mla_aot(g, max_rows=capacity, max_context=context, mode=mode)
     output = compile_kimi_mla_output_aot(g, max_rows=capacity)
     cache = torch.full(((context + 63) // 64, 64, 576), float("nan"), dtype=torch.bfloat16, device="cuda")
-    table = torch.arange(cache.shape[0], dtype=torch.int32, device="cuda")[None]
+    table = torch.arange(cache.shape[0] - 1, -1, -1, dtype=torch.int32, device="cuda")[None]
+    def physical_slots(count, begin=0):
+        logical = torch.arange(begin, begin + count, device="cuda")
+        return table[0, logical // 64].long() * 64 + logical % 64
     history = History()
-    prefix = 65 if mode != "extend" else 0
+    prefix = 65
     x = inputs(rows + prefix, "cuda")
     q = torch.empty(rows, heads, 576, dtype=torch.bfloat16, device="cuda")
     qr = torch.empty(rows, 1536, dtype=torch.bfloat16, device="cuda")
@@ -172,12 +176,13 @@ def test_real_mla_gpu_and_graph_replay(heads, mode, rows):
         px = x[:prefix].contiguous()
         pq, pr = torch.empty(prefix, heads, 576, dtype=torch.bfloat16, device="cuda"), torch.empty(prefix, 1536, dtype=torch.bfloat16, device="cuda")
         ps = torch.empty(producer.scratch_bytes(prefix)["scratch"], dtype=torch.uint8, device="cuda")
-        producer.launch(px, torch.arange(prefix, device="cuda"), w, packed["q_a_layernorm.weight"],
+        producer.launch(px, physical_slots(prefix), w, packed["q_a_layernorm.weight"],
             packed["kv_a_layernorm.weight"], packed["q_b_proj.weight"], uk, cache, pq, pr, ps, scalars=(prefix,))
         with torch.no_grad():
             model(px.float()[None], attention_mask=mask(prefix, prefix, "cuda", torch.float32), past_key_values=history)
     live = x[prefix:].contiguous()
-    slots = torch.arange(prefix, prefix + rows, device="cuda")
+    saved_prefix = cache.clone()
+    slots = physical_slots(rows, prefix)
     lengths = torch.tensor([prefix + rows], dtype=torch.int32, device="cuda")
     cu = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
     splits = attention.geometry["num_splits"]
@@ -204,3 +209,15 @@ def test_real_mla_gpu_and_graph_replay(heads, mode, rows):
     torch.cuda.synchronize()
     for actual, expected in zip((y, q, cache, lse), baseline):
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    # Restore the exact frontier, including the partial page. Replaying the
+    # continuation must regenerate every cache byte and output identically.
+    cache.copy_(saved_prefix)
+    run()
+    for actual, expected in zip((y, q, cache, lse), baseline):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    # Padding rows still compute queries but must not overwrite a cache slot.
+    slots.fill_(-1)
+    before = cache.clone()
+    producer.launch(live, slots, w, packed["q_a_layernorm.weight"], packed["kv_a_layernorm.weight"],
+                    packed["q_b_proj.weight"], uk, cache, q, qr, scratch[0], scalars=(rows,))
+    assert torch.equal(cache.view(torch.uint8), before.view(torch.uint8))
