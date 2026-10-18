@@ -76,6 +76,13 @@ def test_rope_full_extent_official_bytes(kind, span):
         graph.replay()
     for actual, oracle in zip(outputs, expected):
         assert torch.equal(actual.view(torch.int16), oracle.view(torch.int16))
+    fixture_dir = os.environ.get("CUTEAFD_ROPE_FIXTURE_DIR")
+    if fixture_dir:
+        root = Path(fixture_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        mode = "llama3" if scaling is not None else "plain"
+        for name, actual in zip(("cos", "sin"), outputs):
+            actual.view(torch.uint8).cpu().numpy().tofile(root / f"rope_s{span}_{mode}_{name}.bin")
 
 
 @pytest.mark.parametrize("llama3", [False, True])
