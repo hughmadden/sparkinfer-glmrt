@@ -67,7 +67,7 @@ class Case:
         self.pointers, self.bits = pointers.to(self.device), bits.to(self.device)
         self.host_bits = bits.numpy()
         rng = np.random.default_rng(408)
-        self.x = torch.from_numpy((rng.standard_normal((64, self.h))*0.02).astype(np.float16)).to(self.device)
+        self.x = torch.from_numpy(rng.standard_normal((64, self.h)).astype(np.float16)).to(self.device)
         self.weights = torch.from_numpy(rng.uniform(.05, .3, (64, self.topk)).astype(np.float32)).to(self.device)
         s = (self.h + 1023)//1024
         self.fc1 = torch.empty((self.max_groups, self.u, 2, s, 16, 128), device=self.device)

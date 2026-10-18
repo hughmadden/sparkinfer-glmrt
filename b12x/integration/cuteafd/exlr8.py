@@ -45,17 +45,17 @@ class _Exlr8Pointers:
                  output: cute.Pointer, rows: cutlass.Int32, groups: cutlass.Int32,
                  cta_limit: cutlass.Int32, stream: cuda.CUstream):
         # Flat views are address carriers; the core computes all runtime offsets.
-        self.core(cute.make_tensor(x, cute.make_layout(1)),
-                  cute.make_tensor(pointers, cute.make_layout(1)),
-                  cute.make_tensor(bits, cute.make_layout(1)),
-                  cute.make_tensor(group_expert, cute.make_layout(1)),
-                  cute.make_tensor(route_slots, cute.make_layout(1)),
-                  cute.make_tensor(route_group_lane, cute.make_layout(1)),
-                  cute.make_tensor(route_weights, cute.make_layout(1)),
-                  cute.make_tensor(fc1, cute.make_layout(1)),
-                  cute.make_tensor(intermediate, cute.make_layout(1)),
-                  cute.make_tensor(fc2, cute.make_layout(1)),
-                  cute.make_tensor(output, cute.make_layout(1)), rows, groups, cta_limit, stream)
+        self.core(cute.make_tensor(x, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(bits, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(group_expert, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_slots, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_group_lane, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_weights, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(output, cute.make_layout(1, stride=1)), rows, groups, cta_limit, stream)
 
 
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512):
