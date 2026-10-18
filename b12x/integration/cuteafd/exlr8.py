@@ -20,6 +20,11 @@ def geometry(hidden=6144, units=16, top_k=8, max_groups=512):
     result = dict(abi_version=ABI_VERSION, hidden=hidden, units=units, top_k=top_k,
                   max_groups=max_groups, max_rows=64, split_k_blocks=8,
                   fc1_splits=(hidden + 1023) // 1024)
+    tasks = (max_groups * units * 2 * result["fc1_splits"],
+             max_groups * units, max_groups * (hidden // 128), 64 * (hidden // 128))
+    # Grid-stride increments may reach almost twice the task count before exiting.
+    if max(tasks) > (2**31 - 1) // 2 or max(64 * top_k, max_groups * 16) > 2**31 - 1:
+        raise ValueError("EXLR8 task or route indexing exceeds signed int32")
     if max(scratch_bytes(result).values()) > 2**63 - 1:
         raise ValueError("EXLR8 scratch exceeds signed 64-bit addressing")
     return result
