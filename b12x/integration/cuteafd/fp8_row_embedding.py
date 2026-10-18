@@ -45,7 +45,8 @@ class _Gather:
                     lo = u32_as_f32(pair<<cutlass.Uint32(16))*scale
                     hi = u32_as_f32(pair&cutlass.Uint32(0xffff0000))*scale
                 index = row.to(cutlass.Int64)*cutlass.Int64(self.hidden)+col.to(cutlass.Int64)
-                output[index],output[index+cutlass.Int64(1)] = lo,hi
+                output[index] = lo.to(cutlass.BFloat16)
+                output[index+cutlass.Int64(1)] = hi.to(cutlass.BFloat16)
             task += step
 
 
