@@ -2239,14 +2239,15 @@ def kimi_exl3_checkpoint():
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("width", [512, 3072])
-@pytest.mark.parametrize("direct", [False, True])
-def test_kimi_real_experts_e896_situ_cpu_reference(kimi_exl3_checkpoint, width, direct):
+@pytest.mark.parametrize("capacity,direct", [(4, False), (4, True), (1, False), (80, False), (256, False)],
+                         ids=["legacy-packed", "legacy-direct", "m1", "m80", "m256"])
+def test_kimi_real_experts_e896_situ_cpu_reference(kimi_exl3_checkpoint, width, capacity, direct):
     """Native K2 weights, real high local IDs, K16, TP6/full width and graph replay."""
     import numpy as np
 
     tensors, oracle = kimi_exl3_checkpoint
     device = torch.device("cuda", torch.cuda.current_device())
-    hidden, experts, rows, topk = 3584, 896, 4, 16
+    hidden, experts, rows, topk = 3584, 896, capacity, 16
     # Unrouted payload slots are never read. Keep their actual E896 strides so
     # this catches truncation of local IDs >=512, not just large global routes.
     w13 = torch.empty((2, experts, hidden // 16, width // 16, 32), dtype=torch.int16, device=device)
@@ -2273,14 +2274,15 @@ def test_kimi_real_experts_e896_situ_cpu_reference(kimi_exl3_checkpoint, width, 
         down_svh[expert].copy_(torch.from_numpy(payload["w2", "svh"]))
         intermediate[expert].copy_(torch.from_numpy(np.concatenate([
             payload["w1", "svh"], payload["w3", "svh"], payload["w2", "suh"]])))
-    tile = (64, 128, 64, 128) if direct else (128, 128, 128, 128)
+    tile = ((64, 128, 64, 128) if direct else (128, 128, 128, 128)) if capacity == 4 else (64, 256, 64, 256)
     tier0 = prepare_trellis256_moe_weights(
         w13, w2, hidden_size=hidden, intermediate_size=width, num_experts=experts,
-        activation="situ", fc1_tile_n=128, fc2_tile_n=128, params_dtype=torch.float16,
+        activation="situ", fc1_tile_n=tile[1], fc2_tile_n=tile[3], params_dtype=torch.float16,
         w13_layout="trellis_t256_proj", trellis_bits=2, codebook="mcg",
         gate_suh=gate_suh, up_suh=up_suh, intermediate_rotations=intermediate,
         down_svh=down_svh, tile_config=tile)
-    tier1 = _prepared(experts=1, hidden=hidden, intermediate=width, bits=3, seed=273, device=device)
+    tier1 = _prepared(experts=1, hidden=hidden, intermediate=width, bits=3, seed=273, device=device,
+                      tile_config=tile)
     props = torch.cuda.get_device_properties(device)
     launch = compile_mixed_trellis(
         size_m=rows, hidden_size=hidden, intermediate_size=width,
@@ -2297,20 +2299,24 @@ def test_kimi_real_experts_e896_situ_cpu_reference(kimi_exl3_checkpoint, width, 
     binding = bind_mixed_trellis(tier0, tier1, route_map, descriptor, rotations, launch)
     buffers = make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
     generator = torch.Generator(device="cpu").manual_seed(273)
-    x = torch.randn(rows, hidden, generator=generator).to(torch.bfloat16).to(device)
+    probes = torch.randn(4, hidden, generator=generator).to(torch.bfloat16).to(device)
+    # Repeat four bounded oracle probes to fill the actual compiled capacity.
+    # m1 uses the highest local ID; larger capacities exercise all four IDs.
+    probe_rows = torch.arange(rows, device=device) % 4 if rows > 1 else torch.tensor([3], device=device)
+    x = probes[probe_rows].contiguous()
     ids = torch.full((rows, topk), -1, dtype=torch.int32, device=device)
-    ids[:, 0] = torch.tensor(list(tensors), dtype=torch.int32, device=device)
+    ids[:, 0] = torch.tensor(list(tensors), dtype=torch.int32, device=device)[probe_rows]
     weights = torch.zeros((rows, topk), dtype=torch.float32, device=device)
     weights[:, 0] = 1
-    expected = np.concatenate([oracle.expert_output(sliced[expert], x[row:row+1].float().cpu().numpy(),
-                                                    None, activation="situ")
-                               for row, expert in enumerate(tensors)])
+    expected_probes = np.concatenate([oracle.expert_output(sliced[expert], probes[row:row+1].float().cpu().numpy(),
+                                                           None, activation="situ")
+                                      for row, expert in enumerate(tensors)])
+    expected = expected_probes[probe_rows.cpu().numpy()]
     eager = run_bound_mixed_trellis(x, weights, ids, binding, buffers).clone()
     torch.cuda.synchronize()
-    for row, expert in enumerate(tensors):
-        metrics = oracle.comparison(eager[row].float().cpu().numpy(), expected[row])
-        print(dict(expert=expert, width=width, direct=direct, **metrics), flush=True)
-        assert metrics["passed"], metrics
+    metrics = oracle.comparison(eager.float().cpu().numpy(), expected)
+    print(dict(width=width, capacity=capacity, direct=direct, tile=tile, route_block=8, **metrics), flush=True)
+    assert metrics["passed"], metrics
     repeat = run_bound_mixed_trellis(x, weights, ids, binding, buffers)
     assert torch.equal(eager, repeat)
     graph = torch.cuda.CUDAGraph()
