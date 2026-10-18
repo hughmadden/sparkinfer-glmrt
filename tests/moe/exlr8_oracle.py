@@ -27,9 +27,10 @@ def hadamard(x):
 
 
 class Case:
-    def __init__(self, snapshot, layer=40, widths=(2, 3, 4), *, device="cuda"):
+    def __init__(self, snapshot, layer=40, widths=(2, 3, 4), *, device="cuda",
+                 hidden=6144, units=3, nonresident=((1, 1),)):
         self.ref = reference_module()
-        self.h, self.u, self.topk, self.max_groups = 6144, 3, 2, 128
+        self.h, self.u, self.topk, self.max_groups = hidden, units, 2, 128
         self.device = torch.device(device)
         self.widths = widths
         self.owners = []
@@ -39,11 +40,11 @@ class Case:
         index = self.ref.Tensors(Path(snapshot) / "experts" / f"exlr8-layer-{layer:03}.index.safetensors")
         self.checksums = []
         for e, source in enumerate((7, 11, 23, 256)):
-            for u, base_width in enumerate(widths):
-                if e == 1 and u == 1:  # All three projections of one unit are nonresident.
+            for u in range(self.u):
+                if (e, u) in nonresident:
                     continue
                 for p, projection in enumerate(("gate", "up", "down")):
-                    width = widths[(widths.index(base_width) + p) % len(widths)]
+                    width = widths[(u + p) % len(widths)]
                     if source == 256 and width == 2:
                         width = 3  # This checkpoint ships no K2 shared expert.
                     prefix = ("shared." if source == 256 else "") + f"k{width}."
@@ -58,6 +59,11 @@ class Case:
                     checksum = self.ref.xxhash64(payload + c.tobytes() + b.tobytes())
                     assert checksum == int(index.array(prefix + "checksum")[source_e, p, source_u])
                     self.checksums.append(f"{checksum:016x}")
+                    # Native payloads are ordered by hidden K-block (gate/up)
+                    # or hidden output block (down), so a shorter hidden prefix
+                    # retains the exact tile encoding and channel-side vectors.
+                    payload = payload[:self.h * 16 * width]
+                    b = b[:self.h // 128]
                     decoded = self.ref.decode_unit(payload, width, projection, self.h)
                     tensors = [torch.from_numpy(a.copy()).to(self.device) for a in
                                (np.frombuffer(payload, dtype=np.uint8), c, b)]

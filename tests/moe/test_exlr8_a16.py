@@ -131,6 +131,49 @@ def test_exact_trellis_decode(case):
                 np.testing.assert_array_equal(pairs[:, lane, j], reference[:, r, c])
 
 
+@pytest.mark.parametrize("units,hidden", [(5, 6144), (7, 6016)])
+def test_fc2_chunk_tail_and_odd_blocks(units, hidden):
+    case = Case(os.environ["CUTEAFD_EXLR8_SNAPSHOT"], units=units, hidden=hidden,
+                nonresident=((1, 1), (1, 3), (1, 4)))
+    compiled = program(case)
+    case.routing(16)
+    launch(case, compiled, 16, 1)
+    expected = case.output[:16].clone()
+    assert relative(expected[:1], case.oracle(1)) <= 1e-3
+
+    for groups in (23, 24, 25):
+        case.routing(16, chunk=1)
+        # Merge same-expert singleton groups to hit the dispatch boundary
+        # exactly without changing a route or its per-element reduction.
+        while case.groups > groups:
+            experts = case.group_expert[:case.groups].cpu().tolist()
+            pair = next((i, i + 1) for i in range(case.groups - 1)
+                        if experts[i] == experts[i + 1])
+            i, j = pair
+            joined = torch.cat((case.route_slots[i][case.route_slots[i] >= 0],
+                                case.route_slots[j][case.route_slots[j] >= 0]))
+            assert joined.numel() <= 16
+            case.route_slots[i].fill_(-1)
+            case.route_slots[i, :joined.numel()] = joined
+            case.route_slots[j:case.groups - 1] = case.route_slots[j + 1:case.groups].clone()
+            case.group_expert[j:case.groups - 1] = case.group_expert[j + 1:case.groups].clone()
+            case.groups -= 1
+        case.inverse.fill_(-1)
+        for group in range(case.groups):
+            for lane, slot in enumerate(case.route_slots[group].cpu().tolist()):
+                if slot >= 0:
+                    case.inverse.view(-1)[slot] = group * 16 + lane
+        for limit in (1, 48, 188):
+            case.fc1.fill_(float("nan"))
+            case.intermediate.fill_(float("nan"))
+            case.fc2.fill_(float("nan"))
+            case.output.fill_(float("nan"))
+            launch(case, compiled, 16, limit)
+            assert torch.equal(case.output[:16].view(torch.int32),
+                               expected.view(torch.int32)), (units, hidden, groups, limit)
+            assert torch.isnan(case.output[16:]).all()
+
+
 def test_empty_routes_do_not_read_poison(case):
     compiled = program(case)
     case.routing(8)
