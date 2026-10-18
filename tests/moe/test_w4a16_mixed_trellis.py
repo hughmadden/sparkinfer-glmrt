@@ -2134,3 +2134,57 @@ def test_mixed_a8_prefill_oracle_live_rows_and_graph(input_format, bits, tiles, 
         assert tuple(t.data_ptr() for b in buffers for t in (b.fc1, b.activated, b.fc2, b.output)) == addresses
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("experts,bits", [(288, 9), (512, 9), (513, 10), (896, 10), (1024, 10)])
+def test_projection_descriptor_width_follows_routed_geometry(experts, bits):
+    route, descriptor = build_projection_tiered_maps(
+        [0] * experts, [1] * experts, [1] * experts,
+        tier_slots=(experts, experts), device=torch.device("cpu"),
+    )
+    rows = descriptor.view(3, 2 * experts)
+    assert route.tolist() == list(range(experts))
+    assert rows[0, experts - 1] == experts - 1
+    assert rows[1, experts - 1] == (1 << bits) | (experts - 1)
+    assert torch.all(rows[:, experts:] == -1)
+    # A raw tensor from another producer must decode with the same width.
+    _check_descriptor_projection_counts(
+        descriptor.clone(), 2 * experts, gate_counts=(experts, 0),
+        up_counts=(0, experts), descriptor_bits=bits,
+    )
+    if experts == 896:
+        for index in (511, 512, 895):
+            assert int(rows[1, index]) & ((1 << bits) - 1) == index
+            assert int(rows[1, index]) >> bits == 1
+
+
+def test_kimi_partitioned_descriptor_uses_full_expert_geometry():
+    _, descriptor = build_tiered_maps(range(448), range(448, 896), device=torch.device("cpu"))
+    assert descriptor[448] == 1 << 10
+    assert descriptor[895] == (1 << 10) | 447
+
+
+def test_descriptor_width_rejects_overflow():
+    with pytest.raises(ValueError, match="routed expert count"):
+        mixed_trellis_module._descriptor_bits(1025)
+
+
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_mixed_compile_threads_activation_before_cuda(monkeypatch, activation):
+    class ReachedKernel(Exception):
+        pass
+
+    def capture(**kwargs):
+        assert kwargs["activation"] == activation
+        assert kwargs["swiglu_limit"] is None
+        raise ReachedKernel
+
+    monkeypatch.setattr(mixed_trellis_module, "W4A16FusedMoeKernel", capture)
+    with pytest.raises(ReachedKernel):
+        compile_mixed_trellis(
+            size_m=16, hidden_size=3584, intermediate_size=512,
+            tier0_num_experts=896, tier1_num_experts=896, route_num_experts=896,
+            top_k=16, max_m_blocks=256, sms=188, max_shared_mem=101376,
+            force_tile_config=(64, 128, 64, 128), tier0_bits=2, tier1_bits=3,
+            activation=activation,
+        )

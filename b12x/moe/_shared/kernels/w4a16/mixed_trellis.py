@@ -57,12 +57,18 @@ from .kernel import (
     pack_topk_routes_by_expert,
 )
 # Projection descriptors pack the tier in the high bits and the tier-local
-# expert in the low bits. GLM has 288 routed experts, so eight local-index bits
-# are insufficient for a valid one-tier projection. The descriptor is an
-# in-process int32 runtime artifact, not a checkpoint ABI.
-_TIER_DESCRIPTOR_BITS = 9
-_TIER_DESCRIPTOR_MASK = (1 << _TIER_DESCRIPTOR_BITS) - 1
-_MAX_TIER_EXPERTS = 1 << _TIER_DESCRIPTOR_BITS
+# expert in the low bits. Preserve nine bits for existing E<=512 geometries;
+# E896 uses ten. This is an in-process int32 artifact, not a checkpoint ABI.
+_MAX_TIER_EXPERTS = 1024
+
+
+def _descriptor_bits(route_num_experts: int) -> int:
+    """Static routed geometry, not the padded projection-bank slot count."""
+    if not 1 <= int(route_num_experts) <= _MAX_TIER_EXPERTS:
+        raise ValueError("mixed Trellis routed expert count must be in [1, 1024]")
+    return 9 if int(route_num_experts) <= 512 else 10
+
+
 # One SM120 AOT package serves the 188-SM PRO 6000 and the 170-SM 5090.
 # Only workspace sizing uses these bounds; cooperative grids use the live card.
 EXL3_AOT_MAX_SMS = {(12, 0): 188, (12, 1): 48}
@@ -257,12 +263,15 @@ class W4A16MixedTrellisKernel:
     ABI_VERSION = 21
     _token_major_rotation = False
 
+    descriptor_bits = 9
+
     def __init__(
         self,
         *,
         driver: W4A16FusedMoeKernel,
         tier0: W4A16FusedMoeKernel,
         tier1: W4A16FusedMoeKernel,
+        descriptor_bits: int = 9,
         paired_boundary: str | None = None,
         token_major_rotation: bool = False,
     ):
@@ -318,8 +327,11 @@ class W4A16MixedTrellisKernel:
                 "mixed Trellis FC2 schedule factor must divide one packed "
                 f"route block: factor={fc2_factor}, maximum={expected_factor}"
             )
-        if tier0.num_experts > 512 or tier1.num_experts > 512:
-            raise ValueError("tier-local expert ids must fit in nine bits")
+        self.descriptor_bits = descriptor_bits
+        if descriptor_bits not in (9, 10):
+            raise ValueError("descriptor width must be 9 or 10 bits")
+        if max(tier0.num_experts, tier1.num_experts) > (1 << descriptor_bits):
+            raise ValueError("tier-local expert ids exceed descriptor width")
         if driver.num_experts != tier0.num_experts + tier1.num_experts:
             raise ValueError("driver expert count must equal the sum of both tiers")
         if paired_boundary not in (None, "first", "last"):
@@ -371,7 +383,7 @@ class W4A16MixedTrellisKernel:
             self.shared_words,
             self.paired_boundary,
             self.token_major_rotation,
-        )
+        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits))
 
     @cute.jit
     def _dispatch_tier_gemm(
@@ -530,8 +542,8 @@ class W4A16MixedTrellisKernel:
                         if cutlass.const_expr(self.paired_boundary == "first"):
                             reduce_k_tile = Int32(128 // self.driver.fc2.tile_k)
             if descriptor >= Int32(0):
-                tier = descriptor >> Int32(_TIER_DESCRIPTOR_BITS)
-                local_expert = descriptor & Int32(_TIER_DESCRIPTOR_MASK)
+                tier = descriptor >> Int32(self.descriptor_bits)
+                local_expert = descriptor & Int32((1 << self.descriptor_bits) - 1)
                 # FC1 is bounded by the tier's FC1 slot count; FC2 by its own
                 # independent count, since per-projection membership lets the
                 # two differ. Both remain real bounds.
@@ -658,8 +670,8 @@ class W4A16MixedTrellisKernel:
                 descriptor_row * total_experts + combined_expert
             ].to(Int32)
             if descriptor >= Int32(0):
-                tier = descriptor >> Int32(_TIER_DESCRIPTOR_BITS)
-                local_expert = descriptor & Int32(_TIER_DESCRIPTOR_MASK)
+                tier = descriptor >> Int32(self.descriptor_bits)
+                local_expert = descriptor & Int32((1 << self.descriptor_bits) - 1)
                 if cutlass.const_expr(is_fc1):
                     tier0_in_bounds = local_expert < tier0_gate_experts
                     tier1_in_bounds = local_expert < tier1_gate_experts
@@ -1371,6 +1383,7 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
         tier0: W4A16FusedMoeKernel,
         tier1: W4A16FusedMoeKernel,
         tier2: W4A16FusedMoeKernel,
+        descriptor_bits: int = 9,
     ):
         kernels = (driver, tier0, tier1, tier2)
         for name, moe in zip(
@@ -1427,8 +1440,11 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
                 f"route block: factor={fc2_factor}, maximum={expected_factor}"
             )
         tiers = (tier0, tier1, tier2)
-        if any(tier.num_experts > _MAX_TIER_EXPERTS for tier in tiers):
-            raise ValueError("tier-local expert ids must fit in nine bits")
+        self.descriptor_bits = descriptor_bits
+        if descriptor_bits not in (9, 10):
+            raise ValueError("descriptor width must be 9 or 10 bits")
+        if any(tier.num_experts > (1 << descriptor_bits) for tier in tiers):
+            raise ValueError("tier-local expert ids exceed descriptor width")
         if driver.num_experts != sum(tier.num_experts for tier in tiers):
             raise ValueError("driver expert count must equal the sum of all tiers")
         self.driver = driver
@@ -1457,7 +1473,7 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
             self.tier2.__cache_key__,
             self.blocks_per_sm,
             self.shared_words,
-        )
+        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits))
 
     @cute.jit
     def _emit_tier_tile3(
@@ -1527,8 +1543,8 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
                 descriptor_row * total_experts + combined_expert
             ].to(Int32)
             if descriptor >= Int32(0):
-                tier = descriptor >> Int32(_TIER_DESCRIPTOR_BITS)
-                local_expert = descriptor & Int32(_TIER_DESCRIPTOR_MASK)
+                tier = descriptor >> Int32(self.descriptor_bits)
+                local_expert = descriptor & Int32((1 << self.descriptor_bits) - 1)
 
                 if cutlass.const_expr(is_fc1):
                     t0_in_bounds = local_expert < tier0_gate_experts
@@ -2311,6 +2327,7 @@ def compile_mixed_trellis(
     tier1_bits: int = 4,
     trellis_codebook: str = "mcg",
     swiglu_limit: float | None = None,
+    activation: str = "silu",
     moe_block_size: int = 8,
     rotation_input_dtype: str = "bf16",
     full_rotation_output_dtype: str = "fp32",
@@ -2382,14 +2399,13 @@ def compile_mixed_trellis(
     counts = (int(tier0_num_experts), int(tier1_num_experts))
     if any(value <= 0 or value > _MAX_TIER_EXPERTS for value in counts):
         raise ValueError(
-            "two-tier mixed Trellis requires each tier to contain 1..512 slots"
+            "two-tier mixed Trellis requires each tier to contain 1..1024 slots"
         )
     total_experts = sum(counts)
     if route_num_experts is None:
         route_num_experts = total_experts
     route_num_experts = int(route_num_experts)
-    if route_num_experts <= 0:
-        raise ValueError("mixed Trellis route_num_experts must be positive")
+    descriptor_bits = _descriptor_bits(route_num_experts)
     def make_kernel(
         num_experts: int,
         bits: int,
@@ -2402,7 +2418,7 @@ def compile_mixed_trellis(
             intermediate_size=intermediate_size,
             num_experts=num_experts,
             top_k=top_k,
-            activation="silu",
+            activation=activation,
             swiglu_limit=swiglu_limit,
             apply_router_weight_on_input=False,
             zero_fc2_output=False,
@@ -2446,6 +2462,7 @@ def compile_mixed_trellis(
                 driver=make_kernel(total_experts, tier0_bits, **common),
                 tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
                 tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
+                descriptor_bits=descriptor_bits,
                 max_shared_mem=int(max_shared_mem),
                 input_format=input_format,
                 ws_tile_n=ws_tile_n,
@@ -2457,6 +2474,7 @@ def compile_mixed_trellis(
             driver=make_kernel(total_experts, tier0_bits, **common),
             tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
             tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
+            descriptor_bits=descriptor_bits,
             paired_boundary=paired_boundary,
             token_major_rotation=token_major_rotation,
         )
@@ -2677,6 +2695,7 @@ def compile_mixed_trellis3(
     tier2_bits: int = 5,
     trellis_codebook: str = "mcg",
     swiglu_limit: float | None = None,
+    activation: str = "silu",
     moe_block_size: int = 8,
     rotation_input_dtype: str = "bf16",
     full_rotation_output_dtype: str = "fp32",
@@ -2706,7 +2725,7 @@ def compile_mixed_trellis3(
     )
     if any(value <= 0 or value > _MAX_TIER_EXPERTS for value in counts):
         raise ValueError(
-            "three-tier mixed Trellis requires each tier to contain 1..512 slots"
+            "three-tier mixed Trellis requires each tier to contain 1..1024 slots"
         )
     fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
         int(value) for value in force_tile_config
@@ -2717,8 +2736,7 @@ def compile_mixed_trellis3(
     if route_num_experts is None:
         route_num_experts = total_experts
     route_num_experts = int(route_num_experts)
-    if route_num_experts <= 0:
-        raise ValueError("mixed Trellis route_num_experts must be positive")
+    descriptor_bits = _descriptor_bits(route_num_experts)
     def make_kernel(
         num_experts: int,
         trellis_bits: int,
@@ -2731,7 +2749,7 @@ def compile_mixed_trellis3(
             intermediate_size=intermediate_size,
             num_experts=num_experts,
             top_k=top_k,
-            activation="silu",
+            activation=activation,
             swiglu_limit=swiglu_limit,
             apply_router_weight_on_input=False,
             zero_fc2_output=False,
@@ -2764,6 +2782,7 @@ def compile_mixed_trellis3(
             tier0=make_kernel(counts[0], bits[0], **common),
             tier1=make_kernel(counts[1], bits[1], **common),
             tier2=make_kernel(counts[2], bits[2], **common),
+            descriptor_bits=descriptor_bits,
         )
 
     kernel = _select_mixed_fc2_kernel(
@@ -3089,6 +3108,7 @@ def build_tiered_maps(
             f"each mixed Trellis tier supports at most {_MAX_TIER_EXPERTS} experts"
         )
     total = len(tier0_ids) + len(tier1_ids)
+    descriptor_bits = _descriptor_bits(total)
     if sorted((*tier0_ids, *tier1_ids)) != list(range(total)):
         raise ValueError(
             f"mixed Trellis tier ids must be a disjoint partition of [0, {total})"
@@ -3104,7 +3124,7 @@ def build_tiered_maps(
     descriptor_row = torch.tensor(
         [
             *range(len(tier0_ids)),
-            *((1 << _TIER_DESCRIPTOR_BITS) | i for i in range(len(tier1_ids))),
+            *((1 << descriptor_bits) | i for i in range(len(tier1_ids))),
         ],
         dtype=torch.int32,
         device=device,
@@ -3139,7 +3159,7 @@ def build_projection_tiered_maps(
     Returns ``(global_to_combined, descriptor_map)``. ``descriptor_map`` is a
     contiguous ``int32[3 * sum(tier_slots)]`` tensor laid out as gate, up, and
     down rows. A populated entry encodes
-    ``(tier << _TIER_DESCRIPTOR_BITS) | tier_local_index``;
+    ``(tier << bits) | tier_local_index`` (9 bits through E512, otherwise 10);
     unused padded slots contain ``-1``.
     """
 
@@ -3153,10 +3173,13 @@ def build_projection_tiered_maps(
         raise ValueError(
             "mixed Trellis tier_slots must contain exactly two or three counts"
         )
-    if any(value < 0 or value > _MAX_TIER_EXPERTS for value in slots):
+    num_experts = len(projections[0][1])
+    descriptor_bits = _descriptor_bits(num_experts)
+    max_tier_experts = 1 << descriptor_bits
+    if any(value < 0 or value > max_tier_experts for value in slots):
         raise ValueError(
             "mixed Trellis tier slots must be in "
-            f"[0, {_MAX_TIER_EXPERTS}]"
+            f"[0, {max_tier_experts}]"
         )
     num_experts = len(projections[0][1])
     rows: list[int] = []
@@ -3176,12 +3199,12 @@ def build_projection_tiered_maps(
         for tier in tiers:
             local = counters[tier]
             counters[tier] += 1
-            if local > _TIER_DESCRIPTOR_MASK:
+            if local >= max_tier_experts:
                 raise ValueError(
                     f"mixed Trellis {name} tier {tier} exceeds "
                     f"{_MAX_TIER_EXPERTS} experts"
                 )
-            row.append((tier << _TIER_DESCRIPTOR_BITS) | local)
+            row.append((tier << descriptor_bits) | local)
         projection_counts.append(tuple(counters))
         rows.extend(row)
     # The launch sizes the descriptor namespace as the sum of the tier slot
@@ -3226,6 +3249,7 @@ def _check_descriptor_projection_counts(
     *,
     gate_counts: tuple[int, ...],
     up_counts: tuple[int, ...],
+    descriptor_bits: int = 9,
 ) -> None:
     """Fail closed when launch counts disagree with the descriptor map.
 
@@ -3244,7 +3268,7 @@ def _check_descriptor_projection_counts(
         tier_count = len(gate_counts)
         for row in rows[:2]:
             live = row[row >= 0]
-            encoded_tiers = live >> _TIER_DESCRIPTOR_BITS
+            encoded_tiers = live >> descriptor_bits
             if bool((encoded_tiers >= tier_count).any()):
                 raise ValueError(
                     "mixed Trellis descriptor contains a tier outside the "
@@ -3322,7 +3346,7 @@ def _validate_mixed_trellis_tier_storage(
     )
     w2_elements = int(tier.w2.numel())
     # The FC2 expert count is independent of the FC1 gate/up slot counts.
-    # Its upper bound is the descriptor's 9-bit tier-local index range.
+    # The widest descriptor supports 1024 tier-local experts.
     if (
         tier.w2.dtype != torch.int32
         or w2_expert_stride <= 0
@@ -3554,6 +3578,7 @@ def bind_mixed_trellis(
         total_experts,
         gate_counts=gate_counts,
         up_counts=up_counts,
+        descriptor_bits=_descriptor_bits(route_num_experts),
     )
     for name, table, expected_elements in (
         (
@@ -3958,6 +3983,7 @@ def bind_mixed_trellis3(
         total_experts,
         gate_counts=gate_counts,
         up_counts=up_counts,
+        descriptor_bits=_descriptor_bits(route_num_experts),
     )
     for name, table, expected_elements in (
         (

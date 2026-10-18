@@ -37,7 +37,7 @@ from .kernel import (
 )
 from .mixed_trellis import (
     MixedTrellis3CompileResult, W4A16MixedTrellisKernel,
-    _MAX_TIER_EXPERTS, _TIER_DESCRIPTOR_BITS, _TIER_DESCRIPTOR_MASK,
+    _MAX_TIER_EXPERTS, _descriptor_bits,
     _select_mixed_fc2_kernel,
 )
 
@@ -73,6 +73,7 @@ class W4A16MixedTrellis4Kernel(W4A16MixedTrellisKernel):
         tier1: W4A16FusedMoeKernel,
         tier2: W4A16FusedMoeKernel,
         tier3: W4A16FusedMoeKernel,
+        descriptor_bits: int = 9,
     ):
         kernels = (driver, tier0, tier1, tier2, tier3)
         for name, moe in zip(
@@ -129,8 +130,11 @@ class W4A16MixedTrellis4Kernel(W4A16MixedTrellisKernel):
                 f"route block: factor={fc2_factor}, maximum={expected_factor}"
             )
         tiers = (tier0, tier1, tier2, tier3)
-        if any(tier.num_experts > _MAX_TIER_EXPERTS for tier in tiers):
-            raise ValueError("tier-local expert ids must fit in nine bits")
+        self.descriptor_bits = descriptor_bits
+        if descriptor_bits not in (9, 10):
+            raise ValueError("descriptor width must be 9 or 10 bits")
+        if any(tier.num_experts > (1 << descriptor_bits) for tier in tiers):
+            raise ValueError("tier-local expert ids exceed descriptor width")
         if driver.num_experts != sum(tier.num_experts for tier in tiers):
             raise ValueError("driver expert count must equal the sum of all tiers")
         self.driver = driver
@@ -161,7 +165,7 @@ class W4A16MixedTrellis4Kernel(W4A16MixedTrellisKernel):
             self.tier3.__cache_key__,
             self.blocks_per_sm,
             self.shared_words,
-        )
+        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits))
 
     @cute.jit
     def _emit_tier_tile4(
@@ -238,8 +242,8 @@ class W4A16MixedTrellis4Kernel(W4A16MixedTrellisKernel):
                 descriptor_row * total_experts + combined_expert
             ].to(Int32)
             if descriptor >= Int32(0):
-                tier = descriptor >> Int32(_TIER_DESCRIPTOR_BITS)
-                local_expert = descriptor & Int32(_TIER_DESCRIPTOR_MASK)
+                tier = descriptor >> Int32(self.descriptor_bits)
+                local_expert = descriptor & Int32((1 << self.descriptor_bits) - 1)
 
                 if cutlass.const_expr(is_fc1):
                     t0_in_bounds = local_expert < tier0_gate_experts
@@ -911,6 +915,7 @@ def compile_mixed_trellis4(
     tier3_bits: int = 5,
     trellis_codebook: str = "mcg",
     swiglu_limit: float | None = None,
+    activation: str = "silu",
     moe_block_size: int = 8,
     rotation_input_dtype: str = "bf16",
     full_rotation_output_dtype: str = "fp32",
@@ -941,7 +946,7 @@ def compile_mixed_trellis4(
     )
     if any(value <= 0 or value > _MAX_TIER_EXPERTS for value in counts):
         raise ValueError(
-            "four-tier mixed Trellis requires each tier to contain 1..512 slots"
+            "four-tier mixed Trellis requires each tier to contain 1..1024 slots"
         )
     fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
         int(value) for value in force_tile_config
@@ -952,8 +957,7 @@ def compile_mixed_trellis4(
     if route_num_experts is None:
         route_num_experts = total_experts
     route_num_experts = int(route_num_experts)
-    if route_num_experts <= 0:
-        raise ValueError("mixed Trellis route_num_experts must be positive")
+    descriptor_bits = _descriptor_bits(route_num_experts)
     def make_kernel(
         num_experts: int,
         trellis_bits: int,
@@ -966,7 +970,7 @@ def compile_mixed_trellis4(
             intermediate_size=intermediate_size,
             num_experts=num_experts,
             top_k=top_k,
-            activation="silu",
+            activation=activation,
             swiglu_limit=swiglu_limit,
             apply_router_weight_on_input=False,
             zero_fc2_output=False,
@@ -1000,6 +1004,7 @@ def compile_mixed_trellis4(
             tier1=make_kernel(counts[1], bits[1], **common),
             tier2=make_kernel(counts[2], bits[2], **common),
             tier3=make_kernel(counts[3], bits[3], **common),
+            descriptor_bits=descriptor_bits,
         )
 
     kernel = _select_mixed_fc2_kernel(
