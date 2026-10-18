@@ -161,15 +161,15 @@ class _Producer:
         self.tail = _QueryTail(g.heads)
 
     @cute.jit
-    def __call__(self, x: cute.Pointer, slots: cute.Pointer, w_qkv_a: cute.Pointer,
-                 q_norm: cute.Pointer, kv_norm: cute.Pointer, w_q_b: cute.Pointer,
-                 w_uk: cute.Pointer, cache: cute.Pointer, query: cute.Pointer,
+    def __call__(self, x: cute.Pointer, kv_slots: cute.Pointer, w_qkv_a: cute.Pointer,
+                 q_a_norm: cute.Pointer, kv_a_norm: cute.Pointer, w_q_b: cute.Pointer,
+                 w_uk: cute.Pointer, kv_cache: cute.Pointer, query: cute.Pointer,
                  q_resid: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         qkv = cute.recast_ptr(scratch, dtype=BFloat16)
         q = cute.make_ptr(BFloat16, Int64(scratch.toint()) + _offset(Int64(rows) * Int64(self.g.qkv_a_width * 2)),
                           cute.AddressSpace.gmem, assumed_align=16)
         self.qkv(x, w_qkv_a, qkv, rows, stream)
-        self.norm(qkv, q_norm, kv_norm, slots, q_resid, cache, rows, stream)
+        self.norm(qkv, q_a_norm, kv_a_norm, kv_slots, q_resid, kv_cache, rows, stream)
         self.q_b(q_resid, w_q_b, q, rows, stream)
         self.uk(q, w_uk, query, rows, stream)
         self.tail(q, query, rows, stream)
@@ -210,18 +210,18 @@ class _Attention:
         self.merge = DenseMlaMergeKernel(num_splits=self.splits, value_dim=512) if self.splits > 1 else None
 
     @cute.jit
-    def __call__(self, query: cute.Pointer, cache: cute.Pointer, page_table: cute.Pointer,
-                 cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, output: cute.Pointer,
-                 final_lse: cute.Pointer, scratch: cute.Pointer, rows: Int32, batch: Int32,
+    def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
+                 cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
+                 lse: cute.Pointer, scratch: cute.Pointer, rows: Int32, batch: Int32,
                  page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
         g = self.g
         q = cute.make_tensor(cute.recast_ptr(query, dtype=cutlass.Uint8), cute.make_layout((1,)))
-        kv = cute.make_tensor(cute.recast_ptr(cache, dtype=cutlass.Uint8), cute.make_layout((1,)))
+        kv = cute.make_tensor(cute.recast_ptr(kv_cache, dtype=cutlass.Uint8), cute.make_layout((1,)))
         table = cute.make_tensor(page_table, cute.make_layout((Int64(batch) * page_table_width,)))
         lengths = cute.make_tensor(cache_seqlens, cute.make_layout((batch,)))
         cu = cute.make_tensor(cu_seqlens_q, cute.make_layout((batch + Int32(1),)))
-        out = cute.make_tensor(output, cute.make_layout((rows, g.heads, 512), stride=(g.heads * 512, 512, 1)))
-        lse = cute.make_tensor(final_lse, cute.make_layout((rows, g.heads), stride=(g.heads, 1)))
+        out = cute.make_tensor(attn, cute.make_layout((rows, g.heads, 512), stride=(g.heads * 512, 512, 1)))
+        lse_out = cute.make_tensor(lse, cute.make_layout((rows, g.heads), stride=(g.heads, 1)))
         if cutlass.const_expr(self.splits > 1):
             po = cute.make_tensor(cute.recast_ptr(scratch, dtype=BFloat16),
                 cute.make_layout((rows, g.heads, self.splits, 512), stride=(g.heads * self.splits * 512, self.splits * 512, 512, 1)))
@@ -229,13 +229,13 @@ class _Attention:
                                    cute.AddressSpace.gmem, assumed_align=16)
             pl = cute.make_tensor(pl_ptr, cute.make_layout((rows, g.heads, self.splits), stride=(g.heads * self.splits, self.splits, 1)))
         else:
-            po, pl = out, lse
-        self.forward(q, kv, table, lengths, cu, out, lse, po, pl, lse, lse,
+            po, pl = out, lse_out
+        self.forward(q, kv, table, lengths, cu, out, lse_out, po, pl, lse_out, lse_out,
             Float32(g.softmax_scale * math.log2(math.e)), Int64(g.heads * 576 * 2), Int64(576 * 2),
             Int64(64 * 1152), Int64(1152), page_table_width, rows, batch, active_splits, stream)
         if cutlass.const_expr(self.splits > 1):
             if active_splits > Int32(1):
-                self.merge(po, pl, out, lse, active_splits, stream)
+                self.merge(po, pl, out, lse_out, active_splits, stream)
 
 
 def compile_kimi_mla_producer_aot(g=KimiMlaGeometry(), *, max_rows=64):
