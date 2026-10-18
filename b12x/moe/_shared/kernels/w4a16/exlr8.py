@@ -69,6 +69,7 @@ def _side_value(address: Int64, index: Int32):
 
 class Exlr8A16Kernel:
     ABI_VERSION = 1
+    CODE_VERSION = 2
 
     def __init__(self, hidden_size: int, units_per_expert: int, top_k: int,
                  max_groups: int, fast_math: bool = True):
@@ -86,7 +87,7 @@ class Exlr8A16Kernel:
 
     @property
     def __cache_key__(self):
-        return ("exlr8_a16", self.ABI_VERSION, self.hidden_size, self.units,
+        return ("exlr8_a16", self.ABI_VERSION, self.CODE_VERSION, self.hidden_size, self.units,
                 self.top_k, self.max_groups, self.fast_math)
 
     @cute.jit
@@ -106,8 +107,8 @@ class Exlr8A16Kernel:
                                        fc1, intermediate, rows, groups).launch(
                     grid=(min(groups * Int32(self.units), cta_limit), 1, 1),
                     block=(128, 1, 1), stream=stream)
-                self.fc2_kernel(pointers, bits, group_expert, intermediate,
-                                fc2, groups).launch(
+                self.fc2_kernel(pointers, bits, group_expert, route_slots, intermediate,
+                                fc2, rows, groups).launch(
                     grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
                     block=(128, 1, 1), stream=stream)
             self.reduce_kernel(route_group_lane, route_weights, fc2, output,
@@ -211,8 +212,10 @@ class Exlr8A16Kernel:
             for n in cutlass.range_constexpr(4):
                 col = warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
                 base = task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)
-                fc1[base], fc1[base + Int64(1)] = total[n, 0], total[n, 1]
-                fc1[base + Int64(8 * 128)], fc1[base + Int64(8 * 128 + 1)] = total[n, 2], total[n, 3]
+                if width != Int32(0) and row0 >= Int32(0):
+                    fc1[base], fc1[base + Int64(1)] = total[n, 0], total[n, 1]
+                if width != Int32(0) and row1 >= Int32(0):
+                    fc1[base + Int64(8 * 128)], fc1[base + Int64(8 * 128 + 1)] = total[n, 2], total[n, 3]
             task += step
 
     @cute.kernel
@@ -253,15 +256,16 @@ class Exlr8A16Kernel:
                         sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math))
                         g[v] = gate * sigmoid * up * _side_value(ds, col)
                     g[0], g[1], g[2], g[3] = _w4a8_had128_quad(g[0], g[1], g[2], g[3], lane)
-                base = (task.to(Int64) * Int64(16) + row.to(Int64)) * Int64(128) + lane.to(Int64) * Int64(4)
-                for v in cutlass.range_constexpr(4):
-                    intermediate[base + Int64(v)] = g[v].to(cutlass.Float16)
+                    base = (task.to(Int64) * Int64(16) + row.to(Int64)) * Int64(128) + lane.to(Int64) * Int64(4)
+                    for v in cutlass.range_constexpr(4):
+                        intermediate[base + Int64(v)] = g[v].to(cutlass.Float16)
             task += step
 
     @cute.kernel
     def fc2_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
-                   group_expert: cute.Tensor, intermediate: cute.Tensor,
-                   fc2: cute.Tensor, groups: Int32):
+                   group_expert: cute.Tensor, route_slots: cute.Tensor,
+                   intermediate: cute.Tensor, fc2: cute.Tensor,
+                   rows: Int32, groups: Int32):
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
@@ -272,6 +276,13 @@ class Exlr8A16Kernel:
             total = cute.make_rmem_tensor((4, 4), Float32)
             total.fill(Float32(0.0))
             r = lane // Int32(4)
+            slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
+            slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+            row0, row1 = Int32(-1), Int32(-1)
+            if slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k):
+                row0 = r
+            if slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k):
+                row1 = r + Int32(8)
             for unit in cutlass.range(self.units):
                 desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
                 width = bits[desc]
@@ -280,19 +291,21 @@ class Exlr8A16Kernel:
                     scale = _side_value(pointers[desc * Int64(3) + Int64(2)], block)
                     addr = intermediate.iterator.toint() + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
                     if width == Int32(2):
-                        self._accumulate_block(total, payload, addr, r, r + Int32(8), 128,
+                        self._accumulate_block(total, payload, addr, row0, row1, 128,
                             Int32(0), block, lane, warp, 2, True, scale)
                     elif width == Int32(3):
-                        self._accumulate_block(total, payload, addr, r, r + Int32(8), 128,
+                        self._accumulate_block(total, payload, addr, row0, row1, 128,
                             Int32(0), block, lane, warp, 3, True, scale)
                     elif width == Int32(4):
-                        self._accumulate_block(total, payload, addr, r, r + Int32(8), 128,
+                        self._accumulate_block(total, payload, addr, row0, row1, 128,
                             Int32(0), block, lane, warp, 4, True, scale)
             for n in cutlass.range_constexpr(4):
                 col = block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
                 base = (group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)
-                fc2[base], fc2[base + Int64(1)] = total[n, 0], total[n, 1]
-                fc2[base + Int64(8 * self.hidden_size)], fc2[base + Int64(8 * self.hidden_size + 1)] = total[n, 2], total[n, 3]
+                if row0 >= Int32(0):
+                    fc2[base], fc2[base + Int64(1)] = total[n, 0], total[n, 1]
+                if row1 >= Int32(0):
+                    fc2[base + Int64(8 * self.hidden_size)], fc2[base + Int64(8 * self.hidden_size + 1)] = total[n, 2], total[n, 3]
             task += step
 
     @cute.kernel
