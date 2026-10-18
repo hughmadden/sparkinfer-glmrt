@@ -69,7 +69,12 @@ def _side_value(address: Int64, index: Int32):
 
 class Exlr8A16Kernel:
     ABI_VERSION = 1
-    CODE_VERSION = 2
+    CODE_VERSION = 3
+    # Resident CTAs per SM the stream kernels are built for (<=128 registers at
+    # 128 threads). GB10 decode is latency-bound on dependent weight loads, so
+    # the caller's cta_limit should be sm_count * CTAS_PER_SM (cudaDevAttr at
+    # runtime); it never changes results, only how many tasks run at once.
+    CTAS_PER_SM = 4
 
     def __init__(self, hidden_size: int, units_per_expert: int, top_k: int,
                  max_groups: int, fast_math: bool = True):
@@ -102,7 +107,7 @@ class Exlr8A16Kernel:
                 self.fc1_kernel(x, pointers, bits, group_expert, route_slots,
                                 fc1, rows, groups).launch(
                     grid=(min(groups * Int32(self.units * 2 * self.splits), cta_limit), 1, 1),
-                    block=(128, 1, 1), stream=stream)
+                    block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
                 self.activation_kernel(pointers, bits, group_expert, route_slots,
                                        fc1, intermediate, rows, groups).launch(
                     grid=(min(groups * Int32(self.units), cta_limit), 1, 1),
@@ -110,7 +115,7 @@ class Exlr8A16Kernel:
                 self.fc2_kernel(pointers, bits, group_expert, route_slots, intermediate,
                                 fc2, rows, groups).launch(
                     grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
-                    block=(128, 1, 1), stream=stream)
+                    block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
             self.reduce_kernel(route_group_lane, route_weights, fc2, output,
                                rows, groups).launch(
                 grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1),

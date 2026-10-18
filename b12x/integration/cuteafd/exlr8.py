@@ -9,6 +9,9 @@ from cuda.bindings import driver as cuda
 from ._common import Operand, Scalar, compile_program
 
 ABI_VERSION = 1
+# Launch hint, not math: callers pass cta_limit = cudaDevAttr SM count * this.
+# Mirrors Exlr8A16Kernel.CTAS_PER_SM (kept literal so the contract stays CUDA-free).
+CTAS_PER_SM = 4
 POINTERS = ("x", "pointers", "bits", "group_expert", "route_slots",
             "route_group_lane", "route_weights", "fc1", "intermediate", "fc2", "output")
 
@@ -19,7 +22,7 @@ def geometry(hidden=6144, units=16, top_k=8, max_groups=512):
         raise ValueError("EXLR8 requires positive int32 geometry and hidden % 128 == 0")
     result = dict(abi_version=ABI_VERSION, hidden=hidden, units=units, top_k=top_k,
                   max_groups=max_groups, max_rows=64, split_k_blocks=8,
-                  fc1_splits=(hidden + 1023) // 1024)
+                  fc1_splits=(hidden + 1023) // 1024, ctas_per_sm=CTAS_PER_SM)
     tasks = (max_groups * units * 2 * result["fc1_splits"],
              max_groups * units, max_groups * (hidden // 128), 64 * (hidden // 128))
     # Grid-stride increments may reach almost twice the task count before exiting.

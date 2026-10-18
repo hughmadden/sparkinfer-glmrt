@@ -136,8 +136,9 @@ def main():
     parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64")
     parser.add_argument("--replays",type=int,default=100)
     parser.add_argument("--output",type=Path)
-    parser.add_argument("--cta-mult",default="2",
-                        help="EXLR8 cta_limit = SMs * mult; a comma list times extra arms (first is the verdict arm)")
+    parser.add_argument("--cta-mult",default="",
+                        help="EXLR8 cta_limit = SMs * mult (default: the program's ctas_per_sm); "
+                             "a comma list times extra arms, the first is the verdict arm")
     parser.add_argument("--profile",action="store_true",
                         help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
     args = parser.parse_args()
@@ -162,7 +163,7 @@ def main():
         gen = torch.Generator().manual_seed(408+rows)
         ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(rows)]).cuda().int()
         groups = pack(tensors,ids)
-        mults = [int(m) for m in args.cta_mult.split(",")]
+        mults = [int(m) for m in args.cta_mult.split(",")] if args.cta_mult else [candidate.geometry["ctas_per_sm"]]
         cta_limit = props.multi_processor_count*mults[0]
         # L2 is recorded, never compiled in. Launch limiting changes assignment only.
         launch = lambda: candidate.launch(*(t.flatten() for t in tensors),scalars=(rows,groups,cta_limit))
