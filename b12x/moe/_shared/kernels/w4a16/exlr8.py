@@ -310,7 +310,9 @@ class Exlr8A16Kernel:
             if block < Int32(self.blocks):
                 acc = cute.make_rmem_tensor(16, Float32)
                 acc.fill(Float32(0.0))
-                for k16 in cutlass.range_constexpr(8):
+                # A rolled K loop prevents decode scheduling from extending
+                # all eight tiles' live ranges under the four-CTA register cap.
+                for k16 in cutlass.range(8, unroll=1):
                     ka = row0 + Int32(k16 * 32) + (lane & Int32(3)) * Int32(4)
                     kb = row1 + Int32(k16 * 32) + (lane & Int32(3)) * Int32(4)
                     a0 = ld_shared_u32(ka)
