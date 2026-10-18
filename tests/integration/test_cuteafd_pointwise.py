@@ -188,6 +188,50 @@ def test_canonical_projection_dynamic_rows_and_graph(outputs, width, dtype):
         assert torch.equal(out, expected)
 
 
+@pytest.mark.parametrize("rows", [1, 17, 64])
+def test_canonical_router_matches_widened_fp32_logits_and_topk(rows):
+    require_b12x()
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot, compile_route_weights_aot
+    gen = torch.Generator(device="cuda").manual_seed(274)
+    hidden = torch.randn(rows, 4096, generator=gen, device="cuda").bfloat16()
+    weight = (torch.randn(352, 4096, generator=gen, device="cuda") * 0.01).bfloat16()
+    bias = torch.randn(352, generator=gen, device="cuda") * 0.1
+    logits = torch.empty(rows, 352, device="cuda")
+    program = compile_bf16_projection_aot(width=4096, outputs=352, output_dtype=torch.float32)
+    program.launch(hidden, weight, logits, scalars=[rows])
+    # The official router widens these native BF16 operands before its FP32 dot.
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        reference = torch.nn.functional.linear(hidden.float(), weight.float())
+    finally:
+        torch.set_float32_matmul_precision(previous)
+    # Different FP32 reduction orders can disagree near zero. Check both
+    # implementations against an independent FP64 dot, not a relative error
+    # per almost-zero element, using the canonical projection's existing bar.
+    oracle = hidden.double() @ weight.double().t()
+    norm = torch.linalg.vector_norm(oracle)
+    for actual in (logits, reference):
+        relative = torch.linalg.vector_norm(actual.double() - oracle) / norm
+        assert float(relative) < 2e-5
+    delta = (logits - reference).abs().max()
+    print(f"router rows={rows}: max_logit_delta={float(delta):.9g}")
+    scores = logits.sigmoid() + bias
+    reference_scores = reference.sigmoid() + bias
+    ids = scores.topk(8, dim=-1).indices
+    reference_ids = reference_scores.topk(8, dim=-1).indices
+    assert torch.equal(ids, reference_ids)
+    # Rule out a vacuous agreement from a tied eighth/ninth selection boundary.
+    boundary = reference_scores.topk(9, dim=-1).values
+    assert bool(((boundary[:, 7] - boundary[:, 8]) > 1e-6).all())
+    out = torch.empty(rows, 8, device="cuda")
+    compile_route_weights_aot(experts=352, topk=8).launch(
+        logits, bias, ids.to(torch.int32), out, scalars=[rows])
+    selected = reference_scores.gather(-1, reference_ids) - bias[reference_ids]
+    expected = selected / (selected.sum(-1, keepdim=True) + 1e-20) * 3
+    torch.testing.assert_close(out, expected, atol=2e-6, rtol=2e-5)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_canonical_projection_export_abi(tmp_path, dtype):
     require_b12x()
