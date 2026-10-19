@@ -16,6 +16,8 @@ def case_module(name):
 
 @pytest.mark.parametrize("encoding,side,k,n,rows", [
     ("mxfp8", 1, 6144, 2048, 129),
+    ("mxfp8", 1, 6144, 576, 129),
+    ("mxfp8", 1, 6144, 128, 129),
     ("int4_g32", 1, 2048, 16384, 129),
     ("int4_g32", 2, 16384, 6144, 129),
     ("fp8_row", 1, 6144, 154880, 1),
