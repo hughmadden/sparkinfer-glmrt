@@ -479,14 +479,17 @@ def main():
 def grouped_exl3_state(rows, tiers, props):
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     from b12x.moe._shared.kernels.w4a16.host import max_packed_route_slots
-    slots = max_packed_route_slots(rows * 8, 16, 256)
+    from b12x.moe.fused_moe._impl import _projection_mixed_tile_config
+    tile = _projection_mixed_tile_config(None, hidden_size=6144,
+        intermediate_size=512, token_count=4096, direct_topk_routes=False)
     launch = mix.compile_mixed_trellis(
         size_m=4096, hidden_size=6144, intermediate_size=512,
         tier0_num_experts=128, tier1_num_experts=128, tier0_bits=4, tier1_bits=4,
-        top_k=8, max_m_blocks=max_packed_route_slots(4096*8, 16, 256)//16,
+        top_k=8, max_m_blocks=max_packed_route_slots(4096*8, 64, 256)//64,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
-        force_tile_config=(128, 128, 128, 128), trellis_codebook=tiers[0].trellis_codebook,
-        moe_block_size=16, warp_specialized=True, input_format="e4m3_k32",
+        force_tile_config=tile, trellis_codebook=tiers[0].trellis_codebook,
+        moe_block_size=64, warp_specialized=True, input_format="e4m3_k32",
+        ws_input_stages=3, ws_dynamic_tiles=True,
         rotation_input_dtype="bf16", full_rotation_output_dtype="bf16")
     bufs = mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"), sms=props.multi_processor_count)
     mapping, desc = mix.build_ordered_maps(128, 128, device=torch.device("cuda"))

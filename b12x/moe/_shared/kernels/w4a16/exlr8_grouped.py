@@ -16,8 +16,8 @@ from .exlr8 import Exlr8A16Kernel, exlr8_decode_tile, _side_value
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 1
-    CTAS_PER_SM = 4
+    CODE_VERSION = 2
+    CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
         super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True)

@@ -118,7 +118,15 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     if grouped:
         if not device_count or shared_expert or group_rows not in (16, 32, 64):
             raise ValueError("EXLR8 grouped prefill requires device count and group rows 16/32/64")
-        g.update(max_rows=4096, group_rows=group_rows)
+        from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+        g.update(max_rows=4096, group_rows=group_rows,
+                 ctas_per_sm=Exlr8GroupedKernel.CTAS_PER_SM)
+        tasks = (max_groups * units * 2 * g["fc1_splits"] * 4,
+                 max_groups * (hidden // 128) * 4, 4096 * (hidden // 128))
+        if max(tasks) > (2**31 - 1) // 2 or max_groups * group_rows > 2**31 - 1:
+            raise ValueError("EXLR8 grouped task or route indexing exceeds signed int32")
+        if max(scratch_bytes(g).values()) > 2**63 - 1:
+            raise ValueError("EXLR8 grouped scratch exceeds signed 64-bit addressing")
     r = g.get("group_rows", 16)
     h, u, t, m, s = (g[k] for k in ("hidden", "units", "top_k", "max_groups", "fc1_splits"))
     operands = (
