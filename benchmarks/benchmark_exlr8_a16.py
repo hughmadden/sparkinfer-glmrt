@@ -385,7 +385,7 @@ def main():
                         help="interleaved timing rounds; arm order rotates each round, medians reported")
     parser.add_argument("--profile",action="store_true",
                         help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
-    parser.add_argument("--profile-arm", choices=("grouped", "exl3", "mixed"), default="grouped",
+    parser.add_argument("--profile-arm", default="grouped",
                         help="grouped benchmark arm inside cudaProfilerStart/Stop")
     args = parser.parse_args()
     if not args.profile and args.output is None:
@@ -396,6 +396,8 @@ def main():
         parser.error("--grouped-arm requires --grouped")
     if len({name for name, _ in args.grouped_arm}) != len(args.grouped_arm):
         parser.error("--grouped-arm names must be unique")
+    if args.profile_arm not in {"grouped", "exl3", "mixed", *(name for name, _ in args.grouped_arm)}:
+        parser.error("--profile-arm must name an existing benchmark arm")
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
     torch.cuda.set_per_process_memory_fraction(min(
@@ -733,7 +735,10 @@ def grouped_main(args):
                 raise RuntimeError(f"frozen grouped arm {name} differs from snapshot chunked K1")
         if args.profile:
             torch.cuda.cudart().cudaProfilerStart()
-            {"grouped":candidate, "exl3":baseline, "mixed":mixed}[args.profile_arm]()
+            profile_arms = {"grouped": candidate, "exl3": baseline, "mixed": mixed}
+            profile_arms.update({name: functools.partial(candidate, program, ingress)
+                                 for name, (program, ingress, _) in frozen.items()})
+            profile_arms[args.profile_arm]()
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStop()
             print(f"profiled arm={args.profile_arm} rows={total}", flush=True)
