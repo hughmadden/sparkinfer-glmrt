@@ -362,7 +362,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         self.mma_block(b_smem, a_smem, lane, warp, 2, live, acc)
                     elif wg == Int32(3):
                         self.mma_block(b_smem, a_smem, lane, warp, 3, live, acc)
-                    else:
+                    elif wg == Int32(4):
                         self.mma_block(b_smem, a_smem, lane, warp, 4, live, acc)
                     self.scale_into(total_g, acc, _side_value(scales_g, kb), live)
                     acc.fill(Float32(0.0))
@@ -371,7 +371,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         self.mma_block(up_block, a_smem, lane, warp, 2, live, acc)
                     elif wu == Int32(3):
                         self.mma_block(up_block, a_smem, lane, warp, 3, live, acc)
-                    else:
+                    elif wu == Int32(4):
                         self.mma_block(up_block, a_smem, lane, warp, 4, live, acc)
                     self.scale_into(total_u, acc, _side_value(scales_u, kb), live)
                     if kb % Int32(8) == Int32(7):
@@ -498,7 +498,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         elif width == Int32(3):
                             self.mma_block(b_smem + Int32(u * BLOCK_SLOT_WORDS * 4),
                                            base + Int32(u * unit_bytes), lane, warp, 3, live, acc)
-                        else:
+                        elif width == Int32(4):
                             self.mma_block(b_smem + Int32(u * BLOCK_SLOT_WORDS * 4),
                                            base + Int32(u * unit_bytes), lane, warp, 4, live, acc)
                         self.scale_into(total, acc,
@@ -593,7 +593,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             self.mma_block(slot + Int32(a_words * 4), slot, lane, warp, 2, live, acc)
                         elif width == Int32(3):
                             self.mma_block(slot + Int32(a_words * 4), slot, lane, warp, 3, live, acc)
-                        else:
+                        elif width == Int32(4):
                             self.mma_block(slot + Int32(a_words * 4), slot, lane, warp, 4, live, acc)
                         self.scale_into(total, acc,
                                         _side_value(pointers[desc * Int64(3) + Int64(2)], block), live)
