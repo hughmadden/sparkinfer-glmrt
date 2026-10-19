@@ -117,6 +117,7 @@ class Exlr8A16Kernel:
         self.max_groups = int(max_groups)
         self.fast_math = bool(fast_math)
         self.device_count = bool(device_count)
+        self.group_rows = 16
         self.blocks = hidden_size // 128
         self.splits = (self.blocks + 7) // 8
 
@@ -303,19 +304,19 @@ class Exlr8A16Kernel:
             group, unit = task // Int32(self.units), task % Int32(self.units)
             expert = group_expert[group]
             desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3)
-            for iteration in cutlass.range_constexpr(4):
+            for iteration in cutlass.range_constexpr(self.group_rows // 4):
                 row = warp + Int32(iteration * 4)
-                slot = route_slots[group.to(Int64) * Int64(16) + row.to(Int64)]
+                slot = route_slots[group.to(Int64) * Int64(self.group_rows) + row.to(Int64)]
                 g = cute.make_rmem_tensor(4, Float32)
                 u = cute.make_rmem_tensor(4, Float32)
                 g.fill(Float32(0.0))
                 u.fill(Float32(0.0))
                 if bits[desc] != Int32(0) and slot >= Int32(0) and slot < rows * Int32(self.top_k):
                     for split in cutlass.range_constexpr(self.splits):
-                        base = (task.to(Int64) * Int64(2 * self.splits) + Int64(split)) * Int64(16 * 128) + row.to(Int64) * Int64(128) + lane.to(Int64) * Int64(4)
+                        base = (task.to(Int64) * Int64(2 * self.splits) + Int64(split)) * Int64(self.group_rows * 128) + row.to(Int64) * Int64(128) + lane.to(Int64) * Int64(4)
                         for v in cutlass.range_constexpr(4):
                             g[v] = g[v] + fc1[base + Int64(v)]
-                            u[v] = u[v] + fc1[base + Int64(self.splits * 16 * 128 + v)]
+                            u[v] = u[v] + fc1[base + Int64(self.splits * self.group_rows * 128 + v)]
                     gh = _w4a8_had128_quad(g[0], g[1], g[2], g[3], lane)
                     uh = _w4a8_had128_quad(u[0], u[1], u[2], u[3], lane)
                     gs = pointers[desc * Int64(3) + Int64(1)]
@@ -328,7 +329,7 @@ class Exlr8A16Kernel:
                         sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math))
                         g[v] = gate * sigmoid * up * _side_value(ds, col)
                     g[0], g[1], g[2], g[3] = _w4a8_had128_quad(g[0], g[1], g[2], g[3], lane)
-                    base = (task.to(Int64) * Int64(16) + row.to(Int64)) * Int64(128) + lane.to(Int64) * Int64(4)
+                    base = (task.to(Int64) * Int64(self.group_rows) + row.to(Int64)) * Int64(128) + lane.to(Int64) * Int64(4)
                     for v in cutlass.range_constexpr(4):
                         intermediate[base + Int64(v)] = g[v].to(cutlass.Float16)
             task += step
@@ -417,7 +418,7 @@ class Exlr8A16Kernel:
             for slot in cutlass.range_constexpr(self.top_k):
                 route = row.to(Int64) * Int64(self.top_k) + Int64(slot)
                 packed = route_group_lane[route]
-                if packed >= Int32(0) and packed < groups * Int32(16):
+                if packed >= Int32(0) and packed < groups * Int32(self.group_rows):
                     weight = route_weights[route]
                     w0, w1, w2, w3 = ld_global_nc_v4_u32(
                         fc2_address + (packed.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(4))
