@@ -3,7 +3,7 @@
 Each 8-warp CTA owns a full N128 unit (N16 per warp) and up to four M16 tiles.
 Each warp decodes its full 16x16 trellis tile once per K16 step and feeds both
 N8 MMA halves from a single ldmatrix of A. Live M16 tiles are compacted per
-group, shared_a is double-buffered with cp.async, a K128 accumulator is scaled
+group, A and B are staged with cp.async, a K128 accumulator is scaled
 with one pinned FMA, and FC1 split partials fold in ascending split order.
 """
 from __future__ import annotations
@@ -175,7 +175,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 10
+    CODE_VERSION = 11
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -185,7 +185,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         if group_rows not in (16, 32, 64):
             raise ValueError("EXLR8 grouped group_rows must be 16, 32 or 64")
         self.shared_memory_bytes = query_optin_shared_memory()
-        required = 2 * (group_rows * 256 + 8192) + max(1, self.mtiles - 1) * 8192
+        required = group_rows * 256 + 8192 + max(1, self.mtiles - 1) * 8192
         if self.shared_memory_bytes is not None and required > self.shared_memory_bytes:
             raise ValueError(f"EXLR8 grouped needs {required} B shared memory, above "
                              f"the device's {self.shared_memory_bytes} B opt-in limit")
@@ -279,6 +279,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             off1 = off0 + Int32(4096)
             cp_async4_shared_global_cg_pred(shared_b + off1, base_b + off1.to(Int64), (tid < Int32(128)).to(Int32))
         cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
 
     @cute.jit
     def accumulate_fixed_m(self, total: cute.Tensor, shared_a: Int32, shared_b: Int32,
@@ -376,13 +378,13 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             words: cute.struct.Align[
                 cute.struct.MemRange[
                     Uint32,
-                    2 * (self.group_rows * 64 + 2048) + max(1, self.mtiles - 1) * 2048
+                    self.group_rows * 64 + 2048 + max(1, self.mtiles - 1) * 2048
                 ], 1024]
 
         storage = smem.allocate(Storage)
         shared_a = shared_ptr_to_u32(storage.words.data_ptr())
         shared_b = shared_a + Int32(self.group_rows * 256)
-        shared_c = shared_a + Int32(2 * (self.group_rows * 256 + 8192))
+        shared_c = shared_b + Int32(8192)
         tid = Int32(cute.arch.thread_idx()[0])
         task = Int32(cute.arch.block_idx()[0])
         step = Int32(cute.arch.grid_dim()[0])
@@ -408,9 +410,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             width = bits[desc]
             num_live_m, live_m, srow = self.prepare_group_tiles(
                 route_slots, group, rows, tid, lane, shared_a, smem_thread_off, False)
-            self.prepare_group_tiles(route_slots, group, rows, tid, lane,
-                                     shared_a + Int32(self.group_rows * 256 + 8192),
-                                     smem_thread_off, False)
             cute.arch.sync_threads()
 
             if width != Int32(0) and num_live_m > Int32(0):
@@ -418,40 +417,26 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 payload, scales = pointers[desc * Int64(3)], pointers[desc * Int64(3) + Int64(2)]
                 x_addr = x.iterator.toint()
 
-                # Two committed A/B buffers: issue k+1 before consuming k.
-                for initial in cutlass.range_constexpr(2):
-                    if Int32(initial) < Int32(self.blocks):
-                        a_slot = shared_a + Int32(initial * (self.group_rows * 256 + 8192))
-                        b_slot = a_slot + Int32(self.group_rows * 256)
-                        for w in cutlass.range_constexpr(2, 5):
-                            if width == Int32(w):
-                                self.stage_ab(a_slot, b_slot, x_addr, payload, srow, num_live_m,
-                                              Int32(initial), Int32(initial), tid, smem_thread_off,
-                                              col_s, self.hidden_size, w)
                 for split in cutlass.range(self.splits):
                     kb0 = split * Int32(8)
                     total.fill(Float32(0.0))
                     for block in cutlass.range(8):
                         kb = kb0 + block
                         if kb < Int32(self.blocks):
-                            if kb + Int32(1) < Int32(self.blocks):
-                                cute.arch.cp_async_wait_group(1)
-                            else:
-                                cute.arch.cp_async_wait_group(0)
-                            cute.arch.sync_threads()
-                            a_slot = shared_a + (kb % Int32(2)) * Int32(self.group_rows * 256 + 8192)
-                            b_slot = a_slot + Int32(self.group_rows * 256)
                             scale = _side_value(scales, kb)
-                            for w in cutlass.range_constexpr(2, 5):
-                                if width == Int32(w):
-                                    self.accumulate(total, a_slot, b_slot, lane, warp, w, scale, num_live_m)
+                            if width == Int32(2):
+                                self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
+                                              kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 2)
+                                self.accumulate(total, shared_a, shared_b, lane, warp, 2, scale, num_live_m)
+                            elif width == Int32(3):
+                                self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
+                                              kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 3)
+                                self.accumulate(total, shared_a, shared_b, lane, warp, 3, scale, num_live_m)
+                            elif width == Int32(4):
+                                self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
+                                              kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 4)
+                                self.accumulate(total, shared_a, shared_b, lane, warp, 4, scale, num_live_m)
                             cute.arch.sync_threads()
-                            if kb + Int32(2) < Int32(self.blocks):
-                                for w in cutlass.range_constexpr(2, 5):
-                                    if width == Int32(w):
-                                        self.stage_ab(a_slot, b_slot, x_addr, payload, srow, num_live_m,
-                                                      kb + Int32(2), kb + Int32(2), tid, smem_thread_off,
-                                                      col_s, self.hidden_size, w)
                     for v in cutlass.range_constexpr(8):
                         grand0[v] = grand0[v] + total[0, v]
                     for idx in cutlass.range_constexpr(self.mtiles - 1):
@@ -616,20 +601,14 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         if width == Int32(2):
                             self.stage_ab(shared_a, shared_b, unit_addr, payload, srow, num_live_m,
                                           Int32(0), block, tid, smem_thread_off, col_s, 128, 2)
-                            cute.arch.cp_async_wait_group(0)
-                            cute.arch.sync_threads()
                             self.accumulate(total, shared_a, shared_b, lane, warp, 2, scale, num_live_m)
                         elif width == Int32(3):
                             self.stage_ab(shared_a, shared_b, unit_addr, payload, srow, num_live_m,
                                           Int32(0), block, tid, smem_thread_off, col_s, 128, 3)
-                            cute.arch.cp_async_wait_group(0)
-                            cute.arch.sync_threads()
                             self.accumulate(total, shared_a, shared_b, lane, warp, 3, scale, num_live_m)
                         elif width == Int32(4):
                             self.stage_ab(shared_a, shared_b, unit_addr, payload, srow, num_live_m,
                                           Int32(0), block, tid, smem_thread_off, col_s, 128, 4)
-                            cute.arch.cp_async_wait_group(0)
-                            cute.arch.sync_threads()
                             self.accumulate(total, shared_a, shared_b, lane, warp, 4, scale, num_live_m)
                         cute.arch.sync_threads()
 
