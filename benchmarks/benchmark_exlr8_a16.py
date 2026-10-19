@@ -586,7 +586,6 @@ def grouped_main(args):
     limit = int(props.multi_processor_count) * 4
     group_rows = args.group_rows
     capacity = (4096*8 + group_rows-1)//group_rows + 256
-    state = buffers(4096, 6144, 4, 8, capacity, group_rows)
     group = compile_exlr8_group_aot(hidden=6144, top_k=8, max_groups=capacity,
                                     max_rows=4096, group_rows=group_rows)
     grouped = compile_exlr8_a16_aot(units=4, top_k=8, max_groups=capacity,
@@ -598,6 +597,7 @@ def grouped_main(args):
     exl_layers = [(exl3._prepared(4,256,408+2*c,torch.device("cuda")),
                    exl3._prepared(5,1,409+2*c,torch.device("cuda")))
                   for c in range(len(t["tables"]))]
+    state = buffers(4096, 6144, 4, 8, capacity, group_rows)
     mixed_states = [grouped_mixed_state(4096, ts, props) for ts in exl_layers]
     records = []
     for total in map(int, args.rows.split(",")):
