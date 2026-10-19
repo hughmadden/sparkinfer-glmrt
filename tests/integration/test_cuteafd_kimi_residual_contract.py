@@ -57,8 +57,23 @@ def test_situ_abi(capture, intermediate):
     assert info["key"] == (intermediate,)
 
 
+@pytest.mark.parametrize("hidden", [3584, 7168])
+def test_rmsnorm_abi(capture, hidden):
+    _, info = module.compile_kimi_rmsnorm_aot(hidden)
+    assert [(x.name, x.shape, x.dtype, x.role) for x in info["operands"]] == [
+        ("x", f"[rows,{hidden}]", torch.bfloat16, "in"),
+        ("weight", f"[{hidden}]", torch.bfloat16, "in"),
+        ("out", f"[rows,{hidden}]", torch.bfloat16, "out")]
+    assert [(x.name, x.ctype) for x in info["scalars"]] == [("rows", "int32"), ("eps", "float32")]
+    assert info["key"] == (hidden,)
+    assert "scratch" not in info
+    with pytest.raises(ValueError):
+        module.compile_kimi_rmsnorm_aot(4096)
+
+
 def test_no_live_count_compile_keys(capture):
-    for compile_fn in (module.compile_kimi_attn_res_rmsnorm_aot, module.compile_kimi_situ_aot):
+    for compile_fn in (module.compile_kimi_attn_res_rmsnorm_aot, module.compile_kimi_situ_aot,
+                       module.compile_kimi_rmsnorm_aot):
         params = inspect.signature(compile_fn).parameters
         assert "rows" not in params and "arena_rows" not in params
     with pytest.raises(ValueError):

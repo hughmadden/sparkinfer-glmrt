@@ -29,6 +29,47 @@ def _candidate_storage(words):
     return cute.struct(Storage)
 
 
+@cute.jit
+def _normalize_bf16(values: cute.Tensor, weight: cute.Pointer, out: cute.Pointer,
+                    base: Int64, tid: Int64, sums: cute.Tensor, slot: Int32,
+                    eps: Float32, hidden: cutlass.Constexpr, threads: cutlass.Constexpr):
+    square = Float32(0)
+    for j in cutlass.range_constexpr(hidden // threads):
+        square = square + values[j] * values[j]
+    total = _block_sum(square, sums, slot, threads // 32)
+    inv = _rsqrt(div_rn_f32(total, Float32(hidden)) + eps)
+    for j in cutlass.range_constexpr(hidden // threads):
+        d = tid + Int64(j * threads)
+        out[base + d] = (_bf16(values[j] * inv) * Float32(weight[d])).to(BFloat16)
+
+
+class KimiRmsNorm:
+    threads = 512
+
+    def __init__(self, hidden):
+        if hidden not in (3584, 7168):
+            raise ValueError("Kimi RMSNorm requires hidden width 3584 or 7168")
+        self.hidden = hidden
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, eps: Float32, stream: cuda.CUstream):
+        self.kernel(x, weight, out, eps).launch(
+            grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer, eps: Float32):
+        base = Int64(cute.arch.block_idx()[0]) * Int64(self.hidden)
+        tid = Int64(cute.arch.thread_idx()[0])
+        storage = utils.SmemAllocator().allocate(_reduction_storage(1, self.threads // 32))
+        sums = storage.sums.get_tensor(cute.make_layout((1, self.threads // 32)))
+        values = cute.make_rmem_tensor((self.hidden // self.threads,), Float32)
+        for j in cutlass.range_constexpr(self.hidden // self.threads):
+            values[j] = Float32(x[base + tid + Int64(j * self.threads)])
+        _normalize_bf16(values, weight, out, base, tid, sums, Int32(0), eps,
+                        self.hidden, self.threads)
+
+
 class KimiAttnResRmsNorm:
     threads = 512
 
@@ -124,7 +165,6 @@ class KimiAttnResRmsNorm:
                 denominator = denominator + scores[c]
             for c in cutlass.range_constexpr(self.candidates):
                 scores[c] = div_rn_f32(scores[c], denominator)
-        square = Float32(0)
         for j in cutlass.range_constexpr(self.elements):
             value = current[j]
             if cutlass.const_expr(self.has_mix):
@@ -141,15 +181,11 @@ class KimiAttnResRmsNorm:
                     value = value + candidate * scores[c]
                 value = _bf16(value)
             mixed[j] = value
-            square = square + value * value
             if cutlass.const_expr(self.append):
                 at = base + tid + Int64(j * self.threads)
                 arena[Int64(self.candidates - 1) * stride + at] = current[j].to(BFloat16)
-        total = _block_sum(square, sums, Int32(2 * self.candidates), self.warps)
-        inv = _rsqrt(div_rn_f32(total, Float32(self.hidden)) + eps)
-        for j in cutlass.range_constexpr(self.elements):
-            d = tid + Int64(j * self.threads)
-            out[base + d] = (_bf16(mixed[j] * inv) * Float32(norm_weight[d])).to(BFloat16)
+        _normalize_bf16(mixed, norm_weight, out, base, tid, sums,
+                        Int32(2 * self.candidates), eps, self.hidden, self.threads)
 
 
 class KimiSitu:
@@ -196,6 +232,17 @@ def compile_kimi_attn_res_rmsnorm_aot(hidden=7168, candidates=2, prefix_mode="ke
         geometry=dict(hidden=hidden, candidates=candidates, prefix_mode=prefix_mode,
                       append=append, has_mix=has_mix),
         doc="Fixed-stride BF16 prefix update, optional unmixed append, residual mix and RMSNorm.")
+
+
+def compile_kimi_rmsnorm_aot(hidden=3584):
+    """One-launch latent/input norm with separate normalized and weighted casts."""
+    return compile_program(KimiRmsNorm(hidden), name="kimi_rmsnorm", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{hidden}]"),
+        Operand("weight", torch.bfloat16, f"[{hidden}]"),
+        Operand("out", torch.bfloat16, f"[rows,{hidden}]", "out")),
+        scalars=(Scalar("rows"), Scalar("eps", "float32")), key=(hidden,),
+        geometry=dict(hidden=hidden),
+        doc="Kimi RMSNorm with BF16 normalized intermediate and BF16 weight product.")
 
 
 def compile_kimi_situ_aot(intermediate=3072):
