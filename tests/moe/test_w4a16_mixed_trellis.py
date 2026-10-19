@@ -55,6 +55,7 @@ def test_compact_glm_benchmark_arguments_without_cuda():
     assert _parse_args([]).experts == 32
     args = _parse_args(["--compact-glm", "--tp", "4", "6", "--rows", "1", "16"])
     assert (args.experts, args.tp, args.rows, args.bits) == (256, [4, 6], [1, 16], [4, 5])
+    assert _parse_args(["--compact-glm", "--widths", "256"]).widths == [256]
     for argv in [["--compact-glm", "--tp", "3"], ["--rows", "8"],
             ["--compact-glm", "--experts", "7"], ["--compact-glm", "--experts", "258"],
             ["--bits", "4", "4"], ["--iterations", "0"], ["--compact-glm", "--compare-tiles"]]:

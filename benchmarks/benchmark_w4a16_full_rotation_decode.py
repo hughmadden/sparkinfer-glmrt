@@ -62,6 +62,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--compact-glm", action="store_true", help="Compare fixed and compact GLM TP4/TP6 expert kernels")
     parser.add_argument("--tp", type=int, nargs="+", choices=(4, 6), default=[4, 6])
     parser.add_argument("--rows", type=int, nargs="+", choices=(1, 16), default=[1, 16])
+    parser.add_argument("--widths", type=int, nargs="+", choices=(256, 384, 512), default=[256, 384, 512])
     parser.add_argument("--bits", type=int, nargs=2, default=[4, 5])
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -114,6 +115,8 @@ def _compact_glm(args, device):
     records = []
     for tp in args.tp:
         for width in ([512] if tp == 4 else [384, 256]):
+            if width not in args.widths:
+                continue
             tiers = []
             for bits in args.bits:
                 tiers.append(prepare_trellis256_moe_weights(
@@ -199,8 +202,13 @@ def _compact_glm(args, device):
                         if relative > .004:
                             raise RuntimeError(f"compact differs from source masked control: {relative}")
                     graphs.append((name, graph, binding, buffers, tile))
+                timings = {name: [] for name, *_ in graphs}
+                for round_index in range(args.rounds):
+                    order = graphs if round_index % 2 == 0 else list(reversed(graphs))
+                    for name, graph, *_ in order:
+                        timings[name].extend(_time_graph(graph, iterations=args.iterations, rounds=1))
                 for name, graph, binding, buffers, tile in graphs:
-                    samples = _time_graph(graph, iterations=args.iterations, rounds=args.rounds)
+                    samples = timings[name]
                     record = dict(tp=tp, rows=rows, hidden=hidden, width=width, arm=name,
                         bits=args.bits, experts=experts, route_experts=256, topk=topk,
                         min_width=min(widths), max_width=max(widths), tile=tile,
