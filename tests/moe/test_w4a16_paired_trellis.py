@@ -79,7 +79,7 @@ def test_paired_boundary_skips_match_full_width_control(boundary, tile_k, interm
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1), reason="requires Spark SM121")
-@pytest.mark.parametrize("intermediate", [384, 640, 768])
+@pytest.mark.parametrize("intermediate", [256, 384, 640, 768])
 @pytest.mark.parametrize("tile_k", [64, 128])
 @pytest.mark.parametrize("all_owned", [False, True])
 def test_compact_true_width_weights_match_padded_control(intermediate, tile_k, all_owned):
@@ -87,7 +87,8 @@ def test_compact_true_width_weights_match_padded_control(intermediate, tile_k, a
     torch.manual_seed(521031)
     device = torch.device("cuda", 0)
     props = torch.cuda.get_device_properties(device)
-    tile = (tile_k, 128, tile_k, 128)
+    tile_n = 256 if intermediate == 256 and all_owned else 128
+    tile = (tile_k, tile_n, tile_k, tile_n)
     tiers = tuple(_prepared(experts=2, hidden=128, intermediate=intermediate,
         bits=bits, seed=bits * 211, device=device, tile_config=tile) for bits in (3, 4))
     mapping, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)

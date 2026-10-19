@@ -5266,11 +5266,14 @@ class W4A16GemmKernel:
                         + t256_chunk * Int32(16)
                     )
                     if cutlass.const_expr(self._compact_weight is not None):
-                        weight_offset, live_width, compact_fc1 = self._compact_weight
+                        weight_offset, live_width, compact_fc1, full_width = self._compact_weight
                         compact_n16 = Int64(t256_n16)
                         local_n16 = output_n_tile.to(Int64) * Int64(self.cta_n_blocks)
                         if cutlass.const_expr(compact_fc1):
-                            compact_n16 = live_width.to(Int64) // Int64(16)
+                            if cutlass.const_expr(full_width):
+                                compact_n16 = Int64(t256_n16 // 2)
+                            else:
+                                compact_n16 = live_width.to(Int64) // Int64(16)
                             local_n16 = local_n16 % Int64(t256_n16 // 2)
                         b_src_i64 = (
                             weight_offset

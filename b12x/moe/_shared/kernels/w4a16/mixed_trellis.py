@@ -398,7 +398,7 @@ class W4A16MixedTrellisKernel:
             self.shared_words,
             self.paired_boundary,
             self.token_major_rotation,
-        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits)) + (("compact_weights_v1",) if self.compact_weights else ())
+        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits)) + (("compact_weights_v2",) if self.compact_weights else ())
 
     @cute.jit
     def _dispatch_tier_gemm(
@@ -539,19 +539,26 @@ class W4A16MixedTrellisKernel:
             if cutlass.const_expr(self.compact_weights):
                 # Rows 0..2 retain tier/local IDs. Row 3 is the true H128
                 # width; rows 4..6 are projection offsets in uint32 words.
-                live_width = descriptor_map[
-                    Int64(3) * total_experts.to(Int64) + combined_expert.to(Int64)
-                ].to(Int32)
+                # Binding requires positive tile-aligned widths. A single
+                # FC1 tile per half therefore proves every live width is full.
+                full_width = self.driver.intermediate_size == self.driver.fc1.tile_n
+                if cutlass.const_expr(full_width):
+                    live_width = Int32(self.driver.intermediate_size)
+                else:
+                    live_width = descriptor_map[
+                        Int64(3) * total_experts.to(Int64) + combined_expert.to(Int64)
+                    ].to(Int32)
                 weight_offset = descriptor_map[
                     (descriptor_row.to(Int64) + Int64(4)) * total_experts.to(Int64)
                     + combined_expert.to(Int64)
                 ].to(Int64)
-                compact_weight = (weight_offset, live_width, is_fc1)
-                if cutlass.const_expr(is_fc1):
-                    if output_n_tile % fc1_half_tiles >= live_width // Int32(self.driver.fc1.tile_n):
-                        descriptor = Int32(-1)
-                else:
-                    reduce_tile_count = live_width // Int32(self.driver.fc2.tile_k)
+                compact_weight = (weight_offset, live_width, is_fc1, full_width)
+                if cutlass.const_expr(not full_width):
+                    if cutlass.const_expr(is_fc1):
+                        if output_n_tile % fc1_half_tiles >= live_width // Int32(self.driver.fc1.tile_n):
+                            descriptor = Int32(-1)
+                    else:
+                        reduce_tile_count = live_width // Int32(self.driver.fc2.tile_k)
             if cutlass.const_expr(self.paired_boundary is not None):
                 # The fourth descriptor row is mutable batch metadata: one
                 # means compute the boundary block, zero means omit it. The
