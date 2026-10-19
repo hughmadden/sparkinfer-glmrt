@@ -111,7 +111,7 @@ class _Group:
         prefix = smem.allocate_tensor(Int32, cute.make_layout(256), byte_alignment=16)
         valid = smem.allocate_tensor(Int32, cute.make_layout(1), byte_alignment=16)
         if Int32(cute.arch.block_idx()[0]) == Int32(0):
-            self.group(ids, group_expert, route_slots, route_group_lane, group_count,
+            self.pack(ids, group_expert, route_slots, route_group_lane, group_count,
                        prefix, valid, rows)
         else:
             self.ingress(x, signs_in, activation, rows)
@@ -157,7 +157,7 @@ class _Group:
             task += step
 
     @cute.jit
-    def group(self, ids: cute.Pointer, group_expert: cute.Pointer,
+    def pack(self, ids: cute.Pointer, group_expert: cute.Pointer,
               route_slots: cute.Pointer, route_group_lane: cute.Pointer,
               group_count: cute.Pointer, prefix: cute.Tensor, valid: cute.Tensor,
               rows: Int32):
