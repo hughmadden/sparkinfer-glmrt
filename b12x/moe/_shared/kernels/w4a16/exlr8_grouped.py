@@ -79,14 +79,23 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             raise ValueError("EXLR8 grouped group_rows must be 16, 32 or 64")
         self.group_rows = group_rows
         self.mtiles = group_rows // 16
+        # Blocks staged before the loop; also the cp.async wait depth, since
+        # exactly this many groups are newer than the one being consumed.
+        self.prologue = min(STAGES - 1, self.blocks)
         a_words = group_rows * 64
         fc1_words = STAGES * (a_words + 2 * BLOCK_SLOT_WORDS) + 2 * A_TILE_WORDS
-        fc2_words = self.units * a_words + 2 * self.units * BLOCK_SLOT_WORDS
-        self.shared_words = max(fc1_words, fc2_words)
-        if self.shared_words * 4 > MIN_SHARED_MEM:
+        if fc1_words * 4 > MIN_SHARED_MEM:
             raise ValueError(
-                f"EXLR8 grouped needs {self.shared_words * 4} B shared memory, "
+                f"EXLR8 grouped FC1 needs {fc1_words * 4} B shared memory, "
                 f"above the {MIN_SHARED_MEM} B every supported target provides")
+        # FC2 keeps every unit's intermediate resident when it fits, and
+        # otherwise streams one (unit, block) at a time through a two-deep
+        # ring; both walk the units ascending, so results are identical.
+        resident_words = self.units * a_words + 2 * self.units * BLOCK_SLOT_WORDS
+        self.fc2_resident = resident_words * 4 <= MIN_SHARED_MEM
+        ring_words = 2 * (a_words + BLOCK_SLOT_WORDS)
+        self.shared_words = max(fc1_words, resident_words if self.fc2_resident else ring_words)
+        self.fc2_prologue = min(2, self.blocks * self.units)
 
     @property
     def __cache_key__(self):
@@ -107,10 +116,16 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                     intermediate, rows, group_count).launch(
                 grid=(min(Int32(self.max_groups * self.units), cta_limit), 1, 1),
                 block=(256, 1, 1), min_blocks_per_mp=1, stream=stream)
-            self.grouped_fc2_kernel(pointers, bits, group_expert, route_slots,
-                                    intermediate, fc2, rows, group_count).launch(
-                grid=(min(Int32(self.max_groups), cta_limit), 1, 1),
-                block=(256, 1, 1), min_blocks_per_mp=1, stream=stream)
+            if self.fc2_resident:
+                self.grouped_fc2_kernel(pointers, bits, group_expert, route_slots,
+                                        intermediate, fc2, rows, group_count).launch(
+                    grid=(min(Int32(self.max_groups), cta_limit), 1, 1),
+                    block=(256, 1, 1), min_blocks_per_mp=1, stream=stream)
+            else:
+                self.grouped_fc2_split_kernel(pointers, bits, group_expert, route_slots,
+                                              intermediate, fc2, rows, group_count).launch(
+                    grid=(min(Int32(self.max_groups), cta_limit), 1, 1),
+                    block=(256, 1, 1), min_blocks_per_mp=1, stream=stream)
             self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
                                rows, group_count).launch(
                 grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
@@ -324,21 +339,21 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 folded_u.fill(Float32(0.0))
                 total_g.fill(Float32(0.0))
                 total_u.fill(Float32(0.0))
-                for s in cutlass.range_constexpr(STAGES - 1):
+                for s in cutlass.range_constexpr(self.prologue):
                     self.stage_block(base + Int32(s * slot_bytes),
                                      base + Int32(s * slot_bytes) + Int32(a_bytes),
                                      x_address, payload_g, payload_u, route_slots,
                                      group, rows, Int32(s), wg, wu, tid)
                     cute.arch.cp_async_commit_group()
                 for kb in cutlass.range(self.blocks, unroll=1):
-                    nxt = kb + Int32(STAGES - 1)
+                    nxt = kb + Int32(self.prologue)
                     if nxt < Int32(self.blocks):
                         ahead = base + (nxt % Int32(STAGES)) * Int32(slot_bytes)
                         self.stage_block(ahead, ahead + Int32(a_bytes), x_address,
                                          payload_g, payload_u, route_slots, group,
                                          rows, nxt, wg, wu, tid)
                     cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(STAGES - 1)
+                    cute.arch.cp_async_wait_group(self.prologue)
                     cute.arch.sync_threads()
                     a_smem = base + (kb % Int32(STAGES)) * Int32(slot_bytes)
                     b_smem = a_smem + Int32(a_bytes)
@@ -489,6 +504,100 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         self.scale_into(total, acc,
                                         _side_value(pointers[desc * Int64(3) + Int64(2)], block), live)
                 cute.arch.sync_threads()
+                self.store_fc2(total, rids, group, block, lane, warp, fc2)
+                cute.arch.sync_threads()
+            cute.arch.sync_threads()
+            task += step
+
+    @cute.jit
+    def stage_fc2_step(self, slot: Int32, pointers: cute.Tensor, bits: cute.Tensor,
+                       expert: Int32, block: Int32, unit: Int32,
+                       intermediate_address: Int64, route_slots: cute.Tensor,
+                       group: Int32, rows: Int32, tid: Int32):
+        """Stage one (block, unit) step: its A tile and its down block."""
+        self.stage_unit_a(slot, unit, Int32(0), intermediate_address, route_slots,
+                          group, rows, tid)
+        desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
+        width = bits[desc]
+        for i in cutlass.range_constexpr(2):
+            v = tid + Int32(i * 256)
+            if v < width * Int32(128):
+                cp_async4_shared_global(
+                    slot + Int32(self.group_rows * 64 * 4) + v * Int32(16),
+                    pointers[desc * Int64(3)]
+                    + block.to(Int64) * (Int64(BLOCK_SLOT_WORDS) * width.to(Int64))
+                    + v.to(Int64) * Int64(16))
+
+    @cute.kernel
+    def grouped_fc2_split_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
+                                 group_expert: cute.Tensor, route_slots: cute.Tensor,
+                                 intermediate: cute.Tensor, fc2: cute.Tensor,
+                                 rows: Int32, group_count: cute.Tensor):
+        """FC2 for a group whose intermediates exceed shared memory.
+
+        One (block, unit) step streams through a two-deep ring in the same
+        ascending unit order, so the FP32 accumulation is unchanged; only the
+        activation tile is fetched again per output block.
+        """
+        groups = group_count[0]
+        if groups < Int32(0) or groups > Int32(self.max_groups):
+            groups = Int32(0)
+        smem = cutlass.utils.SmemAllocator()
+        a_words = self.group_rows * 64
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[Uint32, 2 * (a_words + BLOCK_SLOT_WORDS)], 1024]
+
+        storage = smem.allocate(Storage)
+        base = shared_ptr_to_u32(storage.words.data_ptr())
+        slot_bytes = (a_words + BLOCK_SLOT_WORDS) * 4
+        total_steps = self.blocks * self.units
+        tid = Int32(cute.arch.thread_idx()[0])
+        task = Int32(cute.arch.block_idx()[0])
+        step = Int32(cute.arch.grid_dim()[0])
+        lane, warp = tid & Int32(31), tid >> Int32(5)
+        while task < groups:
+            group = task
+            expert = group_expert[group]
+            intermediate_address = intermediate.iterator.toint()
+            rids = self.row_ids(route_slots, group, rows, lane, True)
+            live = self.live_tiles(route_slots, group, rows, lane)
+            total = cute.make_rmem_tensor((self.mtiles, 2, 4), Float32)
+            acc = cute.make_rmem_tensor((self.mtiles, 2, 4), Float32)
+            for s in cutlass.range_constexpr(self.fc2_prologue):
+                self.stage_fc2_step(base + Int32(s * slot_bytes), pointers, bits, expert,
+                                    Int32(s) // Int32(self.units), Int32(s) % Int32(self.units),
+                                    intermediate_address, route_slots, group, rows, tid)
+                cute.arch.cp_async_commit_group()
+            for block in cutlass.range(self.blocks, unroll=1):
+                total.fill(Float32(0.0))
+                for unit in cutlass.range(self.units, unroll=1):
+                    here = block * Int32(self.units) + unit
+                    nxt = here + Int32(self.fc2_prologue)
+                    if nxt < Int32(total_steps):
+                        self.stage_fc2_step(base + (nxt % Int32(2)) * Int32(slot_bytes),
+                                            pointers, bits, expert, nxt // Int32(self.units),
+                                            nxt % Int32(self.units), intermediate_address,
+                                            route_slots, group, rows, tid)
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(self.fc2_prologue)
+                    cute.arch.sync_threads()
+                    slot = base + (here % Int32(2)) * Int32(slot_bytes)
+                    desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
+                    width = bits[desc]
+                    if width != Int32(0):
+                        acc.fill(Float32(0.0))
+                        if width == Int32(2):
+                            self.mma_block(slot + Int32(a_words * 4), slot, lane, warp, 2, live, acc)
+                        elif width == Int32(3):
+                            self.mma_block(slot + Int32(a_words * 4), slot, lane, warp, 3, live, acc)
+                        else:
+                            self.mma_block(slot + Int32(a_words * 4), slot, lane, warp, 4, live, acc)
+                        self.scale_into(total, acc,
+                                        _side_value(pointers[desc * Int64(3) + Int64(2)], block), live)
+                    cute.arch.sync_threads()
                 self.store_fc2(total, rids, group, block, lane, warp, fc2)
                 cute.arch.sync_threads()
             cute.arch.sync_threads()
