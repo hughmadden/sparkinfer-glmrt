@@ -211,6 +211,7 @@ def spill_check(program, directory):
         sass = subprocess.check_output(["/usr/local/cuda/bin/cuobjdump", "--dump-sass", str(cubin)], text=True)
         records.append(dict(sha256=hashlib.sha256(blob).hexdigest(), resources=resources,
                             local_bytes=list(map(int, local)),
+                            stack_bytes=list(map(int, re.findall(r"STACK:(\d+)", resources))),
                             local_load_store_instructions=len(re.findall(r"\b(?:LDL|STL)(?:\.|\s)", sass))))
     return records
 
@@ -346,6 +347,7 @@ def main():
                               w8a16_us=base_us, w8a16_error=base_error, cubin_spill_check=spills[name])
                 # Different K-order groups may be eligible; required arms must
                 # additionally agree with the per-op frozen group reference.
+                record["spill_free"] = all(not any(r["local_bytes"] + r["stack_bytes"]) and not r["local_load_store_instructions"] for r in spills[name])
                 record["eligible"] = invariant and tail_untouched and record["fp64_pass"] and (equal or name not in args.require_reference_arm)
                 if record["eligible"]:
                     launches = [lambda p=program: p.launch(*tensors, scalars=scalars)]
