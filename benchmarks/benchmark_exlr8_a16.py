@@ -17,8 +17,10 @@ import functools
 import hashlib
 import importlib.util
 import json
+import re
 from pathlib import Path
 import statistics
+import subprocess
 import sys
 import tempfile
 
@@ -236,20 +238,82 @@ def compile_control(path, group_path):
 L2_SPAN = 2  # weight copies span at least this many times the device L2
 
 
-def compile_grouped_control(path, candidate):
-    """Freeze the previous grouped core while sharing the unchanged serving ABI."""
+def parse_grouped_arm(value):
+    name, separator, revision = value.partition(":")
+    if (not separator or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name)
+            or not revision or revision.startswith("-") or ":" in revision
+            or name in {"chunked", "grouped", "exl3", "mixed_unreachable_k5"}):
+        raise argparse.ArgumentTypeError("grouped arm must be NAME:REV with a nonreserved name")
+    return name, revision
+
+
+def materialize_grouped_arm(revision, directory, repository=None):
+    """Pin both sources with git before exporting a metadata-free run tree."""
+    repository = repository or Path(__file__).resolve().parents[1]
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repository), *args])
+    sha = git("rev-parse", "--verify", revision + "^{commit}").decode().strip()
+    paths = {"core": "b12x/moe/_shared/kernels/w4a16/exlr8_grouped.py",
+             "glue": "b12x/integration/cuteafd/exlr8_glue.py"}
+    directory = Path(directory) / sha
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = {"revision": sha, "sources": {}}
+    for label, path in paths.items():
+        source = git("show", f"{sha}:{path}")
+        (directory / f"{label}.py").write_bytes(source)
+        manifest["sources"][label] = hashlib.sha256(source).hexdigest()
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    return directory
+
+
+def grouped_arm_bundle(revision, directory):
+    if directory is None:
+        return materialize_grouped_arm(revision, Path(tempfile.mkdtemp(prefix="exlr8-arms-")))
+    # Staged runs have no Git database; resolve only an unambiguous SHA prefix.
+    if not re.fullmatch(r"[0-9a-f]{7,40}", revision):
+        raise ValueError("staged grouped arms require a commit SHA")
+    matches = [p for p in Path(directory).glob(revision + "*") if p.is_dir()]
+    if len(matches) != 1:
+        raise ValueError(f"missing or ambiguous frozen grouped arm {revision}")
+    return matches[0]
+
+
+def compile_grouped_arm(directory, candidate):
+    """Compile each revision's own ingress and grouped core with source keys."""
     from b12x.integration.cuteafd import _common
     from b12x.integration.cuteafd.exlr8 import _Exlr8ServingPointers
-    core, digest = load_source("grouped_control", path,
-                               "b12x.moe._shared.kernels.w4a16")
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest["revision"] != directory.name:
+        raise ValueError("frozen grouped revision mismatch")
+    modules = {}
+    for label, package in (("core", "b12x.moe._shared.kernels.w4a16"),
+                           ("glue", "b12x.integration.cuteafd")):
+        path = directory / f"{label}.py"
+        if hashlib.sha256(path.read_bytes()).hexdigest() != manifest["sources"][label]:
+            raise ValueError(f"frozen grouped {label} source digest mismatch")
+        modules[label], _ = load_source("grouped_" + label, path, package)
+    core, glue = modules["core"], modules["glue"]
+    source_key = (manifest["revision"], tuple(sorted(manifest["sources"].items())))
     g = candidate.geometry
     wrapper = object.__new__(_Exlr8ServingPointers)
     wrapper.core = core.Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
                                           g["max_groups"], g["group_rows"])
-    program = _common.compile_program(wrapper, name="exlr8_grouped_control",
+    program = _common.compile_program(wrapper, name="exlr8_frozen_grouped",
         operands=candidate.operands, scalars=candidate.scalars,
-        key=(digest, tuple(sorted(g.items()))), geometry=g, scratch=candidate.scratch)
-    return program, digest
+        key=(source_key, tuple(sorted(g.items()))), geometry=g, scratch=candidate.scratch)
+    # Invoke the frozen factory, which selects its own grouping class.
+    compile_program = glue.compile_program
+    def keyed_group(wrapper, **kwargs):
+        kwargs["name"] = "exlr8_frozen_group"
+        kwargs["key"] = (source_key, kwargs["key"])
+        return _common.compile_program(wrapper, **kwargs)
+    glue.compile_program = keyed_group
+    try:
+        group = glue.compile_exlr8_group_aot(hidden=g["hidden"], top_k=g["top_k"],
+            max_groups=g["max_groups"], max_rows=4096, group_rows=g["group_rows"])
+    finally:
+        glue.compile_program = compile_program
+    return program, group, manifest
 
 
 def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8):
@@ -313,8 +377,10 @@ def main():
                         help="master's K1 core source (b12x/moe/_shared/kernels/w4a16/exlr8.py)")
     parser.add_argument("--control-glue",type=Path,
                         help="master's grouping source (b12x/integration/cuteafd/exlr8_glue.py)")
-    parser.add_argument("--control-grouped-core", type=Path,
-                        help="frozen previous grouped core for a same-session fourth arm")
+    parser.add_argument("--grouped-arm", action="append", type=parse_grouped_arm, default=[],
+                        help="repeatable NAME:REV frozen grouped core and ingress")
+    parser.add_argument("--grouped-arm-source-dir", type=Path,
+                        help="pre-materialized git-source bundles for metadata-free runs")
     parser.add_argument("--repeats",type=int,default=1,
                         help="interleaved timing rounds; arm order rotates each round, medians reported")
     parser.add_argument("--profile",action="store_true",
@@ -326,8 +392,10 @@ def main():
         parser.error("--output is required unless --profile")
     if bool(args.control_core) != bool(args.control_glue):
         parser.error("--control-core and --control-glue go together")
-    if args.control_grouped_core and not args.grouped:
-        parser.error("--control-grouped-core requires --grouped")
+    if args.grouped_arm and not args.grouped:
+        parser.error("--grouped-arm requires --grouped")
+    if len({name for name, _ in args.grouped_arm}) != len(args.grouped_arm):
+        parser.error("--grouped-arm names must be unique")
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
     torch.cuda.set_per_process_memory_fraction(min(
@@ -590,8 +658,9 @@ def grouped_main(args):
                                     max_rows=4096, group_rows=group_rows)
     grouped = compile_exlr8_a16_aot(units=4, top_k=8, max_groups=capacity,
                                     device_count=True, grouped=True, group_rows=group_rows)
-    previous, previous_digest = (compile_grouped_control(args.control_grouped_core, grouped)
-                                if args.control_grouped_core else (None, None))
+    frozen = {name: compile_grouped_arm(grouped_arm_bundle(revision,
+                  args.grouped_arm_source_dir), grouped)
+              for name, revision in args.grouped_arm}
     # Secondary only: mixed K4/K5 with an unreachable K5 slot is not the
     # uniform K4 serving route used for the primary speed bar.
     exl_layers = [(exl3._prepared(4,256,408+2*c,torch.device("cuda")),
@@ -630,9 +699,9 @@ def grouped_main(args):
                                t["signs_out"],t["output"],t["group_count"],scalars=(live,limit))
                     chunk_response[first:first+live].copy_(t["output"][:live])
 
-        def candidate(program=grouped):
+        def candidate(program=grouped, ingress=group):
             for table in t["tables"]:
-                group.launch(ids,wire,t["signs_in"],state["group_expert"],state["route_slots"],
+                ingress.launch(ids,wire,t["signs_in"],state["group_expert"],state["route_slots"],
                              state["inverse"],state["count"],state["activation"],scalars=(total,limit))
                 program.launch(state["activation"],table,t["bits"],state["group_expert"],state["route_slots"],
                                state["inverse"],weights,state["fc1"],state["intermediate"],state["fc2"],
@@ -657,11 +726,11 @@ def grouped_main(args):
         finite_nonzero(state["output"][:total].float(), "grouped EXLR8")
         finite_nonzero(uniform_states[-1][1].output.float(), "uniform grouped EXL3")
         finite_nonzero(mixed_states[-1][1].output[:total].float(), "mixed grouped EXL3")
-        if previous is not None:
-            candidate(previous)
+        for name, (program, ingress, _) in frozen.items():
+            candidate(program, ingress)
             torch.cuda.synchronize()
             if not torch.equal(chunk_response.view(torch.int16), state["output"][:total].view(torch.int16)):
-                raise RuntimeError("frozen grouped control differs from snapshot chunked K1")
+                raise RuntimeError(f"frozen grouped arm {name} differs from snapshot chunked K1")
         if args.profile:
             torch.cuda.cudart().cudaProfilerStart()
             {"grouped":candidate, "exl3":baseline, "mixed":mixed}[args.profile_arm]()
@@ -671,8 +740,8 @@ def grouped_main(args):
             continue
         graphs = {"chunked":capture(chunked),"grouped":capture(candidate),
                   "exl3":capture(baseline),"mixed_unreachable_k5":capture(mixed)}
-        if previous is not None:
-            graphs["previous_grouped"] = capture(lambda: candidate(previous))
+        for name, (program, ingress, _) in frozen.items():
+            graphs[name] = capture(functools.partial(candidate, program, ingress))
         rounds = {n:[] for n in graphs}
         names = list(graphs)
         for r in range(min(3,args.repeats)):
@@ -699,7 +768,7 @@ def grouped_main(args):
             l2_bytes=l2, measured_read_roofline=roof, group_rows=group_rows, rows=records,
             primary_baseline="uniform K4 full_rotation; wire decode included",
             secondary_baseline="mixed K4/K5; K5 descriptor unreachable",
-            previous_grouped_source_sha256=previous_digest,
+            frozen_grouped_sources={name: manifest for name, (_, _, manifest) in frozen.items()},
             target_met=all(r["exl3_speedup"]>=1.0 for r in records)),indent=2))
 
 
