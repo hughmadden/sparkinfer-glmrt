@@ -24,6 +24,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         self.group_rows = group_rows
         self.mtiles = group_rows // 16
 
+    @property
+    def __cache_key__(self):
+        return ("exlr8_a16_grouped", self.CODE_VERSION, self.hidden_size, self.units,
+                self.top_k, self.max_groups, self.group_rows, self.CTAS_PER_SM)
+
     @cute.jit
     def serving(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
                 group_expert: cute.Tensor, route_slots: cute.Tensor,

@@ -508,7 +508,8 @@ def grouped_main(args):
     l2 = int(props.L2_cache_size)
     if l2 <= 0:
         raise RuntimeError("runtime device L2 size is required")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
     roof = None if args.profile else read_roofline()
     t = make_candidate(l2)
     control = compile_control(args.control_core, args.control_glue)
