@@ -41,9 +41,9 @@ def geometry(hidden=6144, units=16, top_k=8, max_groups=512):
 
 def scratch_bytes(g):
     groups, units, hidden = g["max_groups"], g["units"], g["hidden"]
-    return dict(fc1=groups * units * 2 * g["fc1_splits"] * 16 * 128 * 4,
-                intermediate=groups * units * 16 * 128 * 2,
-                fc2=groups * 16 * hidden * 4)
+    return dict(fc1=groups * units * 2 * g["fc1_splits"] * g.get("group_rows", 16) * 128 * 4,
+                intermediate=groups * units * g.get("group_rows", 16) * 128 * 2,
+                fc2=groups * g.get("group_rows", 16) * hidden * 4)
 
 
 class _Exlr8Pointers:
@@ -77,8 +77,13 @@ class _Exlr8Pointers:
 class _Exlr8ServingPointers:
     def __init__(self, g):
         from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
-        self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"],
-                                  g["max_groups"], device_count=True)
+        if g.get("max_rows", 64) > 64:
+            from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+            self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
+                                           g["max_groups"], g["group_rows"])
+        else:
+            self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"],
+                                      g["max_groups"], device_count=True)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -103,25 +108,38 @@ class _Exlr8ServingPointers:
 
 
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
-                         device_count=False, shared_expert=False):
+                         device_count=False, shared_expert=False, grouped=False, group_rows=64):
     if shared_expert:
         if not device_count:
             raise ValueError("shared EXLR8 requires device-count serving ABI")
         if top_k != 1 or max_groups != 4:
             raise ValueError("shared EXLR8 requires top_k=1 and max_groups=4")
     g = geometry(hidden, units, top_k, max_groups)
+    if grouped:
+        if not device_count or shared_expert or group_rows not in (16, 32, 64):
+            raise ValueError("EXLR8 grouped prefill requires device count and group rows 16/32/64")
+        from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+        g.update(max_rows=4096, group_rows=group_rows,
+                 ctas_per_sm=Exlr8GroupedKernel.CTAS_PER_SM)
+        tasks = (max_groups * units * 2 * g["fc1_splits"] * 4,
+                 max_groups * (hidden // 128) * 4, 4096 * (hidden // 128))
+        if max(tasks) > (2**31 - 1) // 2 or max_groups * group_rows > 2**31 - 1:
+            raise ValueError("EXLR8 grouped task or route indexing exceeds signed int32")
+        if max(scratch_bytes(g).values()) > 2**63 - 1:
+            raise ValueError("EXLR8 grouped scratch exceeds signed 64-bit addressing")
+    r = g.get("group_rows", 16)
     h, u, t, m, s = (g[k] for k in ("hidden", "units", "top_k", "max_groups", "fc1_splits"))
     operands = (
         Operand("x", torch.float16, f"[rows,{h}]"),
         Operand("pointers", torch.int64, f"[E,{u},3,3]"),
         Operand("bits", torch.int32, f"[E,{u},3]"),
         Operand("group_expert", torch.int32, f"[{m}]"),
-        Operand("route_slots", torch.int32, f"[{m},16]"),
+        Operand("route_slots", torch.int32, f"[{m},{r}]"),
         Operand("route_group_lane", torch.int32, f"[rows,{t}]"),
         Operand("route_weights", torch.float32, f"[rows,{t}]"),
-        Operand("fc1", torch.float32, f"[{m},{u},2,{s},16,128]", "scratch"),
-        Operand("intermediate", torch.float16, f"[{m},{u},16,128]", "scratch"),
-        Operand("fc2", torch.float32, f"[{m},16,{h}]", "scratch"),
+        Operand("fc1", torch.float32, f"[{m},{u},2,{s},{r},128]", "scratch"),
+        Operand("intermediate", torch.float16, f"[{m},{u},{r},128]", "scratch"),
+        Operand("fc2", torch.float32, f"[{m},{r},{h}]", "scratch"),
         Operand("signs_out", torch.int8, f"[{h}]", align=4),
         Operand("output", torch.bfloat16, f"[rows,{h}]", "out"),
     )
@@ -129,10 +147,11 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     if device_count:
         operands += (Operand("group_count", torch.int32, "[1]"),)
     return compile_program(_Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
-                           name=("exlr8_shared_a16_serving" if shared_expert else
+                           name=("exlr8_a16_grouped" if grouped else
+                                 "exlr8_shared_a16_serving" if shared_expert else
                                  "exlr8_a16_serving" if device_count else "exlr8_a16_decode"), operands=operands,
                            scalars=tuple(Scalar(n) for n in (("rows", "cta_limit") if device_count
                                                             else ("rows", "groups", "cta_limit"))),
-                           key=(h, u, t, m, g["abi_version"], shared_expert), geometry=g,
+                           key=(h, u, t, m, g["abi_version"], shared_expert, grouped, r), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)

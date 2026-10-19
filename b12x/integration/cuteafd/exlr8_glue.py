@@ -84,8 +84,9 @@ def _f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None):
 
 
 class _Group:
-    def __init__(self, experts, top_k, max_groups, hidden, input_format):
+    def __init__(self, experts, top_k, max_groups, hidden, input_format, max_rows=64, group_rows=16):
         self.experts, self.top_k, self.max_groups = experts, top_k, max_groups
+        self.max_rows, self.group_rows = max_rows, group_rows
         self.hidden, self.blocks, self.input_format = hidden, hidden // 128, input_format
         # Wire rows: hidden E4M3 bytes, then hidden/32 UE8M0 scale bytes.
         self.row_bytes = hidden + hidden // 32 if input_format == "fp8_k32" else hidden * 2
@@ -96,7 +97,7 @@ class _Group:
                  route_group_lane: cute.Pointer, group_count: cute.Pointer,
                  activation: cute.Pointer, rows: Int32, cta_limit: Int32,
                  stream: cuda.CUstream):
-        if rows > Int32(0) and rows <= Int32(64) and cta_limit > Int32(0):
+        if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
             ingress = (rows * Int32(self.blocks) + Int32(INGRESS_WARPS - 1)) // Int32(INGRESS_WARPS)
             self.kernel(ids, x, signs_in, group_expert, route_slots, route_group_lane,
                         group_count, activation, rows).launch(
@@ -176,7 +177,7 @@ class _Group:
             for route in cutlass.range(routes):
                 if ids[route] == thread:
                     count += Int32(1)
-        groups = (count + Int32(15)) // Int32(16)
+        groups = (count + Int32(self.group_rows - 1)) // Int32(self.group_rows)
         prefix[thread] = groups
         cute.arch.sync_threads()
         # Inclusive scan of per-expert group counts; neither atomics nor route
@@ -201,25 +202,30 @@ class _Group:
             for local in cutlass.range(groups):
                 group = first + local
                 group_expert[group] = thread
-                for lane in cutlass.range_constexpr(16):
-                    route_slots[group * Int32(16) + Int32(lane)] = Int32(-1)
+                for lane in cutlass.range_constexpr(self.group_rows):
+                    route_slots[group * Int32(self.group_rows) + Int32(lane)] = Int32(-1)
             ordinal = Int32(0)
             if thread < Int32(self.experts):
                 for route in cutlass.range(routes):
                     if ids[route] == thread:
-                        packed = first * Int32(16) + ordinal
+                        packed = first * Int32(self.group_rows) + ordinal
                         route_slots[packed] = route
                         route_group_lane[route] = packed
                         ordinal += Int32(1)
 
 
 def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144,
-                            input_format="fp8_k32", shared_expert=False):
+                            input_format="fp8_k32", shared_expert=False,
+                            max_rows=64, group_rows=16):
+    if max_rows not in (64, 4096) or group_rows not in (16, 32, 64):
+        raise ValueError("EXLR8 grouping supports planned rows 64/4096 and group rows 16/32/64")
+    if max_rows == 64 and group_rows != 16:
+        raise ValueError("EXLR8 decode grouping requires 16-row groups")
     if shared_expert and ((experts, top_k, max_groups) != (1, 1, 4) or input_format != "bf16"):
         raise ValueError("shared EXLR8 grouping requires experts=1, top_k=1, max_groups=4 and BF16 rows")
     if (any(type(v) is not int for v in (experts, top_k, max_groups, hidden))
             or not (1 <= experts <= 256 and 1 <= top_k <= 32
-                    and 0 < max_groups <= (2**31 - 1) // 16)):
+                    and 0 < max_groups <= (2**31 - 1) // group_rows)):
         raise ValueError("EXLR8 grouping requires experts1..256, top_k1..32 and positive capacity")
     if input_format not in INPUT_FORMATS:
         raise ValueError(f"unknown EXLR8 ingress format {input_format!r}")
@@ -229,20 +235,22 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
     row = f"[rows,{hidden + hidden // 32}]" if input_format == "fp8_k32" else f"[rows,{hidden}]"
     x = (Operand("x", torch.uint8, row, note="E4M3 bytes then UE8M0 per-32 scales per row")
          if input_format == "fp8_k32" else Operand("x", torch.bfloat16, row))
-    return compile_program(_Group(experts, top_k, max_groups, hidden, input_format),
-        name="exlr8_shared_group" if shared_expert else "exlr8_group",
+    metadata = {"group_rows": group_rows} if max_rows > 64 else {}
+    return compile_program(_Group(experts, top_k, max_groups, hidden, input_format, max_rows, group_rows),
+        name=("exlr8_grouped_group" if max_rows > 64 else
+              "exlr8_shared_group" if shared_expert else "exlr8_group"),
         operands=(Operand("ids", torch.int32, f"[rows,{top_k}]"),
                   x,
                   Operand("signs_in", torch.int8, f"[{hidden}]", align=4),
                   Operand("group_expert", torch.int32, f"[{max_groups}]", "out"),
-                  Operand("route_slots", torch.int32, f"[{max_groups},16]", "out"),
+                  Operand("route_slots", torch.int32, f"[{max_groups},{group_rows}]", "out"),
                   Operand("route_group_lane", torch.int32, f"[rows,{top_k}]", "out"),
                   Operand("group_count", torch.int32, "[1]", "out"),
                   Operand("activation", torch.float16, f"[rows,{hidden}]", "out")),
         scalars=(Scalar("rows"), Scalar("cta_limit")),
-        key=(experts, top_k, max_groups, hidden, input_format, shared_expert),
+        key=(experts, top_k, max_groups, hidden, input_format, shared_expert, max_rows, group_rows),
         geometry=dict(abi_version=2, experts=experts, top_k=top_k, max_groups=max_groups,
-                      max_rows=64, hidden=hidden, input_format=input_format,
+                      max_rows=max_rows, hidden=hidden, input_format=input_format, **metadata,
                       input_row_bytes=_Group(experts, top_k, max_groups, hidden, input_format).row_bytes,
                       ctas_per_sm=4, ingress_warps=INGRESS_WARPS))
 
@@ -267,8 +275,16 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
          lambda: compile_exlr8_group_aot(experts=1, top_k=1, max_groups=4, hidden=hidden,
                                          input_format="bf16", shared_expert=True)),
     ]
+    grouped = [
+        ("a16_grouped", "exlr8_a16", {"max_rows": 4096},
+         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+             max_groups=(4096 * top_k + 63)//64 + 256, device_count=True, grouped=True)),
+        ("grouped_group", "exlr8_group", {"max_rows": 4096},
+         lambda: compile_exlr8_group_aot(hidden=hidden, top_k=top_k,
+             max_groups=(4096 * top_k + 63)//64 + 256, max_rows=4096, group_rows=64)),
+    ]
     if role == "spark":
-        return result[1:3]
+        return result[1:3] + grouped
     if role == "coordinator":
         return result[3:]
-    return result
+    return result + grouped
