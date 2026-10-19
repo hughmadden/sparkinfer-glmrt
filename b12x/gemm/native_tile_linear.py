@@ -427,8 +427,13 @@ class NativeTileLinear:
         G = self.groups
         F = 4 * G * 4
         blocks = Int64(self.n // self.cols)
-        slots = Int64(self.decode_ctas) * Int64(self.slots)
-        gw = block_cta.to(Int64) * slots + slot.to(Int64)
+        if cutlass.const_expr(self.decode_tiles > 1):
+            slots = Int64(self.decode_ctas) * Int64(self.slots)
+            gw = block_cta.to(Int64) * slots + slot.to(Int64)
+        else:
+            grid, _, _ = cute.arch.grid_dim()
+            slots = Int64(grid) * Int64(self.slots)
+            gw = Int64(cta) * Int64(self.slots) + slot.to(Int64)
         begin = (gw * blocks // slots).to(Int32)
         end = ((gw + Int64(1)) * blocks // slots).to(Int32)
         if cutlass.const_expr(self.decode_tiles > 1):
