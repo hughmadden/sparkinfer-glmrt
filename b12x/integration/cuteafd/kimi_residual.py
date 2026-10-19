@@ -10,10 +10,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 import torch
 
-from b12x._lib.intrinsics import div_rn_f32, fmax_f32
+from b12x._lib.intrinsics import div_rn_f32, fmax_f32, pack_f32x2_to_bfloat2
+from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _bf16, _block_sum, _reduction_storage, _rsqrt
 
@@ -54,7 +55,9 @@ class KimiAttnResRmsNorm:
         storage = utils.SmemAllocator().allocate(_reduction_storage(2 * self.candidates + 1, self.warps))
         sums = storage.sums.get_tensor(cute.make_layout(
             (2 * self.candidates + 1, self.warps), stride=(self.warps, 1)))
-        values = cute.make_rmem_tensor((self.candidates, self.elements), Float32)
+        # Keep the BF16 candidates packed: C9 needs 63, not 126, registers.
+        values = cute.make_rmem_tensor((self.candidates, self.elements // 2), Uint32)
+        current = cute.make_rmem_tensor((self.elements,), Float32)
         scores = cute.make_rmem_tensor((self.candidates,), Float32)
         mixed = cute.make_rmem_tensor((self.elements,), Float32)
         weight = cute.make_rmem_tensor((self.elements,), Float32)
@@ -75,16 +78,18 @@ class KimiAttnResRmsNorm:
                         arena[Int64(8) * stride + at] = value.to(BFloat16)
                 else:
                     value = Float32(arena[Int64(c) * stride + at])
-                values[c, j] = value
+                current[j] = value
+            for j in cutlass.range_constexpr(self.elements // 2):
+                values[c, j] = pack_f32x2_to_bfloat2(current[2 * j], current[2 * j + 1])
             if cutlass.const_expr(self.has_mix):
                 square = Float32(0)
                 for j in cutlass.range_constexpr(self.elements):
-                    square = square + values[c, j] * values[c, j]
+                    square = square + current[j] * current[j]
                 total = _block_sum(square, sums, Int32(2 * c), self.warps)
                 inv = _rsqrt(div_rn_f32(total, Float32(self.hidden)) + eps)
                 dot = Float32(0)
                 for j in cutlass.range_constexpr(self.elements):
-                    dot = dot + (values[c, j] * inv) * weight[j]
+                    dot = dot + (current[j] * inv) * weight[j]
                 scores[c] = _block_sum(dot, sums, Int32(2 * c + 1), self.warps)
         if cutlass.const_expr(self.has_mix):
             maximum = scores[0]
@@ -98,17 +103,21 @@ class KimiAttnResRmsNorm:
                 scores[c] = div_rn_f32(scores[c], denominator)
         square = Float32(0)
         for j in cutlass.range_constexpr(self.elements):
-            value = values[0, j]
+            value = current[j]
             if cutlass.const_expr(self.has_mix):
                 value = Float32(0)
                 for c in cutlass.range_constexpr(self.candidates):
-                    value = value + values[c, j] * scores[c]
+                    if cutlass.const_expr(j % 2 == 0):
+                        candidate = _bf16_lo(values[c, j // 2])
+                    else:
+                        candidate = _bf16_hi(values[c, j // 2])
+                    value = value + candidate * scores[c]
                 value = _bf16(value)
             mixed[j] = value
             square = square + value * value
             if cutlass.const_expr(self.append):
                 at = base + tid + Int64(j * self.threads)
-                arena[Int64(self.candidates - 1) * stride + at] = values[self.candidates - 1, j].to(BFloat16)
+                arena[Int64(self.candidates - 1) * stride + at] = current[j].to(BFloat16)
         total = _block_sum(square, sums, Int32(2 * self.candidates), self.warps)
         inv = _rsqrt(div_rn_f32(total, Float32(self.hidden)) + eps)
         for j in cutlass.range_constexpr(self.elements):
