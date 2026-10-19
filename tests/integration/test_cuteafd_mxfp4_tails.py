@@ -8,9 +8,10 @@ from ..conftest import require_b12x
 from .test_cuteafd_fp8_moe_aot import wire_rows
 
 
-@pytest.mark.parametrize("width", [32, 64, 96, 288, 320, 352])
+@pytest.mark.parametrize("tp,width", [(6, width) for width in (32, 64, 96, 288, 320, 352)]
+                         + [(3, 672), (3, 704)])
 @pytest.mark.parametrize("route,a8", [("decode", False), ("stream", False), ("stream", True)])
-def test_exact_tail_matches_padding_with_poison_and_graph_replay(width, route, a8):
+def test_exact_tail_matches_padding_with_poison_and_graph_replay(tp, width, route, a8):
     require_b12x()
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_scratch_bytes
@@ -25,10 +26,10 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(width, route, a
 
     # Hidden width meets the production stream's weight ring contract.
     g = Exact("tail", hidden=6144, experts=16, top_k=8, intermediate=2048,
-              tp=6, weights="mxfp4", width=width)
+              tp=tp, weights="mxfp4", width=width)
     padded_width = (width + 127) // 128 * 128
     padded = Exact("tail", hidden=6144, experts=16, top_k=8, intermediate=2048,
-                   tp=6, weights="mxfp4", width=padded_width)
+                   tp=tp, weights="mxfp4", width=padded_width)
     gen = torch.Generator(device="cuda").manual_seed(97)
     capacity = 4096
     source, _ = wire_rows(torch.randn(capacity, g.hidden, device="cuda", generator=gen).bfloat16())
