@@ -301,7 +301,7 @@ def main():
                         help="interleaved timing rounds; arm order rotates each round, medians reported")
     parser.add_argument("--profile",action="store_true",
                         help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
-    parser.add_argument("--profile-arm", choices=("grouped", "exl3"), default="grouped",
+    parser.add_argument("--profile-arm", choices=("grouped", "exl3", "mixed"), default="grouped",
                         help="grouped benchmark arm inside cudaProfilerStart/Stop")
     args = parser.parse_args()
     if not args.profile and args.output is None:
@@ -478,7 +478,7 @@ def main():
         json.dump(result,stream,indent=2)
 
 
-def grouped_exl3_state(rows, tiers, props):
+def grouped_mixed_state(rows, tiers, props):
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     from b12x.moe._shared.kernels.w4a16.host import max_packed_route_slots
     from b12x.moe.fused_moe._impl import _projection_mixed_tile_config
@@ -488,10 +488,10 @@ def grouped_exl3_state(rows, tiers, props):
         size_m=4096, hidden_size=6144, intermediate_size=512,
         tier0_num_experts=256, tier1_num_experts=1, tier0_bits=4, tier1_bits=5,
         route_num_experts=256,
-        top_k=8, max_m_blocks=max_packed_route_slots(4096*8, 64, 256)//64,
+        top_k=8, max_m_blocks=(max_packed_route_slots(4096*8, 48, 256)+47)//48,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=tile, trellis_codebook=tiers[0].trellis_codebook,
-        moe_block_size=64, warp_specialized=True, input_format="e4m3_k32",
+        moe_block_size=48, warp_specialized=True, input_format="e4m3_k32",
         ws_input_stages=3, ws_dynamic_tiles=True,
         rotation_input_dtype="bf16", full_rotation_output_dtype="bf16")
     bufs = mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"), sms=props.multi_processor_count)
@@ -505,6 +505,49 @@ def grouped_exl3_state(rows, tiers, props):
         torch.cat([t.down_svh for t in tiers]))
     binding = mix.bind_mixed_trellis(*tiers, mapping, desc, rotations, launch)
     return binding, bufs
+
+
+def grouped_uniform_state(rows, tier, props):
+    from b12x.moe._shared.kernels.w4a16.host import (
+        make_w4a16_packed_buffers, select_route_block_size_m)
+    # Native tiles do not depend on launch K/N geometry. Share their storage,
+    # but retain the uniform serving route's historical K64/N256 policy.
+    tile = (64, 256, 64, 256)
+    tier = dataclasses.replace(tier, fc1_tile_n=256, fc2_tile_n=256,
+                              trellis=dataclasses.replace(tier.trellis, tile_config=tile))
+    block = select_route_block_size_m(rows, 8, 256)
+    bufs = make_w4a16_packed_buffers(tier, m=rows, topk=8, dtype=torch.float16,
+        device=torch.device("cuda"), full_rotation=True, block_size_m=block)
+    bufs = dataclasses.replace(bufs,
+        output=torch.empty((rows, 6144), dtype=torch.bfloat16, device="cuda"))
+    launch = exl3.compile_w4a16_fused_moe(
+        size_m=rows, hidden_size=6144, intermediate_size=512, num_experts=256,
+        top_k=8, activation="silu", apply_router_weight_on_input=False,
+        zero_fc2_output=False, moe_block_size=block,
+        max_m_blocks=int(bufs.block_expert_ids.numel()), element_dtype="fp16",
+        sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
+        weight_layout="trellis_t256", scale_format="e4m3_k32",
+        w13_layout="trellis_t256_proj", trellis_bits=4,
+        trellis_codebook=tier.trellis_codebook, force_tile_config=tile,
+        intermediate_rotation=True, full_rotation=True, rotation_input_dtype="bf16")
+    topk_sum = exl3.compile_w4a16_topk_sum(m=rows, topk=8, hidden_size=6144,
+        element_dtype="fp16", full_rotation=True, full_rotation_output_dtype="bf16",
+        num_experts=256, route_ids_dtype=torch.int32)
+    return tier, bufs, launch, topk_sum, block
+
+
+def run_grouped_uniform(state, decoded, weights, ids):
+    tier, bufs, launch, topk_sum, block = state
+    return exl3.run_w4a16_moe(decoded, tier, weights, ids, activation="silu",
+        intermediate_cache13=bufs.intermediate_cache13, intermediate_cache2=bufs.intermediate_cache2,
+        output=bufs.output, fc1_c_tmp=bufs.fc1_c_tmp, fc2_c_tmp=bufs.fc2_c_tmp,
+        packed_route_indices=bufs.packed_route_indices, block_expert_ids=bufs.block_expert_ids,
+        packed_route_count=bufs.packed_route_count, expert_offsets=bufs.expert_offsets,
+        expert_counts=bufs.expert_counts, fused_launch=launch, topk_sum_launch=topk_sum,
+        route_block_size_m=block, route_mode="packed", full_rotation=True,
+        intermediate_rotation_scales=tier.intermediate_rotations,
+        suh_gate_table=tier.gate_suh, suh_up_table=tier.up_suh, svh_table=tier.down_svh,
+        rotation_a_gate=bufs.rotation_a_gate, rotation_a_up=bufs.rotation_a_up)
 
 
 def grouped_main(args):
@@ -527,11 +570,12 @@ def grouped_main(args):
                                     max_rows=4096, group_rows=group_rows)
     grouped = compile_exlr8_a16_aot(units=4, top_k=8, max_groups=capacity,
                                     device_count=True, grouped=True, group_rows=group_rows)
-    # Use the production mixed K4/K5 binary, routing only the complete K4 tier.
+    # Secondary only: mixed K4/K5 with an unreachable K5 slot is not the
+    # uniform K4 serving route used for the primary speed bar.
     exl_layers = [(exl3._prepared(4,256,408+2*c,torch.device("cuda")),
                    exl3._prepared(5,1,409+2*c,torch.device("cuda")))
                   for c in range(len(t["tables"]))]
-    exl_states = [grouped_exl3_state(4096, ts, props) for ts in exl_layers]
+    mixed_states = [grouped_mixed_state(4096, ts, props) for ts in exl_layers]
     records = []
     for total in map(int, args.rows.split(",")):
         if not 1 <= total <= 4096:
@@ -540,6 +584,8 @@ def grouped_main(args):
         ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(total)]).cuda().int()
         weights = torch.rand((total,8),generator=gen).cuda()/8
         wire = make_wire(torch.randn((total,6144),generator=gen).cuda()*0.02)
+        decoded = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
+        uniform_states = [grouped_uniform_state(total, ts[0], props) for ts in exl_layers]
         chunk_response = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
         chunk_wire = torch.empty((64,6336),dtype=torch.uint8,device="cuda")
         chunk_ids = torch.empty((64,8),dtype=torch.int32,device="cuda")
@@ -570,28 +616,37 @@ def grouped_main(args):
                                t["signs_out"],state["output"],state["count"],scalars=(total,limit))
 
         def baseline():
-            for binding, bufs in exl_states:
+            for uniform in uniform_states:
+                # Uniform full_rotation accepts BF16/FP16, not FP8 wire rows.
+                # Charge the worker's FP8-K32 -> BF16 conversion in this arm.
+                wire_decode(wire, decoded, total)
+                run_grouped_uniform(uniform, decoded, weights, ids)
+
+        def mixed():
+            for binding, bufs in mixed_states:
                 run_bound_mixed_trellis(wire,weights,ids,binding,bufs)
 
-        chunked(); candidate(); baseline()
+        chunked(); candidate(); baseline(); mixed()
         torch.cuda.synchronize()
         if not torch.equal(chunk_response.view(torch.int16),state["output"][:total].view(torch.int16)):
             n = int((chunk_response.view(torch.int16) != state["output"][:total].view(torch.int16)).sum())
             raise RuntimeError(f"grouped result differs from snapshot chunked K1: {n} BF16 words")
         finite_nonzero(state["output"][:total].float(), "grouped EXLR8")
-        finite_nonzero(exl_states[-1][1].output[:total].float(), "grouped EXL3")
+        finite_nonzero(uniform_states[-1][1].output.float(), "uniform grouped EXL3")
+        finite_nonzero(mixed_states[-1][1].output[:total].float(), "mixed grouped EXL3")
         if args.profile:
             torch.cuda.cudart().cudaProfilerStart()
-            (candidate if args.profile_arm == "grouped" else baseline)()
+            {"grouped":candidate, "exl3":baseline, "mixed":mixed}[args.profile_arm]()
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStop()
             print(f"profiled arm={args.profile_arm} rows={total}", flush=True)
             continue
-        graphs = {"chunked":capture(chunked),"grouped":capture(candidate),"exl3":capture(baseline)}
+        graphs = {"chunked":capture(chunked),"grouped":capture(candidate),
+                  "exl3":capture(baseline),"mixed_unreachable_k5":capture(mixed)}
         rounds = {n:[] for n in graphs}
         names = list(graphs)
         for r in range(min(3,args.repeats)):
-            for n in names[r%3:]+names[:r%3]:
+            for n in names[r%len(names):]+names[:r%len(names)]:
                 rounds[n].append(timing(graphs[n],args.replays)/copies)
         med = {n:statistics.median(ts) for n,ts in rounds.items()}
         unique = int(ids.unique().numel()) * 3 * 6144 * 512 * 4//8
@@ -603,12 +658,17 @@ def grouped_main(args):
                    exl3_speedup=med["exl3"]/med["grouped"], unique_weight_bytes=unique,
                    unique_read_roofline_percent=100*unique/med["grouped"]/1000/roof["gbps"],
                    stages={k:v/copies if k.endswith("_us") else v for k,v in stages.items()},
-                   groups=int(state["count"].item()), bitwise_equal=True)
+                   groups=int(state["count"].item()), bitwise_equal=True,
+                   uniform_route_block=uniform_states[0][-1],
+                   uniform_input_conversion="fp8_k32_to_bf16_included")
         records.append(rec)
         print(json.dumps(rec),flush=True)
+        del graphs, uniform_states
     if not args.profile:
         args.output.write_text(json.dumps(dict(schema=3, device=props.name, sm_count=props.multi_processor_count,
             l2_bytes=l2, measured_read_roofline=roof, group_rows=group_rows, rows=records,
+            primary_baseline="uniform K4 full_rotation; wire decode included",
+            secondary_baseline="mixed K4/K5; K5 descriptor unreachable",
             target_met=all(r["exl3_speedup"]>=1.0 for r in records)),indent=2))
 
 
