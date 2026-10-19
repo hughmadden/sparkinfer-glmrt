@@ -263,9 +263,9 @@ class NativeTileLinear:
         self.wpb = 8 * self.groups if not self.int4 else 4 * self.groups
         self.spb = (2 if self.int4 else 1) * 2 * self.groups if self.grouped else 1
         self.decode_ctas = (self.n // self.cols + self.slots - 1) // self.slots
-        # Rows of a decode tile are independent, so a shape with few CTAs splits its
-        # 16-row chunks across more of them; wide shapes stay whole.
-        self.decode_tiles = 4 if self.decode_ctas <= 32 else (2 if self.decode_ctas <= 96 else 1)
+        # Independent row tiles fill out small and medium column grids without
+        # changing the ordered K-segment fold.
+        self.decode_tiles = 4 if self.decode_ctas <= 96 else (2 if self.decode_ctas <= 256 else 1)
 
     # ------------------------------------------------------------------ launch
     @cute.jit
@@ -278,7 +278,8 @@ class NativeTileLinear:
                                                   cta_limit // Int32(self.decode_ctas)))
                 else:
                     row_tiles = Int32(1)
-                rows_per = (rows + row_tiles - Int32(1)) // row_tiles
+                chunks = (rows + Int32(15)) >> Int32(4)
+                rows_per = ((chunks + row_tiles - Int32(1)) // row_tiles) * Int32(16)
                 self.decode(x, payload, scales, output, rows, rows_per, row_tiles).launch(
                     grid=(min(Int32(self.decode_ctas) * row_tiles, cta_limit), 1, 1),
                     block=(self.d_threads, 1, 1),
@@ -429,7 +430,8 @@ class NativeTileLinear:
         blocks = Int64(self.n // self.cols)
         # One group per (block CTA, slot); rows split across CTAs, never columns.
         if cutlass.const_expr(self.decode_tiles > 1):
-            groups = Int64(self.decode_ctas) * Int64(self.slots)
+            grid, _, _ = cute.arch.grid_dim()
+            groups = (Int64(grid) // row_tiles.to(Int64)) * Int64(self.slots)
             gw = block_cta.to(Int64) * Int64(self.slots) + slot.to(Int64)
         else:
             grid, _, _ = cute.arch.grid_dim()

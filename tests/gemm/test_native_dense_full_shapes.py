@@ -32,7 +32,7 @@ def test_scaled_full_checkpoint_shape(encoding, side, k, n, rows):
     assert error <= 1.01*bound, (error.item(), bound.item())
     if rows > 1:
         expected = c.output.clone()
-        for width in (1, 4, 16, 64, 65, 129):
+        for width in (1, 4, 16, 17, 31, 33, 47, 49, 63, 64, 65, 129):
             for limit in (1, 48, 680, 752):
                 c.partial.fill_(float("nan"))
                 c.output.fill_(float("nan"))
