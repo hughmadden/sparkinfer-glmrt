@@ -19,6 +19,16 @@ from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _bf16, _block_sum, _reduction_storage, _rsqrt
 
 
+def _candidate_storage(words):
+    class Storage:
+        pass
+
+    Storage.__annotations__ = {
+        "values": cute.struct.Align[cute.struct.MemRange[Uint32, words], 16],
+    }
+    return cute.struct(Storage)
+
+
 class KimiAttnResRmsNorm:
     threads = 512
 
@@ -35,6 +45,8 @@ class KimiAttnResRmsNorm:
         self.prefix_mode, self.append, self.has_mix = prefix_mode, append, has_mix
         self.elements = hidden // self.threads
         self.warps = self.threads // 32
+        # Bound register liveness without exceeding SM120's per-CTA SMEM limit.
+        self.shared_candidates = max(0, candidates - 3) if candidates >= 5 else 0
 
     @cute.jit
     def __call__(self, arena: cute.Pointer, delta: cute.Pointer,
@@ -52,11 +64,18 @@ class KimiAttnResRmsNorm:
         tid = Int64(cute.arch.thread_idx()[0])
         stride = Int64(arena_rows) * Int64(self.hidden)
         base = row * Int64(self.hidden)
-        storage = utils.SmemAllocator().allocate(_reduction_storage(2 * self.candidates + 1, self.warps))
+        allocator = utils.SmemAllocator()
+        storage = allocator.allocate(_reduction_storage(2 * self.candidates + 1, self.warps))
         sums = storage.sums.get_tensor(cute.make_layout(
             (2 * self.candidates + 1, self.warps), stride=(self.warps, 1)))
-        # Keep the BF16 candidates packed: C9 needs 63, not 126, registers.
-        values = cute.make_rmem_tensor((self.candidates, self.elements // 2), Uint32)
+        # Each lane owns its shared words; the thread-contiguous layout is
+        # bank-conflict-free and never changes the FP32 reduction order.
+        if cutlass.const_expr(self.shared_candidates > 0):
+            parked = allocator.allocate(_candidate_storage(self.shared_candidates * self.hidden // 2))
+            shared = parked.values.get_tensor(cute.make_layout(
+                (self.shared_candidates, self.elements // 2, self.threads),
+                stride=(self.hidden // 2, self.threads, 1)))
+        values = cute.make_rmem_tensor((self.candidates - self.shared_candidates, self.elements // 2), Uint32)
         current = cute.make_rmem_tensor((self.elements,), Float32)
         scores = cute.make_rmem_tensor((self.candidates,), Float32)
         mixed = cute.make_rmem_tensor((self.elements,), Float32)
@@ -80,7 +99,11 @@ class KimiAttnResRmsNorm:
                     value = Float32(arena[Int64(c) * stride + at])
                 current[j] = value
             for j in cutlass.range_constexpr(self.elements // 2):
-                values[c, j] = pack_f32x2_to_bfloat2(current[2 * j], current[2 * j + 1])
+                packed = pack_f32x2_to_bfloat2(current[2 * j], current[2 * j + 1])
+                if cutlass.const_expr(c < self.shared_candidates):
+                    shared[c, j, tid] = packed
+                else:
+                    values[c - self.shared_candidates, j] = packed
             if cutlass.const_expr(self.has_mix):
                 square = Float32(0)
                 for j in cutlass.range_constexpr(self.elements):
@@ -107,10 +130,14 @@ class KimiAttnResRmsNorm:
             if cutlass.const_expr(self.has_mix):
                 value = Float32(0)
                 for c in cutlass.range_constexpr(self.candidates):
-                    if cutlass.const_expr(j % 2 == 0):
-                        candidate = _bf16_lo(values[c, j // 2])
+                    if cutlass.const_expr(c < self.shared_candidates):
+                        packed = shared[c, j // 2, tid]
                     else:
-                        candidate = _bf16_hi(values[c, j // 2])
+                        packed = values[c - self.shared_candidates, j // 2]
+                    if cutlass.const_expr(j % 2 == 0):
+                        candidate = _bf16_lo(packed)
+                    else:
+                        candidate = _bf16_hi(packed)
                     value = value + candidate * scores[c]
                 value = _bf16(value)
             mixed[j] = value
