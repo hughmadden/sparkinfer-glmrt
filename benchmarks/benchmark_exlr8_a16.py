@@ -486,7 +486,8 @@ def grouped_exl3_state(rows, tiers, props):
         intermediate_size=512, token_count=4096, direct_topk_routes=False)
     launch = mix.compile_mixed_trellis(
         size_m=4096, hidden_size=6144, intermediate_size=512,
-        tier0_num_experts=128, tier1_num_experts=128, tier0_bits=4, tier1_bits=4,
+        tier0_num_experts=256, tier1_num_experts=1, tier0_bits=4, tier1_bits=5,
+        route_num_experts=256,
         top_k=8, max_m_blocks=max_packed_route_slots(4096*8, 64, 256)//64,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=tile, trellis_codebook=tiers[0].trellis_codebook,
@@ -494,7 +495,10 @@ def grouped_exl3_state(rows, tiers, props):
         ws_input_stages=3, ws_dynamic_tiles=True,
         rotation_input_dtype="bf16", full_rotation_output_dtype="bf16")
     bufs = mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"), sms=props.multi_processor_count)
-    mapping, desc = mix.build_ordered_maps(128, 128, device=torch.device("cuda"))
+    # The production mixed ABI requires distinct tiers. Every routed expert
+    # is K4; one unreachable K5 slot keeps that ABI without changing its kernels.
+    mapping, desc = mix.build_ordered_maps(256, 1, device=torch.device("cuda"))
+    mapping = mapping[:256]
     rotations = mix.MixedTrellisRotations(
         torch.cat([t.intermediate_rotations for t in tiers]),
         torch.cat([t.gate_suh for t in tiers]), torch.cat([t.up_suh for t in tiers]),
@@ -523,10 +527,10 @@ def grouped_main(args):
                                     max_rows=4096, group_rows=group_rows)
     grouped = compile_exlr8_a16_aot(units=4, top_k=8, max_groups=capacity,
                                     device_count=True, grouped=True, group_rows=group_rows)
-    # Two K4 tiers merely satisfy the existing mixed-kernel descriptor ABI.
-    # Both are the production grouped A16 prefill path, with standard FP8 wire input.
-    exl_layers = [tuple(exl3._prepared(4,128,408+2*c+j,torch.device("cuda"))
-                        for j in range(2)) for c in range(len(t["tables"]))]
+    # Use the production mixed K4/K5 binary, routing only the complete K4 tier.
+    exl_layers = [(exl3._prepared(4,256,408+2*c,torch.device("cuda")),
+                   exl3._prepared(5,1,409+2*c,torch.device("cuda")))
+                  for c in range(len(t["tables"]))]
     exl_states = [grouped_exl3_state(4096, ts, props) for ts in exl_layers]
     records = []
     for total in map(int, args.rows.split(",")):
