@@ -139,74 +139,6 @@ def _ld_cached_pred(address: Int64, r: Int32, rows: Int32, *, loc=None, ip=None)
 
 
 @dsl_user_op
-def _ld_cached_k32x4_pred(address: Int64, r: Int32, rows: Int32, *, loc=None, ip=None):
-    """Predicated four 4-byte read-only loads 16 bytes apart (0 when r >= rows).
-
-    Lane j's base is k32 + 2j; the four 16-k steps of the K32 group sit at +0/8/16/24
-    k, so one quad covers each step exactly at the m16n8k16 A operand slot order and
-    no cross-lane transpose is required after the load.
-    """
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
-        [Int64(address).ir_value(loc=loc, ip=ip),
-         Int32(r).ir_value(loc=loc, ip=ip),
-         Int32(rows).ir_value(loc=loc, ip=ip)],
-        "{ .reg .pred p; setp.lt.s32 p, $5, $6; "
-        "mov.b32 $0, 0; mov.b32 $1, 0; mov.b32 $2, 0; mov.b32 $3, 0; "
-        "@p ld.global.nc.u32 $0, [$4]; "
-        "@p ld.global.nc.u32 $1, [$4+16]; "
-        "@p ld.global.nc.u32 $2, [$4+32]; "
-        "@p ld.global.nc.u32 $3, [$4+48]; }",
-        "=r,=r,=r,=r,l,r,r",
-        has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
-    return (Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
-            Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
-            Uint32(llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)),
-            Uint32(llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)))
-
-
-@dsl_user_op
-def _e4m3x2_bf16(word, *, loc=None, ip=None):
-    """Exact BF16 of the two packed E4M3 bytes in ``word``'s low 16 bits."""
-    return Uint32(llvm.inline_asm(
-        T.i32(), [Uint32(word).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b16 l, h; mov.b32 {l, h}, $1; cvt.rn.bf16x2.e4m3x2 $0, l; }",
-        "=r,r", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
-
-
-@dsl_user_op
-def _int4x2_bf16(word, *, loc=None, ip=None):
-    """Exact BF16 ``q - 8`` of the two low-first nibbles in ``word``'s low byte."""
-    return Uint32(llvm.inline_asm(
-        T.i32(), [Uint32(word).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b32 s, p, c; shr.u32 s, $1, 4; prmt.b32 p, $1, s, 0x0400; "
-        "lop3.b32 p, p, 0x000f000f, 0x43004300, 0xea; mov.b32 c, 0x43084308; "
-        "sub.rn.bf16x2 $0, p, c; }",
-        "=r,r", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
-
-
-@dsl_user_op
-def _ld_cached_b_imm(address: Int64, step: int, *, loc=None, ip=None):
-    """Four 4-byte read-only loads ``step`` bytes apart (in-bounds column, no predicate)."""
-    s = int(step)
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
-        [Int64(address).ir_value(loc=loc, ip=ip)],
-        f"{{ ld.global.nc.u32 $0, [$4]; ld.global.nc.u32 $1, [$4+{s}]; "
-        f"ld.global.nc.u32 $2, [$4+{2 * s}]; ld.global.nc.u32 $3, [$4+{3 * s}]; }}",
-        "=r,=r,=r,=r,l",
-        has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
-    return (Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
-            Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
-            Uint32(llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)),
-            Uint32(llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)))
-
-
-@dsl_user_op
 def _warp_uniform_i32(val: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(llvm.inline_asm(
         T.i32(), [Int32(val).ir_value(loc=loc, ip=ip)],
@@ -304,8 +236,6 @@ class NativeTileLinear:
         self.side2 = g["sharded_side"] == 2
         self.grouped = self.encoding != "fp8_row"
         self.int4 = self.encoding == "int4_g32"
-        # Grouped decode forms both operands directly in MMA slot order.
-        self.slot_b = self.grouped
         self.segments = int(g["segments"])
         self.groups = decode_groups(self.n, self.encoding)
         if self.segments < 1 or self.segments & (self.segments - 1):
@@ -332,6 +262,10 @@ class NativeTileLinear:
         self.prefill_threads = 32 * self.wm * self.wn
         self.wpb = 8 * self.groups if not self.int4 else 4 * self.groups
         self.spb = (2 if self.int4 else 1) * 2 * self.groups if self.grouped else 1
+        self.decode_ctas = (self.n // self.cols + self.slots - 1) // self.slots
+        # Rows of a decode tile are independent, so a shape with few CTAs splits its
+        # 16-row chunks across more of them; wide shapes stay whole.
+        self.decode_tiles = 4 if self.decode_ctas <= 32 else (2 if self.decode_ctas <= 96 else 1)
 
     # ------------------------------------------------------------------ launch
     @cute.jit
@@ -339,9 +273,15 @@ class NativeTileLinear:
                  output: cute.Tensor, rows: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
             if rows <= Int32(DECODE_ROWS):
-                ctas = (self.n // self.cols + self.slots - 1) // self.slots
-                self.decode(x, payload, scales, output, rows).launch(
-                    grid=(min(Int32(ctas), cta_limit), 1, 1), block=(self.d_threads, 1, 1),
+                if cutlass.const_expr(self.decode_tiles > 1):
+                    row_tiles = min(min((rows + Int32(15)) >> Int32(4), Int32(self.decode_tiles)),
+                                    cta_limit // Int32(self.decode_ctas))
+                else:
+                    row_tiles = Int32(1)
+                rows_per = (rows + row_tiles - Int32(1)) // row_tiles
+                self.decode(x, payload, scales, output, rows, rows_per, row_tiles).launch(
+                    grid=(min(Int32(self.decode_ctas) * row_tiles, cta_limit), 1, 1),
+                    block=(self.d_threads, 1, 1),
                     stream=stream, min_blocks_per_mp=3 if self.side2 else 2)
             else:
                 tiles = ((rows + Int32(self.bm - 1)) // Int32(self.bm)) * Int32(self.n_tiles)
@@ -434,18 +374,6 @@ class NativeTileLinear:
         return cute.struct(Storage)
 
     @cute.jit
-    def _decode_scales(self, sdst: cute.Tensor, scales: cute.Tensor,
-                       n0: Int32, g: Int32, j: Int32, kb: Int32):
-        for gi in cutlass.range_constexpr(self.groups):
-            for e in cutlass.range_constexpr(2):
-                col = n0 + Int32(8 * gi) + Int32(2) * j + Int32(e)
-                if cutlass.const_expr(self.int4):
-                    s0, s1 = ld_global_nc_v2_u32(self._s_addr(scales, col, kb))
-                    sdst[(gi * 2 + e) * 2], sdst[(gi * 2 + e) * 2 + 1] = s0, s1
-                else:
-                    sdst[gi * 2 + e] = ld_global_nc_u32(self._s_addr(scales, col, kb))
-
-    @cute.jit
     def _decode_load(self, wdst: cute.Tensor, sdst: cute.Tensor, payload: cute.Tensor,
                      scales: cute.Tensor, n0: Int32, g: Int32, j: Int32, kb: Int32):
         for c in cutlass.range_constexpr(2):
@@ -467,36 +395,43 @@ class NativeTileLinear:
                         wdst[(c * self.groups + gi) * 4 + 2 * h] = w0
                         wdst[(c * self.groups + gi) * 4 + 2 * h + 1] = w1
         if cutlass.const_expr(self.grouped):
-            self._decode_scales(sdst, scales, n0, g, j, kb)
+            for gi in cutlass.range_constexpr(self.groups):
+                for e in cutlass.range_constexpr(2):
+                    col = n0 + Int32(8 * gi) + Int32(2) * j + Int32(e)
+                    if cutlass.const_expr(self.int4):
+                        s0, s1 = ld_global_nc_v2_u32(self._s_addr(scales, col, kb))
+                        sdst[(gi * 2 + e) * 2], sdst[(gi * 2 + e) * 2 + 1] = s0, s1
+                    else:
+                        sdst[gi * 2 + e] = ld_global_nc_u32(self._s_addr(scales, col, kb))
 
     @cute.kernel
     def decode(self, x: cute.Tensor, payload: cute.Tensor, scales: cute.Tensor,
-               output: cute.Tensor, rows: Int32):
+               output: cute.Tensor, rows: Int32, rows_per: Int32, row_tiles: Int32):
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
-        grid, _, _ = cute.arch.grid_dim()
         tid = Int32(tid)
         lane = tid & Int32(31)
         wid = _warp_uniform_i32(tid >> Int32(5)) if cutlass.const_expr(self.segments == 1) else (tid >> Int32(5))
         slot, seg = wid % Int32(self.slots), wid // Int32(self.slots)
         g, j = lane >> Int32(2), lane & Int32(3)
+        tile = Int32(cta) // row_tiles
+        block_cta = Int32(cta) - tile * row_tiles
+        row0 = tile * rows_per
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._decode_storage())
         fold = shared_ptr_to_u32(storage.fold.data_ptr())
         G = self.groups
         F = 4 * G * 4
         blocks = Int64(self.n // self.cols)
-        slots = Int64(grid) * Int64(self.slots)
-        gw = Int64(cta) * Int64(self.slots) + slot.to(Int64)
+        slots = Int64(self.decode_ctas) * Int64(self.slots)
+        gw = block_cta.to(Int64) * slots + slot.to(Int64)
         begin = (gw * blocks // slots).to(Int32)
         end = ((gw + Int64(1)) * blocks // slots).to(Int32)
-        live = (rows + Int32(15)) >> Int32(4)
+        live = (rows_per + Int32(15)) >> Int32(4)
         kb0 = seg * Int32(self.seg_blocks)
         lanek = Int32(8) * j if cutlass.const_expr(self.grouped) else Int32(16) * j
         prmt_sel = j.to(Uint32) * Uint32(0x0101) + Uint32(0x0400)
         x_base = x.iterator.toint() + lanek.to(Int64) * Int64(2)
-        # Direct K32-slot A base: lane j reads k32 + 2j (2 bf16 = one u32) per step.
-        x_slot = x.iterator.toint() + j.to(Int64) * Int64(4)
         span = end - begin
         if cutlass.const_expr(self.segments > 1):
             span = ((blocks + slots - Int64(1)) // slots).to(Int32)
@@ -511,41 +446,21 @@ class NativeTileLinear:
                 nxt = cute.make_rmem_tensor((self.wpb,), Uint32)
                 scur = cute.make_rmem_tensor((self.spb,), Uint32)
                 snxt = cute.make_rmem_tensor((self.spb,), Uint32)
-                if cutlass.const_expr(self.slot_b):
-                    self._decode_scales(scur, scales, n0, g, j, kb0)
-                else:
-                    self._decode_load(cur, scur, payload, scales, n0, g, j, kb0)
+                self._decode_load(cur, scur, payload, scales, n0, g, j, kb0)
                 for b in cutlass.range(self.seg_blocks, unroll=1):
                     kb = kb0 + b
                     if b + Int32(1) < Int32(self.seg_blocks):
-                        if cutlass.const_expr(self.slot_b):
-                            self._decode_scales(snxt, scales, n0, g, j, kb + Int32(1))
-                        else:
-                            self._decode_load(nxt, snxt, payload, scales, n0, g, j, kb + Int32(1))
+                        self._decode_load(nxt, snxt, payload, scales, n0, g, j, kb + Int32(1))
                     for c in cutlass.range_constexpr(2):
                         k0 = kb * Int32(128) + Int32(64 * c)
                         if cutlass.const_expr(self.grouped):
                             for h in cutlass.range_constexpr(2):
                                 k32 = k0 + Int32(32 * h)
                                 if cutlass.const_expr(not self.side2):
-                                    at_m0 = x_slot + (g.to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                    m0_a0, m0_a2, m0_a4, m0_a6 = _ld_cached_k32x4_pred(at_m0, g, rows)
-                                    m0_a1, m0_a3, m0_a5, m0_a7 = _ld_cached_k32x4_pred(
-                                        at_m0 + Int64(16 * self.k), g + Int32(8), rows)
-                                if cutlass.const_expr(self.slot_b):
-                                    wb = self._w_addr(payload, n0 + g, k32 + Int32(2) * j)
-                                    if cutlass.const_expr(self.int4):
-                                        q0, q1, q2, q3 = _ld_cached_b_imm(wb, 4)
-                                        b0, b1 = _int4x2_bf16(q0), _int4x2_bf16(q1)
-                                        b2, b3 = _int4x2_bf16(q2), _int4x2_bf16(q3)
-                                        r_s0, r_s1 = scur[c], scur[2 + c]
-                                    else:
-                                        q0, q1, q2, q3 = _ld_cached_b_imm(wb, 8)
-                                        b0, b1 = _e4m3x2_bf16(q0), _e4m3x2_bf16(q1)
-                                        b2, b3 = _e4m3x2_bf16(q2), _e4m3x2_bf16(q3)
-                                        r_s0 = scur[0] >> Uint32(16 * c)
-                                        r_s1 = scur[1] >> Uint32(16 * c)
-                                elif cutlass.const_expr(self.int4):
+                                    at_m0 = x_base + ((row0 + g).to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
+                                    m0_lo0, m0_lo1, m0_lo2, m0_lo3 = _ld_cached_pred(at_m0, row0 + g, rows)
+                                    m0_hi0, m0_hi1, m0_hi2, m0_hi3 = _ld_cached_pred(at_m0 + Int64(16 * self.k), row0 + g + Int32(8), rows)
+                                if cutlass.const_expr(self.int4):
                                     t_w = _quad_transpose_u8x4(cur[c * 2 + h], prmt_sel)
                                     b0, b1, b2, b3 = _int4x8_bf16(t_w)
                                     r_s0, r_s1 = scur[c], scur[2 + c]
@@ -558,6 +473,8 @@ class NativeTileLinear:
                                 s0 = self._scale(r_s0, h)
                                 s1 = self._scale(r_s1, h)
                                 if cutlass.const_expr(not self.side2):
+                                    m0_a0, m0_a2, m0_a4, m0_a6 = _quad_transpose_x4(m0_lo0, m0_lo1, m0_lo2, m0_lo3, j)
+                                    m0_a1, m0_a3, m0_a5, m0_a7 = _quad_transpose_x4(m0_hi0, m0_hi1, m0_hi2, m0_hi3, j)
                                     acc[0], acc[1], acc[2], acc[3] = _mma_k32_scaled(
                                         acc[0], acc[1], acc[2], acc[3],
                                         m0_a0, m0_a1, m0_a2, m0_a3, m0_a4, m0_a5, m0_a6, m0_a7,
@@ -565,9 +482,11 @@ class NativeTileLinear:
                                 for mt in cutlass.range_constexpr(0 if self.side2 else 1, 4):
                                     if Int32(mt) < live:
                                         r0 = Int32(16 * mt) + g
-                                        at0 = x_slot + (r0.to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                        a0, a2, a4, a6 = _ld_cached_k32x4_pred(at0, r0, rows)
-                                        a1, a3, a5, a7 = _ld_cached_k32x4_pred(at0 + Int64(16 * self.k), r0 + Int32(8), rows)
+                                        at0 = x_base + ((row0 + r0).to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
+                                        lo0, lo1, lo2, lo3 = _ld_cached_pred(at0, row0 + r0, rows)
+                                        hi0, hi1, hi2, hi3 = _ld_cached_pred(at0 + Int64(16 * self.k), row0 + r0 + Int32(8), rows)
+                                        a0, a2, a4, a6 = _quad_transpose_x4(lo0, lo1, lo2, lo3, j)
+                                        a1, a3, a5, a7 = _quad_transpose_x4(hi0, hi1, hi2, hi3, j)
                                         f = 4 * mt
                                         acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
                                             acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
@@ -586,17 +505,16 @@ class NativeTileLinear:
                                     xa.fill(Uint32(0))
                                     for hh in cutlass.range_constexpr(2):
                                         r = Int32(16 * mt + 8 * hh) + g
-                                        if r < rows:
-                                            at = x_base + (r.to(Int64) * Int64(self.k) + k0.to(Int64)) * Int64(2)
+                                        if row0 + r < rows:
+                                            at = x_base + ((row0 + r).to(Int64) * Int64(self.k) + k0.to(Int64)) * Int64(2)
                                             lo = _ld_cached(at)
                                             hi = _ld_cached(at + Int64(16))
                                             for i in cutlass.range_constexpr(4):
                                                 xa[8 * hh + i], xa[8 * hh + 4 + i] = lo[i], hi[i]
                                     for gi in cutlass.range_constexpr(G):
                                         self._mma_chunk(acc, 4 * (mt * G + gi), xa, bw, gi, sc)
-                    if cutlass.const_expr(not self.slot_b):
-                        for i in cutlass.range_constexpr(self.wpb):
-                            cur[i] = nxt[i]
+                    for i in cutlass.range_constexpr(self.wpb):
+                        cur[i] = nxt[i]
                     if cutlass.const_expr(self.grouped):
                         for i in cutlass.range_constexpr(self.spb):
                             scur[i] = snxt[i]
@@ -622,8 +540,8 @@ class NativeTileLinear:
                         for gi in cutlass.range_constexpr(G):
                             f = 4 * (mt * G + gi)
                             col = n0 + Int32(8 * gi) + Int32(2) * j
-                            self._store(output, scales, acc[f], acc[f + 1], Int32(16 * mt) + g, col, rows)
-                            self._store(output, scales, acc[f + 2], acc[f + 3], Int32(16 * mt + 8) + g, col, rows)
+                            self._store(output, scales, acc[f], acc[f + 1], row0 + Int32(16 * mt) + g, col, rows)
+                            self._store(output, scales, acc[f + 2], acc[f + 3], row0 + Int32(16 * mt + 8) + g, col, rows)
 
     # ------------------------------------------------------------------ prefill
     def _storage(self):
