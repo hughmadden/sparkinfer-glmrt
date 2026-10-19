@@ -1,37 +1,168 @@
-"""Device-driven EXLR8 grouping and shared hidden-domain transforms."""
+"""Device-driven EXLR8 grouping fused with the hidden-side ingress transform.
+
+One launch per K1 wave: CTA 0 builds the expert groups; every other CTA turns
+the wave's input rows into the rotated F16 activation all local experts read,
+H128(x * signs.in) once per token, never per expert. Routed Spark waves read
+the standard FP8 E4M3 + UE8M0 per-32 wire rows (the bytes EXL3 receives); the
+coordinator shared expert reads BF16 rows through the same transform.
+"""
 from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32, Int64, Uint32
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 from cuda.bindings import driver as cuda
 
 from ._common import Operand, Scalar, compile_program
+from b12x._lib.intrinsics import (
+    ld_global_nc_u32,
+    ld_global_nc_v2_u32,
+    st_global_v2_u32,
+    u32_as_f32,
+)
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
+from b12x.moe._shared.kernels.w4a16.exlr8 import signed_byte
+
+INPUT_FORMATS = ("fp8_k32", "bf16")
+# Ingress CTAs run eight warps, one (row, 128-column block) task per warp.
+INGRESS_WARPS = 8
+
+
+@dsl_user_op
+def _e4m3x4_scaled(packed: Uint32, scale_bits: Uint32, *, loc=None, ip=None):
+    """Four E4M3 bytes times an F32 scale (exact: E4M3 -> F16 -> F32 widening
+    and a power-of-two mul.rn), as the EXL3 wire decoder computes them."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip), Uint32(scale_bits).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 b01, b23, l0, l1, l2, l3;
+            .reg .b32 hi32, h01, h23;
+            .reg .f32 sc;
+            mov.b32 sc, $5;
+            cvt.u16.u32 b01, $4;
+            shr.b32 hi32, $4, 16;
+            cvt.u16.u32 b23, hi32;
+            cvt.rn.f16x2.e4m3x2 h01, b01;
+            cvt.rn.f16x2.e4m3x2 h23, b23;
+            mov.b32 {l0, l1}, h01;
+            mov.b32 {l2, l3}, h23;
+            cvt.f32.f16 $0, l0;
+            cvt.f32.f16 $1, l1;
+            cvt.f32.f16 $2, l2;
+            cvt.f32.f16 $3, l3;
+            mul.rn.f32 $0, $0, sc;
+            mul.rn.f32 $1, $1, sc;
+            mul.rn.f32 $2, $2, sc;
+            mul.rn.f32 $3, $3, sc;
+        }
+        """,
+        "=f,=f,=f,=f,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@cute.jit
+def _bf16x4_to_f32(lo: Uint32, hi: Uint32):
+    """Four BF16 values (two packed words) widened exactly to F32."""
+    return (u32_as_f32(lo << Uint32(16)), u32_as_f32(lo & Uint32(0xFFFF0000)),
+            u32_as_f32(hi << Uint32(16)), u32_as_f32(hi & Uint32(0xFFFF0000)))
+
+
+@dsl_user_op
+def _f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None):
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+        "cvt.rn.f16x2.f32 $0, $2, $1;", "=r,f,f", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
 
 
 class _Group:
-    def __init__(self, experts, top_k, max_groups):
+    def __init__(self, experts, top_k, max_groups, hidden, input_format):
         self.experts, self.top_k, self.max_groups = experts, top_k, max_groups
+        self.hidden, self.blocks, self.input_format = hidden, hidden // 128, input_format
+        # Wire rows: hidden E4M3 bytes, then hidden/32 UE8M0 scale bytes.
+        self.row_bytes = hidden + hidden // 32 if input_format == "fp8_k32" else hidden * 2
 
     @cute.jit
-    def __call__(self, ids: cute.Pointer, group_expert: cute.Pointer,
-                 route_slots: cute.Pointer, route_group_lane: cute.Pointer,
-                 group_count: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        if rows > Int32(0) and rows <= Int32(64):
-            self.kernel(ids, group_expert, route_slots, route_group_lane,
-                        group_count, rows).launch(grid=(1, 1, 1), block=(256, 1, 1), stream=stream)
+    def __call__(self, ids: cute.Pointer, x: cute.Pointer, signs_in: cute.Pointer,
+                 group_expert: cute.Pointer, route_slots: cute.Pointer,
+                 route_group_lane: cute.Pointer, group_count: cute.Pointer,
+                 activation: cute.Pointer, rows: Int32, cta_limit: Int32,
+                 stream: cuda.CUstream):
+        if rows > Int32(0) and rows <= Int32(64) and cta_limit > Int32(0):
+            ingress = (rows * Int32(self.blocks) + Int32(INGRESS_WARPS - 1)) // Int32(INGRESS_WARPS)
+            self.kernel(ids, x, signs_in, group_expert, route_slots, route_group_lane,
+                        group_count, activation, rows).launch(
+                grid=(Int32(1) + min(ingress, cta_limit), 1, 1), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, ids: cute.Pointer, group_expert: cute.Pointer,
-               route_slots: cute.Pointer, route_group_lane: cute.Pointer,
-               group_count: cute.Pointer, rows: Int32):
-        thread = Int32(cute.arch.thread_idx()[0])
+    def kernel(self, ids: cute.Pointer, x: cute.Pointer, signs_in: cute.Pointer,
+               group_expert: cute.Pointer, route_slots: cute.Pointer,
+               route_group_lane: cute.Pointer, group_count: cute.Pointer,
+               activation: cute.Pointer, rows: Int32):
         smem = utils.SmemAllocator()
         prefix = smem.allocate_tensor(Int32, cute.make_layout(256), byte_alignment=16)
         valid = smem.allocate_tensor(Int32, cute.make_layout(1), byte_alignment=16)
+        if Int32(cute.arch.block_idx()[0]) == Int32(0):
+            self.group(ids, group_expert, route_slots, route_group_lane, group_count,
+                       prefix, valid, rows)
+        else:
+            self.ingress(x, signs_in, activation, rows)
+
+    @cute.jit
+    def ingress(self, x: cute.Pointer, signs_in: cute.Pointer, activation: cute.Pointer,
+                rows: Int32):
+        """activation[row, block] = F16(H128(dequant(x[row, block]) * signs.in)).
+
+        One warp per (row, 128-column block); each lane owns four adjacent
+        columns. Per-element arithmetic depends only on that row's input, so
+        it is identical for every chunk placement, row count and CTA limit.
+        """
+        thread = Int32(cute.arch.thread_idx()[0])
+        lane, warp = thread & Int32(31), thread >> Int32(5)
+        task = (Int32(cute.arch.block_idx()[0]) - Int32(1)) * Int32(INGRESS_WARPS) + warp
+        step = (Int32(cute.arch.grid_dim()[0]) - Int32(1)) * Int32(INGRESS_WARPS)
+        source, out = Int64(x.toint()), Int64(activation.toint())
+        while task < rows * Int32(self.blocks):
+            row, block = task // Int32(self.blocks), task % Int32(self.blocks)
+            col = block * Int32(128) + lane * Int32(4)
+            row_base = source + row.to(Int64) * Int64(self.row_bytes)
+            if cutlass.const_expr(self.input_format == "fp8_k32"):
+                packed = ld_global_nc_u32(row_base + col.to(Int64))
+                # The block's four UE8M0 bytes; lanes 8j..8j+7 share byte j.
+                scales = ld_global_nc_u32(row_base + Int64(self.hidden) + (block * Int32(4)).to(Int64))
+                s = ((scales >> ((lane >> Int32(3)) * Int32(8)).to(Uint32)) & Uint32(0xFF)).to(Int32)
+                # float(UE8M0) = 2^(s - 127); 0 is the F32 subnormal 2^-127, 255 NaN.
+                bits = Uint32(s) << Uint32(23)
+                if s == Int32(0):
+                    bits = Uint32(0x00400000)
+                if s == Int32(255):
+                    bits = Uint32(0x7FFFFFFF)
+                v0, v1, v2, v3 = _e4m3x4_scaled(packed, bits)
+            else:
+                lo, hi = ld_global_nc_v2_u32(row_base + col.to(Int64) * Int64(2))
+                v0, v1, v2, v3 = _bf16x4_to_f32(lo, hi)
+            signs = ld_global_nc_u32(Int64(signs_in.toint()) + col.to(Int64))
+            h0, h1, h2, h3 = _w4a8_had128_quad(v0 * signed_byte(signs, 0), v1 * signed_byte(signs, 1),
+                                               v2 * signed_byte(signs, 2), v3 * signed_byte(signs, 3), lane)
+            st_global_v2_u32(out + (row.to(Int64) * Int64(self.hidden) + col.to(Int64)) * Int64(2),
+                             _f32x2_to_f16x2(h0, h1), _f32x2_to_f16x2(h2, h3))
+            task += step
+
+    @cute.jit
+    def group(self, ids: cute.Pointer, group_expert: cute.Pointer,
+              route_slots: cute.Pointer, route_group_lane: cute.Pointer,
+              group_count: cute.Pointer, prefix: cute.Tensor, valid: cute.Tensor,
+              rows: Int32):
+        """Stable ascending-expert/ascending-route packing (CTA 0 only)."""
+        thread = Int32(cute.arch.thread_idx()[0])
         routes = rows * Int32(self.top_k)
         if thread == Int32(0):
             valid[0] = Int32(1)
@@ -80,122 +211,37 @@ class _Group:
                         ordinal += Int32(1)
 
 
-class _Rotate:
-    def __init__(self, hidden, max_rows):
-        self.hidden, self.blocks, self.max_rows = hidden, hidden // 128, max_rows
-
-    @cute.jit
-    def __call__(self, x: cute.Pointer, signs: cute.Pointer, output: cute.Pointer,
-                 rows: Int32, cta_limit: Int32, stream: cuda.CUstream):
-        if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
-            self.kernel(x, signs, output, rows).launch(
-                grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1), block=(32, 1, 1), stream=stream)
-
-    @cute.kernel
-    def kernel(self, x: cute.Pointer, signs: cute.Pointer, output: cute.Pointer, rows: Int32):
-        lane = Int32(cute.arch.thread_idx()[0])
-        task = Int32(cute.arch.block_idx()[0])
-        step = Int32(cute.arch.grid_dim()[0])
-        while task < rows * Int32(self.blocks):
-            block = task % Int32(self.blocks)
-            base = task.to(Int64) * Int64(128) + lane.to(Int64) * Int64(4)
-            values = cute.make_rmem_tensor(4, Float32)
-            for v in cutlass.range_constexpr(4):
-                values[v] = x[base + Int64(v)].to(Float32) * signs[block * Int32(128) + lane * Int32(4) + Int32(v)].to(Float32)
-            a, b, c, d = _w4a8_had128_quad(values[0], values[1], values[2], values[3], lane)
-            output[base] = a.to(cutlass.Float16)
-            output[base + Int64(1)] = b.to(cutlass.Float16)
-            output[base + Int64(2)] = c.to(cutlass.Float16)
-            output[base + Int64(3)] = d.to(cutlass.Float16)
-            task += step
-
-
-class _Reduce:
-    def __init__(self, hidden, max_ranks, max_rows):
-        self.hidden, self.blocks = hidden, hidden // 128
-        self.max_ranks, self.max_rows = max_ranks, max_rows
-
-    @cute.jit
-    def __call__(self, planes: cute.Pointer, shared: cute.Pointer, signs: cute.Pointer,
-                 residual: cute.Pointer, output: cute.Pointer, rows: Int32,
-                 ranks: Int32, cta_limit: Int32, stream: cuda.CUstream):
-        if rows > Int32(0) and rows <= Int32(self.max_rows) and ranks >= Int32(0) and ranks <= Int32(self.max_ranks) and cta_limit > Int32(0):
-            self.kernel(planes, shared, signs, residual, output, rows, ranks).launch(
-                grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1), block=(32, 1, 1), stream=stream)
-
-    @cute.kernel
-    def kernel(self, planes: cute.Pointer, shared: cute.Pointer, signs: cute.Pointer,
-               residual: cute.Pointer, output: cute.Pointer, rows: Int32, ranks: Int32):
-        lane = Int32(cute.arch.thread_idx()[0])
-        task = Int32(cute.arch.block_idx()[0])
-        step = Int32(cute.arch.grid_dim()[0])
-        while task < rows * Int32(self.blocks):
-            block = task % Int32(self.blocks)
-            base = task.to(Int64) * Int64(128) + lane.to(Int64) * Int64(4)
-            values = cute.make_rmem_tensor(4, Float32)
-            values.fill(Float32(0))
-            for rank in cutlass.range(ranks):
-                plane = cute.make_ptr(Float32, planes[rank], cute.AddressSpace.gmem, assumed_align=16)
-                for v in cutlass.range_constexpr(4):
-                    values[v] = values[v] + plane[base + Int64(v)]
-            for v in cutlass.range_constexpr(4):
-                values[v] = values[v] + shared[base + Int64(v)]
-            a, b, c, d = _w4a8_had128_quad(values[0], values[1], values[2], values[3], lane)
-            values[0], values[1], values[2], values[3] = a, b, c, d
-            for v in cutlass.range_constexpr(4):
-                delta = values[v] * signs[block * Int32(128) + lane * Int32(4) + Int32(v)].to(Float32)
-                output[base + Int64(v)] = (delta + residual[base + Int64(v)].to(Float32)).to(cutlass.BFloat16)
-            task += step
-
-
-def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, shared_expert=False):
-    if shared_expert and (experts, top_k, max_groups) != (1, 1, 4):
-        raise ValueError("shared EXLR8 grouping requires experts=1, top_k=1, max_groups=4")
-    if (any(type(v) is not int for v in (experts, top_k, max_groups))
+def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144,
+                            input_format="fp8_k32", shared_expert=False):
+    if shared_expert and ((experts, top_k, max_groups) != (1, 1, 4) or input_format != "bf16"):
+        raise ValueError("shared EXLR8 grouping requires experts=1, top_k=1, max_groups=4 and BF16 rows")
+    if (any(type(v) is not int for v in (experts, top_k, max_groups, hidden))
             or not (1 <= experts <= 256 and 1 <= top_k <= 32
                     and 0 < max_groups <= (2**31 - 1) // 16)):
         raise ValueError("EXLR8 grouping requires experts1..256, top_k1..32 and positive capacity")
-    return compile_program(_Group(experts, top_k, max_groups),
+    if input_format not in INPUT_FORMATS:
+        raise ValueError(f"unknown EXLR8 ingress format {input_format!r}")
+    if hidden <= 0 or hidden % 128 or 64 * (hidden // 128) > (2**31 - 1) // 2:
+        raise ValueError("EXLR8 ingress requires positive hidden % 128 == 0 within int32 tasks")
+    row = f"[rows,{hidden + hidden // 32}]" if input_format == "fp8_k32" else f"[rows,{hidden}]"
+    x = (Operand("x", torch.uint8, row, note="E4M3 bytes then UE8M0 per-32 scales per row")
+         if input_format == "fp8_k32" else Operand("x", torch.bfloat16, row))
+    return compile_program(_Group(experts, top_k, max_groups, hidden, input_format),
         name="exlr8_shared_group" if shared_expert else "exlr8_group",
         operands=(Operand("ids", torch.int32, f"[rows,{top_k}]"),
+                  x,
+                  Operand("signs_in", torch.int8, f"[{hidden}]", align=4),
                   Operand("group_expert", torch.int32, f"[{max_groups}]", "out"),
                   Operand("route_slots", torch.int32, f"[{max_groups},16]", "out"),
                   Operand("route_group_lane", torch.int32, f"[rows,{top_k}]", "out"),
-                  Operand("group_count", torch.int32, "[1]", "out")),
-        scalars=(Scalar("rows"),), key=(experts, top_k, max_groups, shared_expert),
-        geometry=dict(abi_version=1, experts=experts, top_k=top_k, max_groups=max_groups, max_rows=64))
-
-
-def _check_transform_geometry(hidden, max_rows):
-    if (any(type(v) is not int or v <= 0 or v > 2**31 - 1
-            for v in (hidden, max_rows)) or hidden % 128
-            or max_rows * (hidden // 128) > (2**31 - 1) // 2
-            or max_rows * hidden * 4 > 2**63 - 1):
-        raise ValueError("EXLR8 transform geometry exceeds alignment or indexing bounds")
-
-
-def compile_exlr8_rotate_aot(*, hidden=6144, max_rows=4096):
-    _check_transform_geometry(hidden, max_rows)
-    return compile_program(_Rotate(hidden, max_rows), name="exlr8_rotate",
-        operands=(Operand("x", torch.bfloat16, f"[rows,{hidden}]"),
-                  Operand("signs", torch.int8, f"[{hidden}]"),
-                  Operand("output", torch.float16, f"[rows,{hidden}]", "out")),
-        scalars=(Scalar("rows"), Scalar("cta_limit")), key=(hidden, max_rows),
-        geometry=dict(abi_version=1, hidden=hidden, max_rows=max_rows, ctas_per_sm=4))
-
-
-def compile_exlr8_reduce_aot(*, hidden=6144, max_ranks=6, max_rows=4096):
-    _check_transform_geometry(hidden, max_rows)
-    if type(max_ranks) is not int or not 0 <= max_ranks <= 2**31 - 1:
-        raise ValueError("invalid EXLR8 reduction rank capacity")
-    return compile_program(_Reduce(hidden, max_ranks, max_rows), name="exlr8_reduce",
-        operands=(Operand("planes", torch.int64, f"[{max_ranks}]"),
-                  Operand("shared", torch.float32, f"[rows,{hidden}]"),
-                  Operand("signs", torch.int8, f"[{hidden}]"),
-                  Operand("residual", torch.bfloat16, f"[rows,{hidden}]"),
-                  Operand("output", torch.bfloat16, f"[rows,{hidden}]", "out")),
-        scalars=(Scalar("rows"), Scalar("ranks"), Scalar("cta_limit")), key=(hidden, max_ranks, max_rows),
-        geometry=dict(abi_version=1, hidden=hidden, max_ranks=max_ranks, max_rows=max_rows, ctas_per_sm=4))
+                  Operand("group_count", torch.int32, "[1]", "out"),
+                  Operand("activation", torch.float16, f"[rows,{hidden}]", "out")),
+        scalars=(Scalar("rows"), Scalar("cta_limit")),
+        key=(experts, top_k, max_groups, hidden, input_format, shared_expert),
+        geometry=dict(abi_version=2, experts=experts, top_k=top_k, max_groups=max_groups,
+                      max_rows=64, hidden=hidden, input_format=input_format,
+                      input_row_bytes=_Group(experts, top_k, max_groups, hidden, input_format).row_bytes,
+                      ctas_per_sm=4, ingress_warps=INGRESS_WARPS))
 
 
 def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_groups=512):
@@ -210,16 +256,13 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
                                       max_groups=max_groups, device_count=True)),
         ("group", "exlr8_group", {"max_rows": 64},
-         lambda: compile_exlr8_group_aot(top_k=top_k, max_groups=max_groups)),
-        ("rotate", "exlr8_rotate", {"max_rows": 4096},
-         lambda: compile_exlr8_rotate_aot(hidden=hidden)),
-        ("reduce", "exlr8_reduce", {"max_rows": 4096},
-         lambda: compile_exlr8_reduce_aot(hidden=hidden)),
+         lambda: compile_exlr8_group_aot(top_k=top_k, max_groups=max_groups, hidden=hidden)),
         ("shared_a16_serving", "exlr8_a16", {"max_rows": 64},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=1,
                                       max_groups=4, device_count=True, shared_expert=True)),
         ("shared_group", "exlr8_group", {"max_rows": 64},
-         lambda: compile_exlr8_group_aot(experts=1, top_k=1, max_groups=4, shared_expert=True)),
+         lambda: compile_exlr8_group_aot(experts=1, top_k=1, max_groups=4, hidden=hidden,
+                                         input_format="bf16", shared_expert=True)),
     ]
     if role == "spark":
         return result[1:3]

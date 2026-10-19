@@ -1,11 +1,16 @@
-"""Real-checkpoint K1 component gates; opt in with EXLR8 snapshot/reference paths."""
+"""Real-checkpoint K1 component gates; opt in with EXLR8 snapshot/reference paths.
+
+K1 consumes the rotated F16 activation and writes the BF16 hidden-domain
+partial (local sum, inverse H128 and signs.out). The rotated-domain oracle
+therefore compares through ``case.egress``.
+"""
 import os
 
 import numpy as np
 import pytest
 import torch
 
-from .exlr8_oracle import Case
+from .exlr8_oracle import Case, make_wire
 
 pytestmark = pytest.mark.skipif(not os.environ.get("CUTEAFD_EXLR8_SNAPSHOT"),
                                 reason="EXLR8 component gate requires checkpoint and E1 reference")
@@ -94,8 +99,9 @@ def test_kernel_accuracy(case, amplitude):
         case.intermediate.fill_(float("nan"))
         case.fc2.fill_(float("nan"))
         launch(case, compiled, 8)
-        reference = case.oracle(8)
-        assert relative(case.output[:8], reference) <= 1e-3
+        # One BF16 rounding of the response bounds the extra relative error.
+        reference = case.egress(case.oracle(8))
+        assert relative(case.output[:8], reference) <= 2**-9 + 1e-3
     finally:
         case.x = original
 
@@ -183,7 +189,7 @@ def test_fc2_chunk_tail_and_odd_blocks(units, hidden):
     case.routing(16)
     launch(case, compiled, 16, 1)
     expected = case.output[:16].clone()
-    assert relative(expected[:1], case.oracle(1)) <= 1e-3
+    assert relative(expected[:1], case.egress(case.oracle(1))) <= 2**-9 + 1e-3
 
     for groups in (23, 24, 25):
         case.routing(16, chunk=1)
@@ -232,58 +238,230 @@ def test_empty_routes_do_not_read_poison(case):
     assert torch.isnan(case.output[8:]).all()
 
 
-def test_shared_expert_grouping_serving_reference_and_graph(case):
+def shared_programs(case):
     from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
     from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
 
     shared = compile_exlr8_a16_aot(hidden=case.h, units=case.u, top_k=1,
                                   max_groups=4, device_count=True, shared_expert=True)
-    group = compile_exlr8_group_aot(experts=1, top_k=1, max_groups=4, shared_expert=True)
-    ids = torch.zeros((64, 1), dtype=torch.int32, device=case.device)
-    experts = torch.empty(4, dtype=torch.int32, device=case.device)
-    slots = torch.empty((4, 16), dtype=torch.int32, device=case.device)
-    inverse = torch.empty_like(ids)
-    count = torch.empty(1, dtype=torch.int32, device=case.device)
-    gates = torch.ones((64, 1), device=case.device)
-    scratch = [torch.empty_like(case.fc1[:4]), torch.empty_like(case.intermediate[:4]),
-               torch.empty_like(case.fc2[:4])]
-    output = torch.empty_like(case.output)
-    # Expert slices need dedicated aligned tables, retained across graph replays.
-    pointers, bits = case.pointers[3:4].clone(), case.bits[3:4].clone()
+    group = compile_exlr8_group_aot(experts=1, top_k=1, max_groups=4, hidden=case.h,
+                                    input_format="bf16", shared_expert=True)
+    return shared, group
 
-    def run(rows, limit=96):
-        group.launch(ids, experts, slots, inverse, count, scalars=(rows,))
-        shared.launch(case.x, pointers, bits, experts, slots, inverse,
-                      gates, *scratch, output, count, scalars=(rows, limit))
 
-    # The fixture's fourth expert is the checkpoint's real shared expert. Its
-    # independent decoder includes K3/K4 payloads and the calibrated side data.
-    previous_topk, previous_weights = case.topk, case.weights
-    try:
-        case.topk, case.weights = 1, gates
-        reference = case.oracle(2, expert=3)
-    finally:
-        case.topk, case.weights = previous_topk, previous_weights
-    run(64)
-    expected = output.clone()
-    assert relative(expected[:2], reference) <= 5e-4
+class SharedRun:
+    """Coordinator shared expert: BF16 rows -> shared group ingress -> K1 half."""
+
+    def __init__(self, case, owned=None):
+        self.shared, self.group = shared_programs(case)
+        d = case.device
+        self.ids = torch.zeros((64, 1), dtype=torch.int32, device=d)
+        self.experts = torch.empty(4, dtype=torch.int32, device=d)
+        self.slots = torch.empty((4, 16), dtype=torch.int32, device=d)
+        self.inverse = torch.empty_like(self.ids)
+        self.count = torch.empty(1, dtype=torch.int32, device=d)
+        self.gates = torch.ones((64, 1), device=d)
+        self.activation = torch.empty((64, case.h), dtype=torch.float16, device=d)
+        self.scratch = [torch.empty_like(case.fc1[:4]), torch.empty_like(case.intermediate[:4]),
+                        torch.empty_like(case.fc2[:4])]
+        self.output = torch.empty((64, case.h), dtype=torch.bfloat16, device=d)
+        # Expert slices need dedicated aligned tables, retained across graph replays.
+        self.pointers, self.bits = case.pointers[3:4].clone(), case.bits[3:4].clone()
+        if owned is not None:
+            # TP2 split: unowned intermediate units are nonresident on this GPU.
+            for u in range(case.u):
+                if u not in owned:
+                    self.bits[0, u] = 0
+        self.case = case
+
+    def __call__(self, x, rows, limit=96):
+        c = self.case
+        self.group.launch(self.ids, x, c.signs_in, self.experts, self.slots, self.inverse,
+                          self.count, self.activation, scalars=(rows, limit))
+        self.shared.launch(self.activation, self.pointers, self.bits, self.experts, self.slots,
+                           self.inverse, self.gates, *self.scratch, c.signs_out, self.output,
+                           self.count, scalars=(rows, limit))
+
+
+def test_shared_expert_grouping_serving_reference_and_graph(case):
+    run = SharedRun(case)
+    generator = torch.Generator().manual_seed(4081)
+    x = torch.randn((64, case.h), generator=generator).bfloat16().to(case.device)
+    ids = torch.full((64, 1), 3, dtype=torch.int32)
+    ones = torch.ones((64, 1), dtype=torch.float64)
+    fp64 = case.hidden_reference(x[:4].double(), ids[:4], ones[:4], official=False)
+    official = case.hidden_reference(x[:4].double(), ids[:4], ones[:4], official=True)
+    run(x, 64)
+    expected = run.output.clone()
+    native_error = relative(expected[:4], fp64)
+    assert native_error <= 2**-9 + 1e-3
+    assert native_error <= relative(official, fp64)
     for rows in (1, 2, 16, 32, 63, 64):
         for limit in (1, 7, 188):
-            output.fill_(float("nan"))
-            run(rows, limit)
-            assert torch.equal(output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
-            assert torch.isnan(output[rows:]).all()
-            assert count.item() == (rows + 15) // 16
-    run(64)
+            run.output.fill_(float("nan"))
+            run.activation.fill_(float("nan"))
+            run(x, rows, limit)
+            assert torch.equal(run.output[:rows].view(torch.int16), expected[:rows].view(torch.int16))
+            assert torch.isnan(run.output[rows:]).all()
+            assert run.count.item() == (rows + 15) // 16
+    run(x, 64)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        run(64)
+        run(x, 64)
     for scale in (0.25, 1.0, 0.5):
-        gates.fill_(scale)
+        run.gates.fill_(scale)
         graph.replay()
-        assert torch.equal(output.view(torch.int32), (expected * scale).view(torch.int32))
-    ids[0, 0] = 1
+        assert torch.equal(run.output.view(torch.int16), (expected * scale).view(torch.int16))
+    run.ids[0, 0] = 1
     graph.replay()
-    assert count.item() == -1
-    assert torch.equal(output, torch.zeros_like(output))
+    assert run.count.item() == -1
+    assert torch.equal(run.output, torch.zeros_like(run.output))
+
+
+def test_shared_expert_tp2_halves_sum_to_whole(case):
+    """Each GPU rotates its BF16 input, runs its interleaved half of the
+    intermediate units and inverse-rotates its half; the BF16 halves add up."""
+    generator = torch.Generator().manual_seed(4082)
+    x = torch.randn((64, case.h), generator=generator).bfloat16().to(case.device)
+    halves = []
+    for rank in (0, 1):
+        run = SharedRun(case, owned={u for u in range(case.u) if u % 2 == rank})
+        run(x, 64)
+        halves.append(run.output.float())
+    ids = torch.full((64, 1), 3, dtype=torch.int32)
+    ones = torch.ones((64, 1), dtype=torch.float64)
+    fp64 = case.hidden_reference(x[:4].double(), ids[:4], ones[:4], official=False)
+    assert relative(halves[0][:4] + halves[1][:4], fp64) <= 4e-3
+    whole = SharedRun(case)
+    whole(x, 64)
+    assert relative(halves[0] + halves[1], whole.output.float()) <= 4e-3
+
+
+class SparkStep:
+    """Spark worker step for one <=64-row chunk: Fp8K32 wire rows -> fused
+    group/ingress -> K1 serving -> BF16 response rows."""
+
+    def __init__(self, case):
+        from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
+        self.case = case
+        self.group = compile_exlr8_group_aot(experts=4, top_k=case.topk, max_groups=case.max_groups,
+                                             hidden=case.h, input_format="fp8_k32")
+        self.k1 = program(case, device_count=True)
+        d = case.device
+        self.ids = torch.empty((64, case.topk), dtype=torch.int32, device=d)
+        self.weights = torch.empty((64, case.topk), device=d)
+        self.wire = torch.empty((64, case.h + case.h // 32), dtype=torch.uint8, device=d)
+        self.count = torch.empty(1, dtype=torch.int32, device=d)
+        self.activation = torch.empty((64, case.h), dtype=torch.float16, device=d)
+        self.group_expert = torch.empty((case.max_groups,), dtype=torch.int32, device=d)
+        self.route_slots = torch.empty((case.max_groups, 16), dtype=torch.int32, device=d)
+        self.inverse = torch.empty((64, case.topk), dtype=torch.int32, device=d)
+        self.output = torch.empty((64, case.h), dtype=torch.bfloat16, device=d)
+
+    def launch(self, rows, limit=96):
+        c = self.case
+        self.group.launch(self.ids, self.wire, c.signs_in, self.group_expert, self.route_slots,
+                          self.inverse, self.count, self.activation, scalars=(rows, limit))
+        self.k1.launch(self.activation, c.pointers, c.bits, self.group_expert, self.route_slots,
+                       self.inverse, self.weights, c.fc1, c.intermediate, c.fc2, c.signs_out,
+                       self.output, self.count, scalars=(rows, limit))
+
+    def wave(self, wire, ids, weights, chunks, limit=96):
+        """Run a whole wave in serial chunks, as the worker does; returns BF16 rows."""
+        out = torch.empty((wire.shape[0], self.case.h), dtype=torch.bfloat16, device=self.case.device)
+        first = 0
+        for rows in chunks:
+            self.wire[:rows].copy_(wire[first:first + rows])
+            self.ids[:rows].copy_(ids[first:first + rows])
+            self.weights[:rows].copy_(weights[first:first + rows])
+            self.output.fill_(float("nan"))
+            self.activation.fill_(float("nan"))
+            self.launch(rows, limit)
+            out[first:first + rows].copy_(self.output[:rows])
+            assert torch.isnan(self.output[rows:]).all(), "writes past live rows"
+            first += rows
+        assert first == wire.shape[0]
+        return out
+
+
+def wave_inputs(case, rows, seed=4083):
+    generator = torch.Generator().manual_seed(seed)
+    x = torch.randn((rows, case.h), generator=generator) * 0.5
+    # Some rows carry outliers so per-32 scales span several binades.
+    x[::7, ::97] *= 40.0
+    wire, dequant = make_wire(x.to(case.device))
+    ids = torch.randint(0, 4, (rows, case.topk), generator=generator).int().to(case.device)
+    weights = torch.rand((rows, case.topk), generator=generator).add(0.05).to(case.device)
+    return wire, dequant, ids, weights
+
+
+def test_fp8_ingress_matches_reference(case):
+    from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
+    group = compile_exlr8_group_aot(experts=4, top_k=case.topk, max_groups=case.max_groups,
+                                    hidden=case.h, input_format="fp8_k32")
+    wire, dequant, ids, _ = wave_inputs(case, 64)
+    # UE8M0 edge cases: the F32 subnormal 2^-127 scale byte 0.
+    wire[5, case.h:case.h + 3] = 0
+    dequant[5, :96] = wire[5, :96].view(torch.float8_e4m3fn).double() * 2.0 ** -127
+    rotated = (dequant * case.signs_in.double()).reshape(64, -1, 128)
+    from .exlr8_oracle import hadamard
+    reference = hadamard(rotated).reshape(64, case.h)
+    activation = torch.empty((64, case.h), dtype=torch.float16, device=case.device)
+    tables = [torch.empty((case.max_groups,), dtype=torch.int32, device=case.device),
+              torch.empty((case.max_groups, 16), dtype=torch.int32, device=case.device),
+              torch.empty_like(ids), torch.empty(1, dtype=torch.int32, device=case.device)]
+    for limit in (1, 7, 188):
+        activation.fill_(float("nan"))
+        group.launch(ids, wire, case.signs_in, *tables, activation, scalars=(64, limit))
+        torch.testing.assert_close(activation.double(), reference.half().double(), rtol=1e-3, atol=1e-7)
+        if limit == 1:
+            invariant = activation.clone()
+        assert torch.equal(activation.view(torch.int16), invariant.view(torch.int16))
+        assert tables[3].item() > 0
+
+
+@pytest.mark.parametrize("rows", [1, 8, 64])
+def test_fp8_spark_step_same_quant_error_ratio(case, rows):
+    """Same-quant gate: identical FP8 activations into the native step, the
+    checkpoint's BF16 official arithmetic and FP64; native error <= 1.01x
+    official error against FP64, globally and per row."""
+    step = SparkStep(case)
+    wire, dequant, ids, weights = wave_inputs(case, rows, seed=4084 + rows)
+    native = step.wave(wire, ids, weights, [rows]).double()
+    fp64 = case.hidden_reference(dequant, ids, weights, official=False)
+    official = case.hidden_reference(dequant, ids, weights, official=True).double()
+    assert relative(native, fp64) <= 1.01 * relative(official, fp64)
+    for r in range(rows):
+        assert relative(native[r], fp64[r]) <= 1.01 * relative(official[r], fp64[r]), r
+
+
+def test_fp8_spark_step_chunk_and_cta_invariance(case):
+    """64-row chunking is invisible: each row's BF16 response is bitwise the
+    row computed alone, for waves of 1/8/64/65/128 rows, any chunk placement,
+    packing and CTA limit, and through graph replay of a chunk."""
+    step = SparkStep(case)
+    wire, _, ids, weights = wave_inputs(case, 128, seed=4090)
+    solo = torch.cat([step.wave(wire[r:r + 1], ids[r:r + 1], weights[r:r + 1], [1], limit=1)
+                      for r in range(128)])
+    for chunks in ([1], [8], [64], [64, 1], [64, 64], [1, 63, 64], [17, 47, 64]):
+        total = sum(chunks)
+        for limit in (1, 48, 188):
+            out = step.wave(wire[:total], ids[:total], weights[:total], chunks, limit)
+            assert torch.equal(out.view(torch.int16), solo[:total].view(torch.int16)), (chunks, limit)
+    # Graph replay with new chunk contents in the captured buffers.
+    step.wire[:64].copy_(wire[:64])
+    step.ids[:64].copy_(ids[:64])
+    step.weights[:64].copy_(weights[:64])
+    step.launch(64)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step.launch(64)
+    for first in (64, 0, 64):
+        step.wire[:64].copy_(wire[first:first + 64])
+        step.ids[:64].copy_(ids[first:first + 64])
+        step.weights[:64].copy_(weights[first:first + 64])
+        step.output.fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(step.output.view(torch.int16), solo[first:first + 64].view(torch.int16))
