@@ -88,30 +88,31 @@ def test_compact_true_width_weights_match_padded_control(intermediate, tile_k, a
     device = torch.device("cuda", 0)
     props = torch.cuda.get_device_properties(device)
     tile_n = 256 if intermediate == 256 and all_owned else 128
+    hidden = max(128, tile_n)
     tile = (tile_k, tile_n, tile_k, tile_n)
-    tiers = tuple(_prepared(experts=2, hidden=128, intermediate=intermediate,
+    tiers = tuple(_prepared(experts=2, hidden=hidden, intermediate=intermediate,
         bits=bits, seed=bits * 211, device=device, tile_config=tile) for bits in (3, 4))
     mapping, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)
     widths = [intermediate] * 4 if all_owned else [intermediate, intermediate - 128, intermediate - 128, intermediate]
     compact_descriptor = build_compact_trellis_descriptor(descriptor, widths,
-        hidden_size=128, intermediate_size=intermediate)
+        hidden_size=hidden, intermediate_size=intermediate)
     compact_tiers = []
     for tier_id, tier in enumerate(tiers):
         bits = 3 + tier_id
-        packed = tier.w13.reshape(2, 2, 8, intermediate // 16, 8 * bits)
-        down = tier.w2.reshape(2, intermediate // 16, 8, 8 * bits)
+        packed = tier.w13.reshape(2, 2, hidden // 16, intermediate // 16, 8 * bits)
+        down = tier.w2.reshape(2, intermediate // 16, hidden // 16, 8 * bits)
         local_widths = widths[tier_id * 2:tier_id * 2 + 2]
         w13 = torch.cat([packed[p, e, :, :width // 16].contiguous().flatten()
             for p in range(2) for e, width in enumerate(local_widths)])
         w2 = torch.cat([down[e, :width // 16].contiguous().flatten()
             for e, width in enumerate(local_widths)])
         compact_tiers.append(replace(tier, w13=w13, w2=w2))
-        assert w13.numel() + w2.numel() == sum(local_widths) * 128 * bits * 3 // 32
+        assert w13.numel() + w2.numel() == sum(local_widths) * hidden * bits * 3 // 32
     rotations = combine_trellis_rotations(*tiers)
     control = replace(rotations, intermediate=rotations.intermediate.clone())
     for expert, width in enumerate(widths):
         control.intermediate.view(4, 3 * intermediate)[expert, width:intermediate] = 0
-    args = dict(size_m=16, hidden_size=128, intermediate_size=intermediate,
+    args = dict(size_m=16, hidden_size=hidden, intermediate_size=intermediate,
         tier0_num_experts=2, tier1_num_experts=2, top_k=2, max_m_blocks=8,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=tile, full_rotation_output_dtype="bf16", swiglu_limit=10.)
@@ -127,7 +128,7 @@ def test_compact_true_width_weights_match_padded_control(intermediate, tile_k, a
     broken[4 * 4] += 4
     with pytest.raises(ValueError, match="not canonical"):
         bind_mixed_trellis(*compact_tiers, mapping, broken, rotations, plans[1][0].launch)
-    x = (torch.randn(16, 128, device=device) * .01).to(torch.bfloat16)
+    x = (torch.randn(16, hidden, device=device) * .01).to(torch.bfloat16)
     ids = torch.tensor([[0, 1], [3, -1], [2, 3], [0, 3], [2, 1], [0, 2], [1, 3], [2, 3]],
         device=device, dtype=torch.int32).repeat(2, 1)
     weights = torch.full((16, 2), .5, device=device)
