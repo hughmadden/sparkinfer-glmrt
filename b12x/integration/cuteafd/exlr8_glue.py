@@ -225,7 +225,7 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
         raise ValueError("shared EXLR8 grouping requires experts=1, top_k=1, max_groups=4 and BF16 rows")
     if (any(type(v) is not int for v in (experts, top_k, max_groups, hidden))
             or not (1 <= experts <= 256 and 1 <= top_k <= 32
-                    and 0 < max_groups <= (2**31 - 1) // 16)):
+                    and 0 < max_groups <= (2**31 - 1) // group_rows)):
         raise ValueError("EXLR8 grouping requires experts1..256, top_k1..32 and positive capacity")
     if input_format not in INPUT_FORMATS:
         raise ValueError(f"unknown EXLR8 ingress format {input_format!r}")
@@ -235,6 +235,7 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
     row = f"[rows,{hidden + hidden // 32}]" if input_format == "fp8_k32" else f"[rows,{hidden}]"
     x = (Operand("x", torch.uint8, row, note="E4M3 bytes then UE8M0 per-32 scales per row")
          if input_format == "fp8_k32" else Operand("x", torch.bfloat16, row))
+    metadata = {"group_rows": group_rows} if max_rows > 64 else {}
     return compile_program(_Group(experts, top_k, max_groups, hidden, input_format, max_rows, group_rows),
         name=("exlr8_grouped_group" if max_rows > 64 else
               "exlr8_shared_group" if shared_expert else "exlr8_group"),
@@ -249,7 +250,7 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
         scalars=(Scalar("rows"), Scalar("cta_limit")),
         key=(experts, top_k, max_groups, hidden, input_format, shared_expert, max_rows, group_rows),
         geometry=dict(abi_version=2, experts=experts, top_k=top_k, max_groups=max_groups,
-                      max_rows=max_rows, group_rows=group_rows, hidden=hidden, input_format=input_format,
+                      max_rows=max_rows, hidden=hidden, input_format=input_format, **metadata,
                       input_row_bytes=_Group(experts, top_k, max_groups, hidden, input_format).row_bytes,
                       ctas_per_sm=4, ingress_warps=INGRESS_WARPS))
 
@@ -274,8 +275,16 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
          lambda: compile_exlr8_group_aot(experts=1, top_k=1, max_groups=4, hidden=hidden,
                                          input_format="bf16", shared_expert=True)),
     ]
+    grouped = [
+        ("a16_grouped", "exlr8_a16", {"max_rows": 4096},
+         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+             max_groups=(4096 * top_k + 63)//64 + 256, device_count=True, grouped=True)),
+        ("grouped_group", "exlr8_group", {"max_rows": 4096},
+         lambda: compile_exlr8_group_aot(hidden=hidden, top_k=top_k,
+             max_groups=(4096 * top_k + 63)//64 + 256, max_rows=4096, group_rows=64)),
+    ]
     if role == "spark":
-        return result[1:3]
+        return result[1:3] + grouped
     if role == "coordinator":
         return result[3:]
-    return result
+    return result + grouped
