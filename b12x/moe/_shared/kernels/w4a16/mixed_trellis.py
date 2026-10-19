@@ -112,6 +112,7 @@ class MixedTrellisCompileResult:
     broadcast_suh: bool
     broadcast_svh: bool
     paired_boundary: str | None = field(default=None, kw_only=True)
+    compact_weights: bool = field(default=False, kw_only=True)
     # FC1 rotates staged token rows itself; nothing writes rotation_up.
     fused_input_rotation: bool = field(default=False, kw_only=True)
     # Warp-specialized prefill (mixed_trellis_ws): FC1, SwiGLU and FC2 as three
@@ -262,6 +263,8 @@ class W4A16MixedTrellisKernel:
     # version whenever the compiled argument or tensor-layout contract changes.
     ABI_VERSION = 21
     _token_major_rotation = False
+    compact_weights = False
+    COMPACT_DESCRIPTOR_ROWS = 7
 
     descriptor_bits = 9
 
@@ -273,6 +276,7 @@ class W4A16MixedTrellisKernel:
         tier1: W4A16FusedMoeKernel,
         descriptor_bits: int = 9,
         paired_boundary: str | None = None,
+        compact_weights: bool = False,
         token_major_rotation: bool = False,
     ):
         for name, moe in (("driver", driver), ("tier0", tier0), ("tier1", tier1)):
@@ -337,13 +341,24 @@ class W4A16MixedTrellisKernel:
         if paired_boundary not in (None, "first", "last"):
             raise ValueError("paired boundary must be first, last, or None")
         if paired_boundary is not None:
-            if driver.intermediate_size != 640:
-                raise ValueError("paired boundary requires five resident H128 blocks")
+            if driver.intermediate_size < 256 or driver.intermediate_size % 128:
+                raise ValueError("paired boundary requires at least two whole resident H128 blocks")
             for moe in (driver, tier0, tier1):
                 if not moe.fc1.schedule_whole_tiles or not moe.fc2.schedule_whole_tiles:
                     raise ValueError("paired boundary requires whole-tile scheduling")
                 if 128 % moe.fc1.tile_n or 128 % moe.fc2.tile_k:
                     raise ValueError("paired boundary must align to FC1 N and FC2 K tiles")
+        if compact_weights:
+            if paired_boundary is not None:
+                raise ValueError("compact weights use live widths, not paired boundary flags")
+            if driver.intermediate_size < 128 or driver.intermediate_size % 128:
+                raise ValueError("compact weights require whole resident H128 blocks")
+            for moe in (driver, tier0, tier1):
+                if not moe.fc1.schedule_whole_tiles or not moe.fc2.schedule_whole_tiles:
+                    raise ValueError("compact weights require whole-tile scheduling")
+                if driver.intermediate_size % moe.fc1.tile_n or 128 % moe.fc2.tile_k:
+                    raise ValueError("compact widths must align to FC1 N and FC2 K tiles")
+        self.compact_weights = bool(compact_weights)
         self.paired_boundary = paired_boundary
         self._token_major_rotation = bool(token_major_rotation)
         self.driver = driver
@@ -383,7 +398,7 @@ class W4A16MixedTrellisKernel:
             self.shared_words,
             self.paired_boundary,
             self.token_major_rotation,
-        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits))
+        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits)) + (("compact_weights_v2",) if self.compact_weights else ())
 
     @cute.jit
     def _dispatch_tier_gemm(
@@ -441,15 +456,17 @@ class W4A16MixedTrellisKernel:
                 active_size_m,
             )
 
-    def _dispatch_bound(self, is_fc1, combined_expert, gemm, *args):
+    def _dispatch_bound(self, is_fc1, combined_expert, gemm, compact_weight, *args):
         """Trace-time Python: bind the fused FC1 input rotation (SUH tables and
         the tile's combined expert) around one tier GEMM dispatch."""
         if is_fc1 and self.driver.fused_input_rotation:
             gemm._rotation = (*self._fused_suh, combined_expert)
+        gemm._compact_weight = compact_weight
         try:
             self._dispatch_tier_gemm(gemm, *args)
         finally:
             gemm._rotation = None
+            gemm._compact_weight = None
 
     @cute.jit
     def _emit_tier_tile(
@@ -518,6 +535,30 @@ class W4A16MixedTrellisKernel:
             descriptor = descriptor_map[
                 descriptor_row * total_experts + combined_expert
             ].to(Int32)
+            compact_weight = None
+            if cutlass.const_expr(self.compact_weights):
+                # Rows 0..2 retain tier/local IDs. Row 3 is the true H128
+                # width; rows 4..6 are projection offsets in uint32 words.
+                # Binding requires positive tile-aligned widths. A single
+                # FC1 tile per half therefore proves every live width is full.
+                full_width = self.driver.intermediate_size == self.driver.fc1.tile_n
+                if cutlass.const_expr(full_width):
+                    live_width = Int32(self.driver.intermediate_size)
+                else:
+                    live_width = descriptor_map[
+                        Int64(3) * total_experts.to(Int64) + combined_expert.to(Int64)
+                    ].to(Int32)
+                weight_offset = descriptor_map[
+                    (descriptor_row.to(Int64) + Int64(4)) * total_experts.to(Int64)
+                    + combined_expert.to(Int64)
+                ].to(Int64)
+                compact_weight = (weight_offset, live_width, is_fc1, full_width)
+                if cutlass.const_expr(not full_width):
+                    if cutlass.const_expr(is_fc1):
+                        if output_n_tile % fc1_half_tiles >= live_width // Int32(self.driver.fc1.tile_n):
+                            descriptor = Int32(-1)
+                    else:
+                        reduce_tile_count = live_width // Int32(self.driver.fc2.tile_k)
             if cutlass.const_expr(self.paired_boundary is not None):
                 # The fourth descriptor row is mutable batch metadata: one
                 # means compute the boundary block, zero means omit it. The
@@ -532,13 +573,13 @@ class W4A16MixedTrellisKernel:
                             if local_n < Int32(128 // self.driver.fc1.tile_n):
                                 descriptor = Int32(-1)
                         else:
-                            if local_n >= Int32(512 // self.driver.fc1.tile_n):
+                            if local_n >= Int32((self.driver.intermediate_size - 128) // self.driver.fc1.tile_n):
                                 descriptor = Int32(-1)
                     else:
                         # Whole-tile scheduling assigns the full reduction to
-                        # this CTA. Trim actual K reads, retaining 640-channel
+                        # this CTA. Trim actual K reads, retaining the resident
                         # physical A/B strides and the ordinary output store.
-                        reduce_tile_count = Int32(512 // self.driver.fc2.tile_k)
+                        reduce_tile_count = Int32((self.driver.intermediate_size - 128) // self.driver.fc2.tile_k)
                         if cutlass.const_expr(self.paired_boundary == "first"):
                             reduce_k_tile = Int32(128 // self.driver.fc2.tile_k)
             if descriptor >= Int32(0):
@@ -562,6 +603,7 @@ class W4A16MixedTrellisKernel:
                         is_fc1,
                         combined_expert,
                         gemm,
+                        compact_weight,
                         a_flat,
                         a_alt_flat,
                         t0_b_flat,
@@ -600,6 +642,7 @@ class W4A16MixedTrellisKernel:
                         is_fc1,
                         combined_expert,
                         gemm,
+                        compact_weight,
                         a_flat,
                         a_alt_flat,
                         t1_b_flat,
@@ -882,7 +925,7 @@ class W4A16MixedTrellisKernel:
         # partition is represented by three identical rows.
         descriptor_map = cute.make_tensor(
             descriptor_map_ptr,
-            layout=cute.make_layout((cutlass.Int64(4 if self.paired_boundary is not None else 3) * total_experts,), stride=(1,)),
+            layout=cute.make_layout((cutlass.Int64(self.COMPACT_DESCRIPTOR_ROWS if self.compact_weights else (4 if self.paired_boundary is not None else 3)) * total_experts,), stride=(1,)),
         )
         global_to_combined = cute.make_tensor(
             global_to_combined_ptr,
@@ -2338,6 +2381,7 @@ def compile_mixed_trellis(
     route_num_experts: int | None = None,
     force_blocks_per_sm: int | None = None,
     paired_boundary: str | None = None,
+    compact_weights: bool = False,
     token_major_rotation: bool = False,
     fused_input_rotation: bool = False,
     warp_specialized: bool = False,
@@ -2354,7 +2398,7 @@ def compile_mixed_trellis(
         raise ValueError("EXL3 A8 requires the warp-specialized prefill kernel")
     schedule = parse_decode_schedule(decode_schedule)
     if schedule is not None and (
-        warp_specialized or paired_boundary is not None or direct_topk_routes
+        warp_specialized or paired_boundary is not None or compact_weights or direct_topk_routes
     ):
         raise ValueError(
             "the L2 decode schedule applies to the cooperative packed-route "
@@ -2453,7 +2497,7 @@ def compile_mixed_trellis(
         if warp_specialized:
             from .mixed_trellis_ws import W4A16MixedTrellisWSKernel
 
-            if paired_boundary is not None or token_major_rotation:
+            if paired_boundary is not None or compact_weights or token_major_rotation:
                 raise ValueError(
                     "warp-specialized mixed Trellis has its own input rotation "
                     "and no paired boundary"
@@ -2476,6 +2520,7 @@ def compile_mixed_trellis(
             tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
             descriptor_bits=descriptor_bits,
             paired_boundary=paired_boundary,
+            compact_weights=compact_weights,
             token_major_rotation=token_major_rotation,
         )
 
@@ -2665,6 +2710,7 @@ def compile_mixed_trellis(
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
         paired_boundary=paired_boundary,
+        compact_weights=bool(compact_weights),
         fused_input_rotation=bool(fused_input_rotation) and not warp_specialized,
         warp_specialized=bool(warp_specialized),
         input_format=str(input_format),
@@ -3320,6 +3366,56 @@ def combine_trellis_rotations(
     )
 
 
+def _compact_trellis_layout(rows, *, hidden_size, intermediate_size, bits, descriptor_bits=9):
+    """Canonical compact ABI: three tier/local rows, live width, three U32 offsets."""
+    if len(rows) != 4 or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
+        raise ValueError("compact descriptor requires four equally sized source rows")
+    if hidden_size <= 0 or hidden_size % 128 or intermediate_size <= 0 or intermediate_size % 128:
+        raise ValueError("compact descriptor geometry must use whole H128 blocks")
+    if len(bits) != 2 or any(bit not in (2, 3, 4, 5, 6) for bit in bits):
+        raise ValueError("compact descriptor requires two supported trellis tiers")
+    offsets = [[-1] * len(rows[0]) for _ in range(3)]
+    sizes = [[0, 0, 0] for _ in bits]
+    counts = [[0, 0, 0] for _ in bits]
+    for projection in range(3):
+        for expert, descriptor in enumerate(rows[projection]):
+            width = rows[3][expert]
+            if all(row[expert] == -1 for row in rows[:3]) and width == -1:
+                continue
+            if not isinstance(width, int) or isinstance(width, bool) or not 128 <= width <= intermediate_size or width % 128:
+                raise ValueError("compact live width must be positive H128 and within resident width")
+            if descriptor < 0:
+                continue
+            tier, local = descriptor >> descriptor_bits, descriptor & ((1 << descriptor_bits) - 1)
+            if tier >= len(bits) or local != counts[tier][projection]:
+                raise ValueError("compact descriptors require canonical dense projection-local IDs")
+            offsets[projection][expert] = sizes[tier][projection]
+            sizes[tier][projection] += hidden_size * width * bits[tier] // 32
+            counts[tier][projection] += 1
+    for expert, descriptor in enumerate(rows[1]):
+        if descriptor >= 0:
+            offsets[1][expert] += sizes[descriptor >> descriptor_bits][0]
+    if any(value > 0x7fffffff for row in offsets for value in row):
+        raise ValueError("compact projection offsets exceed signed int32 ABI")
+    payloads = tuple((size[0] + size[1], size[2]) for size in sizes)
+    return [*rows, *offsets], payloads, tuple(tuple(row) for row in counts)
+
+
+def build_compact_trellis_descriptor(descriptor_map, widths, *, hidden_size, intermediate_size,
+                                      bits=(3, 4), descriptor_bits=9):
+    """Prepare immutable true-width weight offsets before graph capture."""
+    if descriptor_map.dtype != torch.int32 or descriptor_map.numel() % 3:
+        raise ValueError("compact source descriptor must have three int32 rows")
+    rows = descriptor_map.detach().cpu().reshape(3, -1).tolist()
+    rows.append(list(widths))
+    packed, _, _ = _compact_trellis_layout(rows, hidden_size=hidden_size,
+        intermediate_size=intermediate_size, bits=bits, descriptor_bits=descriptor_bits)
+    result = torch.tensor(packed, dtype=torch.int32, device=descriptor_map.device).flatten()
+    if hasattr(descriptor_map, "_mt_projection_counts"):
+        result._mt_projection_counts = descriptor_map._mt_projection_counts
+    return result
+
+
 def _validate_mixed_trellis_tier_storage(
     *,
     name: str,
@@ -3331,6 +3427,7 @@ def _validate_mixed_trellis_tier_storage(
     device: torch.device,
     gate_experts: int | None = None,
     up_experts: int | None = None,
+    compact_payload: tuple[int, int, int] | None = None,
 ) -> None:
     """Fail closed before binding expert-sized storage as raw CuTe pointers."""
     expected_experts = int(expected_experts)
@@ -3347,7 +3444,7 @@ def _validate_mixed_trellis_tier_storage(
     w2_elements = int(tier.w2.numel())
     # The FC2 expert count is independent of the FC1 gate/up slot counts.
     # The widest descriptor supports 1024 tier-local experts.
-    if (
+    if compact_payload is None and (
         tier.w2.dtype != torch.int32
         or w2_expert_stride <= 0
         or w2_elements % w2_expert_stride != 0
@@ -3358,7 +3455,7 @@ def _validate_mixed_trellis_tier_storage(
             f"1..{_MAX_TIER_EXPERTS} whole FC2 experts of "
             f"{w2_expert_stride} elements, got {w2_elements}"
         )
-    fc2_experts = w2_elements // w2_expert_stride
+    fc2_experts = w2_elements // w2_expert_stride if compact_payload is None else compact_payload[2]
     if gate_experts is None and up_experts is None:
         gate_experts = expected_experts
         up_experts = expected_experts
@@ -3389,8 +3486,10 @@ def _validate_mixed_trellis_tier_storage(
         or tier.w13.device != device
         or not tier.w13.is_contiguous()
         or _proj_stride <= 0
-        or int(tier.w13.numel()) % _proj_stride != 0
-        or _w13_planes != _expected_w13_planes
+        or (compact_payload is None and (
+            int(tier.w13.numel()) % _proj_stride != 0
+            or _w13_planes != _expected_w13_planes))
+        or (compact_payload is not None and int(tier.w13.numel()) != max(compact_payload[0], 4))
         or int(tier.w13.data_ptr()) % 16 != 0
     ):
         raise ValueError(
@@ -3403,10 +3502,10 @@ def _validate_mixed_trellis_tier_storage(
             "w2",
             tier.w2,
             torch.int32,
-            fc2_experts
+            (fc2_experts
             * (int(intermediate_size) // 16)
             * (int(hidden_size) // 16)
-            * (8 * bits),
+            * (8 * bits)) if compact_payload is None else max(compact_payload[1], 4),
         ),
         # Native Trellis decodes its codebook tiles directly. These scale
         # pointers retain the prepared four-byte dummy ABI and are not the
@@ -3528,6 +3627,21 @@ def bind_mixed_trellis(
     tiers = (tier0, tier1)
     bits = (launch.tier0_bits, launch.tier1_bits)
     device = tier0.w13.device
+    compact_payloads = None
+    compact_counts = None
+    if launch.compact_weights:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("compact descriptor validation must precede graph capture")
+        if descriptor_map.dtype != torch.int32 or descriptor_map.numel() != 7 * sum(counts):
+            raise ValueError("compact descriptor requires seven int32 rows")
+        host_rows = descriptor_map.detach().cpu().reshape(7, -1).tolist()
+        expected, compact_payloads, compact_counts = _compact_trellis_layout(host_rows[:4],
+            hidden_size=launch.hidden_size, intermediate_size=launch.intermediate_size,
+            bits=bits, descriptor_bits=_descriptor_bits(int(launch.topk_sum.route_num_experts)))
+        if host_rows != expected:
+            raise ValueError("compact descriptor projection offsets are not canonical")
+        if any(width > 0 and width % launch.fc1_tile_n for width in host_rows[3]):
+            raise ValueError("compact live widths must align to the FC1 N tile")
     for tier_id, (tier, expected_experts, tier_bits) in enumerate(
         zip(tiers, counts, bits, strict=True)
     ):
@@ -3553,6 +3667,8 @@ def bind_mixed_trellis(
             device=device,
             gate_experts=gate_counts[tier_id],
             up_experts=up_counts[tier_id],
+            compact_payload=None if compact_payloads is None else (
+                *compact_payloads[tier_id], compact_counts[tier_id][2]),
         )
 
     total_experts = sum(counts)
@@ -3561,7 +3677,7 @@ def bind_mixed_trellis(
     )
     for name, mapping, expected_entries in (
         ("global_to_combined", global_to_combined, route_num_experts),
-        ("descriptor_map", descriptor_map, (4 if launch.paired_boundary is not None else 3) * total_experts),
+        ("descriptor_map", descriptor_map, (7 if launch.compact_weights else (4 if launch.paired_boundary is not None else 3)) * total_experts),
     ):
         if (
             mapping.dtype != torch.int32

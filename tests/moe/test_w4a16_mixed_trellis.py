@@ -50,6 +50,19 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
 from b12x.moe.fused_moe.trellis import _projection_tier_bits
 
 
+def test_compact_glm_benchmark_arguments_without_cuda():
+    from benchmarks.benchmark_w4a16_full_rotation_decode import _parse_args
+    assert _parse_args([]).experts == 32
+    args = _parse_args(["--compact-glm", "--tp", "4", "6", "--rows", "1", "16"])
+    assert (args.experts, args.tp, args.rows, args.bits) == (256, [4, 6], [1, 16], [4, 5])
+    assert _parse_args(["--compact-glm", "--widths", "256"]).widths == [256]
+    for argv in [["--compact-glm", "--tp", "3"], ["--rows", "8"],
+            ["--compact-glm", "--experts", "7"], ["--compact-glm", "--experts", "258"],
+            ["--bits", "4", "4"], ["--iterations", "0"], ["--compact-glm", "--compare-tiles"]]:
+        with pytest.raises(SystemExit):
+            _parse_args(argv)
+
+
 def test_projection_tier_rate_family_validation() -> None:
     def tiers(*bits: int) -> tuple[SimpleNamespace, ...]:
         return tuple(SimpleNamespace(bits=bit) for bit in bits)
@@ -154,6 +167,57 @@ def test_explicit_mixed_residency_limits_and_cache_identity() -> None:
     kernel.shared_words = 13056
     with pytest.raises(ValueError, match="shared-memory"):
         apply(kernel, 2, 101376)
+
+
+@pytest.mark.parametrize("widths", [(384, 256, 384, 256), (640, 512, 640, 512), (768,) * 4])
+def test_compact_projection_offsets_match_owned_bytes_without_cuda(widths):
+    rows = [[0, 512, 1, 513], [512, 0, 513, 1], [0, 1, 512, 513], list(widths)]
+    packed, sizes, counts = mixed_trellis_module._compact_trellis_layout(
+        rows, hidden_size=128, intermediate_size=max(widths), bits=(3, 4))
+    assert len(packed) == 7 and counts == ((2, 2, 2), (2, 2, 2))
+    assert sum(sum(payload) for payload in sizes) == sum(
+        128 * widths[e] * (3 if rows[p][e] < 512 else 4) // 32
+        for p in range(3) for e in range(4))
+    for tier in range(2):
+        for projections, payload in [((0, 1), sizes[tier][0]), ((2,), sizes[tier][1])]:
+            spans = sorted((packed[p + 4][e], packed[p + 4][e] + 128 * widths[e] * (3 + tier) // 32)
+                for p in projections for e in range(4) if rows[p][e] >> 9 == tier)
+            assert spans[0][0] == 0 and spans[-1][1] == payload
+            assert all(left[1] == right[0] for left, right in zip(spans, spans[1:]))
+    for invalid in (0, 127, max(widths) + 128):
+        bad = [*rows[:3], [invalid, *widths[1:]]]
+        with pytest.raises(ValueError, match="live width"):
+            mixed_trellis_module._compact_trellis_layout(bad, hidden_size=128,
+                intermediate_size=max(widths), bits=(3, 4))
+    bad = [[1, *rows[0][1:]], *rows[1:]]
+    with pytest.raises(ValueError, match="canonical dense"):
+        mixed_trellis_module._compact_trellis_layout(bad, hidden_size=128,
+            intermediate_size=max(widths), bits=(3, 4))
+
+
+@pytest.mark.parametrize("width", [256, 384, 640, 768])
+@pytest.mark.parametrize("boundary", ["first", "last"])
+def test_paired_boundary_accepts_resident_h128_widths_without_cuda(width, boundary):
+    def moe(experts):
+        gemm = SimpleNamespace(n_tiles=1, k_tiles=1, tile_n=128, tile_k=128,
+            cta_threads=128, moe_block_size=8, schedule_route_block_factor=1,
+            schedule_whole_tiles=True)
+        return SimpleNamespace(full_rotation=True, intermediate_rotation=True,
+            tc_decode_fused_sum=False, weight_layout="trellis_t256", element_dtype="fp16",
+            size_m=8, hidden_size=128, intermediate_size=width, fc1_cols=2*width,
+            top_k=2, moe_block_size=8, activation="silu", rotation_input_dtype="bf16",
+            broadcast_suh=False, trellis_codebook="mcg", direct_topk_routes=False,
+            cta_threads=128, sms=48, num_experts=experts, fc1=gemm, fc2=gemm,
+            blocks_per_sm=1, shared_words=8192, sqg_xor_cheb_t12_smem_off=0)
+    driver, tier0, tier1 = moe(4), moe(2), moe(2)
+    kernel = W4A16MixedTrellisKernel(driver=driver, tier0=tier0, tier1=tier1,
+        paired_boundary=boundary)
+    assert kernel.intermediate_size == width and kernel.paired_boundary == boundary
+    for invalid in (0, 128, 352, 639):
+        driver.intermediate_size = tier0.intermediate_size = tier1.intermediate_size = invalid
+        with pytest.raises(ValueError, match="whole resident H128"):
+            W4A16MixedTrellisKernel(driver=driver, tier0=tier0, tier1=tier1,
+                paired_boundary=boundary)
 
 
 def _mixed_cache_key(tier0_experts: int, tier1_experts: int) -> tuple[object, ...]:
