@@ -287,10 +287,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math))
                         r[v] = gate * sigmoid * up * _side_value(down_scales, column)
                     r[0], r[1], r[2], r[3] = _w4a8_had128_quad(r[0], r[1], r[2], r[3], lane)
-                    base = ((group * Int32(self.units) + unit).to(Int64) * Int64(self.group_rows)
-                            + absolute.to(Int64)) * Int64(128) + col.to(Int64)
+                    out_index = ((group * Int32(self.units) + unit).to(Int64) * Int64(self.group_rows)
+                                 + absolute.to(Int64)) * Int64(128) + col.to(Int64)
                     for v in cutlass.range_constexpr(4):
-                        intermediate[base + Int64(v)] = r[v].to(cutlass.Float16)
+                        intermediate[out_index + Int64(v)] = r[v].to(cutlass.Float16)
             cute.arch.sync_threads()
 
     @cute.kernel
