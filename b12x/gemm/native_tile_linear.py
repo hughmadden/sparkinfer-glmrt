@@ -372,9 +372,10 @@ class NativeTileLinear:
         words = max(1, (self.segments - 1) * self.slots * 4 * self.groups * 32)
         Storage.__annotations__ = {
             "fold": cute.struct.Align[cute.struct.MemRange[Float32, words], 16],
-            "a": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8,
-                self.d_threads // 32 * 2048 if self.stage_decode_a else 1], 128],
         }
+        if self.stage_decode_a:
+            Storage.__annotations__["a"] = cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, self.d_threads // 32 * 2048], 128]
         return cute.struct(Storage)
 
     @cute.jit
@@ -443,7 +444,8 @@ class NativeTileLinear:
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._decode_storage())
         fold = shared_ptr_to_u32(storage.fold.data_ptr())
-        abuf = shared_ptr_to_u32(storage.a.data_ptr()) + wid * Int32(2048)
+        if cutlass.const_expr(self.stage_decode_a):
+            abuf = shared_ptr_to_u32(storage.a.data_ptr()) + wid * Int32(2048)
         G = self.groups
         F = 4 * G * 4
         blocks = Int64(self.n // self.cols)
