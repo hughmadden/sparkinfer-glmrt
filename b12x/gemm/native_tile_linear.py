@@ -273,7 +273,7 @@ class NativeTileLinear:
                 if cutlass.const_expr(self.grouped and not self.side2):
                     self.decode_round2(x, payload, scales, output, rows).launch(
                         grid=(min(Int32(ctas), cta_limit), 1, 1), block=(self.d_threads, 1, 1),
-                        stream=stream)
+                        stream=stream, min_blocks_per_mp=2)
                 else:
                     self.decode(x, payload, scales, output, rows).launch(
                         grid=(min(Int32(ctas), cta_limit), 1, 1), block=(self.d_threads, 1, 1),
