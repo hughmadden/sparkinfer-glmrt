@@ -21,6 +21,16 @@ def test_parse_and_key():
     assert arms.program_key(a, (128, 32)) != arms.program_key(dict(a, revision="d"*40), (128, 32))
 
 
+def test_op_references():
+    entries = {"round2": "a"*40, "gemini": "b"*40}
+    assert arms.parse_references("round2", ["int4_g32/o=gemini"], entries) == {"int4_g32/o": "gemini"}
+    for default, values in (("missing", []), ("round2", ["o=gemini"]),
+                            ("round2", ["mxfp8/q_a=missing"]),
+                            ("round2", ["mxfp8/q_a=gemini", "mxfp8/q_a=round2"])):
+        with pytest.raises(ValueError):
+            arms.parse_references(default, values, entries)
+
+
 def test_cold_copies_covers_runtime_l2():
     assert arms.cold_copies(1 << 20, 128 << 20) == 256
     assert arms.cold_copies(3 << 20, 128 << 20) == 86

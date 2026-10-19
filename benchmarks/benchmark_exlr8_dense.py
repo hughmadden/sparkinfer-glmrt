@@ -29,7 +29,7 @@ from benchmarks.benchmark_exlr8_a16 import capture, timing, read_roofline, finit
 from b12x.integration.cuteafd._common import Operand, Scalar, compile_program, exportable_compilation
 from b12x.integration.cuteafd import trellis_linear, scaled_linear, fp8_row_embedding
 from b12x.integration.cuteafd._fp8_weights import Fp8Projection
-from benchmarks._exlr8_dense_arms import parse_arms, materialize, verify, program_key, cold_copies
+from benchmarks._exlr8_dense_arms import parse_arms, parse_references, materialize, verify, program_key, cold_copies
 
 # Unique native formats/shapes from the GLM 5.3 bit325 load plan.
 SHAPES = (
@@ -223,6 +223,9 @@ def main():
     parser.add_argument("--arm-bundle", type=Path, required=True)
     parser.add_argument("--materialize-only", action="store_true", help="host-side git show, no CUDA")
     parser.add_argument("--reference", required=True)
+    parser.add_argument("--op-reference", action="append", default=[], help="FORMAT/OP=ARM frozen route")
+    parser.add_argument("--accuracy-reference", help="arm whose FP64 error defines the 1.01x ceiling")
+    parser.add_argument("--require-reference-arm", action="append", default=[], help="arm required to match the selected frozen op reference")
     parser.add_argument("--formats", default="mxfp8,int4_g32,fp8_row")
     parser.add_argument("--shapes", help="comma-separated projection names")
     parser.add_argument("--rows", default="1,4,16,64,4096")
@@ -233,8 +236,13 @@ def main():
     parser.add_argument("--profile-rows", type=int)
     args = parser.parse_args()
     arms = parse_arms(args.arm)
-    if args.reference not in arms:
-        parser.error("--reference must name an arm")
+    try:
+        op_references = parse_references(args.reference, args.op_reference, arms)
+    except ValueError as error:
+        parser.error(str(error))
+    accuracy_reference = args.accuracy_reference or args.reference
+    if accuracy_reference not in arms or set(args.require_reference_arm) - set(arms):
+        parser.error("accuracy and required-reference arms must name an arm")
     if args.materialize_only:
         materialize(Path(__file__).resolve().parents[1], args.arm_bundle, arms)
         return
@@ -271,27 +279,41 @@ def main():
             with arm_source(name, arm, args.arm_bundle), exportable_compilation():
                 programs[name] = compile_native(fmt, k, n, side)
             spills[name] = spill_check(programs[name], args.output.parent / "cubins" / name / f"{fmt}-{op}")
-        # One fixture per shape/row, shared by every arm and the frozen reference.
+        # All widths use exactly the same input prefix and weights. Each arm's
+        # own prefill freezes its K order, independently of other arms' ordering.
+        storage, read_bytes = native_tensors(fmt, k, n, 4096, 0)
+        tensors = storage[:5]
+        columns = min(n, 256)
+        if side == 1:
+            payload = tensors[1].flatten()[:columns*k//(2 if fmt == "int4_g32" else 1)]
+            scales = tensors[2][:columns if fmt == "fp8_row" else columns*k//32]
+        else:
+            payload = tensors[1].reshape(k//128, n, -1)[:, :columns].contiguous().flatten()
+            scales = tensors[2].reshape(k//128, n, 4)[:, :columns].contiguous().flatten()
+        weight = reference_weight(fmt, k, columns, side, payload, scales)
+        x = storage[-1]
+        oracle = x.double() @ weight.double().T
+        bf16 = (x @ weight.bfloat16().T).double()
+        prefixes, global_errors = {}, {}
+        for name, program in programs.items():
+            program.launch(*tensors, scalars=(4096, limit))
+            torch.cuda.synchronize()
+            prefixes[name] = tensors[-1][:64].clone()
+            global_errors[name] = torch.linalg.vector_norm(tensors[-1][:, :columns].double()-oracle).item()
+        global_bound = torch.linalg.vector_norm(bf16-oracle).item()
+        global_pass = {name: error <= 1.01*global_errors[accuracy_reference] and error <= 1.01*global_bound
+                       for name, error in global_errors.items()}
+        selected_reference = op_references.get(f"{fmt}/{op}", args.reference)
         for rows in rows_list:
-            storage, read_bytes = native_tensors(fmt, k, n, rows, 0)
-            tensors = storage[:5]
             scalars = (rows, limit)
-            reference = programs[args.reference]
+            reference = programs[selected_reference]
             reference.launch(*tensors, scalars=scalars)
             torch.cuda.synchronize()
-            expected = tensors[-1].clone()
-            # Bound FP64 work at the largest vocabulary shape, retaining full K.
-            columns = min(n, 256)
-            if side == 1:
-                payload, scales = tensors[1][:columns*k//(2 if fmt == "int4_g32" else 1)], tensors[2][:columns if fmt == "fp8_row" else columns*k//32]
-            else:
-                payload = tensors[1].reshape(k//128, n, -1)[:, :columns].contiguous().flatten()
-                scales = tensors[2].reshape(k//128, n, 4)[:, :columns].contiguous().flatten()
-            weight = reference_weight(fmt, k, columns, side, payload, scales)
-            x = storage[-1][:min(rows, 64)]
-            oracle = x.double() @ weight.double().T
-            bf16 = (x @ weight.bfloat16().T).double()
-            bound = torch.linalg.vector_norm(bf16 - oracle).item()
+            expected = tensors[-1][:rows].clone()
+            programs[accuracy_reference].launch(*tensors, scalars=scalars)
+            torch.cuda.synchronize()
+            reference_error = torch.linalg.vector_norm(tensors[-1][:rows, :columns].double()-oracle[:rows]).item()
+            bound = torch.linalg.vector_norm(bf16[:rows]-oracle[:rows]).item()
             copies = copies_for(read_bytes, args.cold_l2 and rows <= 64)
             extra = [(tensors[1].clone(), tensors[2].clone()) for _ in range(copies-1)]
             base_us, base_error = None, None
@@ -309,14 +331,24 @@ def main():
                 tensors[-1].fill_(float("nan"))
                 program.launch(*tensors, scalars=scalars)
                 torch.cuda.synchronize()
-                equal = torch.equal(expected.view(torch.int32), tensors[-1].view(torch.int32))
-                error = torch.linalg.vector_norm(tensors[-1][:len(x), :columns].double()-oracle).item()
+                equal = torch.equal(expected.view(torch.int32), tensors[-1][:rows].view(torch.int32))
+                prefix_rows = min(rows, 64)
+                invariant = torch.equal(prefixes[name][:prefix_rows].view(torch.int32),
+                                        tensors[-1][:prefix_rows].view(torch.int32))
+                tail_untouched = torch.isnan(tensors[-1][rows:]).all().item()
+                error = torch.linalg.vector_norm(tensors[-1][:rows, :columns].double()-oracle[:rows]).item()
                 record = dict(arm=name, revision=arms[name]["revision"], format=fmt, projection=op,
-                              rows=rows, bitwise_equal=equal, fp64_error=error, bf16_error=bound,
-                              fp64_pass=error <= 1.01*bound, w8a16_us=base_us,
-                              w8a16_error=base_error, cubin_spill_check=spills[name])
-                # A failed arm is reported but never receives a performance result.
-                if equal and record["fp64_pass"]:
+                              rows=rows, bitwise_equal=equal, row_invariant=invariant,
+                              output_tail_untouched=tail_untouched, frozen_reference=selected_reference,
+                              fp64_error=error, bf16_error=bound, accuracy_reference_error=reference_error,
+                              global_fp64_error=global_errors[name],
+                              global_accuracy_reference_error=global_errors[accuracy_reference],
+                              fp64_pass=global_pass[name] and error <= 1.01*bound and error <= 1.01*reference_error,
+                              w8a16_us=base_us, w8a16_error=base_error, cubin_spill_check=spills[name])
+                # Different K-order groups may be eligible; required arms must
+                # additionally agree with the per-op frozen group reference.
+                record["eligible"] = invariant and tail_untouched and record["fp64_pass"] and (equal or name not in args.require_reference_arm)
+                if record["eligible"]:
                     launches = [lambda p=program: p.launch(*tensors, scalars=scalars)]
                     launches += [lambda w=w, s=s, p=program: p.launch(tensors[0], w, s, *tensors[3:], scalars=scalars) for w, s in extra]
                     graph = capture(rotated(launches))
@@ -334,8 +366,9 @@ def main():
                 report["measurements"].append(record)
                 args.output.write_text(json.dumps(report, indent=2)+"\n")
                 print(json.dumps(record), flush=True)
-            del storage, tensors, expected, extra, weight, x, oracle, bf16
-    failed = [m for m in report["measurements"] if not m["bitwise_equal"] or not m["fp64_pass"]]
+            del expected, extra
+        del storage, tensors, prefixes, weight, x, oracle, bf16
+    failed = [m for m in report["measurements"] if not m["eligible"]]
     print(f"Wrote {len(report['measurements'])} measurements; {len(failed)} failed gates", flush=True)
     return bool(failed)
 

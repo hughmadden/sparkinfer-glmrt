@@ -23,6 +23,18 @@ def parse_arms(values):
     return arms
 
 
+def parse_references(default, values, arms):
+    if default not in arms:
+        raise ValueError("reference must name an arm")
+    result = {}
+    for value in values:
+        op, sep, arm = value.partition("=")
+        if not sep or not re.fullmatch(r"(?:mxfp8|int4_g32|fp8_row)/[A-Za-z0-9_]+", op) or arm not in arms or op in result:
+            raise ValueError(f"invalid or duplicate op reference {value!r}")
+        result[op] = arm
+    return result
+
+
 def program_key(arm, geometry):
     return (arm["revision"], arm["sha256"], *geometry)
 
