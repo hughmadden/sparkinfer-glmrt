@@ -414,9 +414,13 @@ class NativeTileLinear:
         wid = _warp_uniform_i32(tid >> Int32(5)) if cutlass.const_expr(self.segments == 1) else (tid >> Int32(5))
         slot, seg = wid % Int32(self.slots), wid // Int32(self.slots)
         g, j = lane >> Int32(2), lane & Int32(3)
-        tile = Int32(cta) // row_tiles
-        block_cta = Int32(cta) - tile * row_tiles
-        row0 = tile * rows_per
+        if cutlass.const_expr(self.decode_tiles > 1):
+            tile = Int32(cta) // row_tiles
+            block_cta = Int32(cta) - tile * row_tiles
+            row0 = tile * rows_per
+        else:
+            block_cta = Int32(cta)
+            row0 = Int32(0)
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._decode_storage())
         fold = shared_ptr_to_u32(storage.fold.data_ptr())
@@ -427,7 +431,10 @@ class NativeTileLinear:
         gw = block_cta.to(Int64) * slots + slot.to(Int64)
         begin = (gw * blocks // slots).to(Int32)
         end = ((gw + Int64(1)) * blocks // slots).to(Int32)
-        live = (rows_per + Int32(15)) >> Int32(4)
+        if cutlass.const_expr(self.decode_tiles > 1):
+            live = (rows_per + Int32(15)) >> Int32(4)
+        else:
+            live = (rows + Int32(15)) >> Int32(4)
         kb0 = seg * Int32(self.seg_blocks)
         lanek = Int32(8) * j if cutlass.const_expr(self.grouped) else Int32(16) * j
         prmt_sel = j.to(Uint32) * Uint32(0x0101) + Uint32(0x0400)
