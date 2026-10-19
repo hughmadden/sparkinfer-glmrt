@@ -196,6 +196,27 @@ def compile_control(path, group_path):
     core, digest = load_source("core", path)
     glue, glue_digest = load_source("glue", group_path, "b12x.integration.cuteafd")
     O, S = _common.Operand, _common.Scalar
+    if core.Exlr8A16Kernel.ABI_VERSION == 3:
+        from b12x.integration.cuteafd.exlr8 import _Exlr8ServingPointers, geometry
+        g = geometry(units=4)
+        wrapper = _Exlr8ServingPointers(g)
+        wrapper.core = core.Exlr8A16Kernel(6144, 4, 8, 512, device_count=True)
+        names = ("x", "pointers", "bits", "group_expert", "route_slots", "route_group_lane",
+                 "route_weights", "fc1", "intermediate", "fc2", "signs_out", "output", "group_count")
+        dtypes = (torch.float16, torch.int64, torch.int32, torch.int32, torch.int32, torch.int32,
+                  torch.float32, torch.float32, torch.float16, torch.float32, torch.int8,
+                  torch.bfloat16, torch.int32)
+        k1 = _common.compile_program(wrapper, name="exlr8_control_k1_v3",
+            operands=tuple(O(n, t, "") for n, t in zip(names, dtypes)),
+            scalars=(S("rows"), S("cta_limit")), key=(digest,))
+        group = _common.compile_program(glue._Group(256, 8, 512, 6144, "fp8_k32"),
+            name="exlr8_control_group_v2", operands=(O("ids", torch.int32, ""),
+                O("x", torch.uint8, ""), O("signs_in", torch.int8, ""),
+                O("group_expert", torch.int32, ""), O("route_slots", torch.int32, ""),
+                O("route_group_lane", torch.int32, ""), O("group_count", torch.int32, ""),
+                O("activation", torch.float16, "")),
+            scalars=(S("rows"), S("cta_limit")), key=(glue_digest,))
+        return k1, group
     k1 = _common.compile_program(_ControlPointers(core), name="exlr8_control_k1", operands=(
         O("x", torch.float16, ""), O("pointers", torch.int64, ""), O("bits", torch.int32, ""),
         O("group_expert", torch.int32, ""), O("route_slots", torch.int32, ""),
@@ -267,6 +288,8 @@ def exl3_state(rows, tier, expert_map, props):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--grouped", action="store_true", help="matched grouped prefill gate")
+    parser.add_argument("--group-rows", type=int, default=64)
     parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64,4096")
     parser.add_argument("--replays",type=int,default=20)
     parser.add_argument("--output",type=Path)
@@ -285,6 +308,9 @@ def main():
         parser.error("--control-core and --control-glue go together")
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
+    torch.cuda.set_per_process_memory_fraction(0.25)
+    if args.grouped:
+        return grouped_main(args)
     props = torch.cuda.get_device_properties(0)
     l2_bytes = int(getattr(props, "L2_cache_size", 0) or 24 << 20)
     if not args.profile:
@@ -448,6 +474,132 @@ def main():
                   rows=records,target_met=all(r.get("target_met", True) for r in records))
     with args.output.open("x") as stream:
         json.dump(result,stream,indent=2)
+
+
+def grouped_exl3_state(rows, tiers, props):
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
+    from b12x.moe._shared.kernels.w4a16.host import max_packed_route_slots
+    slots = max_packed_route_slots(rows * 8, 16, 256)
+    launch = mix.compile_mixed_trellis(
+        size_m=4096, hidden_size=6144, intermediate_size=512,
+        tier0_num_experts=128, tier1_num_experts=128, tier0_bits=4, tier1_bits=4,
+        top_k=8, max_m_blocks=max_packed_route_slots(4096*8, 16, 256)//16,
+        sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
+        force_tile_config=(128, 128, 128, 128), trellis_codebook=tiers[0].trellis_codebook,
+        moe_block_size=16, warp_specialized=True, input_format="e4m3_k32",
+        rotation_input_dtype="bf16", full_rotation_output_dtype="bf16")
+    bufs = mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"), sms=props.multi_processor_count)
+    mapping, desc = mix.build_ordered_maps(128, 128, device=torch.device("cuda"))
+    rotations = mix.MixedTrellisRotations(
+        torch.cat([t.intermediate_rotations for t in tiers]),
+        torch.cat([t.gate_suh for t in tiers]), torch.cat([t.up_suh for t in tiers]),
+        torch.cat([t.down_svh for t in tiers]))
+    binding = mix.bind_mixed_trellis(*tiers, mapping, desc, rotations, launch)
+    return binding, bufs
+
+
+def grouped_main(args):
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis import run_bound_mixed_trellis
+    from tests.moe.test_exlr8_grouped import buffers
+    props = torch.cuda.get_device_properties(0)
+    l2 = int(props.L2_cache_size)
+    if l2 <= 0:
+        raise RuntimeError("runtime device L2 size is required")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    roof = None if args.profile else read_roofline()
+    t = make_candidate(l2)
+    control = compile_control(args.control_core, args.control_glue)
+    limit = int(props.multi_processor_count) * 4
+    group_rows = args.group_rows
+    capacity = (4096*8 + group_rows-1)//group_rows + 256
+    state = buffers(4096, 6144, 4, 8, capacity, group_rows)
+    group = compile_exlr8_group_aot(hidden=6144, top_k=8, max_groups=capacity,
+                                    max_rows=4096, group_rows=group_rows)
+    grouped = compile_exlr8_a16_aot(units=4, top_k=8, max_groups=capacity,
+                                    device_count=True, grouped=True, group_rows=group_rows)
+    # Two K4 tiers merely satisfy the existing mixed-kernel descriptor ABI.
+    # Both are the production grouped A16 prefill path, with standard FP8 wire input.
+    exl_layers = [tuple(exl3._prepared(4,128,408+2*c+j,torch.device("cuda"))
+                        for j in range(2)) for c in range(len(t["tables"]))]
+    exl_states = [grouped_exl3_state(4096, ts, props) for ts in exl_layers]
+    records = []
+    for total in map(int, args.rows.split(",")):
+        if not 1 <= total <= 4096:
+            raise ValueError("grouped benchmark rows must be 1..4096")
+        gen = torch.Generator().manual_seed(408+total)
+        ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(total)]).cuda().int()
+        weights = torch.rand((total,8),generator=gen).cuda()/8
+        wire = make_wire(torch.randn((total,6144),generator=gen).cuda()*0.02)
+        chunk_response = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
+        chunk_wire = torch.empty((64,6336),dtype=torch.uint8,device="cuda")
+        chunk_ids = torch.empty((64,8),dtype=torch.int32,device="cuda")
+        chunk_weights = torch.empty((64,8),device="cuda")
+        copies = len(t["tables"])
+
+        def chunked():
+            k1c, gc = control
+            for table in t["tables"]:
+                for first in range(0,total,64):
+                    live = min(64,total-first)
+                    chunk_wire[:live].copy_(wire[first:first+live])
+                    chunk_ids[:live].copy_(ids[first:first+live])
+                    chunk_weights[:live].copy_(weights[first:first+live])
+                    gc.launch(chunk_ids,chunk_wire,t["signs_in"],t["group_expert"],t["route_slots"],
+                              t["route_group_lane"],t["group_count"],t["activation"],scalars=(live,limit))
+                    k1c.launch(t["activation"],table,t["bits"],t["group_expert"],t["route_slots"],
+                               t["route_group_lane"],chunk_weights,t["fc1"],t["intermediate"],t["fc2"],
+                               t["signs_out"],t["output"],t["group_count"],scalars=(live,limit))
+                    chunk_response[first:first+live].copy_(t["output"][:live])
+
+        def candidate():
+            for table in t["tables"]:
+                group.launch(ids,wire,t["signs_in"],state["group_expert"],state["route_slots"],
+                             state["inverse"],state["count"],state["activation"],scalars=(total,limit))
+                grouped.launch(state["activation"],table,t["bits"],state["group_expert"],state["route_slots"],
+                               state["inverse"],weights,state["fc1"],state["intermediate"],state["fc2"],
+                               t["signs_out"],state["output"],state["count"],scalars=(total,limit))
+
+        def baseline():
+            for binding, bufs in exl_states:
+                run_bound_mixed_trellis(wire,weights,ids,binding,bufs)
+
+        chunked(); candidate(); baseline()
+        torch.cuda.synchronize()
+        if not torch.equal(chunk_response.view(torch.int16),state["output"][:total].view(torch.int16)):
+            n = int((chunk_response.view(torch.int16) != state["output"][:total].view(torch.int16)).sum())
+            raise RuntimeError(f"grouped result differs from snapshot chunked K1: {n} BF16 words")
+        finite_nonzero(state["output"][:total].float(), "grouped EXLR8")
+        finite_nonzero(exl_states[-1][1].output[:total].float(), "grouped EXL3")
+        if args.profile:
+            torch.cuda.cudart().cudaProfilerStart()
+            candidate()
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
+            print(f"profiled rows={total}", flush=True)
+            continue
+        graphs = {"chunked":capture(chunked),"grouped":capture(candidate),"exl3":capture(baseline)}
+        rounds = {n:[] for n in graphs}
+        names = list(graphs)
+        for r in range(min(3,args.repeats)):
+            for n in names[r%3:]+names[:r%3]:
+                rounds[n].append(timing(graphs[n],args.replays)/copies)
+        med = {n:statistics.median(ts) for n,ts in rounds.items()}
+        unique = int(ids.unique().numel()) * 3 * 6144 * 512 * 4//8
+        stages = stage_profile(graphs["grouped"], args.output.parent,
+            {"ingress":("_Group",),"fc1":("grouped_fc1_kernel",),"activation":("activation_kernel",),
+             "fc2":("grouped_fc2_kernel",),"egress":("reduce_kernel",)})
+        rec = dict(rows=total, **{n+"_us":v for n,v in med.items()}, rounds_us=rounds,
+                   chunked_speedup=med["chunked"]/med["grouped"],
+                   exl3_speedup=med["exl3"]/med["grouped"], unique_weight_bytes=unique,
+                   unique_read_roofline_percent=100*unique/med["grouped"]/1000/roof["gbps"],
+                   stages={k:v/copies if k.endswith("_us") else v for k,v in stages.items()},
+                   groups=int(state["count"].item()), bitwise_equal=True)
+        records.append(rec)
+        print(json.dumps(rec),flush=True)
+    if not args.profile:
+        args.output.write_text(json.dumps(dict(schema=3, device=props.name, sm_count=props.multi_processor_count,
+            l2_bytes=l2, measured_read_roofline=roof, group_rows=group_rows, rows=records,
+            target_met=all(r["exl3_speedup"]>=1.0 for r in records)),indent=2))
 
 
 if __name__ == "__main__":
