@@ -24,6 +24,29 @@ def test_bench_wire_matches_oracle_wire():
     assert torch.equal((values * scales).reshape(5, 6144), dequant)
 
 
+def test_grouped_control_uses_frozen_core_and_source_key(monkeypatch, tmp_path):
+    from b12x.integration.cuteafd import _common
+    path = tmp_path / "grouped.py"
+    path.write_text("class Exlr8GroupedKernel:\n"
+                    "    def __init__(self, *args): self.geometry = args\n")
+    geometry = dict(hidden=6144, units=4, top_k=8, max_groups=768, group_rows=64)
+    candidate = SimpleNamespace(geometry=geometry, operands=("operand",),
+                                scalars=("scalar",), scratch={})
+    calls = []
+    def compile_program(wrapper, **kwargs):
+        calls.append((wrapper, kwargs))
+        return wrapper
+    monkeypatch.setattr(_common, "compile_program", compile_program)
+    program, digest = bench.compile_grouped_control(path, candidate)
+    assert program.core.geometry == (6144, 4, 8, 768, 64)
+    assert calls[0][1]["operands"] == candidate.operands
+    assert calls[0][1]["scalars"] == candidate.scalars
+    assert calls[0][1]["key"][0] == digest
+    path.write_text(path.read_text() + "\n# distinct source\n")
+    _, changed = bench.compile_grouped_control(path, candidate)
+    assert changed != digest
+
+
 def test_stage_needles_cover_every_step_kernel():
     assert set(bench.STAGES) == {"ingress", "fc1", "activation", "fc2", "egress"}
 
