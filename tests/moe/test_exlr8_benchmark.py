@@ -24,11 +24,34 @@ def test_bench_wire_matches_oracle_wire():
     assert torch.equal((values * scales).reshape(5, 6144), dequant)
 
 
-def test_grouped_control_uses_frozen_core_and_source_key(monkeypatch, tmp_path):
+@pytest.mark.parametrize("value", ["master:6d67f5eb", "gemini:e8717e05"])
+def test_grouped_arm_argument(value):
+    assert bench.parse_grouped_arm(value) == tuple(value.split(":"))
+
+
+@pytest.mark.parametrize("value", ["missing", ":HEAD", "a:", "exl3:HEAD", "a:--help", "a:b:c"])
+def test_grouped_arm_bad_argument(value):
+    with pytest.raises(bench.argparse.ArgumentTypeError):
+        bench.parse_grouped_arm(value)
+
+
+def test_grouped_arm_uses_own_ingress_and_source_keys(monkeypatch, tmp_path):
     from b12x.integration.cuteafd import _common
-    path = tmp_path / "grouped.py"
-    path.write_text("class Exlr8GroupedKernel:\n"
+    directory = tmp_path / ("a" * 40)
+    directory.mkdir()
+    (directory / "core.py").write_text("class Exlr8GroupedKernel:\n"
                     "    def __init__(self, *args): self.geometry = args\n")
+    glue = directory / "glue.py"
+    glue.write_text("from ._common import compile_program\n"
+                   "def compile_exlr8_group_aot(**kwargs):\n"
+                   "    return compile_program('frozen ingress', key=(64,), **kwargs)\n")
+    def manifest():
+        result = dict(revision=directory.name, sources={label:
+            bench.hashlib.sha256((directory / (label + '.py')).read_bytes()).hexdigest()
+            for label in ('core', 'glue')})
+        (directory / "manifest.json").write_text(bench.json.dumps(result))
+        return result
+    manifest()
     geometry = dict(hidden=6144, units=4, top_k=8, max_groups=768, group_rows=64)
     candidate = SimpleNamespace(geometry=geometry, operands=("operand",),
                                 scalars=("scalar",), scratch={})
@@ -37,14 +60,30 @@ def test_grouped_control_uses_frozen_core_and_source_key(monkeypatch, tmp_path):
         calls.append((wrapper, kwargs))
         return wrapper
     monkeypatch.setattr(_common, "compile_program", compile_program)
-    program, digest = bench.compile_grouped_control(path, candidate)
+    program, ingress, provenance = bench.compile_grouped_arm(directory, candidate)
     assert program.core.geometry == (6144, 4, 8, 768, 64)
-    assert calls[0][1]["operands"] == candidate.operands
-    assert calls[0][1]["scalars"] == candidate.scalars
-    assert calls[0][1]["key"][0] == digest
-    path.write_text(path.read_text() + "\n# distinct source\n")
-    _, changed = bench.compile_grouped_control(path, candidate)
-    assert changed != digest
+    assert ingress == "frozen ingress"
+    assert calls[0][1]["key"][0] == calls[1][1]["key"][0]
+    old_key = calls[0][1]["key"]
+    glue.write_text(glue.read_text() + "\n# distinct ingress\n")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        bench.compile_grouped_arm(directory, candidate)
+    manifest()
+    bench.compile_grouped_arm(directory, candidate)
+    assert calls[-2][1]["key"] != old_key
+    assert bench.grouped_arm_bundle('aaaaaaa', tmp_path) == directory
+
+
+def test_grouped_arm_materialization_uses_git_revision(monkeypatch, tmp_path):
+    calls = []
+    def git(args):
+        calls.append(args[3:])
+        return (b'b' * 40 + b'\n') if args[3] == 'rev-parse' else args[-1].encode()
+    monkeypatch.setattr(bench.subprocess, 'check_output', git)
+    directory = bench.materialize_grouped_arm('HEAD', tmp_path)
+    assert directory.name == 'b' * 40
+    assert calls[0] == ['rev-parse', '--verify', 'HEAD^{commit}']
+    assert all(call[1].startswith('b' * 40 + ':') for call in calls[1:])
 
 
 def test_stage_needles_cover_every_step_kernel():
