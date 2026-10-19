@@ -244,7 +244,8 @@ class NativeTileLinear:
         self.slots = max(1, DECODE_WARPS // self.segments)
         self.d_threads = 32 * self.slots * self.segments
         self.stages = 2 if self.grouped else int(stages)
-        self.bm = PREFILL_BM
+        # The q_a tile trades row reuse for another resident CTA and shorter barriers.
+        self.bm = 64 if (self.encoding == "mxfp8" and self.k == 6144 and self.n == 2048) else PREFILL_BM
         self.bn = 128 if (not self.grouped and self.n % 128 == 0) else 64
         self.wn = self.bn // 32
         self.wm = 2 if not self.grouped else 4
@@ -278,7 +279,7 @@ class NativeTileLinear:
                 if cutlass.const_expr(self.grouped):
                     self.prefill(x, payload, scales, output, rows).launch(
                         grid=(min(tiles, cta_limit), 1, 1), block=(self.prefill_threads, 1, 1),
-                        stream=stream, min_blocks_per_mp=2)
+                        stream=stream, min_blocks_per_mp=3 if self.bm == 64 else 2)
                 else:
                     self.prefill_row(x, payload, scales, output, rows).launch(
                         grid=(min(tiles, cta_limit), 1, 1), block=(self.prefill_threads, 1, 1),
