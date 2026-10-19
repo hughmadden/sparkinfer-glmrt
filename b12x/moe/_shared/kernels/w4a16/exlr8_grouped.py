@@ -11,12 +11,15 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
 from cuda.bindings import driver as cuda
 
-from b12x._lib.intrinsics import f16_mma_m16n8k16_f32, ld_global_nc_u32
+from b12x._lib.intrinsics import (
+    cp_async4_shared_global, f16_mma_m16n8k16_f32, ldmatrix_m8n8x4_b16,
+    shared_ptr_to_u32, st_shared_v4_u32,
+)
 from .exlr8 import Exlr8A16Kernel, exlr8_decode_tile, _side_value
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 2
+    CODE_VERSION = 3
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -55,8 +58,29 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 block=(128, 1, 1), stream=stream)
 
     @cute.jit
-    def accumulate(self, total: cute.Tensor, payload: Int64, a_address: Int64,
-                   row_ids: cute.Tensor, a_stride: cutlass.Constexpr,
+    def stage_a(self, smem: Int32, a_address: Int64, route_slots: cute.Tensor,
+                group: Int32, rows: Int32, input_block: Int32, tid: Int32,
+                a_stride: cutlass.Constexpr, down: cutlass.Constexpr):
+        # Sixteen-byte vectors cover K128 once per CTA. XOR the vector column
+        # with the row bank group so ldmatrix's eight rows use distinct banks.
+        for i in cutlass.range_constexpr(self.group_rows * 16 // 128):
+            vector = tid + Int32(i * 128)
+            row, col = vector // Int32(16), vector % Int32(16)
+            slot = route_slots[group.to(Int64) * Int64(self.group_rows) + row.to(Int64)]
+            target = smem + (row * Int32(16) + (col ^ (row & Int32(7)))) * Int32(16)
+            if slot >= Int32(0) and slot < rows * Int32(self.top_k):
+                source_row = row if cutlass.const_expr(down) else slot // Int32(self.top_k)
+                source = a_address + (source_row.to(Int64) * Int64(a_stride)
+                    + input_block.to(Int64) * Int64(128) + col.to(Int64) * Int64(8)) * Int64(2)
+                cp_async4_shared_global(target, source)
+            else:
+                st_shared_v4_u32(target, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def accumulate(self, total: cute.Tensor, payload: Int64, smem: Int32,
                    input_block: Int32, output_block: Int32, nquad: Int32,
                    lane: Int32, warp: Int32, width: cutlass.Constexpr,
                    down: cutlass.Constexpr, scale: Float32):
@@ -69,16 +93,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             b0, b1, b2, b3 = exlr8_decode_tile(payload, tile, lane, width)
             if warp % Int32(2) != Int32(0):
                 b0, b1 = b2, b3
-            k = input_block * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
             for m in cutlass.range_constexpr(self.mtiles):
-                a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                row0, row1 = row_ids[m, 0], row_ids[m, 1]
-                if row0 >= Int32(0):
-                    addr = a_address + (row0.to(Int64) * Int64(a_stride) + k.to(Int64)) * Int64(2)
-                    a0, a2 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
-                if row1 >= Int32(0):
-                    addr = a_address + (row1.to(Int64) * Int64(a_stride) + k.to(Int64)) * Int64(2)
-                    a1, a3 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
+                row = Int32(m * 16) + (lane & Int32(15))
+                col = Int32(k16 * 2) + lane // Int32(16)
+                address = smem + (row * Int32(16) + (col ^ (row & Int32(7)))) * Int32(16)
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(address)
                 d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                     acc[m, 0], acc[m, 1], acc[m, 2], acc[m, 3], a0, a1, a2, a3, b0, b1)
                 acc[m, 0], acc[m, 1], acc[m, 2], acc[m, 3] = d0, d1, d2, d3
@@ -106,6 +125,15 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         groups = group_count[0]
         if groups < Int32(0) or groups > Int32(self.max_groups):
             groups = Int32(0)
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[Uint32, self.group_rows * 64], 1024]
+
+        storage = smem.allocate(Storage)
+        shared_a = shared_ptr_to_u32(storage.words.data_ptr())
         tid = Int32(cute.arch.thread_idx()[0])
         task = Int32(cute.arch.block_idx()[0])
         step = Int32(cute.arch.grid_dim()[0])
@@ -129,15 +157,18 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     kb = split * Int32(8) + block
                     if kb < Int32(self.blocks):
                         scale = _side_value(scales, kb)
+                        self.stage_a(shared_a, x.iterator.toint(), route_slots, group, rows,
+                                     kb, tid, self.hidden_size, False)
                         if width == Int32(2):
-                            self.accumulate(total, payload, x.iterator.toint(), rids, self.hidden_size,
+                            self.accumulate(total, payload, shared_a,
                                             kb, Int32(0), nquad, lane, warp, 2, False, scale)
                         elif width == Int32(3):
-                            self.accumulate(total, payload, x.iterator.toint(), rids, self.hidden_size,
+                            self.accumulate(total, payload, shared_a,
                                             kb, Int32(0), nquad, lane, warp, 3, False, scale)
                         elif width == Int32(4):
-                            self.accumulate(total, payload, x.iterator.toint(), rids, self.hidden_size,
+                            self.accumulate(total, payload, shared_a,
                                             kb, Int32(0), nquad, lane, warp, 4, False, scale)
+                        cute.arch.sync_threads()
             col = nquad * Int32(32) + warp * Int32(8) + (lane & Int32(3)) * Int32(2)
             for m in cutlass.range_constexpr(self.mtiles):
                 for v in cutlass.range_constexpr(2):
@@ -145,6 +176,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     base = (logical.to(Int64) * Int64(self.group_rows) + local.to(Int64)) * Int64(128) + col.to(Int64)
                     if width != Int32(0) and rids[m, v] >= Int32(0):
                         fc1[base], fc1[base + Int64(1)] = total[m, 2*v], total[m, 2*v+1]
+            cute.arch.sync_threads()
             task += step
 
     @cute.kernel
@@ -155,6 +187,15 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         groups = group_count[0]
         if groups < Int32(0) or groups > Int32(self.max_groups):
             groups = Int32(0)
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[Uint32, self.group_rows * 64], 1024]
+
+        storage = smem.allocate(Storage)
+        shared_a = shared_ptr_to_u32(storage.words.data_ptr())
         tid = Int32(cute.arch.thread_idx()[0])
         task = Int32(cute.arch.block_idx()[0])
         step = Int32(cute.arch.grid_dim()[0])
@@ -174,15 +215,17 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     payload = pointers[desc * Int64(3)]
                     scale = _side_value(pointers[desc * Int64(3) + Int64(2)], block)
                     addr = intermediate.iterator.toint() + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(self.group_rows * 128 * 2)
+                    self.stage_a(shared_a, addr, route_slots, group, rows, Int32(0), tid, 128, True)
                     if width == Int32(2):
-                        self.accumulate(total, payload, addr, rids, 128, Int32(0), block,
+                        self.accumulate(total, payload, shared_a, Int32(0), block,
                                         nquad, lane, warp, 2, True, scale)
                     elif width == Int32(3):
-                        self.accumulate(total, payload, addr, rids, 128, Int32(0), block,
+                        self.accumulate(total, payload, shared_a, Int32(0), block,
                                         nquad, lane, warp, 3, True, scale)
                     elif width == Int32(4):
-                        self.accumulate(total, payload, addr, rids, 128, Int32(0), block,
+                        self.accumulate(total, payload, shared_a, Int32(0), block,
                                         nquad, lane, warp, 4, True, scale)
+                    cute.arch.sync_threads()
             col = block * Int32(128) + nquad * Int32(32) + warp * Int32(8) + (lane & Int32(3)) * Int32(2)
             for m in cutlass.range_constexpr(self.mtiles):
                 for v in cutlass.range_constexpr(2):
@@ -190,4 +233,5 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     base = (group.to(Int64) * Int64(self.group_rows) + local.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)
                     if rids[m, v] >= Int32(0):
                         fc2[base], fc2[base + Int64(1)] = total[m, 2*v], total[m, 2*v+1]
+            cute.arch.sync_threads()
             task += step
