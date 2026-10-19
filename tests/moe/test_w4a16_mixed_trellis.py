@@ -50,6 +50,18 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
 from b12x.moe.fused_moe.trellis import _projection_tier_bits
 
 
+def test_compact_glm_benchmark_arguments_without_cuda():
+    from benchmarks.benchmark_w4a16_full_rotation_decode import _parse_args
+    assert _parse_args([]).experts == 32
+    args = _parse_args(["--compact-glm", "--tp", "4", "6", "--rows", "1", "16"])
+    assert (args.experts, args.tp, args.rows, args.bits) == (256, [4, 6], [1, 16], [4, 5])
+    for argv in [["--compact-glm", "--tp", "3"], ["--rows", "8"],
+            ["--compact-glm", "--experts", "7"], ["--compact-glm", "--experts", "258"],
+            ["--bits", "4", "4"], ["--iterations", "0"], ["--compact-glm", "--compare-tiles"]]:
+        with pytest.raises(SystemExit):
+            _parse_args(argv)
+
+
 def test_projection_tier_rate_family_validation() -> None:
     def tiers(*bits: int) -> tuple[SimpleNamespace, ...]:
         return tuple(SimpleNamespace(bits=bit) for bit in bits)

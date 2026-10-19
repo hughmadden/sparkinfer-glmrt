@@ -356,7 +356,7 @@ class W4A16MixedTrellisKernel:
             for moe in (driver, tier0, tier1):
                 if not moe.fc1.schedule_whole_tiles or not moe.fc2.schedule_whole_tiles:
                     raise ValueError("compact weights require whole-tile scheduling")
-                if 128 % moe.fc1.tile_n or 128 % moe.fc2.tile_k:
+                if driver.intermediate_size % moe.fc1.tile_n or 128 % moe.fc2.tile_k:
                     raise ValueError("compact widths must align to FC1 N and FC2 K tiles")
         self.compact_weights = bool(compact_weights)
         self.paired_boundary = paired_boundary
@@ -3633,6 +3633,8 @@ def bind_mixed_trellis(
             bits=bits, descriptor_bits=_descriptor_bits(int(launch.topk_sum.route_num_experts)))
         if host_rows != expected:
             raise ValueError("compact descriptor projection offsets are not canonical")
+        if any(width > 0 and width % launch.fc1_tile_n for width in host_rows[3]):
+            raise ValueError("compact live widths must align to the FC1 N tile")
     for tier_id, (tier, expected_experts, tier_bits) in enumerate(
         zip(tiers, counts, bits, strict=True)
     ):
