@@ -304,8 +304,8 @@ class NativeTileLinear:
         self.side2 = g["sharded_side"] == 2
         self.grouped = self.encoding != "fp8_row"
         self.int4 = self.encoding == "int4_g32"
-        # Grouped side-1 decode forms both operands directly in MMA slot order.
-        self.slot_b = self.grouped and not self.side2
+        # Grouped decode forms both operands directly in MMA slot order.
+        self.slot_b = self.grouped
         self.segments = int(g["segments"])
         self.groups = decode_groups(self.n, self.encoding)
         if self.segments < 1 or self.segments & (self.segments - 1):
@@ -565,16 +565,9 @@ class NativeTileLinear:
                                 for mt in cutlass.range_constexpr(0 if self.side2 else 1, 4):
                                     if Int32(mt) < live:
                                         r0 = Int32(16 * mt) + g
-                                        if cutlass.const_expr(self.side2):
-                                            at0 = x_base + (r0.to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                            lo0, lo1, lo2, lo3 = _ld_cached_pred(at0, r0, rows)
-                                            hi0, hi1, hi2, hi3 = _ld_cached_pred(at0 + Int64(16 * self.k), r0 + Int32(8), rows)
-                                            a0, a2, a4, a6 = _quad_transpose_x4(lo0, lo1, lo2, lo3, j)
-                                            a1, a3, a5, a7 = _quad_transpose_x4(hi0, hi1, hi2, hi3, j)
-                                        else:
-                                            at0 = x_slot + (r0.to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                            a0, a2, a4, a6 = _ld_cached_k32x4_pred(at0, r0, rows)
-                                            a1, a3, a5, a7 = _ld_cached_k32x4_pred(at0 + Int64(16 * self.k), r0 + Int32(8), rows)
+                                        at0 = x_slot + (r0.to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
+                                        a0, a2, a4, a6 = _ld_cached_k32x4_pred(at0, r0, rows)
+                                        a1, a3, a5, a7 = _ld_cached_k32x4_pred(at0 + Int64(16 * self.k), r0 + Int32(8), rows)
                                         f = 4 * mt
                                         acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
                                             acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
