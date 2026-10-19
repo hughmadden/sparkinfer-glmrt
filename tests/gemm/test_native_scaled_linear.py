@@ -36,6 +36,18 @@ class Case:
                             self.output.flatten(),scalars=(rows,limit))
 
 
+@pytest.mark.parametrize("encoding,side,k,n", [
+    ("mxfp8", 1, 256, 96), ("mxfp8", 2, 256, 96),
+    ("int4_g32", 1, 256, 96), ("int4_g32", 2, 256, 96),
+    ("fp8_row", 1, 256, 96),
+])
+def test_benchmark_reference_weight(encoding, side, k, n):
+    from benchmarks.benchmark_exlr8_dense import reference_weight
+    c = Case(encoding, side, k=k, n=n, rows=1)
+    actual = reference_weight(encoding, k, n, side, c.payload, c.scales)
+    assert torch.equal(actual, c.weight)
+
+
 @pytest.mark.parametrize("encoding,side", [("mxfp8",1),("mxfp8",2),("int4_g32",1),("int4_g32",2),("fp8_row",1)])
 def test_accuracy_and_row_invariance(encoding,side):
     c = Case(encoding,side)
