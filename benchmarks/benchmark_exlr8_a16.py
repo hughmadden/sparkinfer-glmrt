@@ -116,8 +116,10 @@ def read_roofline():
 
 
 def finite_nonzero(tensor, label):
-    if not bool(torch.isfinite(tensor).all()) or not bool(torch.count_nonzero(tensor)):
-        raise RuntimeError(f"{label} output must be finite and nonzero")
+    bad = int((~torch.isfinite(tensor)).sum())
+    if bad or not bool(torch.count_nonzero(tensor)):
+        raise RuntimeError(f"{label} output must be finite and nonzero "
+                           f"({bad} non-finite of {tensor.numel()})")
 
 
 STAGES = {"ingress": ("_Group",), "fc1": ("fc1_kernel",),
@@ -307,7 +309,9 @@ def main():
         chunks = [min(64, total-first) for first in range(0, total, 64)]
         ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(total)]).cuda().int()
         weights = torch.rand((total,8),generator=gen).cuda()/8
-        x = torch.randn((total,6144),generator=gen).cuda()*0.5
+        # Master's amplitude: EXL3's FP16 intermediates overflow on random K4
+        # payloads at unit-scale activations.
+        x = torch.randn((total,6144),generator=gen).cuda()*0.02
         wire = make_wire(x)
         # One graph per arm; chunks replay serially through 64-row owned
         # buffers, layers rotate through distinct weight copies (cold L2).
