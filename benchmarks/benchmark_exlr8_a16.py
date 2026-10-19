@@ -236,6 +236,22 @@ def compile_control(path, group_path):
 L2_SPAN = 2  # weight copies span at least this many times the device L2
 
 
+def compile_grouped_control(path, candidate):
+    """Freeze the previous grouped core while sharing the unchanged serving ABI."""
+    from b12x.integration.cuteafd import _common
+    from b12x.integration.cuteafd.exlr8 import _Exlr8ServingPointers
+    core, digest = load_source("grouped_control", path,
+                               "b12x.moe._shared.kernels.w4a16")
+    g = candidate.geometry
+    wrapper = object.__new__(_Exlr8ServingPointers)
+    wrapper.core = core.Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
+                                          g["max_groups"], g["group_rows"])
+    program = _common.compile_program(wrapper, name="exlr8_grouped_control",
+        operands=candidate.operands, scalars=candidate.scalars,
+        key=(digest, tuple(sorted(g.items()))), geometry=g, scratch=candidate.scratch)
+    return program, digest
+
+
 def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8):
     """Synthetic K4 payloads, replicated into enough distinct layers that a
     replay over them streams every weight from DRAM (cold L2)."""
@@ -297,6 +313,8 @@ def main():
                         help="master's K1 core source (b12x/moe/_shared/kernels/w4a16/exlr8.py)")
     parser.add_argument("--control-glue",type=Path,
                         help="master's grouping source (b12x/integration/cuteafd/exlr8_glue.py)")
+    parser.add_argument("--control-grouped-core", type=Path,
+                        help="frozen previous grouped core for a same-session fourth arm")
     parser.add_argument("--repeats",type=int,default=1,
                         help="interleaved timing rounds; arm order rotates each round, medians reported")
     parser.add_argument("--profile",action="store_true",
@@ -308,9 +326,12 @@ def main():
         parser.error("--output is required unless --profile")
     if bool(args.control_core) != bool(args.control_glue):
         parser.error("--control-core and --control-glue go together")
+    if args.control_grouped_core and not args.grouped:
+        parser.error("--control-grouped-core requires --grouped")
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
-    torch.cuda.set_per_process_memory_fraction(0.25)
+    torch.cuda.set_per_process_memory_fraction(min(
+        0.25, (12 << 30) / torch.cuda.get_device_properties(0).total_memory))
     if args.grouped:
         return grouped_main(args)
     props = torch.cuda.get_device_properties(0)
@@ -570,6 +591,8 @@ def grouped_main(args):
                                     max_rows=4096, group_rows=group_rows)
     grouped = compile_exlr8_a16_aot(units=4, top_k=8, max_groups=capacity,
                                     device_count=True, grouped=True, group_rows=group_rows)
+    previous, previous_digest = (compile_grouped_control(args.control_grouped_core, grouped)
+                                if args.control_grouped_core else (None, None))
     # Secondary only: mixed K4/K5 with an unreachable K5 slot is not the
     # uniform K4 serving route used for the primary speed bar.
     exl_layers = [(exl3._prepared(4,256,408+2*c,torch.device("cuda")),
@@ -607,11 +630,11 @@ def grouped_main(args):
                                t["signs_out"],t["output"],t["group_count"],scalars=(live,limit))
                     chunk_response[first:first+live].copy_(t["output"][:live])
 
-        def candidate():
+        def candidate(program=grouped):
             for table in t["tables"]:
                 group.launch(ids,wire,t["signs_in"],state["group_expert"],state["route_slots"],
                              state["inverse"],state["count"],state["activation"],scalars=(total,limit))
-                grouped.launch(state["activation"],table,t["bits"],state["group_expert"],state["route_slots"],
+                program.launch(state["activation"],table,t["bits"],state["group_expert"],state["route_slots"],
                                state["inverse"],weights,state["fc1"],state["intermediate"],state["fc2"],
                                t["signs_out"],state["output"],state["count"],scalars=(total,limit))
 
@@ -634,6 +657,11 @@ def grouped_main(args):
         finite_nonzero(state["output"][:total].float(), "grouped EXLR8")
         finite_nonzero(uniform_states[-1][1].output.float(), "uniform grouped EXL3")
         finite_nonzero(mixed_states[-1][1].output[:total].float(), "mixed grouped EXL3")
+        if previous is not None:
+            candidate(previous)
+            torch.cuda.synchronize()
+            if not torch.equal(chunk_response.view(torch.int16), state["output"][:total].view(torch.int16)):
+                raise RuntimeError("frozen grouped control differs from snapshot chunked K1")
         if args.profile:
             torch.cuda.cudart().cudaProfilerStart()
             {"grouped":candidate, "exl3":baseline, "mixed":mixed}[args.profile_arm]()
@@ -643,6 +671,8 @@ def grouped_main(args):
             continue
         graphs = {"chunked":capture(chunked),"grouped":capture(candidate),
                   "exl3":capture(baseline),"mixed_unreachable_k5":capture(mixed)}
+        if previous is not None:
+            graphs["previous_grouped"] = capture(lambda: candidate(previous))
         rounds = {n:[] for n in graphs}
         names = list(graphs)
         for r in range(min(3,args.repeats)):
@@ -669,6 +699,7 @@ def grouped_main(args):
             l2_bytes=l2, measured_read_roofline=roof, group_rows=group_rows, rows=records,
             primary_baseline="uniform K4 full_rotation; wire decode included",
             secondary_baseline="mixed K4/K5; K5 descriptor unreachable",
+            previous_grouped_source_sha256=previous_digest,
             target_met=all(r["exl3_speedup"]>=1.0 for r in records)),indent=2))
 
 
