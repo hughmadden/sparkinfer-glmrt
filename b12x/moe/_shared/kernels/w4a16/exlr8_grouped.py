@@ -9,7 +9,7 @@ four M16 accumulators. No weight byte is fetched or decoded twice. Gate and up
 share one A tile. The six K1 splits fold inside the CTA in ascending order and
 the fused activation applies the same SwiGLU and H128 pair the decode route
 runs, so the fc1 scratch is never written. FC2 gives every CTA one group: when
-every unit intermediate fits the 99 KiB CTA budget it stays resident while all
+every unit intermediate fits the device's opt-in CTA budget it stays resident while all
 output blocks stream through a two-block ring, so each intermediate is read
 once per group instead of once per (block, unit); otherwise (the benchmark's
 four units, and the exporter's sixteen) each (block, unit) step streams one
@@ -43,10 +43,35 @@ STAGES = 3
 BLOCK_SLOT_WORDS = 2048
 # Gate (and up) scratch for one M16 tile: 16 rows x 128 columns, F32.
 A_TILE_WORDS = 16 * 128
-# SM120 and SM121 both report 102400 B shared per SM and 101376 B opt-in per
-# CTA (cudaDevAttrMaxSharedMemoryPerBlockOptin); every kernel here stays under
-# that, so one build launches on every supported card.
-MIN_SHARED_MEM = 99 * 1024
+
+
+def query_optin_shared_memory() -> int | None:
+    """This host's per-CTA opt-in shared memory, or None without a device.
+
+    The CTA budget comes from the driver (cudaDevAttrMaxSharedMemoryPerBlock-
+    Optin) every time a kernel is built, so no card's limit is baked into a
+    layout. Offline AOT export runs with CUDA hidden from the compiler
+    workers; there the caller gets None and only the universal streamed
+    layout is compiled, which fits whenever FC1 does on every SM12x card.
+    """
+    try:
+        status = cuda.cuInit(0)
+        if isinstance(status, tuple):
+            status = status[0]
+        if status != cuda.CUresult.CUDA_SUCCESS:
+            return None
+        device = cuda.cuDeviceGet(0)
+        if device[0] != cuda.CUresult.CUDA_SUCCESS:
+            return None
+        attribute = (cuda.CUdevice_attribute
+                     .CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+        value = cuda.cuDeviceGetAttribute(attribute, device[1])
+        if value[0] != cuda.CUresult.CUDA_SUCCESS:
+            return None
+        limit = int(value[1])
+    except Exception:
+        return None
+    return limit if limit > 0 else None
 
 
 @cute.jit
@@ -77,38 +102,53 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     CODE_VERSION = 5
     CTAS_PER_SM = 2
 
-    def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
+    def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64,
+                 shared_memory_bytes=None, resident_fc2=None):
         super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True)
         if group_rows not in (16, 32, 64):
             raise ValueError("EXLR8 grouped group_rows must be 16, 32 or 64")
         self.group_rows = group_rows
         self.mtiles = group_rows // 16
+        # The CTA budget is the device's own opt-in limit: a caller that has
+        # already queried it passes it, otherwise it is queried here. It
+        # decides which compiled layout this kernel object uses, and a limit
+        # that fits no layout is refused instead of launching an oversized
+        # request. With no device (offline export) the universal streamed
+        # layout is chosen, so one artifact serves every SM12x card.
+        self.shared_memory_bytes = (shared_memory_bytes if shared_memory_bytes is not None
+                                    else query_optin_shared_memory())
         # Blocks staged before the loop; also the cp.async wait depth, since
         # exactly this many groups are newer than the one being consumed.
         self.prologue = min(STAGES - 1, self.blocks)
         a_words = group_rows * 64
         fc1_words = STAGES * (a_words + 2 * BLOCK_SLOT_WORDS)
-        if fc1_words * 4 > MIN_SHARED_MEM:
+        if self.shared_memory_bytes is not None and fc1_words * 4 > self.shared_memory_bytes:
             raise ValueError(
                 f"EXLR8 grouped FC1 needs {fc1_words * 4} B shared memory, "
-                f"above the {MIN_SHARED_MEM} B every supported target provides")
-        # FC2 keeps every unit's intermediate resident when it fits, and
-        # otherwise streams one (unit, block) at a time through a two-deep
-        # ring; both walk the units ascending, so results are identical.
+                f"above the device's {self.shared_memory_bytes} B opt-in limit")
+        # FC2 keeps every unit's intermediate resident when the queried limit
+        # allows it, and otherwise streams one (unit, block) at a time through
+        # a three-deep ring; both walk the units ascending, so the FP32
+        # accumulation is identical.
         resident_words = self.units * a_words + 2 * self.units * BLOCK_SLOT_WORDS
-        self.fc2_resident = resident_words * 4 <= MIN_SHARED_MEM
+        if resident_fc2 is None:
+            self.fc2_resident = (self.shared_memory_bytes is not None
+                                 and resident_words * 4 <= self.shared_memory_bytes)
+        else:
+            self.fc2_resident = bool(resident_fc2)
         ring_words = 3 * (a_words + BLOCK_SLOT_WORDS)
-        if not self.fc2_resident and ring_words * 4 > MIN_SHARED_MEM:
+        needed = resident_words if self.fc2_resident else ring_words
+        if self.shared_memory_bytes is not None and needed * 4 > self.shared_memory_bytes:
             raise ValueError(
-                f"EXLR8 grouped streamed FC2 needs {ring_words * 4} B shared "
-                f"memory, above the {MIN_SHARED_MEM} B every target provides")
-        self.shared_words = max(fc1_words, resident_words if self.fc2_resident else ring_words)
+                f"EXLR8 grouped FC2 needs {needed * 4} B shared memory, above "
+                f"the device's {self.shared_memory_bytes} B opt-in limit")
+        self.shared_words = max(fc1_words, needed)
         self.fc2_prologue = min(2, self.blocks * self.units)
 
     @property
     def __cache_key__(self):
         return ("exlr8_a16_grouped", self.CODE_VERSION, self.hidden_size, self.units,
-                self.top_k, self.max_groups, self.group_rows, STAGES)
+                self.top_k, self.max_groups, self.group_rows, STAGES, self.fc2_resident)
 
     @cute.jit
     def serving(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
