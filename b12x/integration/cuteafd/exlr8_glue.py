@@ -194,6 +194,8 @@ class _Group:
             group_count[0] = Int32(-1)
             if valid[0] != Int32(0) and total <= Int32(self.max_groups):
                 group_count[0] = total
+        # Loop-carried locals are typed before the branches (helper-function scope).
+        group, packed, ordinal = Int32(0), Int32(0), Int32(0)
         if valid[0] != Int32(0) and total <= Int32(self.max_groups):
             first = prefix[thread] - groups
             for local in cutlass.range(groups):
