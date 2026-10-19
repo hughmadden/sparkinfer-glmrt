@@ -223,8 +223,9 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
         raise ValueError("EXLR8 grouping requires experts1..256, top_k1..32 and positive capacity")
     if input_format not in INPUT_FORMATS:
         raise ValueError(f"unknown EXLR8 ingress format {input_format!r}")
-    if hidden <= 0 or hidden % 128 or 64 * (hidden // 128) > (2**31 - 1) // 2:
-        raise ValueError("EXLR8 ingress requires positive hidden % 128 == 0 within int32 tasks")
+    # 32-bit column and per-chunk element indexing: a 64-row F16 chunk's bytes fit int32.
+    if hidden <= 0 or hidden % 128 or 64 * hidden * 2 > 2**31 - 1:
+        raise ValueError("EXLR8 ingress requires positive hidden % 128 == 0 within int32 indexing")
     row = f"[rows,{hidden + hidden // 32}]" if input_format == "fp8_k32" else f"[rows,{hidden}]"
     x = (Operand("x", torch.uint8, row, note="E4M3 bytes then UE8M0 per-32 scales per row")
          if input_format == "fp8_k32" else Operand("x", torch.bfloat16, row))
