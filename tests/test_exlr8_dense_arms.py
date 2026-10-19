@@ -21,6 +21,15 @@ def test_parse_and_key():
     assert arms.program_key(a, (128, 32)) != arms.program_key(dict(a, revision="d"*40), (128, 32))
 
 
+def test_cold_copies_covers_runtime_l2():
+    assert arms.cold_copies(1 << 20, 128 << 20) == 256
+    assert arms.cold_copies(3 << 20, 128 << 20) == 86
+    assert arms.cold_copies(1 << 30, 128 << 20) == 1
+    for weight, l2 in ((0, 1), (1, 0), (-1, 1)):
+        with pytest.raises(ValueError):
+            arms.cold_copies(weight, l2)
+
+
 def test_bundle_pins_and_verifies(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

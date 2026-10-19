@@ -27,6 +27,12 @@ def program_key(arm, geometry):
     return (arm["revision"], arm["sha256"], *geometry)
 
 
+def cold_copies(weight_bytes, l2_bytes):
+    if weight_bytes <= 0 or l2_bytes <= 0:
+        raise ValueError("weight and L2 sizes must be positive")
+    return max(1, (2*l2_bytes + weight_bytes - 1)//weight_bytes)
+
+
 def materialize(repo, bundle, arms):
     bundle = Path(bundle)
     bundle.mkdir(parents=True, exist_ok=True)

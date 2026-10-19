@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 import sys
 import contextlib
-import tempfile
+import ctypes
 
 import torch
 import cutlass
@@ -29,7 +29,7 @@ from benchmarks.benchmark_exlr8_a16 import capture, timing, read_roofline, finit
 from b12x.integration.cuteafd._common import Operand, Scalar, compile_program, exportable_compilation
 from b12x.integration.cuteafd import trellis_linear, scaled_linear, fp8_row_embedding
 from b12x.integration.cuteafd._fp8_weights import Fp8Projection
-from benchmarks._exlr8_dense_arms import parse_arms, materialize, verify, program_key
+from benchmarks._exlr8_dense_arms import parse_arms, materialize, verify, program_key, cold_copies
 
 # Unique native formats/shapes from the GLM 5.3 bit325 load plan.
 SHAPES = (
@@ -64,12 +64,17 @@ class BlockFp8:
                         cutlass.Int64(scratch.toint()), stream)
 
 
-L2_SPAN = 256 << 20  # 2x the SM120 L2: rotated weight copies arrive DRAM-cold
-
-
 def copies_for(weight_bytes, cold_l2):
-    """Distinct weight copies a cold-L2 graph rotates through (consecutive layers)."""
-    return max(1, min(64, -(-L2_SPAN // max(1, weight_bytes)))) if cold_l2 else 1
+    """Consecutive-layer copies span twice this device's queried L2 capacity."""
+    if not cold_l2:
+        return 1
+    runtime = ctypes.CDLL("libcudart.so.12")
+    l2_bytes = ctypes.c_int()
+    # cudaDevAttrL2CacheSize = 38; no probing another card or assumed SM count.
+    status = runtime.cudaDeviceGetAttribute(ctypes.byref(l2_bytes), 38, torch.cuda.current_device())
+    if status:
+        raise RuntimeError(f"cudaDeviceGetAttribute(L2CacheSize) failed: {status}")
+    return cold_copies(weight_bytes, l2_bytes.value)
 
 
 def rotated(launches):
