@@ -17,7 +17,6 @@ from pathlib import Path
 import re
 import sys
 import contextlib
-import ctypes
 
 import torch
 import cutlass
@@ -68,13 +67,13 @@ def copies_for(weight_bytes, cold_l2):
     """Consecutive-layer copies span twice this device's queried L2 capacity."""
     if not cold_l2:
         return 1
-    runtime = ctypes.CDLL("libcudart.so.12")
-    l2_bytes = ctypes.c_int()
-    # cudaDevAttrL2CacheSize = 38; no probing another card or assumed SM count.
-    status = runtime.cudaDeviceGetAttribute(ctypes.byref(l2_bytes), 38, torch.cuda.current_device())
-    if status:
-        raise RuntimeError(f"cudaDeviceGetAttribute(L2CacheSize) failed: {status}")
-    return cold_copies(weight_bytes, l2_bytes.value)
+    status, device = cuda.cuDeviceGet(torch.cuda.current_device())
+    if status != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuDeviceGet failed: {status}")
+    status, l2_bytes = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, device)
+    if status != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuDeviceGetAttribute(L2CacheSize) failed: {status}")
+    return cold_copies(weight_bytes, l2_bytes)
 
 
 def rotated(launches):
