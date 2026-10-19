@@ -93,7 +93,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         # ring; both walk the units ascending, so results are identical.
         resident_words = self.units * a_words + 2 * self.units * BLOCK_SLOT_WORDS
         self.fc2_resident = resident_words * 4 <= MIN_SHARED_MEM
-        ring_words = 2 * (a_words + BLOCK_SLOT_WORDS)
+        ring_words = 3 * (a_words + BLOCK_SLOT_WORDS)
         self.shared_words = max(fc1_words, resident_words if self.fc2_resident else ring_words)
         self.fc2_prologue = min(2, self.blocks * self.units)
 
@@ -535,9 +535,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                  rows: Int32, group_count: cute.Tensor):
         """FC2 for a group whose intermediates exceed shared memory.
 
-        One (block, unit) step streams through a two-deep ring in the same
-        ascending unit order, so the FP32 accumulation is unchanged; only the
-        activation tile is fetched again per output block.
+        One (block, unit) step streams through a three-slot ring (two steps in
+        flight) in the same ascending unit order, so the FP32 accumulation is
+        unchanged; only the activation tile is fetched again per output block.
         """
         groups = group_count[0]
         if groups < Int32(0) or groups > Int32(self.max_groups):
@@ -548,7 +548,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         @cute.struct
         class Storage:
             words: cute.struct.Align[
-                cute.struct.MemRange[Uint32, 2 * (a_words + BLOCK_SLOT_WORDS)], 1024]
+                cute.struct.MemRange[Uint32, 3 * (a_words + BLOCK_SLOT_WORDS)], 1024]
 
         storage = smem.allocate(Storage)
         base = shared_ptr_to_u32(storage.words.data_ptr())
@@ -577,14 +577,14 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     here = block * Int32(self.units) + unit
                     nxt = here + Int32(self.fc2_prologue)
                     if nxt < Int32(total_steps):
-                        self.stage_fc2_step(base + (nxt % Int32(2)) * Int32(slot_bytes),
+                        self.stage_fc2_step(base + (nxt % Int32(3)) * Int32(slot_bytes),
                                             pointers, bits, expert, nxt // Int32(self.units),
                                             nxt % Int32(self.units), intermediate_address,
                                             route_slots, group, rows, tid)
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(self.fc2_prologue)
                     cute.arch.sync_threads()
-                    slot = base + (here % Int32(2)) * Int32(slot_bytes)
+                    slot = base + (here % Int32(3)) * Int32(slot_bytes)
                     desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
                     width = bits[desc]
                     if width != Int32(0):

@@ -54,12 +54,14 @@ def reverse_packing(state, rows):
     state["inverse"][:rows].flatten()[slots[valid]] = packed[valid]
 
 
-@pytest.mark.parametrize("group_rows", [16, 32, 64])
+# (group_rows, units): the units=8 case exceeds the shared-memory budget for
+# resident intermediates, so it exercises the streamed FC2 ring.
+@pytest.mark.parametrize("group_rows, units", [(16, 3), (32, 3), (64, 3), (64, 8)])
 @pytest.mark.skipif(not os.environ.get("CUTEAFD_EXLR8_SNAPSHOT"), reason="checkpoint fixture required")
-def test_checkpoint_grouped_matches_chunks(group_rows):
+def test_checkpoint_grouped_matches_chunks(group_rows, units):
     torch.cuda.set_per_process_memory_fraction(0.25)
-    case = Case(os.environ["CUTEAFD_EXLR8_SNAPSHOT"], layer=40, hidden=1152, units=3)
-    rows, hidden, units, topk = 129, case.h, case.u, case.topk
+    case = Case(os.environ["CUTEAFD_EXLR8_SNAPSHOT"], layer=40, hidden=1152, units=units)
+    rows, hidden, topk = 129, case.h, case.topk
     gen = torch.Generator().manual_seed(408)
     wire, _ = make_wire(torch.randn((rows, hidden), generator=gen).cuda() * 0.02)
     ids = (torch.arange(rows * topk, device="cuda").reshape(rows, topk) % 4).int()
