@@ -274,8 +274,8 @@ class NativeTileLinear:
         if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
             if rows <= Int32(DECODE_ROWS):
                 if cutlass.const_expr(self.decode_tiles > 1):
-                    row_tiles = min(min((rows + Int32(15)) >> Int32(4), Int32(self.decode_tiles)),
-                                    cta_limit // Int32(self.decode_ctas))
+                    row_tiles = max(Int32(1), min(min((rows + Int32(15)) >> Int32(4), Int32(self.decode_tiles)),
+                                                  cta_limit // Int32(self.decode_ctas)))
                 else:
                     row_tiles = Int32(1)
                 rows_per = (rows + row_tiles - Int32(1)) // row_tiles
@@ -427,15 +427,16 @@ class NativeTileLinear:
         G = self.groups
         F = 4 * G * 4
         blocks = Int64(self.n // self.cols)
+        # One group per (block CTA, slot); rows split across CTAs, never columns.
         if cutlass.const_expr(self.decode_tiles > 1):
-            slots = Int64(self.decode_ctas) * Int64(self.slots)
-            gw = block_cta.to(Int64) * slots + slot.to(Int64)
+            groups = Int64(self.decode_ctas) * Int64(self.slots)
+            gw = block_cta.to(Int64) * Int64(self.slots) + slot.to(Int64)
         else:
             grid, _, _ = cute.arch.grid_dim()
-            slots = Int64(grid) * Int64(self.slots)
+            groups = Int64(grid) * Int64(self.slots)
             gw = Int64(cta) * Int64(self.slots) + slot.to(Int64)
-        begin = (gw * blocks // slots).to(Int32)
-        end = ((gw + Int64(1)) * blocks // slots).to(Int32)
+        begin = (gw * blocks // groups).to(Int32)
+        end = ((gw + Int64(1)) * blocks // groups).to(Int32)
         if cutlass.const_expr(self.decode_tiles > 1):
             live = (rows_per + Int32(15)) >> Int32(4)
         else:
@@ -446,7 +447,7 @@ class NativeTileLinear:
         x_base = x.iterator.toint() + lanek.to(Int64) * Int64(2)
         span = end - begin
         if cutlass.const_expr(self.segments > 1):
-            span = ((blocks + slots - Int64(1)) // slots).to(Int32)
+            span = ((blocks + groups - Int64(1)) // groups).to(Int32)
         for it in cutlass.range(span, unroll=1):
             block = begin + it
             active = block < end
