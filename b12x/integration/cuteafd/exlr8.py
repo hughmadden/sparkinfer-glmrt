@@ -1,4 +1,9 @@
-"""EXLR8 A16 unit-expert ABI v1; all tables and scratch belong to the caller."""
+"""EXLR8 A16 unit-expert ABI v3; all tables and scratch belong to the caller.
+
+Input is the rotated F16 activation the grouping step writes (H128 with
+signs.in applied once per token); output is the BF16 hidden-domain partial
+of the local experts (summed, inverse H128 and signs.out applied once).
+"""
 from __future__ import annotations
 
 import cutlass
@@ -8,12 +13,13 @@ from cuda.bindings import driver as cuda
 
 from ._common import Operand, Scalar, compile_program
 
-ABI_VERSION = 1
+ABI_VERSION = 3
 # Launch hint, not math: callers pass cta_limit = cudaDevAttr SM count * this.
 # Mirrors Exlr8A16Kernel.CTAS_PER_SM (kept literal so the contract stays CUDA-free).
 CTAS_PER_SM = 4
 POINTERS = ("x", "pointers", "bits", "group_expert", "route_slots",
-            "route_group_lane", "route_weights", "fc1", "intermediate", "fc2", "output")
+            "route_group_lane", "route_weights", "fc1", "intermediate", "fc2",
+            "signs_out", "output")
 
 
 def geometry(hidden=6144, units=16, top_k=8, max_groups=512):
@@ -50,7 +56,8 @@ class _Exlr8Pointers:
                  group_expert: cute.Pointer, route_slots: cute.Pointer,
                  route_group_lane: cute.Pointer, route_weights: cute.Pointer,
                  fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
-                 output: cute.Pointer, rows: cutlass.Int32, groups: cutlass.Int32,
+                 signs_out: cute.Pointer, output: cute.Pointer, rows: cutlass.Int32,
+                 groups: cutlass.Int32,
                  cta_limit: cutlass.Int32, stream: cuda.CUstream):
         # Flat views are address carriers; the core computes all runtime offsets.
         self.core(cute.make_tensor(x, cute.make_layout(1, stride=1)),
@@ -63,6 +70,7 @@ class _Exlr8Pointers:
                   cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
                   cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
                   cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(signs_out, cute.make_layout(1, stride=1)),
                   cute.make_tensor(output, cute.make_layout(1, stride=1)), rows, groups, cta_limit, stream)
 
 
@@ -77,7 +85,7 @@ class _Exlr8ServingPointers:
                  group_expert: cute.Pointer, route_slots: cute.Pointer,
                  route_group_lane: cute.Pointer, route_weights: cute.Pointer,
                  fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
-                 output: cute.Pointer, group_count: cute.Pointer,
+                 signs_out: cute.Pointer, output: cute.Pointer, group_count: cute.Pointer,
                  rows: cutlass.Int32, cta_limit: cutlass.Int32, stream: cuda.CUstream):
         self.core.serving(cute.make_tensor(x, cute.make_layout(1, stride=1)),
                   cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
@@ -89,6 +97,7 @@ class _Exlr8ServingPointers:
                   cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
                   cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
                   cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(signs_out, cute.make_layout(1, stride=1)),
                   cute.make_tensor(output, cute.make_layout(1, stride=1)), rows,
                   cute.make_tensor(group_count, cute.make_layout(1, stride=1)), cta_limit, stream)
 
@@ -113,11 +122,11 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
         Operand("fc1", torch.float32, f"[{m},{u},2,{s},16,128]", "scratch"),
         Operand("intermediate", torch.float16, f"[{m},{u},16,128]", "scratch"),
         Operand("fc2", torch.float32, f"[{m},16,{h}]", "scratch"),
-        Operand("output", torch.float32, f"[rows,{h}]", "out"),
+        Operand("signs_out", torch.int8, f"[{h}]", align=4),
+        Operand("output", torch.bfloat16, f"[rows,{h}]", "out"),
     )
     sizes = scratch_bytes(g)
     if device_count:
-        g["abi_version"] = 2
         operands += (Operand("group_count", torch.int32, "[1]"),)
     return compile_program(_Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
                            name=("exlr8_shared_a16_serving" if shared_expert else

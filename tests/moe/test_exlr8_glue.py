@@ -1,15 +1,28 @@
-"""EXLR8 device grouping and hidden-domain transforms, without model weights."""
+"""EXLR8 device grouping fused with the ingress transform, without model weights."""
 import pytest
 import torch
 
-from .exlr8_oracle import hadamard
+from .exlr8_oracle import hadamard, make_wire
+
+
+def ingress_buffers(rows, hidden, fmt, seed=408):
+    generator = torch.Generator().manual_seed(seed)
+    x = torch.randn(rows, hidden, generator=generator)
+    signs = (torch.randint(2, (hidden,), generator=generator) * 2 - 1).char().cuda()
+    if fmt == "fp8_k32":
+        wire, dequant = make_wire(x.cuda())
+        return wire, dequant.cpu(), signs
+    x = x.bfloat16()
+    return x.cuda(), x.double(), signs
 
 
 def test_grouping_stable_packing_and_graph():
     from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
 
     experts, topk, capacity, rows = 7, 3, 64, 64
-    program = compile_exlr8_group_aot(experts=experts, top_k=topk, max_groups=capacity)
+    program = compile_exlr8_group_aot(experts=experts, top_k=topk, max_groups=capacity, hidden=128)
+    x, _, signs = ingress_buffers(rows, 128, "fp8_k32")
+    activation = torch.empty((rows, 128), dtype=torch.float16, device="cuda")
     ids = torch.empty((rows, topk), dtype=torch.int32, device="cuda")
     groups = torch.full((capacity,), -99, dtype=torch.int32, device="cuda")
     slots = torch.full((capacity, 16), -99, dtype=torch.int32, device="cuda")
@@ -17,7 +30,7 @@ def test_grouping_stable_packing_and_graph():
     count = torch.empty(1, dtype=torch.int32, device="cuda")
 
     def launch(live=rows):
-        program.launch(ids, groups, slots, inverse, count, scalars=(live,))
+        program.launch(ids, x, signs, groups, slots, inverse, count, activation, scalars=(live, 7))
 
     def check(host, live=rows):
         expected_groups, expected_slots = [], []
@@ -68,102 +81,72 @@ def test_grouping_stable_packing_and_graph():
 def test_grouping_overflow_does_not_publish_tables():
     from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
 
-    program = compile_exlr8_group_aot(experts=2, top_k=1, max_groups=1)
+    program = compile_exlr8_group_aot(experts=2, top_k=1, max_groups=1, hidden=128)
+    x, _, signs = ingress_buffers(64, 128, "fp8_k32")
+    activation = torch.empty((64, 128), dtype=torch.float16, device="cuda")
     ids = torch.arange(64, dtype=torch.int32, device="cuda") % 2
     groups = torch.full((1,), -99, dtype=torch.int32, device="cuda")
     slots = torch.full((16,), -99, dtype=torch.int32, device="cuda")
     inverse = torch.full_like(ids, -99)
     count = torch.empty(1, dtype=torch.int32, device="cuda")
-    program.launch(ids, groups, slots, inverse, count, scalars=(64,))
+    program.launch(ids, x, signs, groups, slots, inverse, count, activation, scalars=(64, 7))
     assert count.item() == -1
     assert (inverse == -1).all()
     assert (groups == -99).all() and (slots == -99).all()
 
 
+@pytest.mark.parametrize("fmt", ["fp8_k32", "bf16"])
 @pytest.mark.parametrize("hidden", [128, 384, 6144])
-def test_rotation_reference_rows_ctas_and_graph(hidden):
-    from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_rotate_aot
+def test_ingress_reference_rows_ctas_and_graph(hidden, fmt):
+    from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
 
-    rows = 65
-    program = compile_exlr8_rotate_aot(hidden=hidden, max_rows=rows)
-    generator = torch.Generator().manual_seed(408)
-    x = torch.randn(rows, hidden, generator=generator).bfloat16().cuda()
-    signs = (torch.randint(2, (hidden,), generator=generator) * 2 - 1).char().cuda()
+    rows = 64
+    program = compile_exlr8_group_aot(experts=3, top_k=2, max_groups=128, hidden=hidden,
+                                      input_format=fmt)
+    x, exact, signs = ingress_buffers(rows, hidden, fmt)
+    reference = hadamard((exact * signs.cpu()).reshape(rows, -1, 128)).reshape(rows, hidden)
+    ids = (torch.arange(rows * 2, dtype=torch.int32, device="cuda") % 3).reshape(rows, 2)
+    tables = [torch.empty(128, dtype=torch.int32, device="cuda"),
+              torch.empty((128, 16), dtype=torch.int32, device="cuda"),
+              torch.empty_like(ids), torch.empty(1, dtype=torch.int32, device="cuda")]
     output = torch.empty((rows + 1, hidden), dtype=torch.float16, device="cuda")
-    reference = hadamard((x.cpu().double() * signs.cpu()).reshape(rows, -1, 128)).reshape(rows, hidden)
-    for live in (1, 16, 64, 65):
+    for live in (1, 16, 63, 64):
         for limit in (1, 7, 188):
             output.fill_(float("nan"))
-            program.launch(x, signs, output, scalars=(live, limit))
-            torch.testing.assert_close(output[:live].cpu().double(), reference[:live], atol=0.002, rtol=0.001)
+            program.launch(ids, x, signs, *tables, output, scalars=(live, limit))
+            torch.testing.assert_close(output[:live].cpu().double(), reference[:live].half().double(),
+                                       rtol=1e-3, atol=1e-7)
             assert torch.isnan(output[live:]).all()
+            routes = ids[:live].flatten().tolist()
+            assert tables[3].item() == sum(-(-routes.count(e) // 16) for e in set(routes))
             if live == rows and limit == 1:
                 invariant = output[:rows].clone()
             if live == rows:
                 assert torch.equal(output[:rows].view(torch.int16), invariant.view(torch.int16))
+    # Each row's transform is independent of the rows around it.
+    for first in (0, 17, 40):
+        output.fill_(float("nan"))
+        # A fresh allocation keeps the shifted rows 16-byte aligned.
+        program.launch(ids, x[first:].clone(), signs, *tables, output, scalars=(rows - first, 7))
+        assert torch.equal(output[:rows - first].view(torch.int16), invariant[first:].view(torch.int16))
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        program.launch(x, signs, output, scalars=(rows, 7))
+        program.launch(ids, x, signs, *tables, output, scalars=(rows, 7))
     output.fill_(float("nan"))
     graph.replay()
     assert torch.equal(output[:rows].view(torch.int16), invariant.view(torch.int16))
     for invalid in (0, -1, rows + 1):
         output.fill_(float("nan"))
-        program.launch(x, signs, output, scalars=(invalid, 7))
-        assert torch.isnan(output).all()
-
-
-@pytest.mark.parametrize("hidden", [128, 384, 6144])
-def test_reduce_reference_rows_ctas_and_graph(hidden):
-    from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_reduce_aot
-
-    rows, ranks = 65, 6
-    program = compile_exlr8_reduce_aot(hidden=hidden, max_ranks=ranks, max_rows=rows)
-    generator = torch.Generator().manual_seed(409)
-    planes = [torch.randn(rows, hidden, generator=generator).cuda() for _ in range(ranks)]
-    addresses = torch.tensor([p.data_ptr() for p in planes], dtype=torch.int64, device="cuda")
-    shared = torch.randn(rows, hidden, generator=generator).cuda()
-    signs = (torch.randint(2, (hidden,), generator=generator) * 2 - 1).char().cuda()
-    residual = torch.randn(rows, hidden, generator=generator).bfloat16().cuda()
-    output = torch.empty((rows + 1, hidden), dtype=torch.bfloat16, device="cuda")
-    for n in (0, 1, ranks):
-        summed = torch.zeros_like(shared, device="cpu")
-        for plane in planes[:n]:
-            summed += plane.cpu()
-        summed += shared.cpu()
-        reference = hadamard(summed.double().reshape(rows, -1, 128)).reshape(rows, hidden)
-        reference = reference * signs.cpu() + residual.cpu().double()
-        for live in (1, 16, 64, rows):
-            for limit in (1, 7, 188):
-                output.fill_(float("nan"))
-                program.launch(addresses, shared, signs, residual, output, scalars=(live, n, limit))
-                actual = output[:live].cpu().double()
-                torch.testing.assert_close(actual, reference[:live], atol=0.04, rtol=0.005)
-                assert torch.isnan(output[live:]).all()
-                if live == rows and limit == 1:
-                    invariant = output[:rows].clone()
-                if live == rows:
-                    assert torch.equal(output[:rows].view(torch.int16), invariant.view(torch.int16))
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        program.launch(addresses, shared, signs, residual, output, scalars=(rows, ranks, 7))
-    output.fill_(float("nan"))
-    graph.replay()
-    assert torch.equal(output[:rows].view(torch.int16), invariant.view(torch.int16))
-    for live, n in ((rows + 1, ranks), (-1, ranks), (rows, -1), (rows, ranks + 1)):
-        output.fill_(float("nan"))
-        program.launch(addresses, shared, signs, residual, output, scalars=(live, n, 7))
+        program.launch(ids, x, signs, *tables, output, scalars=(invalid, 7))
         assert torch.isnan(output).all()
 
 
 @pytest.mark.parametrize("kind,kwargs", [
     ("group", {"experts": 257}), ("group", {"top_k": 0}),
     ("group", {"max_groups": 2**31}), ("group", {"experts": True}),
-    ("rotate", {"hidden": 129}), ("rotate", {"max_rows": 0}),
-    ("rotate", {"hidden": 2**30, "max_rows": 4096}),
-    ("reduce", {"max_ranks": -1}), ("reduce", {"max_rows": 2**31}),
+    ("group", {"hidden": 129}), ("group", {"hidden": 2**30}),
+    ("group", {"input_format": "e4m3"}), ("group", {"shared_expert": True}),
 ])
 def test_invalid_geometry_rejected_before_compilation(kind, kwargs):
     from b12x.integration.cuteafd import exlr8_glue

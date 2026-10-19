@@ -26,6 +26,28 @@ def hadamard(x):
     return x * (128.0 ** -0.5)
 
 
+def hadamard_axis0(x):
+    return hadamard(x.transpose(0, 1).contiguous()).transpose(0, 1)
+
+
+def make_wire(x):
+    """Standard Fp8K32 rows: E4M3 bytes then UE8M0 per-32 scale bytes.
+
+    Returns (wire uint8 [rows, h + h/32], exact dequantized float64 [rows, h]).
+    """
+    rows, h = x.shape
+    blocks = x.float().reshape(rows, h // 32, 32)
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+    exponent = torch.ceil(torch.log2(amax / 448.0)).clamp(-127, 127)
+    scale = torch.exp2(exponent)
+    e4m3 = (blocks / scale).to(torch.float8_e4m3fn)
+    wire = torch.empty((rows, h + h // 32), dtype=torch.uint8, device=x.device)
+    wire[:, :h] = e4m3.reshape(rows, h).view(torch.uint8)
+    wire[:, h:] = (exponent.reshape(rows, h // 32) + 127).to(torch.uint8)
+    dequant = (e4m3.double() * scale.double()).reshape(rows, h)
+    return wire, dequant
+
+
 class Case:
     def __init__(self, snapshot, layer=40, widths=(2, 3, 4), *, device="cuda",
                  hidden=6144, units=3, nonresident=((1, 1),)):
@@ -38,6 +60,9 @@ class Case:
         pointers = torch.zeros((4, self.u, 3, 3), dtype=torch.int64)
         bits = torch.zeros((4, self.u, 3), dtype=torch.int32)
         index = self.ref.Tensors(Path(snapshot) / "experts" / f"exlr8-layer-{layer:03}.index.safetensors")
+        # The layer's hidden-side rotation, shared by every routed and shared expert.
+        self.signs_in = torch.from_numpy(index.array("signs.in")[:self.h].astype(np.int8).copy()).to(self.device)
+        self.signs_out = torch.from_numpy(index.array("signs.out")[:self.h].astype(np.int8).copy()).to(self.device)
         self.checksums = []
         for e, source in enumerate((7, 11, 23, 256)):
             for u in range(self.u):
@@ -80,7 +105,7 @@ class Case:
         self.fc1 = torch.empty((self.max_groups, self.u, 2, s, 16, 128), device=self.device)
         self.intermediate = torch.empty((self.max_groups, self.u, 16, 128), dtype=torch.float16, device=self.device)
         self.fc2 = torch.empty((self.max_groups, 16, self.h), device=self.device)
-        self.output = torch.empty((64, self.h), device=self.device)
+        self.output = torch.empty((64, self.h), dtype=torch.bfloat16, device=self.device)
 
     def routing(self, rows, *, chunk=16, reverse=False):
         expert, slots = [], []
@@ -111,7 +136,53 @@ class Case:
 
     def tensors(self):
         return (self.x, self.pointers, self.bits, self.group_expert, self.route_slots,
-                self.inverse, self.weights, self.fc1, self.intermediate, self.fc2, self.output)
+                self.inverse, self.weights, self.fc1, self.intermediate, self.fc2,
+                self.signs_out, self.output)
+
+    def egress(self, rotated):
+        """Hidden-domain partial from a rotated-domain sum: signs.out * H128."""
+        h = hadamard(rotated.reshape(*rotated.shape[:-1], -1, 128)).reshape(rotated.shape)
+        return h * self.signs_out.to(rotated.dtype)
+
+    def hidden_weights(self, e, dtype=torch.float64):
+        """Dense hidden-domain gate/up [h, 128u] and down [128u, h] of expert e
+        (resident units only), composed exactly as the format defines them."""
+        signs_in, signs_out = self.signs_in.to(dtype), self.signs_out.to(dtype)
+        mats = ([], [], [])
+        for u in range(self.u):
+            if not self.host_bits[e, u, 0]:
+                continue
+            for p in (0, 1, 2):
+                t, c, b = self.decoded[e, u, p]
+                w = hadamard_axis0(hadamard(t.to(dtype)))
+                side = b.to(dtype).repeat_interleave(128)
+                if p < 2:
+                    w = w * (signs_in * side)[:, None] * c.to(dtype)[None, :]
+                else:
+                    w = w * c.to(dtype)[:, None] * (signs_out * side)[None, :]
+                mats[p].append(w)
+        return torch.cat(mats[0], 1), torch.cat(mats[1], 1), torch.cat(mats[2], 0)
+
+    def hidden_reference(self, x, ids, weights, *, official):
+        """Hidden-domain MoE partial of the local experts for dequantized rows.
+
+        official=False: every operation in FP64. official=True: the checkpoint's
+        BF16 serving arithmetic (BF16 operands and results per op, FP32 MMA
+        accumulation, routed sum in BF16), one row at a time.
+        """
+        dtype = torch.bfloat16 if official else torch.float64
+        mats = {e: self.hidden_weights(e) for e in sorted(set(ids.flatten().tolist()))}
+        if official:
+            mats = {e: tuple(m.to(dtype) for m in v) for e, v in mats.items()}
+        out = torch.zeros((x.shape[0], self.h), dtype=dtype, device=self.device)
+        for r in range(x.shape[0]):
+            a = x[r:r+1].to(dtype)
+            for slot in range(ids.shape[1]):
+                gate_w, up_w, down_w = mats[int(ids[r, slot])]
+                gate, up = a @ gate_w, a @ up_w
+                mid = torch.nn.functional.silu(gate) * up
+                out[r] = out[r] + ((mid @ down_w) * weights[r, slot].to(dtype))[0]
+        return out
 
     def oracle(self, rows, *, fp64=False, round_intermediate=True, expert=None):
         # Single-row products intentionally avoid batch-size dependent BLAS choices.

@@ -2,9 +2,12 @@
 
 Pointers are I64 [expert, unit, projection, payload/channel/block]. Widths
 are I32 [expert, unit, projection]; zero marks a nonresident unit. Payloads
-retain native gate/up grouped and down item128 order. Hidden-side rotations
-belong to the caller. All scratch is caller-owned, and live row/group counts
-and the device-derived CTA limit are launch scalars, never compile keys.
+retain native gate/up grouped and down item128 order. The F16 input is already
+in the rotated hidden domain (the grouping step applies H128/signs.in once per
+token). The final stage sums the local experts' F32 partials in fixed slot
+order, applies the inverse H128 and signs.out once per row and rounds to BF16.
+All scratch is caller-owned, and live row/group counts and the device-derived
+CTA limit are launch scalars, never compile keys.
 """
 from __future__ import annotations
 
@@ -20,7 +23,9 @@ from b12x._lib.intrinsics import (
     half2_to_float2_scaled,
     ld_global_b16,
     ld_global_nc_u32,
+    ld_global_nc_v4_u32,
     packed_dequant_trellis_to_half2x4,
+    u32_as_f32,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
@@ -36,6 +41,30 @@ def _e4m3_round_half2(value: Uint32, *, loc=None, ip=None):
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
     )
     return Uint32(result)
+
+
+@dsl_user_op
+def store_bf16x4(address: Int64, v0: Float32, v1: Float32, v2: Float32, v3: Float32,
+                 *, loc=None, ip=None):
+    """Round four F32 values once to BF16 (nearest even, no saturation, as a
+    torch cast) and store them as one 8-byte vector."""
+    llvm.inline_asm(
+        None,
+        [Int64(address).ir_value(loc=loc, ip=ip), Float32(v0).ir_value(loc=loc, ip=ip),
+         Float32(v1).ir_value(loc=loc, ip=ip), Float32(v2).ir_value(loc=loc, ip=ip),
+         Float32(v3).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b32 lo, hi; cvt.rn.bf16x2.f32 lo, $2, $1; cvt.rn.bf16x2.f32 hi, $4, $3; "
+        "st.global.v2.b32 [$0], {lo, hi}; }",
+        "l,f,f,f,f", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+@cute.jit
+def signed_byte(word: Uint32, index: cutlass.Constexpr):
+    """Byte ``index`` of a little-endian word as a signed I8 value in F32."""
+    shifted = (word << Uint32(24 - 8 * index)).to(Int32)
+    return (shifted >> Int32(24)).to(Float32)
 
 
 @cute.jit
@@ -68,8 +97,8 @@ def _side_value(address: Int64, index: Int32):
 
 
 class Exlr8A16Kernel:
-    ABI_VERSION = 1
-    CODE_VERSION = 3
+    ABI_VERSION = 3
+    CODE_VERSION = 4
     # Resident CTAs per SM the stream kernels are built for (<=128 registers at
     # 128 threads). GB10 decode is latency-bound on dependent weight loads, so
     # the caller's cta_limit should be sm_count * CTAS_PER_SM (cudaDevAttr at
@@ -101,7 +130,7 @@ class Exlr8A16Kernel:
                  group_expert: cute.Tensor, route_slots: cute.Tensor,
                  route_group_lane: cute.Tensor, route_weights: cute.Tensor,
                  fc1: cute.Tensor, intermediate: cute.Tensor, fc2: cute.Tensor,
-                 output: cute.Tensor, rows: Int32, groups: Int32,
+                 signs_out: cute.Tensor, output: cute.Tensor, rows: Int32, groups: Int32,
                  cta_limit: Int32, stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(64) and groups >= Int32(0) and groups <= Int32(self.max_groups) and cta_limit > Int32(0):
             if groups > Int32(0):
@@ -117,9 +146,9 @@ class Exlr8A16Kernel:
                                 fc2, rows, groups).launch(
                     grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
                     block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
-            self.reduce_kernel(route_group_lane, route_weights, fc2, output,
+            self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
                                rows, groups).launch(
-                grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1),
+                grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
                 block=(128, 1, 1), stream=stream)
 
     @cute.jit
@@ -127,8 +156,8 @@ class Exlr8A16Kernel:
                 group_expert: cute.Tensor, route_slots: cute.Tensor,
                 route_group_lane: cute.Tensor, route_weights: cute.Tensor,
                 fc1: cute.Tensor, intermediate: cute.Tensor, fc2: cute.Tensor,
-                output: cute.Tensor, rows: Int32, group_count: cute.Tensor,
-                cta_limit: Int32, stream: cuda.CUstream):
+                signs_out: cute.Tensor, output: cute.Tensor, rows: Int32,
+                group_count: cute.Tensor, cta_limit: Int32, stream: cuda.CUstream):
         # Grids and launch count are independent of route data, including zero
         # groups. Each kernel bounds its tasks with the device-resident count.
         if rows > Int32(0) and rows <= Int32(64) and cta_limit > Int32(0):
@@ -144,9 +173,9 @@ class Exlr8A16Kernel:
                             fc2, rows, group_count).launch(
                 grid=(min(Int32(self.max_groups * self.blocks), cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
-            self.reduce_kernel(route_group_lane, route_weights, fc2, output,
+            self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
                                rows, group_count).launch(
-                grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1),
+                grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
                 block=(128, 1, 1), stream=stream)
 
     @cute.jit
@@ -358,23 +387,47 @@ class Exlr8A16Kernel:
 
     @cute.kernel
     def reduce_kernel(self, route_group_lane: cute.Tensor, route_weights: cute.Tensor,
-                      fc2: cute.Tensor, output: cute.Tensor, rows: Int32, groups):
+                      fc2: cute.Tensor, signs_out: cute.Tensor, output: cute.Tensor,
+                      rows: Int32, groups):
+        """Local expert sum and egress: one warp per (row, 128-column block).
+
+        Each lane owns four adjacent columns. The F32 partials are summed in
+        fixed slot order (route order within the row), then the inverse H128
+        runs once on the summed partial, signs.out applies and the row rounds
+        once to BF16. Every element depends only on its own row's routes, so
+        the output is bitwise independent of row count, packing and CTA limit.
+        """
         if cutlass.const_expr(self.device_count):
             groups = groups[0]
             # Invalid counts never index descriptor or scratch storage.
             if groups < Int32(0) or groups > Int32(self.max_groups):
                 groups = Int32(0)
         tid, _, _ = cute.arch.thread_idx()
-        task, _, _ = cute.arch.block_idx()
-        step, _, _ = cute.arch.grid_dim()
+        cta, _, _ = cute.arch.block_idx()
+        grid, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        task = Int32(cta) * Int32(4) + warp
+        step = Int32(grid) * Int32(4)
+        fc2_address = fc2.iterator.toint()
         while task < rows * Int32(self.blocks):
             row, block = task // Int32(self.blocks), task % Int32(self.blocks)
-            col = block * Int32(128) + Int32(tid)
-            value = Float32(0.0)
+            col = block * Int32(128) + lane * Int32(4)
+            values = cute.make_rmem_tensor(4, Float32)
+            values.fill(Float32(0.0))
             for slot in cutlass.range_constexpr(self.top_k):
                 route = row.to(Int64) * Int64(self.top_k) + Int64(slot)
                 packed = route_group_lane[route]
                 if packed >= Int32(0) and packed < groups * Int32(16):
-                    value += route_weights[route] * fc2[packed.to(Int64) * Int64(self.hidden_size) + col.to(Int64)]
-            output[row.to(Int64) * Int64(self.hidden_size) + col.to(Int64)] = value
+                    weight = route_weights[route]
+                    w0, w1, w2, w3 = ld_global_nc_v4_u32(
+                        fc2_address + (packed.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(4))
+                    values[0] = values[0] + weight * u32_as_f32(w0)
+                    values[1] = values[1] + weight * u32_as_f32(w1)
+                    values[2] = values[2] + weight * u32_as_f32(w2)
+                    values[3] = values[3] + weight * u32_as_f32(w3)
+            h0, h1, h2, h3 = _w4a8_had128_quad(values[0], values[1], values[2], values[3], lane)
+            signs = ld_global_nc_u32(signs_out.iterator.toint() + col.to(Int64))
+            store_bf16x4(output.iterator.toint() + (row.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(2),
+                         h0 * signed_byte(signs, 0), h1 * signed_byte(signs, 1),
+                         h2 * signed_byte(signs, 2), h3 * signed_byte(signs, 3))
             task += step
