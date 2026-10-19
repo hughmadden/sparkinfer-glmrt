@@ -8,10 +8,13 @@ and every warp decodes its own tile column from shared memory and feeds all
 four M16 accumulators. No weight byte is fetched or decoded twice. Gate and up
 share one A tile. The six K1 splits fold inside the CTA in ascending order and
 the fused activation applies the same SwiGLU and H128 pair the decode route
-runs, so the fc1 scratch is never written. FC2 gives every CTA one group: the
-group's four unit intermediates (64 KiB) stay resident in shared memory while
-all output blocks stream through a two-block ring, so each intermediate is
-read once per group instead of once per (block, unit).
+runs, so the fc1 scratch is never written. FC2 gives every CTA one group: when
+every unit intermediate fits the 99 KiB CTA budget it stays resident while all
+output blocks stream through a two-block ring, so each intermediate is read
+once per group instead of once per (block, unit); otherwise (the benchmark's
+four units, and the exporter's sixteen) each (block, unit) step streams one
+intermediate slice and its down block through a three-deep ring, walking units
+ascending per block so the FP32 total accumulates in K1's order.
 
 Every reduction keeps K1's order: eight ascending m16n8k16 FP16 MMAs per K128
 block, exactly one FP32 FMA per K128 scale, an ascending split fold, ascending
@@ -40,9 +43,10 @@ STAGES = 3
 BLOCK_SLOT_WORDS = 2048
 # Gate (and up) scratch for one M16 tile: 16 rows x 128 columns, F32.
 A_TILE_WORDS = 16 * 128
-# Every supported target (SM120, SM121) exposes at least this much opt-in
-# shared memory per CTA; both kernels are built to stay under it.
-MIN_SHARED_MEM = 227 * 1024
+# SM120 and SM121 both report 102400 B shared per SM and 101376 B opt-in per
+# CTA (cudaDevAttrMaxSharedMemoryPerBlockOptin); every kernel here stays under
+# that, so one build launches on every supported card.
+MIN_SHARED_MEM = 99 * 1024
 
 
 @cute.jit
@@ -83,7 +87,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         # exactly this many groups are newer than the one being consumed.
         self.prologue = min(STAGES - 1, self.blocks)
         a_words = group_rows * 64
-        fc1_words = STAGES * (a_words + 2 * BLOCK_SLOT_WORDS) + 2 * A_TILE_WORDS
+        fc1_words = STAGES * (a_words + 2 * BLOCK_SLOT_WORDS)
         if fc1_words * 4 > MIN_SHARED_MEM:
             raise ValueError(
                 f"EXLR8 grouped FC1 needs {fc1_words * 4} B shared memory, "
@@ -94,6 +98,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         resident_words = self.units * a_words + 2 * self.units * BLOCK_SLOT_WORDS
         self.fc2_resident = resident_words * 4 <= MIN_SHARED_MEM
         ring_words = 3 * (a_words + BLOCK_SLOT_WORDS)
+        if not self.fc2_resident and ring_words * 4 > MIN_SHARED_MEM:
+            raise ValueError(
+                f"EXLR8 grouped streamed FC2 needs {ring_words * 4} B shared "
+                f"memory, above the {MIN_SHARED_MEM} B every target provides")
         self.shared_words = max(fc1_words, resident_words if self.fc2_resident else ring_words)
         self.fc2_prologue = min(2, self.blocks * self.units)
 
@@ -306,14 +314,17 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         @cute.struct
         class Storage:
             words: cute.struct.Align[
-                cute.struct.MemRange[Uint32, STAGES * (a_words + 2 * BLOCK_SLOT_WORDS) + 2 * A_TILE_WORDS],
+                cute.struct.MemRange[Uint32, STAGES * (a_words + 2 * BLOCK_SLOT_WORDS)],
                 1024]
 
         storage = smem.allocate(Storage)
         base = shared_ptr_to_u32(storage.words.data_ptr())
         a_bytes = a_words * 4
         slot_bytes = a_bytes + 2 * BLOCK_SLOT_WORDS * 4
-        act_smem = base + Int32(STAGES * slot_bytes)
+        # The activation scratch reuses the first ring slot: every staged
+        # block has been consumed by the time it runs, and the next task's
+        # prologue is issued only after its closing barrier.
+        act_smem = base
         tid = Int32(cute.arch.thread_idx()[0])
         task = Int32(cute.arch.block_idx()[0])
         step = Int32(cute.arch.grid_dim()[0])
