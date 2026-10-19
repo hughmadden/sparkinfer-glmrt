@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 import re
 import sys
+import contextlib
 
 import torch
 import cutlass
@@ -27,6 +28,7 @@ from benchmarks.benchmark_exlr8_a16 import capture, timing, read_roofline, finit
 from b12x.integration.cuteafd._common import Operand, Scalar, compile_program, exportable_compilation
 from b12x.integration.cuteafd import trellis_linear, scaled_linear, fp8_row_embedding
 from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+from benchmarks._exlr8_dense_arms import parse_arms, parse_references, materialize, verify, program_key, cold_copies
 
 # Unique native formats/shapes from the GLM 5.3 bit325 load plan.
 SHAPES = (
@@ -61,12 +63,17 @@ class BlockFp8:
                         cutlass.Int64(scratch.toint()), stream)
 
 
-L2_SPAN = 256 << 20  # 2x the SM120 L2: rotated weight copies arrive DRAM-cold
-
-
 def copies_for(weight_bytes, cold_l2):
-    """Distinct weight copies a cold-L2 graph rotates through (consecutive layers)."""
-    return max(1, min(64, -(-L2_SPAN // max(1, weight_bytes)))) if cold_l2 else 1
+    """Consecutive-layer copies span twice this device's queried L2 capacity."""
+    if not cold_l2:
+        return 1
+    status, device = cuda.cuDeviceGet(torch.cuda.current_device())
+    if status != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuDeviceGet failed: {status}")
+    status, l2_bytes = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, device)
+    if status != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuDeviceGetAttribute(L2CacheSize) failed: {status}")
+    return cold_copies(weight_bytes, l2_bytes)
 
 
 def rotated(launches):
@@ -102,26 +109,52 @@ def baseline(k, n, rows, a16=False, cold_l2=False):
     return graph, (tensors, extra), len(launches)
 
 
-def compile_native(fmt, k, n, side, control=False):
-    module = {"trellis": trellis_linear, "embedding": fp8_row_embedding}.get(fmt, scaled_linear)
-    original = module.compile_program
+def compile_native(fmt, k, n, side):
+    if fmt == "trellis":
+        return trellis_linear.compile_trellis_linear_aot(input_features=k, output_features=n,
+                                                       sharded_side=side)
+    if fmt == "embedding":
+        return fp8_row_embedding.compile_fp8_row_embedding_aot(hidden=k, vocabulary=n)
+    return scaled_linear.compile_scaled_linear_aot(input_features=k, output_features=n,
+                                                  encoding=fmt, sharded_side=side)
 
-    def distinct(*args, **kwargs):
-        kwargs["name"] += "_bench_control"
-        return original(*args, **kwargs)
 
+@contextlib.contextmanager
+def arm_source(name, arm, bundle):
+    """Patch only the imported dense class; compiled symbols and keys include its source."""
+    import b12x.gemm.native_tile_linear as current
+    path = bundle / arm["path"]
+    spec = importlib.util.spec_from_file_location("dense_arm_" + name + "_" + arm["sha256"], path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    original_class, original_compile = current.NativeTileLinear, scaled_linear.compile_program
+
+    def compile_distinct(*args, **kwargs):
+        kwargs["name"] += "_" + name + "_" + arm["sha256"][:16]
+        kwargs["key"] = program_key(arm, kwargs["key"])
+        return original_compile(*args, **kwargs)
+
+    current.NativeTileLinear = module.NativeTileLinear
+    scaled_linear.compile_program = compile_distinct
     try:
-        if control:
-            module.compile_program = distinct
-        if fmt == "trellis":
-            return module.compile_trellis_linear_aot(input_features=k, output_features=n,
-                                                     sharded_side=side)
-        if fmt == "embedding":
-            return module.compile_fp8_row_embedding_aot(hidden=k, vocabulary=n)
-        return module.compile_scaled_linear_aot(input_features=k, output_features=n,
-                                                encoding=fmt, sharded_side=side)
+        yield
     finally:
-        module.compile_program = original
+        current.NativeTileLinear, scaled_linear.compile_program = original_class, original_compile
+
+
+def reference_weight(fmt, k, n, side, payload, scales):
+    q = payload.reshape(n, -1) if side == 1 else payload.reshape(k//128, n, -1).permute(1, 0, 2).reshape(n, -1)
+    if fmt == "int4_g32":
+        values = torch.stack((q & 15, q >> 4), -1).reshape(n, k).float() - 8
+    else:
+        values = q.contiguous().view(torch.float8_e4m3fn).float()
+    if fmt == "fp8_row":
+        return values * scales[:, None]
+    scale = scales.reshape(n, k//32) if side == 1 else scales.reshape(k//128, n, 4).permute(1, 0, 2).reshape(n, k//32)
+    if fmt == "mxfp8":
+        scale = torch.exp2(scale.float() - 127)
+    return values * scale.float().repeat_interleave(32, 1)
 
 
 def native_tensors(fmt, k, n, rows, splits=None):
@@ -178,130 +211,168 @@ def spill_check(program, directory):
         sass = subprocess.check_output(["/usr/local/cuda/bin/cuobjdump", "--dump-sass", str(cubin)], text=True)
         records.append(dict(sha256=hashlib.sha256(blob).hexdigest(), resources=resources,
                             local_bytes=list(map(int, local)),
+                            stack_bytes=list(map(int, re.findall(r"STACK:(\d+)", resources))),
                             local_load_store_instructions=len(re.findall(r"\b(?:LDL|STL)(?:\.|\s)", sass))))
     return records
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--formats", default="trellis,mxfp8,int4_g32,fp8_row,embedding")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--arm", action="append", required=True, help="NAME=git-rev; repeatable")
+    parser.add_argument("--arm-bundle", type=Path, required=True)
+    parser.add_argument("--materialize-only", action="store_true", help="host-side git show, no CUDA")
+    parser.add_argument("--reference", required=True)
+    parser.add_argument("--op-reference", action="append", default=[], help="FORMAT/OP=ARM frozen route")
+    parser.add_argument("--accuracy-reference", help="arm whose FP64 error defines the 1.01x ceiling")
+    parser.add_argument("--require-reference-arm", action="append", default=[], help="arm required to match the selected frozen op reference")
+    parser.add_argument("--formats", default="mxfp8,int4_g32,fp8_row")
     parser.add_argument("--shapes", help="comma-separated projection names")
     parser.add_argument("--rows", default="1,4,16,64,4096")
     parser.add_argument("--replays", type=int, default=20)
-    parser.add_argument("--cold-l2", action="store_true",
-                        help="rotate distinct weight copies (>=2x L2) in each graph, both arms")
-    parser.add_argument("--resume", action="store_true", help="retain completed measurements and run only missing rows")
+    parser.add_argument("--cold-l2", action="store_true")
+    parser.add_argument("--profile-arm")
+    parser.add_argument("--profile-op", help="FORMAT/OP")
+    parser.add_argument("--profile-rows", type=int)
     args = parser.parse_args()
+    arms = parse_arms(args.arm)
+    try:
+        op_references = parse_references(args.reference, args.op_reference, arms)
+    except ValueError as error:
+        parser.error(str(error))
+    accuracy_reference = args.accuracy_reference or args.reference
+    if accuracy_reference not in arms or set(args.require_reference_arm) - set(arms):
+        parser.error("accuracy and required-reference arms must name an arm")
+    if args.materialize_only:
+        materialize(Path(__file__).resolve().parents[1], args.arm_bundle, arms)
+        return
+    arms = verify(args.arm_bundle, arms)
+    if args.output is None:
+        parser.error("--output is required for measurement")
     rows_list = [int(v) for v in args.rows.split(",")]
     if any(r < 1 or r > 4096 for r in rows_list) or args.replays < 1:
         parser.error("rows must be in 1..4096 and replays positive")
     formats = set(args.formats.split(","))
-    if formats - {s[0] for s in SHAPES}:
-        parser.error("unknown format")
+    if formats - {"mxfp8", "int4_g32", "fp8_row"}:
+        parser.error("multi-arm dense core supports mxfp8, int4_g32 and fp8_row")
     names = set(args.shapes.split(",")) if args.shapes else {s[1] for s in SHAPES}
     shapes = [s for s in SHAPES if s[0] in formats and s[1] in names]
+    profile = any((args.profile_arm, args.profile_op, args.profile_rows))
+    if profile:
+        if args.profile_arm not in arms or not args.profile_op or args.profile_rows not in rows_list:
+            parser.error("profile requires a named arm, FORMAT/OP and one selected row count")
+        shapes = [s for s in shapes if f"{s[0]}/{s[1]}" == args.profile_op]
+        rows_list = [args.profile_rows]
     if not shapes:
         parser.error("empty shape selection")
     torch.manual_seed(408)
     props = torch.cuda.get_device_properties(0)
-    cta_limit = props.multi_processor_count * 4
-    report = dict(device=props.name, sms=props.multi_processor_count,
+    limit = props.multi_processor_count * 4
+    report = dict(device=props.name, sms=props.multi_processor_count, arms=arms,
                   read_ceiling=read_roofline(), measurements=[],
-                  scope="synthetic native operand only; rotations/output transforms excluded",
-                  throughput="stored weight+scale bytes read once; not DRAM traffic counters",
-                  fp8_comparison="same shape/rows, synthetic FP8 weights, not quality equivalence",
-                  source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
-    session = {key: value for key, value in report.items() if key != "measurements"}
-    if args.resume:
-        previous = json.loads(args.output.read_text())
-        if (previous["device"], previous["sms"]) != (report["device"], report["sms"]):
-            raise RuntimeError("resume requires the same GPU model and SM count")
-        previous.setdefault("sessions", [{key: value for key, value in previous.items()
-                                          if key not in ("measurements", "sessions")}])
-        report = previous
-    else:
-        report["sessions"] = []
-    session_id = len(report["sessions"])
-    report["sessions"].append(session)
-    ceiling = session["read_ceiling"]["gbps"]
-    complete = {(m["format"], m["projection"], m["rows"]) for m in report["measurements"]}
+                  scope="synthetic scaled dense operands; stored bytes, not measured DRAM traffic",
+                  reference=args.reference, cold_l2=args.cold_l2)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    for fmt, name, k, n, side in shapes:
-        missing = [rows for rows in rows_list if (fmt, name, rows) not in complete]
-        if not missing:
-            continue
-        with exportable_compilation():
-            program = compile_native(fmt, k, n, side)
-        spill = spill_check(program, args.output.parent / "cubins" / f"{fmt}-{name}")
-        control = compile_native(fmt, k, n, side, control=True)
-        for rows in missing:
-            storage, read_bytes = native_tensors(
-                fmt, k, n, rows, 0 if program.geometry.get("core") == "tile" else None)
-            tensors = storage if fmt == "embedding" else storage[:5]
-            scalars = (rows, 2, cta_limit) if fmt == "trellis" else (rows, cta_limit)
-            graph = capture(lambda: program.launch(*tensors, scalars=scalars))
-            finite_nonzero(tensors[-1], fmt)
-            expected = tensors[-1].clone()
-            control_graph = capture(lambda: control.launch(*tensors, scalars=scalars))
-            for tensor in tensors[3:]:
-                tensor.fill_(float("nan"))
-            control_graph.replay()
-            if not torch.equal(expected.view(torch.int16), tensors[-1].view(torch.int16)):
-                raise RuntimeError(f"{fmt}/{name}/rows{rows}: same-session control mismatch")
-            replays = 1 if rows > 64 else args.replays
-            # Copies by stored weight size (the embedding gathers only a few rows of it).
-            stored = tensors[1].numel()*tensors[1].element_size()+tensors[2].numel()*tensors[2].element_size()
-            n_copies = copies_for(stored, args.cold_l2 and rows <= 64)
-            if n_copies > 1:
-                extra = [(tensors[1].clone(), tensors[2].clone()) for _ in range(n_copies-1)]
-                launches = [lambda: program.launch(*tensors, scalars=scalars)]
-                launches += [lambda p=p, q=q: program.launch(tensors[0], p, q, *tensors[3:], scalars=scalars)
-                             for p, q in extra]
-                graph = capture(rotated(launches))
-            native_us = timing(graph, replays)/n_copies
-            control_us = timing(control_graph, replays)
-            fp8_us = None
-            fp8_status = "not_applicable" if fmt == "embedding" else "ok"
-            fp8_error = None
-            if fmt != "embedding":
+    for fmt, op, k, n, side in shapes:
+        programs, spills = {}, {}
+        for name, arm in arms.items():
+            with arm_source(name, arm, args.arm_bundle), exportable_compilation():
+                programs[name] = compile_native(fmt, k, n, side)
+            spills[name] = spill_check(programs[name], args.output.parent / "cubins" / name / f"{fmt}-{op}")
+        # All widths use exactly the same input prefix and weights. Each arm's
+        # own prefill freezes its K order, independently of other arms' ordering.
+        storage, read_bytes = native_tensors(fmt, k, n, 4096, 0)
+        tensors = storage[:5]
+        columns = min(n, 256)
+        if side == 1:
+            payload = tensors[1].flatten()[:columns*k//(2 if fmt == "int4_g32" else 1)]
+            scales = tensors[2][:columns if fmt == "fp8_row" else columns*k//32]
+        else:
+            payload = tensors[1].reshape(k//128, n, -1)[:, :columns].contiguous().flatten()
+            scales = tensors[2].reshape(k//128, n, 4)[:, :columns].contiguous().flatten()
+        weight = reference_weight(fmt, k, columns, side, payload, scales)
+        x = storage[-1]
+        oracle = x.double() @ weight.double().T
+        bf16 = (x @ weight.bfloat16().T).double()
+        prefixes, global_errors = {}, {}
+        for name, program in programs.items():
+            program.launch(*tensors, scalars=(4096, limit))
+            torch.cuda.synchronize()
+            prefixes[name] = tensors[-1][:64].clone()
+            global_errors[name] = torch.linalg.vector_norm(tensors[-1][:, :columns].double()-oracle).item()
+        global_bound = torch.linalg.vector_norm(bf16-oracle).item()
+        global_pass = {name: error <= 1.01*global_errors[accuracy_reference] and error <= 1.01*global_bound
+                       for name, error in global_errors.items()}
+        selected_reference = op_references.get(f"{fmt}/{op}", args.reference)
+        for rows in rows_list:
+            scalars = (rows, limit)
+            reference = programs[selected_reference]
+            reference.launch(*tensors, scalars=scalars)
+            torch.cuda.synchronize()
+            expected = tensors[-1][:rows].clone()
+            programs[accuracy_reference].launch(*tensors, scalars=scalars)
+            torch.cuda.synchronize()
+            reference_error = torch.linalg.vector_norm(tensors[-1][:rows, :columns].double()-oracle[:rows]).item()
+            bound = torch.linalg.vector_norm(bf16[:rows]-oracle[:rows]).item()
+            copies = copies_for(read_bytes, args.cold_l2 and rows <= 64)
+            extra = [(tensors[1].clone(), tensors[2].clone()) for _ in range(copies-1)]
+            base_us, base_error = None, None
+            if not profile:
                 try:
-                    fp8_graph, fp8_storage, fp8_copies = baseline(k, n, rows, cold_l2=args.cold_l2)
+                    graph, keep, count = baseline(k, n, rows, a16=True, cold_l2=args.cold_l2)
                 except TypeError as error:
                     if "dense_gemm launch is unsupported" not in str(error):
                         raise
-                    fp8_status, fp8_error = "unsupported", str(error)
+                    base_error = str(error)
                 else:
-                    fp8_us = timing(fp8_graph, replays)/fp8_copies
-                    del fp8_graph, fp8_storage
-            a16_us = None
-            if fmt != "embedding" and rows > 64:
-                try:
-                    a16_graph, a16_storage, a16_copies = baseline(k, n, rows, a16=True, cold_l2=args.cold_l2)
-                except TypeError as error:
-                    if "dense_gemm launch is unsupported" not in str(error):
-                        raise
-                else:
-                    a16_us = timing(a16_graph, replays)/a16_copies
-                    del a16_graph, a16_storage
-            gbps = read_bytes/native_us/1000
-            row = dict(format=fmt, projection=name, k=k, n=n, sharded_side=side,
-                       rows=rows, read_bytes=read_bytes, native_us=native_us,
-                       gbps=gbps, read_ceiling_percent=100*gbps/ceiling,
-                       target_met=gbps >= .95*ceiling,
-                       session_id=session_id, read_ceiling_gbps=ceiling,
-                       cold_l2=args.cold_l2, weight_copies=n_copies,
-                       control_us=control_us, control_bitwise_equal=True, cubin_spill_check=spill,
-                       block_fp8_status=fp8_status, block_fp8_error=fp8_error,
-                       block_fp8_us=fp8_us, speedup_vs_block_fp8=fp8_us/native_us if fp8_us else None,
-                       block_fp8_w8a16_us=a16_us,
-                       speedup_vs_block_fp8_w8a16=a16_us/native_us if a16_us else None)
-            report["measurements"].append(row)
-            args.output.write_text(json.dumps(report, indent=2)+"\n")
-            print(json.dumps(row), flush=True)
-            del graph, control_graph, expected, tensors, storage
-    print(f"Wrote {len(report['measurements'])} measurements", flush=True)
+                    base_us = timing(graph, 1 if rows > 64 else args.replays)/count
+                    del graph, keep
+            for name, program in programs.items():
+                tensors[-1].fill_(float("nan"))
+                program.launch(*tensors, scalars=scalars)
+                torch.cuda.synchronize()
+                equal = torch.equal(expected.view(torch.int32), tensors[-1][:rows].view(torch.int32))
+                prefix_rows = min(rows, 64)
+                invariant = torch.equal(prefixes[name][:prefix_rows].view(torch.int32),
+                                        tensors[-1][:prefix_rows].view(torch.int32))
+                tail_untouched = torch.isnan(tensors[-1][rows:]).all().item()
+                error = torch.linalg.vector_norm(tensors[-1][:rows, :columns].double()-oracle[:rows]).item()
+                record = dict(arm=name, revision=arms[name]["revision"], format=fmt, projection=op,
+                              rows=rows, bitwise_equal=equal, row_invariant=invariant,
+                              output_tail_untouched=tail_untouched, frozen_reference=selected_reference,
+                              fp64_error=error, bf16_error=bound, accuracy_reference_error=reference_error,
+                              global_fp64_error=global_errors[name],
+                              global_accuracy_reference_error=global_errors[accuracy_reference],
+                              fp64_pass=global_pass[name] and error <= 1.01*bound and error <= 1.01*reference_error,
+                              w8a16_us=base_us, w8a16_error=base_error, cubin_spill_check=spills[name])
+                # Different K-order groups may be eligible; required arms must
+                # additionally agree with the per-op frozen group reference.
+                record["spill_free"] = all(not any(r["local_bytes"] + r["stack_bytes"]) and not r["local_load_store_instructions"] for r in spills[name])
+                record["eligible"] = invariant and tail_untouched and record["fp64_pass"] and (equal or name not in args.require_reference_arm)
+                if record["eligible"]:
+                    launches = [lambda p=program: p.launch(*tensors, scalars=scalars)]
+                    launches += [lambda w=w, s=s, p=program: p.launch(tensors[0], w, s, *tensors[3:], scalars=scalars) for w, s in extra]
+                    graph = capture(rotated(launches))
+                    if profile:
+                        if name == args.profile_arm:
+                            torch.cuda.cudart().cudaProfilerStart()
+                            graph.replay()
+                            torch.cuda.synchronize()
+                            torch.cuda.cudart().cudaProfilerStop()
+                    else:
+                        us = timing(graph, 1 if rows > 64 else args.replays)/copies
+                        record.update(native_us=us, speedup_vs_w8a16=base_us/us if base_us else None,
+                                      weight_copies=copies, read_bytes=read_bytes)
+                    del graph
+                report["measurements"].append(record)
+                args.output.write_text(json.dumps(report, indent=2)+"\n")
+                print(json.dumps(record), flush=True)
+            del expected, extra
+        del storage, tensors, prefixes, weight, x, oracle, bf16
+    failed = [m for m in report["measurements"] if not m["eligible"]]
+    print(f"Wrote {len(report['measurements'])} measurements; {len(failed)} failed gates", flush=True)
+    return bool(failed)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

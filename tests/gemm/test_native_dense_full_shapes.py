@@ -15,8 +15,11 @@ def case_module(name):
 
 
 @pytest.mark.parametrize("encoding,side,k,n,rows", [
-    ("mxfp8", 1, 6144, 2048, 16),
-    ("int4_g32", 2, 16384, 6144, 16),
+    ("mxfp8", 1, 6144, 2048, 129),
+    ("mxfp8", 1, 6144, 576, 129),
+    ("mxfp8", 1, 6144, 128, 129),
+    ("int4_g32", 1, 2048, 16384, 129),
+    ("int4_g32", 2, 16384, 6144, 129),
     ("fp8_row", 1, 6144, 154880, 1),
 ])
 def test_scaled_full_checkpoint_shape(encoding, side, k, n, rows):
@@ -31,12 +34,13 @@ def test_scaled_full_checkpoint_shape(encoding, side, k, n, rows):
     assert error <= 1.01*bound, (error.item(), bound.item())
     if rows > 1:
         expected = c.output.clone()
-        for width in (1, 4, 16):
-            c.partial.fill_(float("nan"))
-            c.output.fill_(float("nan"))
-            c.launch(width, 48)
-            assert torch.equal(c.output[:width].view(torch.int32), expected[:width].view(torch.int32))
-            assert torch.isnan(c.output[width:]).all()
+        for width in (1, 4, 16, 17, 31, 33, 47, 49, 63, 64, 65, 129):
+            for limit in (1, 48, 680, 752):
+                c.partial.fill_(float("nan"))
+                c.output.fill_(float("nan"))
+                c.launch(width, limit)
+                assert torch.equal(c.output[:width].view(torch.int32), expected[:width].view(torch.int32))
+                assert torch.isnan(c.output[width:]).all()
 
 
 def test_trellis_full_checkpoint_shape():
