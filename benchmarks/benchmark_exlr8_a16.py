@@ -301,6 +301,8 @@ def main():
                         help="interleaved timing rounds; arm order rotates each round, medians reported")
     parser.add_argument("--profile",action="store_true",
                         help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
+    parser.add_argument("--profile-arm", choices=("grouped", "exl3"), default="grouped",
+                        help="grouped benchmark arm inside cudaProfilerStart/Stop")
     args = parser.parse_args()
     if not args.profile and args.output is None:
         parser.error("--output is required unless --profile")
@@ -576,10 +578,10 @@ def grouped_main(args):
         finite_nonzero(exl_states[-1][1].output[:total].float(), "grouped EXL3")
         if args.profile:
             torch.cuda.cudart().cudaProfilerStart()
-            candidate()
+            (candidate if args.profile_arm == "grouped" else baseline)()
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStop()
-            print(f"profiled rows={total}", flush=True)
+            print(f"profiled arm={args.profile_arm} rows={total}", flush=True)
             continue
         graphs = {"chunked":capture(chunked),"grouped":capture(candidate),"exl3":capture(baseline)}
         rounds = {n:[] for n in graphs}
