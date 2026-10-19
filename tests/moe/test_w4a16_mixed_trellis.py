@@ -156,6 +156,32 @@ def test_explicit_mixed_residency_limits_and_cache_identity() -> None:
         apply(kernel, 2, 101376)
 
 
+@pytest.mark.parametrize("widths", [(384, 256, 384, 256), (640, 512, 640, 512), (768,) * 4])
+def test_compact_projection_offsets_match_owned_bytes_without_cuda(widths):
+    rows = [[0, 512, 1, 513], [512, 0, 513, 1], [0, 1, 512, 513], list(widths)]
+    packed, sizes, counts = mixed_trellis_module._compact_trellis_layout(
+        rows, hidden_size=128, intermediate_size=max(widths), bits=(3, 4))
+    assert len(packed) == 7 and counts == ((2, 2, 2), (2, 2, 2))
+    assert sum(sum(payload) for payload in sizes) == sum(
+        128 * widths[e] * (3 if rows[p][e] < 512 else 4) // 32
+        for p in range(3) for e in range(4))
+    for tier in range(2):
+        for projections, payload in [((0, 1), sizes[tier][0]), ((2,), sizes[tier][1])]:
+            spans = sorted((packed[p + 4][e], packed[p + 4][e] + 128 * widths[e] * (3 + tier) // 32)
+                for p in projections for e in range(4) if rows[p][e] >> 9 == tier)
+            assert spans[0][0] == 0 and spans[-1][1] == payload
+            assert all(left[1] == right[0] for left, right in zip(spans, spans[1:]))
+    for invalid in (0, 127, max(widths) + 128):
+        bad = [*rows[:3], [invalid, *widths[1:]]]
+        with pytest.raises(ValueError, match="live width"):
+            mixed_trellis_module._compact_trellis_layout(bad, hidden_size=128,
+                intermediate_size=max(widths), bits=(3, 4))
+    bad = [[1, *rows[0][1:]], *rows[1:]]
+    with pytest.raises(ValueError, match="canonical dense"):
+        mixed_trellis_module._compact_trellis_layout(bad, hidden_size=128,
+            intermediate_size=max(widths), bits=(3, 4))
+
+
 @pytest.mark.parametrize("width", [256, 384, 640, 768])
 @pytest.mark.parametrize("boundary", ["first", "last"])
 def test_paired_boundary_accepts_resident_h128_widths_without_cuda(width, boundary):

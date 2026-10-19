@@ -1190,6 +1190,7 @@ class W4A16GemmKernel:
         self.fused_input_rotation = bool(fused_input_rotation)
         # Trace-time binding (suh_gate, suh_up, expert) for the FC1 tile being traced.
         self._rotation = None
+        self._compact_weight = None
         self.fused_topk_sum = bool(fused_topk_sum)
         self.fused_sum_topk = int(fused_sum_topk)
         # Whole-tile persistent scheduling: every mn-tile is computed by one
@@ -5264,7 +5265,21 @@ class W4A16GemmKernel:
                         + pipe * Int32(self.b_sh_stage_bytes)
                         + t256_chunk * Int32(16)
                     )
-                    if cutlass.const_expr(self.weight_layout_trellis256_proj):
+                    if cutlass.const_expr(self._compact_weight is not None):
+                        weight_offset, live_width, compact_fc1 = self._compact_weight
+                        compact_n16 = Int64(t256_n16)
+                        local_n16 = output_n_tile.to(Int64) * Int64(self.cta_n_blocks)
+                        if cutlass.const_expr(compact_fc1):
+                            compact_n16 = live_width.to(Int64) // Int64(16)
+                            local_n16 = local_n16 % Int64(t256_n16 // 2)
+                        b_src_i64 = (
+                            weight_offset
+                            + (tile_idx.to(Int64) * Int64(self.cta_k_blocks)
+                               + t256_kt.to(Int64)) * compact_n16 * Int64(t256_tile_u32)
+                            + local_n16 * Int64(t256_tile_u32)
+                            + t256_in_kt.to(Int64) * Int64(4)
+                        )
+                    elif cutlass.const_expr(self.weight_layout_trellis256_proj):
                         t256_half_n16 = t256_n16 // 2
                         t256_out_n16 = output_n_tile * Int32(self.cta_n_blocks)
                         t256_proj = (
