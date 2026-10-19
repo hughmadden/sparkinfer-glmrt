@@ -337,8 +337,8 @@ class W4A16MixedTrellisKernel:
         if paired_boundary not in (None, "first", "last"):
             raise ValueError("paired boundary must be first, last, or None")
         if paired_boundary is not None:
-            if driver.intermediate_size != 640:
-                raise ValueError("paired boundary requires five resident H128 blocks")
+            if driver.intermediate_size < 256 or driver.intermediate_size % 128:
+                raise ValueError("paired boundary requires at least two whole resident H128 blocks")
             for moe in (driver, tier0, tier1):
                 if not moe.fc1.schedule_whole_tiles or not moe.fc2.schedule_whole_tiles:
                     raise ValueError("paired boundary requires whole-tile scheduling")
@@ -532,13 +532,13 @@ class W4A16MixedTrellisKernel:
                             if local_n < Int32(128 // self.driver.fc1.tile_n):
                                 descriptor = Int32(-1)
                         else:
-                            if local_n >= Int32(512 // self.driver.fc1.tile_n):
+                            if local_n >= Int32((self.driver.intermediate_size - 128) // self.driver.fc1.tile_n):
                                 descriptor = Int32(-1)
                     else:
                         # Whole-tile scheduling assigns the full reduction to
-                        # this CTA. Trim actual K reads, retaining 640-channel
+                        # this CTA. Trim actual K reads, retaining the resident
                         # physical A/B strides and the ordinary output store.
-                        reduce_tile_count = Int32(512 // self.driver.fc2.tile_k)
+                        reduce_tile_count = Int32((self.driver.intermediate_size - 128) // self.driver.fc2.tile_k)
                         if cutlass.const_expr(self.paired_boundary == "first"):
                             reduce_k_tile = Int32(128 // self.driver.fc2.tile_k)
             if descriptor >= Int32(0):

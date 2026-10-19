@@ -156,6 +156,31 @@ def test_explicit_mixed_residency_limits_and_cache_identity() -> None:
         apply(kernel, 2, 101376)
 
 
+@pytest.mark.parametrize("width", [256, 384, 640, 768])
+@pytest.mark.parametrize("boundary", ["first", "last"])
+def test_paired_boundary_accepts_resident_h128_widths_without_cuda(width, boundary):
+    def moe(experts):
+        gemm = SimpleNamespace(n_tiles=1, k_tiles=1, tile_n=128, tile_k=128,
+            cta_threads=128, moe_block_size=8, schedule_route_block_factor=1,
+            schedule_whole_tiles=True)
+        return SimpleNamespace(full_rotation=True, intermediate_rotation=True,
+            tc_decode_fused_sum=False, weight_layout="trellis_t256", element_dtype="fp16",
+            size_m=8, hidden_size=128, intermediate_size=width, fc1_cols=2*width,
+            top_k=2, moe_block_size=8, activation="silu", rotation_input_dtype="bf16",
+            broadcast_suh=False, trellis_codebook="mcg", direct_topk_routes=False,
+            cta_threads=128, sms=48, num_experts=experts, fc1=gemm, fc2=gemm,
+            blocks_per_sm=1, shared_words=8192, sqg_xor_cheb_t12_smem_off=0)
+    driver, tier0, tier1 = moe(4), moe(2), moe(2)
+    kernel = W4A16MixedTrellisKernel(driver=driver, tier0=tier0, tier1=tier1,
+        paired_boundary=boundary)
+    assert kernel.intermediate_size == width and kernel.paired_boundary == boundary
+    for invalid in (0, 128, 352, 639):
+        driver.intermediate_size = tier0.intermediate_size = tier1.intermediate_size = invalid
+        with pytest.raises(ValueError, match="whole resident H128"):
+            W4A16MixedTrellisKernel(driver=driver, tier0=tier0, tier1=tier1,
+                paired_boundary=boundary)
+
+
 def _mixed_cache_key(tier0_experts: int, tier1_experts: int) -> tuple[object, ...]:
     """Build the key without constructing CUDA-backed kernels.
 
