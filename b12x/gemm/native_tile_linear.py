@@ -415,8 +415,8 @@ class NativeTileLinear:
         slot, seg = wid % Int32(self.slots), wid // Int32(self.slots)
         g, j = lane >> Int32(2), lane & Int32(3)
         if cutlass.const_expr(self.decode_tiles > 1):
-            tile = Int32(cta) // row_tiles
-            block_cta = Int32(cta) - tile * row_tiles
+            block_cta = Int32(cta) // row_tiles
+            tile = Int32(cta) - block_cta * row_tiles
             row0 = tile * rows_per
         else:
             block_cta = Int32(cta)
