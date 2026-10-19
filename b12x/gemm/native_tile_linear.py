@@ -266,6 +266,7 @@ class NativeTileLinear:
         # Independent row tiles fill out small and medium column grids without
         # changing the ordered K-segment fold.
         self.decode_tiles = 4 if self.decode_ctas <= 96 else (2 if self.decode_ctas <= 256 else 1)
+        self.stage_decode_a = self.grouped and not self.side2
 
     # ------------------------------------------------------------------ launch
     @cute.jit
@@ -371,8 +372,25 @@ class NativeTileLinear:
         words = max(1, (self.segments - 1) * self.slots * 4 * self.groups * 32)
         Storage.__annotations__ = {
             "fold": cute.struct.Align[cute.struct.MemRange[Float32, words], 16],
+            "a": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8,
+                self.d_threads // 32 * 2048 if self.stage_decode_a else 1], 128],
         }
         return cute.struct(Storage)
+
+    @cute.jit
+    def _decode_stage_a(self, dst: Int32, x: cute.Tensor, row0: Int32,
+                        rows: Int32, k0: Int32, lane: Int32):
+        # One swizzled 16x64 BF16 tile per warp feeds both K32 groups.
+        for i in cutlass.range_constexpr(4):
+            unit = Int32(i * 32) + lane
+            row, col = unit >> Int32(3), unit & Int32(7)
+            src = x.iterator.toint() + ((row0 + row).to(Int64) * Int64(self.k)
+                + k0.to(Int64) + col.to(Int64) * Int64(8)) * Int64(2)
+            pred = Int32(0)
+            if row0 + row < rows:
+                pred = Int32(1)
+            cp_async4_shared_global_pred(
+                dst + row * Int32(128) + ((col ^ (row & Int32(7))) << Int32(4)), src, pred)
 
     @cute.jit
     def _decode_load(self, wdst: cute.Tensor, sdst: cute.Tensor, payload: cute.Tensor,
@@ -425,6 +443,7 @@ class NativeTileLinear:
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._decode_storage())
         fold = shared_ptr_to_u32(storage.fold.data_ptr())
+        abuf = shared_ptr_to_u32(storage.a.data_ptr()) + wid * Int32(2048)
         G = self.groups
         F = 4 * G * 4
         blocks = Int64(self.n // self.cols)
@@ -469,9 +488,15 @@ class NativeTileLinear:
                     for c in cutlass.range_constexpr(2):
                         k0 = kb * Int32(128) + Int32(64 * c)
                         if cutlass.const_expr(self.grouped):
+                            if cutlass.const_expr(self.stage_decode_a):
+                                cute.arch.sync_warp()
+                                self._decode_stage_a(abuf, x, row0, rows, k0, lane)
+                                cute.arch.cp_async_commit_group()
+                                cute.arch.cp_async_wait_group(0)
+                                cute.arch.sync_warp()
                             for h in cutlass.range_constexpr(2):
                                 k32 = k0 + Int32(32 * h)
-                                if cutlass.const_expr(not self.side2):
+                                if cutlass.const_expr(not self.side2 and not self.stage_decode_a):
                                     at_m0 = x_base + ((row0 + g).to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
                                     m0_lo0, m0_lo1, m0_lo2, m0_lo3 = _ld_cached_pred(at_m0, row0 + g, rows)
                                     m0_hi0, m0_hi1, m0_hi2, m0_hi3 = _ld_cached_pred(at_m0 + Int64(16 * self.k), row0 + g + Int32(8), rows)
@@ -488,8 +513,17 @@ class NativeTileLinear:
                                 s0 = self._scale(r_s0, h)
                                 s1 = self._scale(r_s1, h)
                                 if cutlass.const_expr(not self.side2):
-                                    m0_a0, m0_a2, m0_a4, m0_a6 = _quad_transpose_x4(m0_lo0, m0_lo1, m0_lo2, m0_lo3, j)
-                                    m0_a1, m0_a3, m0_a5, m0_a7 = _quad_transpose_x4(m0_hi0, m0_hi1, m0_hi2, m0_hi3, j)
+                                    if cutlass.const_expr(self.stage_decode_a):
+                                        ar = lane & Int32(15)
+                                        unit = Int32(4 * h) + (lane >> Int32(4))
+                                        at = abuf + ar * Int32(128)
+                                        m0_a0, m0_a1, m0_a2, m0_a3 = ldmatrix_m8n8x4_b16(
+                                            at + ((unit ^ (ar & Int32(7))) << Int32(4)))
+                                        m0_a4, m0_a5, m0_a6, m0_a7 = ldmatrix_m8n8x4_b16(
+                                            at + (((unit + Int32(2)) ^ (ar & Int32(7))) << Int32(4)))
+                                    else:
+                                        m0_a0, m0_a2, m0_a4, m0_a6 = _quad_transpose_x4(m0_lo0, m0_lo1, m0_lo2, m0_lo3, j)
+                                        m0_a1, m0_a3, m0_a5, m0_a7 = _quad_transpose_x4(m0_hi0, m0_hi1, m0_hi2, m0_hi3, j)
                                     acc[0], acc[1], acc[2], acc[3] = _mma_k32_scaled(
                                         acc[0], acc[1], acc[2], acc[3],
                                         m0_a0, m0_a1, m0_a2, m0_a3, m0_a4, m0_a5, m0_a6, m0_a7,
