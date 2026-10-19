@@ -274,6 +274,8 @@ def main():
                         help="master's K1 core source (b12x/moe/_shared/kernels/w4a16/exlr8.py)")
     parser.add_argument("--control-glue",type=Path,
                         help="master's grouping source (b12x/integration/cuteafd/exlr8_glue.py)")
+    parser.add_argument("--repeats",type=int,default=1,
+                        help="interleaved timing rounds; arm order rotates each round, medians reported")
     parser.add_argument("--profile",action="store_true",
                         help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
     args = parser.parse_args()
@@ -395,13 +397,22 @@ def main():
         candidate_graph = capture(candidate)
         candidate_graph.replay()
         finite_nonzero(response.float(), "EXLR8")
-        baseline_us = None
+        graphs = {"candidate": candidate_graph}
         if states:
-            baseline_graph = capture(baseline)
-            baseline_graph.replay()
+            graphs["baseline"] = capture(baseline)
+            graphs["baseline"].replay()
             finite_nonzero(response.float(), "EXL3")
-            baseline_us = timing(baseline_graph,args.replays)/layers
-        candidate_us = timing(candidate_graph,args.replays)/layers
+        if control:
+            graphs["control"] = capture(control_run)
+        names = list(graphs)
+        rounds = {n: [] for n in names}
+        for r in range(args.repeats):
+            order = names[r % len(names):] + names[:r % len(names)]
+            for n in order:
+                rounds[n].append(timing(graphs[n], args.replays)/layers)
+        med = {n: statistics.median(v) for n, v in rounds.items()}
+        baseline_us = med.get("baseline")
+        candidate_us = med["candidate"]
         unique = sum(int(ids[f:f+r].unique().numel()) for f, r in zip(range(0,total,64), chunks))
         payload_bytes = unique*3*6144*512*4//8
         stages = stage_profile(candidate_graph,args.output.parent)
@@ -416,9 +427,10 @@ def main():
                           exl3_gbps=payload_bytes/baseline_us/1000,
                           exl3_read_roofline_percent=100*payload_bytes/baseline_us/1000/read_only["gbps"],
                           target=0.97, target_met=baseline_us/candidate_us>=0.97)
+        record["rounds_us"] = rounds
         if control:
-            control_graph = capture(control_run)
-            control_us = timing(control_graph,args.replays)/layers
+            control_graph = graphs["control"]
+            control_us = med["control"]
             cstages = stage_profile(control_graph,args.output.parent)
             record.update(control_us=control_us, candidate_over_control=control_us/candidate_us,
                           control_stages={k: (v/layers if k.endswith("_us") else v) for k, v in cstages.items()})
