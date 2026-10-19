@@ -87,7 +87,7 @@ def test_compact_true_width_weights_match_padded_control(intermediate, tile_k, a
     torch.manual_seed(521031)
     device = torch.device("cuda", 0)
     props = torch.cuda.get_device_properties(device)
-    tile_n = 256 if intermediate == 256 and all_owned else 128
+    tile_n = 256 if intermediate == 256 and all_owned and tile_k == 64 else 128
     hidden = max(128, tile_n)
     tile = (tile_k, tile_n, tile_k, tile_n)
     tiers = tuple(_prepared(experts=2, hidden=hidden, intermediate=intermediate,
