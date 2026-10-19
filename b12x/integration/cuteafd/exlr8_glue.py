@@ -214,6 +214,159 @@ class _Group:
                         ordinal += Int32(1)
 
 
+@dsl_user_op
+def _warp_match_count_and_rank(val: Int32, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(val).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 mask, lane, lower;
+            mov.u32 lane, %laneid;
+            shl.b32 lower, 1, lane;
+            sub.u32 lower, lower, 1;
+            match.any.sync.b32 mask, $2, 0xffffffff;
+            popc.b32 $0, mask;
+            and.b32 lower, mask, lower;
+            popc.b32 $1, lower;
+        }
+        """,
+        "=r,=r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return (Int32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+            Int32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)))
+
+
+@dsl_user_op
+def _warp_sync(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None, [], "bar.warp.sync 0xffffffff;", "",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+class _GroupPrefill(_Group):
+    @cute.kernel
+    def kernel(self, ids: cute.Pointer, x: cute.Pointer, signs_in: cute.Pointer,
+               group_expert: cute.Pointer, route_slots: cute.Pointer,
+               route_group_lane: cute.Pointer, group_count: cute.Pointer,
+               activation: cute.Pointer, rows: Int32):
+        smem = utils.SmemAllocator()
+        prefix = smem.allocate_tensor(Int32, cute.make_layout(256), byte_alignment=16)
+        valid = smem.allocate_tensor(Int32, cute.make_layout(1), byte_alignment=16)
+        s_counts = smem.allocate_tensor(Int32, cute.make_layout(8 * 256), byte_alignment=16)
+        if Int32(cute.arch.block_idx()[0]) == Int32(0):
+            self.pack(ids, group_expert, route_slots, route_group_lane, group_count,
+                      prefix, valid, s_counts, rows)
+        else:
+            self.ingress(x, signs_in, activation, rows)
+
+    @cute.jit
+    def pack(self, ids: cute.Pointer, group_expert: cute.Pointer,
+             route_slots: cute.Pointer, route_group_lane: cute.Pointer,
+             group_count: cute.Pointer, prefix: cute.Tensor, valid: cute.Tensor,
+             s_counts: cute.Tensor, rows: Int32):
+        """Parallel warp-interval ascending-expert/ascending-route packing (CTA 0 only)."""
+        thread = Int32(cute.arch.thread_idx()[0])
+        lane, warp = thread & Int32(31), thread >> Int32(5)
+        routes = rows * Int32(self.top_k)
+        for i in cutlass.range_constexpr(8):
+            s_counts[Int32(i * 256) + thread] = Int32(0)
+        if thread == Int32(0):
+            valid[0] = Int32(1)
+        cute.arch.sync_threads()
+
+        vec32_total = (routes + Int32(31)) >> Int32(5)
+        vec32_per_warp = (vec32_total + Int32(7)) >> Int32(3)
+        r_start = warp * (vec32_per_warp << Int32(5))
+        r_end = min(routes, r_start + (vec32_per_warp << Int32(5)))
+
+        r_base = r_start
+        while r_base < r_end:
+            r = r_base + lane
+            eid = Int32(-1)
+            if r < r_end:
+                eid = ids[r]
+                route_group_lane[r] = Int32(-1)
+                if eid < Int32(0) or eid >= Int32(self.experts):
+                    valid[0] = Int32(0)
+                    eid = Int32(-1)
+            cnt, rank = _warp_match_count_and_rank(eid)
+            if eid >= Int32(0) and rank == Int32(0):
+                s_counts[warp * Int32(256) + eid] = s_counts[warp * Int32(256) + eid] + cnt
+            r_base += Int32(32)
+        cute.arch.sync_threads()
+
+        c0 = s_counts[thread]
+        c1 = s_counts[Int32(256) + thread]
+        c2 = s_counts[Int32(512) + thread]
+        c3 = s_counts[Int32(768) + thread]
+        c4 = s_counts[Int32(1024) + thread]
+        c5 = s_counts[Int32(1280) + thread]
+        c6 = s_counts[Int32(1536) + thread]
+        c7 = s_counts[Int32(1792) + thread]
+        count = Int32(0)
+        if thread < Int32(self.experts):
+            count = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7
+        groups = (count + Int32(self.group_rows - 1)) // Int32(self.group_rows)
+        prefix[thread] = groups
+        cute.arch.sync_threads()
+
+        for step in cutlass.range_constexpr(8):
+            distance = Int32(1 << step)
+            addend = Int32(0)
+            if thread >= distance:
+                addend = prefix[thread - distance]
+            cute.arch.sync_threads()
+            prefix[thread] = prefix[thread] + addend
+            cute.arch.sync_threads()
+
+        total = prefix[Int32(255)]
+        if thread == Int32(0):
+            group_count[0] = Int32(-1)
+            if valid[0] != Int32(0) and total <= Int32(self.max_groups):
+                group_count[0] = total
+
+        if valid[0] != Int32(0) and total <= Int32(self.max_groups):
+            first = prefix[thread] - groups
+            base_slot = first * Int32(self.group_rows)
+            s_counts[thread] = base_slot
+            s_counts[Int32(256) + thread] = base_slot + c0
+            s_counts[Int32(512) + thread] = base_slot + c0 + c1
+            s_counts[Int32(768) + thread] = base_slot + c0 + c1 + c2
+            s_counts[Int32(1024) + thread] = base_slot + c0 + c1 + c2 + c3
+            s_counts[Int32(1280) + thread] = base_slot + c0 + c1 + c2 + c3 + c4
+            s_counts[Int32(1536) + thread] = base_slot + c0 + c1 + c2 + c3 + c4 + c5
+            s_counts[Int32(1792) + thread] = base_slot + c0 + c1 + c2 + c3 + c4 + c5 + c6
+            for local in cutlass.range(groups):
+                group_expert[first + local] = thread
+            for idx in cutlass.range(thread, total * Int32(self.group_rows), 256):
+                route_slots[idx] = Int32(-1)
+            cute.arch.sync_threads()
+
+            r_base = r_start
+            while r_base < r_end:
+                r = r_base + lane
+                eid = Int32(-1)
+                if r < r_end:
+                    eid = ids[r]
+                cnt, rank = _warp_match_count_and_rank(eid)
+                base_val = Int32(0)
+                if eid >= Int32(0):
+                    base_val = s_counts[warp * Int32(256) + eid]
+                _warp_sync()
+                if eid >= Int32(0):
+                    if rank == Int32(0):
+                        s_counts[warp * Int32(256) + eid] = base_val + cnt
+                    packed = base_val + rank
+                    route_slots[packed] = r
+                    route_group_lane[r] = packed
+                _warp_sync()
+                r_base += Int32(32)
+
+
 def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144,
                             input_format="fp8_k32", shared_expert=False,
                             max_rows=64, group_rows=16):
@@ -236,7 +389,8 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
     x = (Operand("x", torch.uint8, row, note="E4M3 bytes then UE8M0 per-32 scales per row")
          if input_format == "fp8_k32" else Operand("x", torch.bfloat16, row))
     metadata = {"group_rows": group_rows} if max_rows > 64 else {}
-    return compile_program(_Group(experts, top_k, max_groups, hidden, input_format, max_rows, group_rows),
+    group_cls = _GroupPrefill if max_rows > 64 else _Group
+    return compile_program(group_cls(experts, top_k, max_groups, hidden, input_format, max_rows, group_rows),
         name=("exlr8_grouped_group" if max_rows > 64 else
               "exlr8_shared_group" if shared_expert else "exlr8_group"),
         operands=(Operand("ids", torch.int32, f"[rows,{top_k}]"),
