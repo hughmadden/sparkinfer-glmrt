@@ -488,10 +488,10 @@ def grouped_mixed_state(rows, tiers, props):
         size_m=4096, hidden_size=6144, intermediate_size=512,
         tier0_num_experts=256, tier1_num_experts=1, tier0_bits=4, tier1_bits=5,
         route_num_experts=256,
-        top_k=8, max_m_blocks=(max_packed_route_slots(4096*8, 48, 256)+47)//48,
+        top_k=8, max_m_blocks=(max_packed_route_slots(4096*8, 32, 256)+31)//32,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=tile, trellis_codebook=tiers[0].trellis_codebook,
-        moe_block_size=48, warp_specialized=True, input_format="e4m3_k32",
+        moe_block_size=32, warp_specialized=True, input_format="e4m3_k32",
         ws_input_stages=3, ws_dynamic_tiles=True,
         rotation_input_dtype="bf16", full_rotation_output_dtype="bf16")
     bufs = mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"), sms=props.multi_processor_count)
