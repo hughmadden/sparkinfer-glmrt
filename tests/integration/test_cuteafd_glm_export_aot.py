@@ -24,6 +24,16 @@ def _programs():
         "glm_producer_m64": lambda: attn.compile_glm_producer_aot(g, max_rows=64),
         "glm_index_producer_m64": lambda: attn.compile_glm_index_producer_aot(g, max_rows=64),
         "glm_o_m64": lambda: attn.compile_glm_o_aot(g, max_rows=64),
+        **{f"glm_stage_{stage}": lambda s=stage: attn.compile_glm_attention_stage_aot(
+            g, stage=s, max_rows=4096)
+           for stage in ("rank_pack", "query_rope", "index_post", "absorb", "values")},
+        **{f"glm_stage_{stage}_{mode}": lambda s=stage, m=mode: attn.compile_glm_attention_stage_aot(
+            g, stage=s, max_rows=4096 if m == "prefill" else 64, fp8_only=m)
+           for stage in ("absorb", "values") for mode in ("decode", "prefill")},
+        "glm_stage_absorb_split": lambda: attn.compile_glm_attention_stage_aot(
+            g, stage="absorb", max_rows=64, fp8_only="decode", query_row=2 * g.heads * g.latent_dim),
+        "glm_stage_rope_split": lambda: attn.compile_glm_attention_stage_aot(
+            g, stage="query_rope", max_rows=64, query_row=2 * g.heads * g.latent_dim),
         "glm_ffn_i12288_m64": lambda: ffn.compile_glm_ffn_aot(g, inter=12288, max_rows=64),
         "glm_index_topk_decode_m64": lambda: idx.compile_glm_index_topk_aot(
             g, max_rows=64, max_pages=2048, mode="decode"),

@@ -25,6 +25,7 @@ def P(kind, **kw):
         from b12x.integration.cuteafd import GLM53, glm_attention, glm_ffn
 
         fn = {"producer": glm_attention.compile_glm_producer_aot,
+              "stage": glm_attention.compile_glm_attention_stage_aot,
               "index_producer": glm_attention.compile_glm_index_producer_aot,
               "o": glm_attention.compile_glm_o_aot, "ffn": glm_ffn.compile_glm_ffn_aot}[kind]
         _PROGRAMS[key] = fn(GLM53, **kw)
@@ -71,6 +72,9 @@ def _compare(name, rows, new, old, bitwise):
 
 DECODE_ROWS = [1, 16, 17, 64]
 PREFILL = [(64, 0), (300, 0), (5, 1), (300, 1)]
+STAGE_CASES = [("decode", 1, 0), ("decode", 17, 0), ("decode", 64, 0),
+               ("prefill", 5, 1), ("prefill", 300, 0), ("prefill", 300, 1),
+               ("prefill", 4096, 1)]
 
 
 def _producer_inputs(rows):
@@ -251,3 +255,104 @@ def test_glm_ffn_w8_prefill(layer, inter, rows, fp8):
     new_p.launch(x, gu_fp8, gu_scale, down_fp8, down_scale, new, _scratch(new_p, rows), scalars=(rows, fp8))
     torch.cuda.synchronize()
     _compare(f"glm_ffn_i{inter} prefill fp8={fp8}", rows, new, old, fp8 == 0)
+
+
+@pytest.mark.parametrize("mode,rows,fp8", STAGE_CASES)
+@pytest.mark.parametrize("split", [False, True])
+def test_glm_producer_stages_match_fused(mode, rows, fp8, split):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.glm_attention import _align
+
+    a, names, qkv, scale, qb, qb_scale, norms, x = _producer_inputs(rows)
+    uk, uk_scale, _, _ = _kv_b_fp8(a)
+    cap = 4096 if mode == "prefill" else 64
+    pitch = 64 * 576 * (2 if split else 1)
+    options = {"query_row": pitch} if split else {}
+    fused = P("producer", max_rows=cap, fp8_only=mode, **options)
+    positions = torch.arange(rows, dtype=torch.int64, device="cuda") + 100
+    slots = torch.arange(rows, dtype=torch.int64, device="cuda")
+    cache = torch.zeros(((rows + 63) // 64 + 1, 64 * 656), dtype=torch.uint8, device="cuda")
+    query = torch.full((rows, pitch), 7, dtype=torch.bfloat16, device="cuda")
+    qr = torch.empty((rows, 2048), dtype=torch.bfloat16, device="cuda")
+    scratch = _scratch(fused, rows)
+    scalars = (rows, fp8) if mode == "prefill" else (rows,)
+    cs = cos_sin(8192)
+    fused.launch(x, positions, slots, cs, qkv, _kscale(names) if mode == "prefill" else scale,
+                 *norms, qb, qb_scale, uk, uk_scale, cache, query, qr, scratch, scalars=scalars)
+    # Isolate the format-neutral boundaries using the fused projection outputs.
+    qkv_out = scratch[:rows * 2624 * 2].view(torch.bfloat16)
+    offset = _align(rows * 2624 * 2)
+    qb_out = scratch[offset:offset + rows * 64 * 256 * 2].view(torch.bfloat16)
+    result = torch.full_like(query, 7)
+    result_qr = torch.empty_like(qr)
+    result_cache = torch.zeros_like(cache)
+    pack = P("stage", stage="rank_pack", max_rows=cap)
+    absorb = P("stage", stage="absorb", max_rows=cap, fp8_only=mode, **options)
+    rope = P("stage", stage="query_rope", max_rows=cap, **options)
+
+    def launch():
+        pack.launch(qkv_out, *norms, positions, slots, cs, result_qr, result_cache, scalars=(rows,))
+        absorb.launch(qb_out, uk, uk_scale, result, scalars=(rows,))
+        rope.launch(qb_out, positions, cs, result, scalars=(rows,))
+
+    launch()
+    torch.cuda.synchronize()
+    for actual, expected in ((result, query), (result_qr, qr), (result_cache, cache)):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    graph = torch.cuda.CUDAGraph()
+    with kernel_resolution_guard("GLM format-neutral producer stages"), torch.cuda.graph(graph):
+        launch()
+    result.fill_(7)
+    result_qr.fill_(float("nan"))
+    result_cache.zero_()
+    with kernel_resolution_guard("GLM stage replay"):
+        graph.replay()
+    torch.cuda.synchronize()
+    for actual, expected in ((result, query), (result_qr, qr), (result_cache, cache)):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("mode,rows,fp8", STAGE_CASES)
+def test_glm_index_stage_matches_fused(mode, rows, fp8):
+    from b12x.integration.cuteafd.glm_attention import _align
+
+    ix, wik, norms, x, qr = _index_inputs(rows)
+    iq, iq_scale = fp8_rows([ix + "wq_b.weight"])
+    cap = 4096 if mode == "prefill" else 64
+    fused = P("index_producer", max_rows=cap, fp8_only=mode)
+    positions = torch.arange(rows, dtype=torch.int64, device="cuda")
+    cs = cos_sin(8192)
+    cache = torch.zeros(((rows + 63) // 64 + 1, 8448), dtype=torch.uint8, device="cuda")
+    q8 = torch.empty((rows, 32, 128), dtype=torch.float8_e4m3fn, device="cuda")
+    hw = torch.empty((rows, 32), dtype=torch.float32, device="cuda")
+    scratch = _scratch(fused, rows)
+    scalars = (rows, fp8) if mode == "prefill" else (rows,)
+    fused.launch(x, qr, positions, positions, cs, iq, iq_scale, wik, *norms,
+                 cache, q8, hw, scratch, scalars=scalars)
+    iq_out = scratch[:rows * 4096 * 2].view(torch.bfloat16)
+    offset = _align(rows * 4096 * 2)
+    kw_out = scratch[offset:offset + rows * 160 * 2].view(torch.bfloat16)
+    result = (torch.empty_like(q8), torch.empty_like(hw), torch.zeros_like(cache))
+    P("stage", stage="index_post", max_rows=cap).launch(
+        iq_out, kw_out, positions, positions, cs, *norms, *result, scalars=(rows,))
+    torch.cuda.synchronize()
+    for actual, expected in zip(result, (q8, hw, cache)):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("mode,rows,fp8", STAGE_CASES)
+def test_glm_values_stage_matches_fused(mode, rows, fp8):
+    a, attn, _ = _o_inputs(rows)
+    _, _, uv, uv_scale = _kv_b_fp8(a)
+    wo, wo_scale = fp8_rows([a + "o_proj.weight"])
+    cap = 4096 if mode == "prefill" else 64
+    fused = P("o", max_rows=cap, fp8_only=mode)
+    scratch = _scratch(fused, rows)
+    output = torch.empty((rows, 6144), dtype=torch.bfloat16, device="cuda")
+    scalars = (rows, fp8) if mode == "prefill" else (rows,)
+    fused.launch(attn, uv, uv_scale, wo, wo_scale, output, scratch, scalars=scalars)
+    values = torch.empty((rows, 64, 256), dtype=torch.bfloat16, device="cuda")
+    P("stage", stage="values", max_rows=cap, fp8_only=mode).launch(
+        attn, uv, uv_scale, values, scalars=(rows,))
+    torch.cuda.synchronize()
+    assert torch.equal(values.view(torch.uint8).flatten(), scratch[:values.numel() * 2])
