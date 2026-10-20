@@ -213,7 +213,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 25
+    CODE_VERSION = 26
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -912,18 +912,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             b_local_base = Int32(0)
             if cutlass.const_expr(self.blocks == 48):
                 if pow2_slice:
-                    task_eff = task
-                    if use_chunks and step == Int32(96):
-                        task_eff = (
-                            ((task + Int32(32)) if (task < Int32(64)) else (task - Int32(64)))
-                            if (task < Int32(96) and limit_tasks >= Int32(96))
-                            else (
-                                ((task + Int32(64)) if (task < Int32(128)) else (task - Int32(32)))
-                                if (task < Int32(192) and limit_tasks >= Int32(192))
-                                else task
-                            )
-                        )
-                    group = task_eff if use_chunks else (task >> slice_shift)
+                    group = task if use_chunks else (task >> slice_shift)
                     b_local_base = Int32(0) if use_chunks else (task & (slice_blocks - Int32(1)))
                 elif sliced:
                     q = task if use_chunks else (task >> slice_shift)
