@@ -213,7 +213,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 17
+    CODE_VERSION = 18
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -254,15 +254,43 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                    rows, group_count, unit_limit).launch(
                 grid=(min(Int32(self.max_groups) * unit_limit, cta_limit), 1, 1),
                 block=(256, 1, 1), stream=stream)
-            self.grouped_fc2_kernel(pointers, bits, unit_count, unit_map,
-                                    group_expert, route_slots, intermediate, fc2,
-                                    rows, group_count, unit_limit).launch(
-                grid=(min(Int32(self.max_groups * self.blocks), cta_limit), 1, 1),
-                block=(256, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
-            self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
-                               rows, group_count).launch(
-                grid=(min((rows * Int32(self.blocks) + Int32(7)) // Int32(8), cta_limit), 1, 1),
-                block=(256, 1, 1), stream=stream)
+            fc2_cta_limit = max(Int32(1), cta_limit >> Int32(1))
+            if cutlass.const_expr(self.blocks == 48):
+                slice_shift = (
+                    Int32(1) if rows <= Int32(512)
+                    else (Int32(0) if rows <= Int32(1024) else Int32(4))
+                )
+                slice_blocks = Int32(3) << slice_shift
+                slice_base = Int32(0)
+                while slice_base < Int32(48):
+                    self.grouped_fc2_kernel(
+                        pointers, bits, unit_count, unit_map,
+                        group_expert, route_slots, intermediate, fc2,
+                        rows, group_count, unit_limit, slice_base, slice_blocks, slice_shift
+                    ).launch(
+                        grid=(min(Int32(self.max_groups * self.blocks), fc2_cta_limit), 1, 1),
+                        block=(256, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+                    self.reduce_kernel(
+                        route_group_lane, route_weights, fc2, signs_out, output,
+                        rows, group_count, slice_base, slice_blocks, slice_shift
+                    ).launch(
+                        grid=(min((rows * slice_blocks + Int32(7)) // Int32(8), cta_limit), 1, 1),
+                        block=(256, 1, 1), stream=stream)
+                    slice_base += slice_blocks
+            else:
+                self.grouped_fc2_kernel(
+                    pointers, bits, unit_count, unit_map,
+                    group_expert, route_slots, intermediate, fc2,
+                    rows, group_count, unit_limit, Int32(0), Int32(self.blocks), Int32(0)
+                ).launch(
+                    grid=(min(Int32(self.max_groups * self.blocks), fc2_cta_limit), 1, 1),
+                    block=(256, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+                self.reduce_kernel(
+                    route_group_lane, route_weights, fc2, signs_out, output,
+                    rows, group_count, Int32(0), Int32(self.blocks), Int32(0)
+                ).launch(
+                    grid=(min((rows * Int32(self.blocks) + Int32(7)) // Int32(8), cta_limit), 1, 1),
+                    block=(256, 1, 1), stream=stream)
 
     @cute.jit
     def prepare_group_tiles(self, route_slots: cute.Tensor, group: Int32, rows: Int32,
@@ -452,7 +480,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 valid = ((out_meta >> Int32(16 + idx)) & Int32(1)).to(Int32)
                 source = base_a + m.to(Int64) * Int64(16 * 128 * 2)
                 target = shared_a + Int32(idx * 4096) + smem_thread_off
-                cp_async4_shared_global_cg_pred(target, source, valid)
+                cp_async4_shared_global_ca_pred(target, source, valid)
 
     @cute.jit
     def accumulate_fc2_fixed_m(self, total: cute.Tensor, shared_a: Int32, shared_b: Int32,
@@ -804,7 +832,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                            unit_count: cute.Tensor, unit_map: cute.Tensor,
                            group_expert: cute.Tensor, route_slots: cute.Tensor,
                            intermediate: cute.Tensor, fc2: cute.Tensor,
-                           rows: Int32, group_count: cute.Tensor, unit_limit: Int32):
+                           rows: Int32, group_count: cute.Tensor, unit_limit: Int32,
+                           slice_base: Int32, slice_blocks: Int32, slice_shift: Int32):
         groups = group_count[0]
         if groups < Int32(0) or groups > Int32(self.max_groups):
             groups = Int32(0)
@@ -835,16 +864,28 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             else (8 if (self.blocks % 8 == 0) else (3 if (self.blocks % 3 == 0) else self.blocks))
         )
         chunks_per_group = self.blocks // b_chunk_const
-        use_chunks = (groups * Int32(chunks_per_group)) >= step
-        limit_tasks = (groups * Int32(chunks_per_group)) if use_chunks else (groups * Int32(self.blocks))
-        b_count = Int32(b_chunk_const) if use_chunks else Int32(1)
+        group_tasks = groups * Int32(chunks_per_group)
+        use_chunks = group_tasks >= step
+        limit_tasks = group_tasks if use_chunks else (groups * slice_blocks)
+        b_count = (
+            ((Int32(1) << slice_shift) if cutlass.const_expr(self.blocks == 48) else Int32(b_chunk_const))
+            if use_chunks else Int32(1)
+        )
         max_slot = rows * Int32(self.top_k)
 
         total = cute.make_rmem_tensor((self.mtiles, 8), Float32)
 
         while task < limit_tasks:
-            group = (task // Int32(chunks_per_group)) if use_chunks else (task // Int32(self.blocks))
-            block_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else (task % Int32(self.blocks))
+            group = Int32(0)
+            b_local_base = Int32(0)
+            if cutlass.const_expr(self.blocks == 48):
+                q = task if use_chunks else (task >> slice_shift)
+                group = q // Int32(3)
+                b_local_base = ((q - group * Int32(3)) << slice_shift) if use_chunks else (task - group * slice_blocks)
+            else:
+                group = (task // Int32(chunks_per_group)) if use_chunks else (task // Int32(self.blocks))
+                b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else (task % Int32(self.blocks))
+            block_base = slice_base + b_local_base
 
             expert = group_expert[group]
             group_base = group.to(Int64) * Int64(self.group_rows)
@@ -936,7 +977,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     step_parity = Int32(0)
 
                     for b_idx in cutlass.range(b_count):
-                        block = block_base + b_idx
+                        b_out = b_local_base + b_idx
                         total.fill(Float32(0.0))
                         for k in cutlass.range(owned):
                             cur_scale = packed_scale
@@ -988,7 +1029,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         out_meta_b = bind_loop_i32(out_meta, b_idx)
                         col_in_block = warp * Int32(16) + (lane & Int32(3)) * Int32(2)
                         block_out_base = fc2_addr + (
-                            (block * max_slot).to(Int64) * Int64(128) + col_in_block.to(Int64)
+                            (b_out * max_slot).to(Int64) * Int64(128) + col_in_block.to(Int64)
                         ) * Int64(4)
                         for idx in cutlass.range_constexpr(self.mtiles):
                             if Int32(idx) < num_live_m:
@@ -1005,10 +1046,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     total.fill(Float32(0.0))
                     for b_idx in cutlass.range(b_count):
                         out_meta_b = bind_loop_i32(out_meta, b_idx)
-                        block = block_base + b_idx
+                        b_out = b_local_base + b_idx
                         col_in_block = warp * Int32(16) + (lane & Int32(3)) * Int32(2)
                         block_out_base = fc2_addr + (
-                            (block * max_slot).to(Int64) * Int64(128) + col_in_block.to(Int64)
+                            (b_out * max_slot).to(Int64) * Int64(128) + col_in_block.to(Int64)
                         ) * Int64(4)
                         for idx in cutlass.range_constexpr(self.mtiles):
                             if Int32(idx) < num_live_m:
@@ -1027,7 +1068,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     @cute.kernel
     def reduce_kernel(self, route_group_lane: cute.Tensor, route_weights: cute.Tensor,
                       fc2: cute.Tensor, signs_out: cute.Tensor, output: cute.Tensor,
-                      rows: Int32, group_count: cute.Tensor):
+                      rows: Int32, group_count: cute.Tensor,
+                      slice_base: Int32, slice_blocks: Int32, slice_shift: Int32):
         groups = group_count[0]
         if groups < Int32(0) or groups > Int32(self.max_groups):
             groups = Int32(0)
@@ -1042,15 +1084,23 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         output_address = output.iterator.toint()
         max_slot = rows * Int32(self.top_k)
 
-        while task < rows * Int32(self.blocks):
-            row, block = task // Int32(self.blocks), task % Int32(self.blocks)
+        while task < rows * slice_blocks:
+            row = Int32(0)
+            b_out = Int32(0)
+            if cutlass.const_expr(self.blocks == 48):
+                row = (task >> slice_shift) // Int32(3)
+                b_out = task - row * slice_blocks
+            else:
+                row = task // Int32(self.blocks)
+                b_out = task % Int32(self.blocks)
+            block = slice_base + b_out
             col = block * Int32(128) + lane * Int32(4)
             values = cute.make_rmem_tensor(4, Float32)
             values.fill(Float32(0.0))
             if groups > Int32(0):
                 row_route_base = row.to(Int64) * Int64(self.top_k)
                 row_fc2_base = fc2_address + (
-                    (block * max_slot).to(Int64) * Int64(128)
+                    (b_out * max_slot).to(Int64) * Int64(128)
                     + row_route_base * Int64(128)
                     + lane.to(Int64) * Int64(4)
                 ) * Int64(4)
