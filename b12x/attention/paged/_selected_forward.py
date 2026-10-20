@@ -165,6 +165,7 @@ class _SelectedPositionPagedForwardKernel:
                 "selected-position paged forward requires 1, 2, or 4 KV warps"
             )
         self.tile_n = 16 * self.kv_warps
+        self.tile_count = (self.selection_width + self.tile_n - 1) // self.tile_n
         self.page_size = int(page_size)
         if self.page_size <= 0:
             raise ValueError(
@@ -365,7 +366,7 @@ class _SelectedPositionPagedForwardKernel:
         )
 
     @cute.jit
-    def _mma_selected_tile(
+    def _resolve_selected_bases(
         self,
         tile: Int32,
         row: Int32,
@@ -373,37 +374,13 @@ class _SelectedPositionPagedForwardKernel:
         request_id: Int64,
         request_valid,
         query_position: Int64,
-        key_cache: cute.Pointer,
-        value_cache: cute.Pointer,
         block_table: cute.Pointer,
         selected_positions: cute.Pointer,
         key_bases: cute.Tensor,
         value_bases: cute.Tensor,
-        shared_query: cute.Tensor,
-        shared_key: cute.Tensor,
-        shared_value: cute.Tensor,
-        shared_probability: cute.Tensor,
-        shared_row_scale: cute.Tensor,
         num_cache_pages: Int64,
         table_width: Int64,
         thread: Int32,
-        tiled_mma_qk: cute.TiledMma,
-        tiled_mma_pv: cute.TiledMma,
-        register_query: cute.Tensor,
-        register_key: cute.Tensor,
-        register_probability: cute.Tensor,
-        register_value: cute.Tensor,
-        copy_query: cute.TiledCopy,
-        copy_key: cute.TiledCopy,
-        copy_probability: cute.TiledCopy,
-        copy_value: cute.TiledCopy,
-        copy_source_query: cute.Tensor,
-        copy_source_key: cute.Tensor,
-        copy_source_probability: cute.Tensor,
-        copy_source_value: cute.Tensor,
-        accumulator_output: cute.Tensor,
-        softmax: Softmax,
-        is_first: cutlass.Constexpr,
     ) -> None:
         column = thread
         if column < Int32(self.tile_n):
@@ -455,6 +432,37 @@ class _SelectedPositionPagedForwardKernel:
                 value_bases[column] = value_base
         cute.arch.sync_threads()
 
+    @cute.jit
+    def _selected_tile_body(
+        self,
+        kv_head: Int32,
+        key_cache: cute.Pointer,
+        value_cache: cute.Pointer,
+        key_bases: cute.Tensor,
+        value_bases: cute.Tensor,
+        shared_key: cute.Tensor,
+        shared_value: cute.Tensor,
+        shared_probability: cute.Tensor,
+        shared_row_scale: cute.Tensor,
+        thread: Int32,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        register_query: cute.Tensor,
+        register_key: cute.Tensor,
+        register_probability: cute.Tensor,
+        register_value: cute.Tensor,
+        copy_query: cute.TiledCopy,
+        copy_key: cute.TiledCopy,
+        copy_probability: cute.TiledCopy,
+        copy_value: cute.TiledCopy,
+        copy_source_query: cute.Tensor,
+        copy_source_key: cute.Tensor,
+        copy_source_probability: cute.Tensor,
+        copy_source_value: cute.Tensor,
+        accumulator_output: cute.Tensor,
+        softmax: Softmax,
+        is_first: cutlass.Constexpr,
+    ) -> None:
         if const_expr(not self.kv_is_fp8):
             vectors_per_row = self.head_dim // 8
             for vector_iter in cutlass.range_constexpr(
@@ -611,7 +619,110 @@ class _SelectedPositionPagedForwardKernel:
             copy_probability,
             copy_value,
         )
-        cute.arch.sync_threads()
+
+    @cute.jit
+    def _scan_selected_flags(
+        self,
+        split: Int32,
+        row: Int32,
+        kv_head: Int32,
+        request_valid,
+        query_position: Int64,
+        selected_positions: cute.Pointer,
+        tile_flags: cute.Tensor,
+        tiles_per_split: Int32,
+        splits: Int32,
+        thread: Int32,
+    ) -> None:
+        """Flag every tile that can hold a selected position for this split.
+
+        The position scan runs once, strided across the block, so the tile loop
+        can skip a fully unselected tile without re-reading metadata or
+        entering its load/MMA/softmax body. A flagged tile may still resolve to
+        nothing (block-table validity is rechecked there); the flag only ever
+        suppresses work that provably contributes nothing.
+
+        A row base of a selection width that is a multiple of four stays
+        16-byte aligned, so four positions move per 128-bit load; other widths
+        keep the scalar path.
+        """
+        selection_group = kv_head // Int32(self.kv_heads // self.selection_groups)
+        position_base = (
+            row.to(Int64) * Int64(self.selection_groups)
+            + selection_group.to(Int64)
+        ) * Int64(self.selection_width)
+        if const_expr(self.selection_width % 4 == 0):
+            groups_per_tile = self.tile_n // 4
+            scan_total = tiles_per_split * Int32(groups_per_tile)
+            for scan_iter in cutlass.range(
+                (scan_total + Int32(self.threads) - 1) // Int32(self.threads),
+                unroll=1,
+            ):
+                linear = thread + Int32(scan_iter * self.threads)
+                if linear < scan_total:
+                    local_tile = linear // Int32(groups_per_tile)
+                    column_group = linear % Int32(groups_per_tile)
+                    tile = split + local_tile * splits
+                    selected_column = (
+                        tile * Int32(self.tile_n) + column_group * Int32(4)
+                    )
+                    if request_valid & (
+                        selected_column < Int32(self.selection_width)
+                    ):
+                        word0, word1, word2, word3 = ld_global_nc_v4_u32(
+                            _pointer_as_int64(
+                                selected_positions,
+                                position_base + selected_column.to(Int64),
+                            )
+                        )
+                        selected0 = word0.to(Int32).to(Int64)
+                        selected1 = word1.to(Int32).to(Int64)
+                        selected2 = word2.to(Int32).to(Int64)
+                        selected3 = word3.to(Int32).to(Int64)
+                        valid = (
+                            (
+                                (selected0 >= Int64(0))
+                                & (selected0 <= query_position)
+                            )
+                            | (
+                                (selected1 >= Int64(0))
+                                & (selected1 <= query_position)
+                            )
+                            | (
+                                (selected2 >= Int64(0))
+                                & (selected2 <= query_position)
+                            )
+                            | (
+                                (selected3 >= Int64(0))
+                                & (selected3 <= query_position)
+                            )
+                        )
+                        if valid:
+                            tile_flags[tile] = Int32(1)
+        else:
+            scan_total = tiles_per_split * Int32(self.tile_n)
+            for scan_iter in cutlass.range(
+                (scan_total + Int32(self.threads) - 1) // Int32(self.threads),
+                unroll=1,
+            ):
+                linear = thread + Int32(scan_iter * self.threads)
+                if linear < scan_total:
+                    local_tile = linear // Int32(self.tile_n)
+                    column = linear % Int32(self.tile_n)
+                    tile = split + local_tile * splits
+                    selected_column = tile * Int32(self.tile_n) + column
+                    valid = request_valid & (
+                        selected_column < Int32(self.selection_width)
+                    )
+                    if valid:
+                        logical_position = selected_positions[
+                            position_base + selected_column.to(Int64)
+                        ].to(Int64)
+                        valid = (logical_position >= Int64(0)) & (
+                            logical_position <= query_position
+                        )
+                    if valid:
+                        tile_flags[tile] = Int32(1)
 
     @cute.kernel
     def kernel(
@@ -692,6 +803,15 @@ class _SelectedPositionPagedForwardKernel:
             layout=cute.make_layout((self.tile_n,), stride=(1,)),
             byte_alignment=16,
         )
+        tile_flags = allocator.allocate_tensor(
+            element_type=Int32,
+            layout=cute.make_layout((self.tile_count,), stride=(1,)),
+            byte_alignment=4,
+        )
+        flag_element = thread
+        while flag_element < Int32(self.tile_count):
+            tile_flags[flag_element] = Int32(0)
+            flag_element += Int32(self.threads)
 
         query_element = thread
         first_query_head = kv_head * Int32(self.heads_per_kv)
@@ -768,28 +888,46 @@ class _SelectedPositionPagedForwardKernel:
         )
         softmax.reset()
 
-        tile_count = Int32((self.selection_width + self.tile_n - 1) // self.tile_n)
+        tile_count = Int32(self.tile_count)
         tiles_per_split = (tile_count - split + splits - Int32(1)) // splits
-        self._mma_selected_tile(
+        self._scan_selected_flags(
+            split,
+            row,
+            kv_head,
+            request_valid,
+            query_position,
+            selected_positions,
+            tile_flags,
+            tiles_per_split,
+            splits,
+            thread,
+        )
+        cute.arch.sync_threads()
+        self._resolve_selected_bases(
             split,
             row,
             kv_head,
             request_id,
             request_valid,
             query_position,
-            key_cache,
-            value_cache,
             block_table,
             selected_positions,
             key_bases,
             value_bases,
-            shared_query,
+            num_cache_pages,
+            table_width,
+            thread,
+        )
+        self._selected_tile_body(
+            kv_head,
+            key_cache,
+            value_cache,
+            key_bases,
+            value_bases,
             shared_key,
             shared_value,
             shared_probability,
             shared_row_scale,
-            num_cache_pages,
-            table_width,
             thread,
             tiled_mma_qk,
             tiled_mma_pv,
@@ -811,45 +949,53 @@ class _SelectedPositionPagedForwardKernel:
         )
         for local_tile in cutlass.range(tiles_per_split - Int32(1), unroll=1):
             tile = split + (Int32(local_tile) + Int32(1)) * splits
-            self._mma_selected_tile(
-                tile,
-                row,
-                kv_head,
-                request_id,
-                request_valid,
-                query_position,
-                key_cache,
-                value_cache,
-                block_table,
-                selected_positions,
-                key_bases,
-                value_bases,
-                shared_query,
-                shared_key,
-                shared_value,
-                shared_probability,
-                shared_row_scale,
-                num_cache_pages,
-                table_width,
-                thread,
-                tiled_mma_qk,
-                tiled_mma_pv,
-                register_query,
-                register_key,
-                register_probability,
-                register_value,
-                copy_query,
-                copy_key,
-                copy_probability,
-                copy_value,
-                copy_source_query,
-                copy_source_key,
-                copy_source_probability,
-                copy_source_value,
-                accumulator_output,
-                softmax,
-                is_first=False,
-            )
+            if tile_flags[tile] != Int32(0):
+                cute.arch.sync_threads()
+                self._resolve_selected_bases(
+                    tile,
+                    row,
+                    kv_head,
+                    request_id,
+                    request_valid,
+                    query_position,
+                    block_table,
+                    selected_positions,
+                    key_bases,
+                    value_bases,
+                    num_cache_pages,
+                    table_width,
+                    thread,
+                )
+                self._selected_tile_body(
+                    kv_head,
+                    key_cache,
+                    value_cache,
+                    key_bases,
+                    value_bases,
+                    shared_key,
+                    shared_value,
+                    shared_probability,
+                    shared_row_scale,
+                    thread,
+                    tiled_mma_qk,
+                    tiled_mma_pv,
+                    register_query,
+                    register_key,
+                    register_probability,
+                    register_value,
+                    copy_query,
+                    copy_key,
+                    copy_probability,
+                    copy_value,
+                    copy_source_query,
+                    copy_source_key,
+                    copy_source_probability,
+                    copy_source_value,
+                    accumulator_output,
+                    softmax,
+                    is_first=False,
+                )
+        cute.arch.sync_threads()
 
         if thread < Int32(self.qk_warps * 32):
             output_scale = softmax.finalize()
