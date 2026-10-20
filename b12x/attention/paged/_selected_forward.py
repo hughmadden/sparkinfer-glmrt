@@ -42,6 +42,7 @@ from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compiler import run_compiled
 from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
 from b12x._lib.intrinsics import (
+    atomic_add_shared_i32,
     bfloat2_to_float2_scaled,
     pack_f32x2_to_bfloat2,
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
@@ -645,6 +646,10 @@ class _SelectedPositionPagedForwardKernel:
         A row base of a selection width that is a multiple of four stays
         16-byte aligned, so four positions move per 128-bit load; other widths
         keep the scalar path.
+
+        Several lanes can find a selected position in the same tile, so hits
+        accumulate with a CTA-scope shared-memory atomic rather than a plain
+        store; the tile loop only tests the flag for non-zero.
         """
         selection_group = kv_head // Int32(self.kv_heads // self.selection_groups)
         position_base = (
@@ -698,7 +703,10 @@ class _SelectedPositionPagedForwardKernel:
                             )
                         )
                         if valid:
-                            tile_flags[tile] = Int32(1)
+                            atomic_add_shared_i32(
+                                shared_ptr_to_u32(tile_flags.iterator + tile),
+                                Int32(1),
+                            )
         else:
             scan_total = tiles_per_split * Int32(self.tile_n)
             for scan_iter in cutlass.range(
@@ -722,7 +730,10 @@ class _SelectedPositionPagedForwardKernel:
                             logical_position <= query_position
                         )
                     if valid:
-                        tile_flags[tile] = Int32(1)
+                        atomic_add_shared_i32(
+                            shared_ptr_to_u32(tile_flags.iterator + tile),
+                            Int32(1),
+                        )
 
     @cute.kernel
     def kernel(
