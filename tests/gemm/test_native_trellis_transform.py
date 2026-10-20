@@ -101,7 +101,8 @@ def test_bf16_rotated_single_round(features):
     rotated = torch.empty_like(x)
     blocks = torch.empty(features//128, device="cuda", dtype=torch.float16)
     program = compile_trellis_input_aot(features=features, max_rows=256, output_dtype="bf16")
-    program.launch(x, suh, rotated, blocks, scalars=(256, 752))
+    limit = torch.cuda.get_device_properties(0).multi_processor_count*4
+    program.launch(x, suh, rotated, blocks, scalars=(256, limit))
     expected = hadamard(x.float()*suh.float()).bfloat16()
     torch.testing.assert_close(rotated, expected, rtol=0, atol=0)
     torch.testing.assert_close(blocks, torch.ones_like(blocks), rtol=0, atol=0)
