@@ -11,9 +11,34 @@ from ._common import Operand, Scalar, compile_program
 
 
 class _Selection:
+    """Prepare the visible causal prefix only, over a bounded persistent grid.
+
+    The shared radix top-k bounds every read with ``lengths``: it never reads
+    ``normalized[visible:]``.  The frozen serving prepare normalized the whole
+    capacity extent anyway -- 131,072 entries per row for a checkpoint whose
+    runtime extent is 1M tokens -- so a short prompt paid ~128x dead traffic.
+    Normalizing ``[0, visible)`` leaves the top-k bit-identical (the masked
+    tail is unreachable and its bytes are ignored), and the persistent y grid
+    keeps a short prefix from dispatching up to 512 empty tiles per row while
+    a full extent still spreads across the SMs.
+
+    ``TARGET_BLOCKS`` sizes the launch: ``ceil(TARGET_BLOCKS / count)`` parts
+    per row, capped by the capacity tiles.  A block whose columns start past
+    the visible prefix loads one scalar and exits, so the y extent has to stay
+    small for short prompts; it still has to expose enough blocks to fill the
+    card when every row is at full extent.
+    """
+
+    # Total blocks the prepare grid aims for.  At the captured serving shape
+    # (64 rows x 4 groups, 8K prompt) 1,024 blocks cover the ~263K visible
+    # entries once each; the full 131,072-entry extent still gets 1,024 blocks
+    # of 256 threads over count=1,024 rows, enough to saturate memory.
+    TARGET_BLOCKS = 1024
+
     def __init__(self, groups, capacity):
         from b12x.attention.dsa_indexer.tiled_topk import _build_row_topk_kernel, _resolve_smem_candidate_capacity
         self.groups, self.capacity = groups, capacity
+        self.tiles = (capacity + 255) // 256
         self.topk = _build_row_topk_kernel(512, False,
             _resolve_smem_candidate_capacity(topk=512), True, True)
 
@@ -24,40 +49,50 @@ class _Selection:
                  values: cute.Pointer, ids: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
         count = rows * self.groups
-        self.prepare(scores, positions, requests, normalized, lengths).launch(
-            grid=(count, (self.capacity + 255) // 256, 1), block=(256, 1, 1), stream=stream)
-        score_tensor = cute.make_tensor(normalized, cute.make_layout((Int64(count) * self.capacity,)))
-        length_tensor = cute.make_tensor(lengths, cute.make_layout((count,)))
-        value_tensor = cute.make_tensor(values, cute.make_layout((Int64(count) * 512,)))
-        id_tensor = cute.make_tensor(ids, cute.make_layout((Int64(count) * 512,)))
-        self.topk(score_tensor, length_tensor, length_tensor, value_tensor, id_tensor,
-                  value_tensor, id_tensor, length_tensor, Int32(0), count,
-                  Int32(self.capacity), Int32(0), Int32(0), Int32(1), Int32(1),
-                  Int32(512), Int32(0), Int32(self.capacity), Int32(0), Int32(1),
-                  Int32(1), Int32(0), stream)
-        self.expand(ids, positions, requests, selected).launch(
-            grid=(count, 17, 1), block=(256, 1, 1), stream=stream)
+        if rows > Int32(0):
+            # Runtime row count, runtime grid: ceil(TARGET_BLOCKS/count) parts
+            # per row, never more capacity tiles than the extent has.
+            parts = min((Int32(self.TARGET_BLOCKS) + count - Int32(1)) // count,
+                        Int32(self.tiles))
+            self.prepare(scores, positions, requests, normalized, lengths).launch(
+                grid=(count, parts, 1), block=(256, 1, 1), stream=stream)
+            score_tensor = cute.make_tensor(normalized, cute.make_layout((Int64(count) * self.capacity,)))
+            length_tensor = cute.make_tensor(lengths, cute.make_layout((count,)))
+            value_tensor = cute.make_tensor(values, cute.make_layout((Int64(count) * 512,)))
+            id_tensor = cute.make_tensor(ids, cute.make_layout((Int64(count) * 512,)))
+            self.topk(score_tensor, length_tensor, length_tensor, value_tensor, id_tensor,
+                      value_tensor, id_tensor, length_tensor, Int32(0), count,
+                      Int32(self.capacity), Int32(0), Int32(0), Int32(1), Int32(1),
+                      Int32(512), Int32(0), Int32(self.capacity), Int32(0), Int32(1),
+                      Int32(1), Int32(0), stream)
+            self.expand(ids, positions, requests, selected).launch(
+                grid=(count, 17, 1), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
     def prepare(self, scores: cute.Pointer, positions: cute.Pointer,
                 requests: cute.Pointer, normalized: cute.Pointer, lengths: cute.Pointer):
-        row, tile, _ = cute.arch.block_idx()
+        row, part, _ = cute.arch.block_idx()
+        _, parts, _ = cute.arch.grid_dim()
         thread, _, _ = cute.arch.thread_idx()
-        column = tile * 256 + thread
         query = row // self.groups
-        if (tile == 0) & (thread == 0):
-            visible = min(max(positions[query].to(Int64) // 8, Int64(0)), Int64(self.capacity))
-            if requests[query] < 0:
-                visible = Int64(0)
+        visible = min(max(positions[query].to(Int64) // 8, Int64(0)), Int64(self.capacity))
+        if requests[query] < 0:
+            visible = Int64(0)
+        if (part == 0) & (thread == 0):
             lengths[row] = Int32(visible)
-        if column < self.capacity:
-            offset = Int64(row) * self.capacity + column
+        base = Int64(row) * self.capacity
+        column = part * 256 + thread
+        stride = parts * 256
+        visible32 = Int32(visible)
+        while column < visible32:
+            offset = base + Int64(column)
             score = Float32(scores[offset])
             # IEEE +/-0 compare equal in the oracle. Radix ordering must see one
             # representation so its exact lower-id tie order remains identical.
             if score == Float32(0):
                 score = Float32(0)
             normalized[offset] = score
+            column = column + stride
 
     @cute.kernel
     def expand(self, ids: cute.Pointer, positions: cute.Pointer,
