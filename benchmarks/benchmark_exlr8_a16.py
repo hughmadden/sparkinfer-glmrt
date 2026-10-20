@@ -123,11 +123,12 @@ def _read_stream(src, sums, BLOCK: tl.constexpr):
 def _exchange_traffic(src, dst, n_elements, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     step = tl.num_programs(0) * BLOCK
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    while offsets < n_elements:
+    base = pid * BLOCK
+    while base < n_elements:
+        offsets = base + tl.arange(0, BLOCK)
         values = tl.load(src + offsets, mask=offsets < n_elements, other=0.0)
         tl.store(dst + offsets, values, mask=offsets < n_elements)
-        offsets += step
+        base += step
 
 
 def read_roofline():
