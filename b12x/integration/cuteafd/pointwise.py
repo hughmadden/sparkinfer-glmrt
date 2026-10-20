@@ -17,7 +17,10 @@ from cutlass import BFloat16, Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from b12x._lib.intrinsics import div_rn_f32, rsqrt_approx_ftz_f32
+from b12x._lib.intrinsics import (
+    div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, rsqrt_approx_ftz_f32,
+    st_global_v4_u32,
+)
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _bf16, _warp_sum
 from ._fp8_moe_kernels import _post_silu_product
@@ -166,6 +169,11 @@ class AffineNorm:
 class RuntimeAffineNorm(AffineNorm):
     """Runtime epsilon ABI; keep the legacy constant kernel unchanged for AOT users."""
 
+    def __init__(self, width, heads, eps, zero_centered, subtract_mean, bias, rotary,
+                 vector_io=False):
+        super().__init__(width, heads, eps, zero_centered, subtract_mean, bias, rotary)
+        self.vector_io = bool(vector_io)
+
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, bias: cute.Pointer,
                  cos: cute.Pointer, sin: cute.Pointer, positions: cute.Pointer, out: cute.Pointer,
@@ -173,37 +181,21 @@ class RuntimeAffineNorm(AffineNorm):
         self.kernel(x, weight, bias, cos, sin, positions, out, epsilon).launch(
             grid=(rows, self.heads, 1), block=(32, 1, 1), stream=stream)
 
-    @cute.kernel
-    def kernel(self, x: cute.Pointer, weight: cute.Pointer, bias: cute.Pointer,
-               cos: cute.Pointer, sin: cute.Pointer, positions: cute.Pointer, out: cute.Pointer, epsilon: Float32):
-        x, weight, bias = _view(x), _view(weight), _view(bias)
-        cos, sin, positions, out = _view(cos), _view(sin), _view(positions), _view(out)
-        row = Int64(cute.arch.block_idx()[0])
-        head = Int64(cute.arch.block_idx()[1])
-        lane = Int32(cute.arch.thread_idx()[0])
-        base = (row * Int64(self.heads) + head) * Int64(self.width)
+    @cute.jit
+    def _wide(self, x_addr: Int64, w_addr: Int64, out_addr: Int64, x: cute.Tensor,
+              weight: cute.Tensor, out: cute.Tensor, base: Int64, lane: Int32,
+              epsilon: Float32):
+        # Keep the reduction's striped operands in registers before the chain;
+        # the per-lane accumulation order is the generic path's, so the
+        # reduction stays bit-identical.
+        held = []
         squares, total = Float32(0.0), Float32(0.0)
-        if cutlass.const_expr(self.width == 192 and self.rotary == 64):
-            if lane < Int32(16):
-                for block in cutlass.range_constexpr(3):
-                    for element in cutlass.range_constexpr(4):
-                        dim = Int64(block * 64 + element) + Int64(lane) * Int64(4)
-                        v = Float32(x[base + dim])
-                        squares = _fma(v, v, squares)
-        elif cutlass.const_expr(self.width == 192 and self.rotary == 192):
-            for element in cutlass.range_constexpr(8):
-                dim = lane * Int32(8) + Int32(element)
-                v = Float32(0.0)
-                if dim < Int32(192):
-                    v = Float32(x[base + Int64(dim)])
-                squares = _fma(v, v, squares)
-        else:
-            for chunk in cutlass.range_constexpr((self.width + 31) // 32):
-                dim = Int32(chunk * 32) + lane
-                if dim < Int32(self.width):
-                    v = Float32(x[base + Int64(dim)])
-                    squares = _add(squares, _mul(v, v))
-                    total = _add(total, v)
+        for chunk in cutlass.range_constexpr(self.width // 32):
+            held.append(Float32(x[base + Int64(chunk * 32) + Int64(lane)]))
+        for value in held:
+            squares = _add(squares, _mul(value, value))
+            if cutlass.const_expr(self.subtract_mean):
+                total = _add(total, value)
         squares = _warp_sum(squares)
         mean = Float32(0.0)
         variance = div_rn_f32(squares, Float32(self.width))
@@ -211,24 +203,98 @@ class RuntimeAffineNorm(AffineNorm):
             mean = div_rn_f32(_warp_sum(total), Float32(self.width))
             variance = _sub(variance, _mul(mean, mean))
         inv = rsqrt_approx_ftz_f32(_add(variance, epsilon))
-        for chunk in cutlass.range_constexpr((self.width + 31) // 32):
-            dim = Int32(chunk * 32) + lane
-            if dim < Int32(self.width):
-                value = self._normalized(x, weight, bias, base, dim, mean, inv)
-                if cutlass.const_expr(self.rotary > 0):
-                    half = Int32(self.rotary // 2)
-                    if dim < Int32(self.rotary):
-                        pair = dim % half
-                        real = self._normalized(x, weight, bias, base, pair, mean, inv)
-                        imag = self._normalized(x, weight, bias, base, pair + half, mean, inv)
-                        position = Int64(positions[row])
-                        cache_at = position * Int64(self.rotary // 2) + Int64(pair)
-                        c, s = Float32(cos[cache_at]), Float32(sin[cache_at])
-                        if dim < half:
-                            value = _sub(_mul(real, c), _mul(imag, s))
-                        else:
-                            value = _fma(real, s, _mul(imag, c))
-                out[base + Int64(dim)] = value.to(BFloat16)
+        self._vector_rows(x_addr, w_addr, out_addr, x, weight, out, base, lane, mean, inv)
+
+    @cute.jit
+    def _vector_rows(self, x_addr: Int64, w_addr: Int64, out_addr: Int64, x: cute.Tensor,
+                     weight: cute.Tensor, out: cute.Tensor, base: Int64, lane: Int32,
+                     mean: Float32, inv: Float32):
+        # Per-lane contiguous vector chunks; the per-element math and its
+        # rounding are the scalar path's.  compile_program declares every
+        # operand pointer 16-byte aligned, and width % 256 == 0 makes each row
+        # base a multiple of 1024 B (F32) / 512 B (BF16), so this chunk's
+        # accesses are 16-byte aligned.
+        for chunk in cutlass.range_constexpr(self.width // 256):
+            first = Int64(chunk * 256) + Int64(lane) * Int64(8)
+            x0, x1, x2, x3 = ld_global_v4_f32(x_addr + (base + first) * Int64(4))
+            x4, x5, x6, x7 = ld_global_v4_f32(x_addr + (base + first) * Int64(4) + Int64(16))
+            w0, w1, w2, w3 = ld_global_v4_f32(w_addr + first * Int64(4))
+            w4, w5, w6, w7 = ld_global_v4_f32(w_addr + first * Int64(4) + Int64(16))
+            normalized = []
+            for value, weight_value in ((x0, w0), (x1, w1), (x2, w2), (x3, w3),
+                                        (x4, w4), (x5, w5), (x6, w6), (x7, w7)):
+                if cutlass.const_expr(self.zero_centered):
+                    weight_value = _add(weight_value, Float32(1.0))
+                normalized.append(_mul(_mul(_sub(value, mean), inv), weight_value))
+            st_global_v4_u32(out_addr + (base + first) * Int64(2),
+                pack_f32x2_to_bfloat2(normalized[0], normalized[1]),
+                pack_f32x2_to_bfloat2(normalized[2], normalized[3]),
+                pack_f32x2_to_bfloat2(normalized[4], normalized[5]),
+                pack_f32x2_to_bfloat2(normalized[6], normalized[7]))
+
+    @cute.kernel
+    def kernel(self, x: cute.Pointer, weight: cute.Pointer, bias: cute.Pointer,
+               cos: cute.Pointer, sin: cute.Pointer, positions: cute.Pointer, out: cute.Pointer, epsilon: Float32):
+        x_addr, w_addr, out_addr = (Int64(x.toint()), Int64(weight.toint()),
+                                    Int64(out.toint()))
+        x, weight, bias = _view(x), _view(weight), _view(bias)
+        cos, sin, positions, out = _view(cos), _view(sin), _view(positions), _view(out)
+        row = Int64(cute.arch.block_idx()[0])
+        head = Int64(cute.arch.block_idx()[1])
+        lane = Int32(cute.arch.thread_idx()[0])
+        base = (row * Int64(self.heads) + head) * Int64(self.width)
+        wide = (self.vector_io and self.rotary == 0 and not self.bias
+                and self.width % 256 == 0)
+        if cutlass.const_expr(wide):
+            self._wide(x_addr, w_addr, out_addr, x, weight, out, base, lane, epsilon)
+        else:
+            squares, total = Float32(0.0), Float32(0.0)
+            if cutlass.const_expr(self.width == 192 and self.rotary == 64):
+                if lane < Int32(16):
+                    for block in cutlass.range_constexpr(3):
+                        for element in cutlass.range_constexpr(4):
+                            dim = Int64(block * 64 + element) + Int64(lane) * Int64(4)
+                            v = Float32(x[base + dim])
+                            squares = _fma(v, v, squares)
+            elif cutlass.const_expr(self.width == 192 and self.rotary == 192):
+                for element in cutlass.range_constexpr(8):
+                    dim = lane * Int32(8) + Int32(element)
+                    v = Float32(0.0)
+                    if dim < Int32(192):
+                        v = Float32(x[base + Int64(dim)])
+                    squares = _fma(v, v, squares)
+            else:
+                for chunk in cutlass.range_constexpr((self.width + 31) // 32):
+                    dim = Int32(chunk * 32) + lane
+                    if dim < Int32(self.width):
+                        v = Float32(x[base + Int64(dim)])
+                        squares = _add(squares, _mul(v, v))
+                        total = _add(total, v)
+            squares = _warp_sum(squares)
+            mean = Float32(0.0)
+            variance = div_rn_f32(squares, Float32(self.width))
+            if cutlass.const_expr(self.subtract_mean):
+                mean = div_rn_f32(_warp_sum(total), Float32(self.width))
+                variance = _sub(variance, _mul(mean, mean))
+            inv = rsqrt_approx_ftz_f32(_add(variance, epsilon))
+            for chunk in cutlass.range_constexpr((self.width + 31) // 32):
+                dim = Int32(chunk * 32) + lane
+                if dim < Int32(self.width):
+                    value = self._normalized(x, weight, bias, base, dim, mean, inv)
+                    if cutlass.const_expr(self.rotary > 0):
+                        half = Int32(self.rotary // 2)
+                        if dim < Int32(self.rotary):
+                            pair = dim % half
+                            real = self._normalized(x, weight, bias, base, pair, mean, inv)
+                            imag = self._normalized(x, weight, bias, base, pair + half, mean, inv)
+                            position = Int64(positions[row])
+                            cache_at = position * Int64(self.rotary // 2) + Int64(pair)
+                            c, s = Float32(cos[cache_at]), Float32(sin[cache_at])
+                            if dim < half:
+                                value = _sub(_mul(real, c), _mul(imag, s))
+                            else:
+                                value = _fma(real, s, _mul(imag, c))
+                    out[base + Int64(dim)] = value.to(BFloat16)
 
 
 class ResidualAdd:
@@ -402,7 +468,9 @@ def compile_affine_norm_aot(*, width, heads=1, eps=1e-5, zero_centered=False,
                             subtract_mean=False, bias=False, rotary=0,
                             input_dtype=torch.float32, parameter_dtype=torch.float32):
     # None explicitly selects the scalar ABI; the historical default stays constant.
-    launch = (RuntimeAffineNorm(width, heads, 1.0, zero_centered, subtract_mean, bias, rotary)
+    launch = (RuntimeAffineNorm(width, heads, 1.0, zero_centered, subtract_mean, bias, rotary,
+                                vector_io=input_dtype is torch.float32
+                                and parameter_dtype is torch.float32)
               if eps is None else
               AffineNorm(width, heads, eps, zero_centered, subtract_mean, bias, rotary))
     if width == 192 and rotary and (subtract_mean or bias):
@@ -418,6 +486,7 @@ def compile_affine_norm_aot(*, width, heads=1, eps=1e-5, zero_centered=False,
         return compile_program(launch, name="affine_norm_runtime_eps", operands=operands,
             scalars=(Scalar("rows"), Scalar("epsilon", "float32")),
             key=(width, heads, zero_centered, subtract_mean, bias, rotary, input_dtype, parameter_dtype),
+            version=2,
             geometry=dict(width=width, heads=heads, epsilon="runtime_float32", zero_centered=zero_centered,
                 subtract_mean=subtract_mean, bias=bias, rotary=rotary))
     return compile_program(launch, name="affine_norm", operands=operands, scalars=(Scalar("rows"),),
