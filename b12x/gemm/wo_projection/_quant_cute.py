@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -107,10 +108,12 @@ class _WOQuantCuTeLaunch:
         cos_sin_type: type[cutlass.Numeric],
         threads: int,
         row_frequencies: bool = False,
+        amax_floor: float = 0.0,
     ) -> None:
         if mode not in ("grouped", "group_major"):
             raise ValueError(f"unsupported WO quant mode {mode!r}")
         self._mode = mode
+        self._amax_floor = float(amax_floor)
         self._total_k = int(total_k)
         # Per-group width: group_width for grouped, rank for group-major.
         self._span = int(span)
@@ -300,6 +303,8 @@ class _WOQuantCuTeLaunch:
                     max_abs,
                     cute.arch.shuffle_sync_bfly(max_abs, offset=1 << shift),
                 )
+            if cutlass.const_expr(self._amax_floor > 0.0):
+                max_abs = fmax_f32(max_abs, cutlass.Float32(self._amax_floor))
 
             _, scale_byte = pow2_ceil_ue8m0(
                 max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
@@ -418,7 +423,11 @@ def _get_compiled_wo_quant(
     positions_dtype: torch.dtype,
     cos_sin_dtype: torch.dtype,
     row_frequencies: bool = False,
+    amax_floor: float = 0.0,
 ) -> Callable:
+    amax_floor = float(amax_floor)
+    if not math.isfinite(amax_floor) or not 0.0 <= amax_floor <= 1.0:
+        raise ValueError("WO MXFP8 amax_floor must be finite and between zero and one")
     source_type = _cutlass_source_type(source_dtype)
     positions_type = _cutlass_positions_type(positions_dtype)
     cos_sin_type = _cutlass_cos_sin_type(cos_sin_dtype)
@@ -435,6 +444,7 @@ def _get_compiled_wo_quant(
         cos_sin_type,
         _THREADS,
         row_frequencies,
+        amax_floor,
     )
     cache_key = (
         mode,
@@ -450,6 +460,9 @@ def _get_compiled_wo_quant(
         str(cos_sin_dtype),
         _THREADS,
     )
+    if amax_floor > 0.0:
+        # Floorless kernels keep their existing key.
+        cache_key += (amax_floor,)
     raise_if_kernel_resolution_frozen(
         "cute.compile",
         target=launch,
@@ -610,7 +623,11 @@ __all__ = [
 
 
 def compile_wo_grouped_quant_aot(
-    *, groups: int, group_width: int, row_frequencies: bool = False
+    *,
+    groups: int,
+    group_width: int,
+    row_frequencies: bool = False,
+    amax_floor: float = 0.0,
 ) -> object:
     """Export grouped BF16-to-MXFP8 quantization with runtime row count/grid.
 
@@ -619,6 +636,8 @@ def compile_wo_grouped_quant_aot(
     With row_frequencies, cos_sin_ptr holds interleaved FP32 [live_rows,32,2]
     frequencies for inverse RoPE on the last 64 columns of each 512-column
     head. Rotated values round to BF16 before quantization; positions_ptr is unused.
+    amax_floor raises each 32-value block's amax before scaling; set 1e-4 for
+    the DeepSeek-V4.1 K32 contract, as for the dense MXFP8 row quantizer.
     """
     if groups < 1 or group_width < 128 or group_width % 128:
         raise ValueError("grouped quantization requires positive groups and K%128=0")
@@ -636,4 +655,5 @@ def compile_wo_grouped_quant_aot(
         torch.int64,
         torch.float32 if row_frequencies else torch.bfloat16,
         row_frequencies,
+        amax_floor,
     ).compiled
