@@ -114,7 +114,11 @@ def test_checkpoint_grouped_matches_chunks(group_rows, units):
 @pytest.mark.parametrize("units", [1, 16])
 def test_every_live_row_count_matches_decode(units):
     torch.cuda.set_per_process_memory_fraction(0.25)
-    hidden, topk, rows = 128, 2, 4096
+    # Two K128 blocks: block 1's pinned FMA uses its own scale load and the
+    # partial plane is written after both blocks accumulate. Cross-split
+    # read+add is covered by the hidden-1152 checkpoint cases (9 blocks,
+    # 2 splits).
+    hidden, topk, rows = 256, 2, 4096
     gen = torch.Generator(device="cuda").manual_seed(408)
     owners = []
     pointers = torch.zeros((4, units, 3, 3), dtype=torch.int64)
