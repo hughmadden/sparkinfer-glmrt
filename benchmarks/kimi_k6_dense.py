@@ -1,9 +1,10 @@
 """Same-process exported shared-ABI K6 versus canonical engine BF16 projections.
 
 This deliberately does not call the general trellis GEMM. Random native payloads
-measure the projection only, excluding caller-owned H128 transforms. Decode
-samples evict L2 outside the timed region. Each arm runs through its exported C
-wrapper, captured once before timing; sampling order alternates each round.
+measure the projection; --transforms adds the exported H128 ingress and egress.
+Decode samples evict L2 outside the timed region. Each arm runs through its
+exported C wrapper, captured once before timing; sampling order alternates each
+round. Poisoned-output replay guards reject empty or wrong-stream captures.
 """
 from __future__ import annotations
 
@@ -50,6 +51,7 @@ def main():
     parser.add_argument("--shapes", default="7168:6144:1,7168:163840:1", help="K:N:side list")
     parser.add_argument("--rows", default="1,64,256")
     parser.add_argument("--samples", type=int, default=15)
+    parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     import torch
@@ -57,6 +59,7 @@ def main():
     from b12x.integration.cuteafd import exportable_compilation
     from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
     torch.manual_seed(273)
     device = torch.cuda.current_device()
     sms = torch.cuda.get_device_properties(device).multi_processor_count
@@ -68,7 +71,7 @@ def main():
     records = []
     metadata = dict(device=torch.cuda.get_device_name(), sms=sms, l2_bytes=l2,
                     samples=args.samples, kernel_path="exported shared trellis ABI v1",
-                    transforms_included=False, decode_cache="cold, 2x runtime L2 bytes")
+                    transforms_included=args.transforms, decode_cache="cold, 2x runtime L2 bytes")
     for shape in args.shapes.split(","):
         k, n, side = map(int, shape.split(":"))
         directory = args.output_dir / f"k{k}_n{n}_s{side}"
@@ -84,6 +87,15 @@ def main():
         bf16_output = torch.empty(capacity*n, device="cuda", dtype=torch.bfloat16)
         weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
         arms = {}
+        suh=torch.ones(k,device="cuda",dtype=torch.float16)
+        svh=torch.ones(n,device="cuda",dtype=torch.float16)
+        transformed_output=torch.empty(capacity*n,device="cuda",dtype=torch.float32 if n==163840 else torch.bfloat16)
+        if args.transforms:
+            with exportable_compilation():
+                ingress=compile_trellis_input_aot(features=k,max_rows=capacity)
+                egress=compile_trellis_output_aot(features=n,output_dtype="f32" if n==163840 else "bf16",max_rows=capacity)
+            ingress=exported(ingress,directory,"input_transform")
+            egress=exported(egress,directory,"output_transform")
         for codebook in ("mcg", "mul1", "bf16"):
             print(f"compiling {shape} {codebook}", flush=True)
             with exportable_compilation():
@@ -96,16 +108,30 @@ def main():
             for name, lib in arms.items():
                 values = [x_bf16.data_ptr(), weight.data_ptr(), bf16_output.data_ptr(), rows] if name == "bf16" else \
                     [t.data_ptr() for t in (inputs, payload, scales, partial, output)] + [rows, 0, sms*4]
-                def run(lib=lib, values=values):
-                    result = lib.run(*values, torch.cuda.current_stream().cuda_stream)
+                def run(lib=lib, values=values, name=name):
+                    stream=torch.cuda.current_stream().cuda_stream
+                    if args.transforms and name != "bf16":
+                        result=ingress.run(x_bf16.data_ptr(),suh.data_ptr(),x.data_ptr(),scales.data_ptr(),rows,sms*4,stream)
+                        if result:
+                            raise RuntimeError(f"input transform returned {result}")
+                    result = lib.run(*values, stream)
                     if result:
                         raise RuntimeError(f"exported wrapper returned {result}")
+                    if args.transforms and name != "bf16":
+                        result=egress.run(output.data_ptr(),svh.data_ptr(),transformed_output.data_ptr(),rows,sms*4,stream)
+                        if result:
+                            raise RuntimeError(f"output transform returned {result}")
                 run()
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     run()
+                target=bf16_output[:rows*n] if name=="bf16" else transformed_output[:rows*n] if args.transforms else output[:rows*n]
+                target.fill_(float("nan"))
                 graph.replay()
+                torch.cuda.synchronize()
+                if not torch.isfinite(target).all().item():
+                    raise RuntimeError(f"{name} graph did not overwrite poisoned output")
                 graphs[name] = graph
             torch.cuda.synchronize()
             samples = {name: [] for name in arms}
