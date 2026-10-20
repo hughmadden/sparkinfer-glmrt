@@ -149,7 +149,7 @@ def test_every_live_row_count_matches_decode(units):
         run(dec, base, wire[first:], ids[first:], weights[first:], pointers, bits, signs, 64, 48)
         expected[first:first+64].copy_(base["output"][:64])
     assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
-    live_counts = range(1, rows+1) if os.environ.get("EXLR8_EXHAUSTIVE") else (1, 16, 64, 65, 512, 1024, 4096)
+    live_counts = range(1, rows+1) if os.environ.get("EXLR8_EXHAUSTIVE") else (1, 16, 64, 65, 512, 1024, 1408, 2048, 4096)
     with kernel_resolution_guard("EXLR8 grouped exhaustive row invariance"):
         for live in live_counts:
             for limit in (1, 48, 188):

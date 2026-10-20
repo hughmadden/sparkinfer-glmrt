@@ -482,7 +482,7 @@ def main():
                         help="explicit serving geometry; omitted keeps legacy compact TP4 fixture")
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--layer", type=int, default=3)
-    parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64,4096")
+    parser.add_argument("--rows",default=None)
     parser.add_argument("--replays",type=int,default=20)
     parser.add_argument("--output",type=Path)
     parser.add_argument("--control-core",type=Path,
@@ -500,6 +500,8 @@ def main():
     parser.add_argument("--profile-arm", default="grouped",
                         help="grouped benchmark arm inside cudaProfilerStart/Stop")
     args = parser.parse_args()
+    if args.rows is None:
+        args.rows = "512,1408,2048,4096" if args.grouped else "1,2,3,4,5,6,7,8,16,64,4096"
     if not args.profile and args.output is None:
         parser.error("--output is required unless --profile")
     if bool(args.control_core) != bool(args.control_glue):
@@ -918,6 +920,18 @@ def grouped_main(args):
         stages = stage_profile(graphs["grouped"], args.output.parent,
             {"ingress":("_Group",),"fc1":("grouped_fc1_kernel",),"activation":("activation_kernel",),
              "fc2":("grouped_fc2_kernel",),"egress":("reduce_kernel",)})
+        arm_stages = {
+            name: {
+                k: v / copies if k.endswith("_us") else v
+                for k, v in stage_profile(
+                    graphs[name], args.output.parent,
+                    {"ingress": ("_Group",), "fc1": ("grouped_fc1_kernel",),
+                     "activation": ("activation_kernel",), "fc2": ("grouped_fc2_kernel",),
+                     "egress": ("reduce_kernel",)}
+                ).items()
+            }
+            for name in frozen
+        }
         k4_stages = stage_profile(graphs["exl3"], args.output.parent,
             {"wire_decode": ("_wire_decode",), "fc1_fc2_fused": ("W4A16FusedMoeKernel",),
              "fc1": ("ws_fc1_kernel",), "activation": ("ws_act_kernel",),
@@ -928,6 +942,7 @@ def grouped_main(args):
                    exl3_speedup=med["exl3"]/med["grouped"], unique_weight_bytes=unique,
                    unique_read_roofline_percent=100*unique/med["grouped"]/1000/roof["gbps"],
                    stages={k:v/copies if k.endswith("_us") else v for k,v in stages.items()},
+                   arm_stages=arm_stages,
                    groups=int(state["count"].item()), bitwise_equal=True,
                    uniform_route_block=uniform_states[0][-1] if owned is None else 64,
                    uniform_input_conversion=("fp8_k32_to_bf16_included" if owned is None
