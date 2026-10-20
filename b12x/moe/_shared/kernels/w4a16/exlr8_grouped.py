@@ -18,6 +18,8 @@ from cuda.bindings import driver as cuda
 from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     f16_mma_m16n8k16_f32,
+    half2_to_float2_scaled,
+    ld_global_b16,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
     packed_dequant_trellis_to_half2x4,
@@ -105,6 +107,22 @@ def cp_async4_shared_global_cg_pred(smem_addr: Int32, gmem_addr: Int64, pred: In
 
 
 @dsl_user_op
+def ld_global_nc_v4_u32_pred(addr: Int64, pred: Int32, *, loc=None, ip=None):
+    v = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],
+        "{ .reg .pred p; mov.b32 $0, 0; mov.b32 $1, 0; mov.b32 $2, 0; mov.b32 $3, 0; "
+        "setp.ne.b32 p, $5, 0; @p ld.global.nc.v4.u32 {$0, $1, $2, $3}, [$4]; }",
+        "=r,=r,=r,=r,l,r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return (Uint32(llvm.extractvalue(T.i32(), v, [0], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), v, [1], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), v, [2], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), v, [3], loc=loc, ip=ip)))
+
+
+@dsl_user_op
 def st_global_v2_f32(addr: Int64, v0: Float32, v1: Float32, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -117,12 +135,22 @@ def st_global_v2_f32(addr: Int64, v0: Float32, v1: Float32, *, loc=None, ip=None
 
 
 @dsl_user_op
+def bind_loop_i32(val: Int32, dep: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(llvm.inline_asm(
+        T.i32(),
+        [Int32(val).ir_value(loc=loc, ip=ip), Int32(dep).ir_value(loc=loc, ip=ip)],
+        "mov.b32 $0, $1;", "=r,r,r",
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
 def ld_shared_v4_f32(smem_addr: Int32, *, loc=None, ip=None):
     v = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
         [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
         "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];", "=f,=f,=f,=f,r",
-        has_side_effects=False, is_align_stack=False,
+        has_side_effects=True, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
     return (Float32(llvm.extractvalue(T.f32(), v, [0], loc=loc, ip=ip)),
             Float32(llvm.extractvalue(T.f32(), v, [1], loc=loc, ip=ip)),
@@ -175,7 +203,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 12
+    CODE_VERSION = 15
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -258,23 +286,36 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 else:
                     st_shared_v4_u32(shared_a + Int32(idx * 4096) + smem_thread_off,
                                      Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                    if cutlass.const_expr(not down and self.mtiles == 4):
+                        if num_live_m <= Int32(3) and Int32(idx) < Int32(3):
+                            st_shared_v4_u32(shared_a + Int32(12288 + idx * 4096) + smem_thread_off,
+                                             Uint32(0), Uint32(0), Uint32(0), Uint32(0))
         return num_live_m, live_m, srow
 
     @cute.jit
-    def stage_ab(self, shared_a: Int32, shared_b: Int32, a_address: Int64, b_address: Int64,
-                 srow: cute.Tensor, num_live_m: Int32, input_block: Int32, tile_block: Int32,
-                 tid: Int32, smem_thread_off: Int32, col_s: Int32,
-                 a_stride: cutlass.Constexpr, width: cutlass.Constexpr):
+    def zero_invalid_a_tiles(self, shared_a_dst: Int32, srow: cute.Tensor,
+                             num_live_m: Int32, smem_thread_off: Int32):
+        for idx in cutlass.range_constexpr(self.mtiles):
+            if Int32(idx) < num_live_m and srow[idx] < Int32(0):
+                st_shared_v4_u32(shared_a_dst + Int32(idx * 4096) + smem_thread_off,
+                                 Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+
+    @cute.jit
+    def stage_a_async(self, shared_a: Int32, a_address: Int64, srow: cute.Tensor,
+                      num_live_m: Int32, input_block: Int32, smem_thread_off: Int32,
+                      col_s: Int32, a_stride: cutlass.Constexpr,
+                      max_tiles: cutlass.Constexpr):
         col_offset_bytes = (input_block.to(Int64) * Int64(128) + col_s.to(Int64) * Int64(8)) * Int64(2)
         base_a = a_address + col_offset_bytes
-        for idx in cutlass.range_constexpr(self.mtiles):
-            if Int32(idx) < num_live_m:
-                sr = srow[idx]
-                valid = (sr >= Int32(0)).to(Int32)
-                safe_sr = max(sr, Int32(0))
-                source = base_a + safe_sr.to(Int64) * Int64(a_stride * 2)
+        for idx in cutlass.range_constexpr(max_tiles):
+            if Int32(idx) < num_live_m and srow[idx] >= Int32(0):
+                source = base_a + srow[idx].to(Int64) * Int64(a_stride * 2)
                 target = shared_a + Int32(idx * 4096) + smem_thread_off
-                cp_async4_shared_global_ca_pred(target, source, valid)
+                cp_async4_shared_global(target, source)
+
+    @cute.jit
+    def stage_b_async(self, shared_b: Int32, b_address: Int64, tile_block: Int32,
+                      tid: Int32, width: cutlass.Constexpr):
         base_b = b_address + tile_block.to(Int64) * Int64(2048 * width)
         off0 = tid * Int32(16)
         cp_async4_shared_global(shared_b + off0, base_b + off0.to(Int64))
@@ -283,15 +324,61 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             cp_async4_shared_global(shared_b + off1, base_b + off1.to(Int64))
         elif cutlass.const_expr(width == 3):
             off1 = off0 + Int32(4096)
-            cp_async4_shared_global_cg_pred(shared_b + off1, base_b + off1.to(Int64), (tid < Int32(128)).to(Int32))
+            cp_async4_shared_global_cg_pred(
+                shared_b + off1, base_b + off1.to(Int64), (tid < Int32(128)).to(Int32))
+
+    @cute.jit
+    def stage_b_async_dyn(self, shared_b: Int32, b_address: Int64, tile_block: Int32,
+                          tid: Int32, width: Int32):
+        if width != Int32(0):
+            base_b = b_address + tile_block.to(Int64) * (width.to(Int64) * Int64(2048))
+            off0 = tid * Int32(16)
+            cp_async4_shared_global(shared_b + off0, base_b + off0.to(Int64))
+            off1 = off0 + Int32(4096)
+            if width == Int32(4):
+                cp_async4_shared_global(shared_b + off1, base_b + off1.to(Int64))
+            elif width == Int32(3):
+                cp_async4_shared_global_cg_pred(
+                    shared_b + off1, base_b + off1.to(Int64), (tid < Int32(128)).to(Int32))
+
+    @cute.jit
+    def get_fc2_unit_desc(self, pointers: cute.Tensor, bits: cute.Tensor,
+                          unit_map: cute.Tensor, expert: Int32, k: Int32,
+                          group_inter_base: Int64):
+        unit = unit_map[expert.to(Int64) * Int64(self.units) + k.to(Int64)]
+        desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
+        width = bits[desc]
+        payload = pointers[desc * Int64(3)]
+        scales = pointers[desc * Int64(3) + Int64(2)]
+        unit_addr = group_inter_base + k.to(Int64) * Int64(self.group_rows * 128 * 2)
+        return width, payload, scales, unit_addr
+
+    @cute.jit
+    def stage_ab_issue(self, shared_a: Int32, shared_b: Int32, a_address: Int64, b_address: Int64,
+                       srow: cute.Tensor, num_live_m: Int32, input_block: Int32, tile_block: Int32,
+                       tid: Int32, smem_thread_off: Int32, col_s: Int32,
+                       a_stride: cutlass.Constexpr, width: cutlass.Constexpr,
+                       max_tiles: cutlass.Constexpr):
+        self.stage_a_async(shared_a, a_address, srow, num_live_m, input_block,
+                           smem_thread_off, col_s, a_stride, max_tiles)
+        self.stage_b_async(shared_b, b_address, tile_block, tid, width)
         cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def stage_ab(self, shared_a: Int32, shared_b: Int32, a_address: Int64, b_address: Int64,
+                 srow: cute.Tensor, num_live_m: Int32, input_block: Int32, tile_block: Int32,
+                 tid: Int32, smem_thread_off: Int32, col_s: Int32,
+                 a_stride: cutlass.Constexpr, width: cutlass.Constexpr):
+        self.stage_ab_issue(shared_a, shared_b, a_address, b_address, srow, num_live_m,
+                            input_block, tile_block, tid, smem_thread_off, col_s,
+                            a_stride, width, self.mtiles)
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
     @cute.jit
     def accumulate_fixed_m(self, total: cute.Tensor, shared_a: Int32, shared_b: Int32,
                            lane: Int32, warp: Int32,
-                           width: cutlass.Constexpr, scale: Float32,
+                           width: cutlass.Constexpr, packed_scale: Uint32,
                            m_live: cutlass.Constexpr):
         acc = cute.make_rmem_tensor((m_live, 8), Float32)
         acc.fill(Float32(0.0))
@@ -337,6 +424,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     acc[idx, 4], acc[idx, 5], acc[idx, 6], acc[idx, 7],
                     a0, a1, a2, a3, b2, b3)
                 acc[idx, 4], acc[idx, 5], acc[idx, 6], acc[idx, 7] = d4, d5, d6, d7
+        scale, _ = half2_to_float2_scaled(packed_scale, Float32(1.0))
         for idx in cutlass.range_constexpr(m_live):
             for v in cutlass.range_constexpr(8):
                 total[idx, v] = fma_rn_f32(acc[idx, v], scale, total[idx, v])
@@ -344,31 +432,67 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     @cute.jit
     def accumulate(self, total: cute.Tensor, shared_a: Int32, shared_b: Int32,
                    lane: Int32, warp: Int32,
-                   width: cutlass.Constexpr, scale: Float32, num_live_m: Int32):
+                   width: cutlass.Constexpr, packed_scale: Uint32, num_live_m: Int32):
         if cutlass.const_expr(self.mtiles == 1):
             if num_live_m >= Int32(1):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 1)
+                                        width, packed_scale, 1)
         elif cutlass.const_expr(self.mtiles == 2):
             if num_live_m == Int32(1):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 1)
+                                        width, packed_scale, 1)
             elif num_live_m >= Int32(2):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 2)
+                                        width, packed_scale, 2)
         else:
             if num_live_m == Int32(1):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 1)
+                                        width, packed_scale, 1)
             elif num_live_m == Int32(2):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 2)
+                                        width, packed_scale, 2)
             elif num_live_m == Int32(3):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 3)
+                                        width, packed_scale, 3)
             elif num_live_m >= Int32(4):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 4)
+                                        width, packed_scale, 4)
+
+    @cute.jit
+    def fold_shared_plane(self, c_base: Int32, tid: Int32, split: Int32,
+                          total: cute.Tensor, tile_idx: cutlass.Constexpr):
+        c_lo = c_base + tid * Int32(16)
+        c_hi = c_lo + Int32(4096)
+        if split == Int32(0):
+            st_shared_v4_f32(
+                c_lo,
+                Float32(0.0) + total[tile_idx, 0], Float32(0.0) + total[tile_idx, 1],
+                Float32(0.0) + total[tile_idx, 2], Float32(0.0) + total[tile_idx, 3])
+            st_shared_v4_f32(
+                c_hi,
+                Float32(0.0) + total[tile_idx, 4], Float32(0.0) + total[tile_idx, 5],
+                Float32(0.0) + total[tile_idx, 6], Float32(0.0) + total[tile_idx, 7])
+        else:
+            c0, c1, c2, c3 = ld_shared_v4_f32(c_lo)
+            c4, c5, c6, c7 = ld_shared_v4_f32(c_hi)
+            st_shared_v4_f32(
+                c_lo,
+                c0 + total[tile_idx, 0], c1 + total[tile_idx, 1],
+                c2 + total[tile_idx, 2], c3 + total[tile_idx, 3])
+            st_shared_v4_f32(
+                c_hi,
+                c4 + total[tile_idx, 4], c5 + total[tile_idx, 5],
+                c6 + total[tile_idx, 6], c7 + total[tile_idx, 7])
+
+    @cute.jit
+    def load_shared_plane(self, c_base: Int32, tid: Int32,
+                          total: cute.Tensor, tile_idx: cutlass.Constexpr):
+        c_lo = c_base + tid * Int32(16)
+        c_hi = c_lo + Int32(4096)
+        c0, c1, c2, c3 = ld_shared_v4_f32(c_lo)
+        c4, c5, c6, c7 = ld_shared_v4_f32(c_hi)
+        total[tile_idx, 0], total[tile_idx, 1], total[tile_idx, 2], total[tile_idx, 3] = c0, c1, c2, c3
+        total[tile_idx, 4], total[tile_idx, 5], total[tile_idx, 6], total[tile_idx, 7] = c4, c5, c6, c7
 
     @cute.kernel
     def grouped_fc1_kernel(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -391,15 +515,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
 
         storage = smem.allocate(Storage)
         shared_a = shared_ptr_to_u32(storage.words.data_ptr())
-        shared_b = shared_a + Int32(self.group_rows * 256)
-        shared_c = shared_b + Int32(8192)
         tid = Int32(cute.arch.thread_idx()[0])
         task = Int32(cute.arch.block_idx()[0])
         step = Int32(cute.arch.grid_dim()[0])
         lane, warp = tid & Int32(31), tid >> Int32(5)
         r_s, col_s = tid >> Int32(4), tid & Int32(15)
         smem_thread_off = (r_s * Int32(16) + (col_s ^ (r_s & Int32(7)))) * Int32(16)
-        smem_c_tid = shared_c + tid * Int32(32)
         num_up = unit_limit * Int32(2)
         grand0 = cute.make_rmem_tensor(8, Float32)
         total = cute.make_rmem_tensor((self.mtiles, 8), Float32)
@@ -413,9 +534,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             proj = up_idx & Int32(1)
             k = up_idx >> Int32(1)
             expert = group_expert[group]
-            # Compact ownership: only the first unit_count[expert] task positions
-            # of a group own residency. Dead positions skip the route-slot scan,
-            # tile preparation and barriers entirely.
             if k < unit_count[expert]:
                 unit = unit_map[expert.to(Int64) * Int64(self.units) + k.to(Int64)]
                 logical = (group * unit_limit + k) * Int32(2) + proj
@@ -429,65 +547,158 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     grand0.fill(Float32(0.0))
                     payload, scales = pointers[desc * Int64(3)], pointers[desc * Int64(3) + Int64(2)]
                     x_addr = x.iterator.toint()
-
-                    for split in cutlass.range(self.splits):
-                        kb0 = split * Int32(8)
-                        total.fill(Float32(0.0))
-                        for block in cutlass.range(8):
-                            kb = kb0 + block
-                            if kb < Int32(self.blocks):
-                                scale = _side_value(scales, kb)
-                                if width == Int32(2):
-                                    self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
-                                                  kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 2)
-                                    self.accumulate(total, shared_a, shared_b, lane, warp, 2, scale, num_live_m)
-                                elif width == Int32(3):
-                                    self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
-                                                  kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 3)
-                                    self.accumulate(total, shared_a, shared_b, lane, warp, 3, scale, num_live_m)
-                                elif width == Int32(4):
-                                    self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
-                                                  kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 4)
-                                    self.accumulate(total, shared_a, shared_b, lane, warp, 4, scale, num_live_m)
-                                cute.arch.sync_threads()
-                        for v in cutlass.range_constexpr(8):
-                            grand0[v] = grand0[v] + total[0, v]
-                        for idx in cutlass.range_constexpr(self.mtiles - 1):
-                            c_addr = smem_c_tid + Int32(idx * 8192)
-                            if split == Int32(0):
-                                st_shared_v4_f32(
-                                    c_addr,
-                                    Float32(0.0) + total[idx + 1, 0], Float32(0.0) + total[idx + 1, 1],
-                                    Float32(0.0) + total[idx + 1, 2], Float32(0.0) + total[idx + 1, 3])
-                                st_shared_v4_f32(
-                                    c_addr + Int32(16),
-                                    Float32(0.0) + total[idx + 1, 4], Float32(0.0) + total[idx + 1, 5],
-                                    Float32(0.0) + total[idx + 1, 6], Float32(0.0) + total[idx + 1, 7])
-                            else:
-                                c0, c1, c2, c3 = ld_shared_v4_f32(c_addr)
-                                c4, c5, c6, c7 = ld_shared_v4_f32(c_addr + Int32(16))
-                                st_shared_v4_f32(
-                                    c_addr,
-                                    c0 + total[idx + 1, 0], c1 + total[idx + 1, 1],
-                                    c2 + total[idx + 1, 2], c3 + total[idx + 1, 3])
-                                st_shared_v4_f32(
-                                    c_addr + Int32(16),
-                                    c4 + total[idx + 1, 4], c5 + total[idx + 1, 5],
-                                    c6 + total[idx + 1, 6], c7 + total[idx + 1, 7])
-
-                    for v in cutlass.range_constexpr(8):
-                        total[0, v] = grand0[v]
-                    for idx in cutlass.range_constexpr(self.mtiles - 1):
-                        c_addr = smem_c_tid + Int32(idx * 8192)
-                        c0, c1, c2, c3 = ld_shared_v4_f32(c_addr)
-                        c4, c5, c6, c7 = ld_shared_v4_f32(c_addr + Int32(16))
-                        total[idx + 1, 0], total[idx + 1, 1], total[idx + 1, 2], total[idx + 1, 3] = c0, c1, c2, c3
-                        total[idx + 1, 4], total[idx + 1, 5], total[idx + 1, 6], total[idx + 1, 7] = c4, c5, c6, c7
-
+                    fc1_addr = fc1.iterator.toint()
                     col0 = warp * Int32(16) + (lane & Int32(3)) * Int32(2)
                     group_base = group.to(Int64) * Int64(self.group_rows)
-                    fc1_addr = fc1.iterator.toint()
                     max_slot = rows * Int32(self.top_k)
+
+                    if cutlass.const_expr(self.mtiles == 4):
+                        if num_live_m <= Int32(3):
+                            shared_b0 = shared_a + Int32(24576)
+                            shared_c1 = shared_a + Int32(40960)
+                            if width == Int32(2):
+                                self.stage_ab_issue(shared_a, shared_b0, x_addr, payload, srow,
+                                                    num_live_m, Int32(0), Int32(0), tid,
+                                                    smem_thread_off, col_s, self.hidden_size, 2, 3)
+                            elif width == Int32(3):
+                                self.stage_ab_issue(shared_a, shared_b0, x_addr, payload, srow,
+                                                    num_live_m, Int32(0), Int32(0), tid,
+                                                    smem_thread_off, col_s, self.hidden_size, 3, 3)
+                            elif width == Int32(4):
+                                self.stage_ab_issue(shared_a, shared_b0, x_addr, payload, srow,
+                                                    num_live_m, Int32(0), Int32(0), tid,
+                                                    smem_thread_off, col_s, self.hidden_size, 4, 3)
+                            for split in cutlass.range(self.splits):
+                                kb0 = split * Int32(8)
+                                total.fill(Float32(0.0))
+                                for block in cutlass.range(8):
+                                    kb = kb0 + block
+                                    if kb < Int32(self.blocks):
+                                        parity = kb & Int32(1)
+                                        next_parity = (kb + Int32(1)) & Int32(1)
+                                        cur_a = shared_a + parity * Int32(12288)
+                                        cur_b = shared_b0 + parity * Int32(8192)
+                                        next_a = shared_a + next_parity * Int32(12288)
+                                        next_b = shared_b0 + next_parity * Int32(8192)
+                                        cute.arch.cp_async_wait_group(0)
+                                        cute.arch.sync_threads()
+                                        packed_scale = ld_global_b16(scales + kb.to(Int64) * Int64(2))
+                                        if width == Int32(2):
+                                            if kb + Int32(1) < Int32(self.blocks):
+                                                self.stage_ab_issue(next_a, next_b, x_addr, payload, srow,
+                                                                    num_live_m, kb + Int32(1), kb + Int32(1),
+                                                                    tid, smem_thread_off, col_s, self.hidden_size, 2, 3)
+                                            self.accumulate(total, cur_a, cur_b, lane, warp, 2, packed_scale, num_live_m)
+                                        elif width == Int32(3):
+                                            if kb + Int32(1) < Int32(self.blocks):
+                                                self.stage_ab_issue(next_a, next_b, x_addr, payload, srow,
+                                                                    num_live_m, kb + Int32(1), kb + Int32(1),
+                                                                    tid, smem_thread_off, col_s, self.hidden_size, 3, 3)
+                                            self.accumulate(total, cur_a, cur_b, lane, warp, 3, packed_scale, num_live_m)
+                                        elif width == Int32(4):
+                                            if kb + Int32(1) < Int32(self.blocks):
+                                                self.stage_ab_issue(next_a, next_b, x_addr, payload, srow,
+                                                                    num_live_m, kb + Int32(1), kb + Int32(1),
+                                                                    tid, smem_thread_off, col_s, self.hidden_size, 4, 3)
+                                            self.accumulate(total, cur_a, cur_b, lane, warp, 4, packed_scale, num_live_m)
+                                for v in cutlass.range_constexpr(8):
+                                    grand0[v] = grand0[v] + total[0, v]
+                                if num_live_m >= Int32(2):
+                                    self.fold_shared_plane(shared_c1, tid, split, total, 1)
+                                if cutlass.const_expr(self.splits > 1):
+                                    if num_live_m == Int32(3):
+                                        g_c2 = fc1_addr + (
+                                            Int64(self.max_groups * self.units * 2 * self.group_rows * 128)
+                                            + logical.to(Int64) * Int64(2048) + tid.to(Int64) * Int64(8)
+                                        ) * Int64(4)
+                                        if split == Int32(0):
+                                            st_global_v2_f32(g_c2, Float32(0.0) + total[2, 0], Float32(0.0) + total[2, 1])
+                                            st_global_v2_f32(g_c2 + Int64(8), Float32(0.0) + total[2, 2], Float32(0.0) + total[2, 3])
+                                            st_global_v2_f32(g_c2 + Int64(16), Float32(0.0) + total[2, 4], Float32(0.0) + total[2, 5])
+                                            st_global_v2_f32(g_c2 + Int64(24), Float32(0.0) + total[2, 6], Float32(0.0) + total[2, 7])
+                                        else:
+                                            q0, q1, q2, q3 = ld_global_nc_v4_u32(g_c2)
+                                            q4, q5, q6, q7 = ld_global_nc_v4_u32(g_c2 + Int64(16))
+                                            total[2, 0] = u32_as_f32(q0) + total[2, 0]
+                                            total[2, 1] = u32_as_f32(q1) + total[2, 1]
+                                            total[2, 2] = u32_as_f32(q2) + total[2, 2]
+                                            total[2, 3] = u32_as_f32(q3) + total[2, 3]
+                                            total[2, 4] = u32_as_f32(q4) + total[2, 4]
+                                            total[2, 5] = u32_as_f32(q5) + total[2, 5]
+                                            total[2, 6] = u32_as_f32(q6) + total[2, 6]
+                                            total[2, 7] = u32_as_f32(q7) + total[2, 7]
+                                            if split + Int32(1) < Int32(self.splits):
+                                                st_global_v2_f32(g_c2, total[2, 0], total[2, 1])
+                                                st_global_v2_f32(g_c2 + Int64(8), total[2, 2], total[2, 3])
+                                                st_global_v2_f32(g_c2 + Int64(16), total[2, 4], total[2, 5])
+                                                st_global_v2_f32(g_c2 + Int64(24), total[2, 6], total[2, 7])
+                            for v in cutlass.range_constexpr(8):
+                                total[0, v] = grand0[v]
+                            if num_live_m >= Int32(2):
+                                self.load_shared_plane(shared_c1, tid, total, 1)
+                        else:
+                            shared_b = shared_a + Int32(16384)
+                            shared_c = shared_b + Int32(8192)
+                            for split in cutlass.range(self.splits):
+                                kb0 = split * Int32(8)
+                                total.fill(Float32(0.0))
+                                for block in cutlass.range(8):
+                                    kb = kb0 + block
+                                    if kb < Int32(self.blocks):
+                                        packed_scale = ld_global_b16(scales + kb.to(Int64) * Int64(2))
+                                        if width == Int32(2):
+                                            self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
+                                                          kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 2)
+                                            self.accumulate(total, shared_a, shared_b, lane, warp, 2, packed_scale, num_live_m)
+                                        elif width == Int32(3):
+                                            self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
+                                                          kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 3)
+                                            self.accumulate(total, shared_a, shared_b, lane, warp, 3, packed_scale, num_live_m)
+                                        elif width == Int32(4):
+                                            self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
+                                                          kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 4)
+                                            self.accumulate(total, shared_a, shared_b, lane, warp, 4, packed_scale, num_live_m)
+                                        cute.arch.sync_threads()
+                                for v in cutlass.range_constexpr(8):
+                                    grand0[v] = grand0[v] + total[0, v]
+                                for idx in cutlass.range_constexpr(3):
+                                    self.fold_shared_plane(shared_c + Int32(idx * 8192), tid, split, total, idx + 1)
+                            for v in cutlass.range_constexpr(8):
+                                total[0, v] = grand0[v]
+                            for idx in cutlass.range_constexpr(3):
+                                self.load_shared_plane(shared_c + Int32(idx * 8192), tid, total, idx + 1)
+                    else:
+                        shared_b = shared_a + Int32(self.group_rows * 256)
+                        shared_c = shared_b + Int32(8192)
+                        for split in cutlass.range(self.splits):
+                            kb0 = split * Int32(8)
+                            total.fill(Float32(0.0))
+                            for block in cutlass.range(8):
+                                kb = kb0 + block
+                                if kb < Int32(self.blocks):
+                                    packed_scale = ld_global_b16(scales + kb.to(Int64) * Int64(2))
+                                    if width == Int32(2):
+                                        self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
+                                                      kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 2)
+                                        self.accumulate(total, shared_a, shared_b, lane, warp, 2, packed_scale, num_live_m)
+                                    elif width == Int32(3):
+                                        self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
+                                                      kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 3)
+                                        self.accumulate(total, shared_a, shared_b, lane, warp, 3, packed_scale, num_live_m)
+                                    elif width == Int32(4):
+                                        self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
+                                                      kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 4)
+                                        self.accumulate(total, shared_a, shared_b, lane, warp, 4, packed_scale, num_live_m)
+                                    cute.arch.sync_threads()
+                            for v in cutlass.range_constexpr(8):
+                                grand0[v] = grand0[v] + total[0, v]
+                            for idx in cutlass.range_constexpr(self.mtiles - 1):
+                                self.fold_shared_plane(shared_c + Int32(idx * 8192), tid, split, total, idx + 1)
+                        for v in cutlass.range_constexpr(8):
+                            total[0, v] = grand0[v]
+                        for idx in cutlass.range_constexpr(self.mtiles - 1):
+                            self.load_shared_plane(shared_c + Int32(idx * 8192), tid, total, idx + 1)
+
                     for idx in cutlass.range_constexpr(self.mtiles):
                         if Int32(idx) < num_live_m:
                             m = live_m[idx]
@@ -577,11 +788,14 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         @cute.struct
         class Storage:
             words: cute.struct.Align[
-                cute.struct.MemRange[Uint32, self.group_rows * 64 + 2048], 1024]
+                cute.struct.MemRange[
+                    Uint32,
+                    2 * self.group_rows * 64 + 4096
+                ], 1024]
 
         storage = smem.allocate(Storage)
         shared_a = shared_ptr_to_u32(storage.words.data_ptr())
-        shared_b = shared_a + Int32(self.group_rows * 256)
+        shared_b0 = shared_a + Int32(2 * self.group_rows * 256)
         tid = Int32(cute.arch.thread_idx()[0])
         task = Int32(cute.arch.block_idx()[0])
         step = Int32(cute.arch.grid_dim()[0])
@@ -590,63 +804,170 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         smem_thread_off = (r_s * Int32(16) + (col_s ^ (r_s & Int32(7)))) * Int32(16)
         inter_addr = intermediate.iterator.toint()
         fc2_addr = fc2.iterator.toint()
-        max_slot = rows * Int32(self.top_k)
 
-        while task < groups * Int32(self.blocks):
-            g_tile_base = (task // Int32(self.blocks * 4)) * Int32(4)
-            tile_g = min(Int32(4), groups - g_tile_base)
-            rem = task - g_tile_base * Int32(self.blocks)
-            group = g_tile_base + (rem % tile_g)
-            block = rem // tile_g
+        b_chunk_const = 8 if (self.blocks % 8 == 0) else (3 if (self.blocks % 3 == 0) else self.blocks)
+        chunks_per_group = self.blocks // b_chunk_const
+        use_chunks = (groups * Int32(chunks_per_group)) >= step
+        limit_tasks = (groups * Int32(chunks_per_group)) if use_chunks else (groups * Int32(self.blocks))
+        b_count = Int32(b_chunk_const) if use_chunks else Int32(1)
+
+        total = cute.make_rmem_tensor((self.mtiles, 8), Float32)
+
+        while task < limit_tasks:
+            group = Int32(0)
+            block_base = Int32(0)
+            if use_chunks:
+                g_tile_base = (task // Int32(chunks_per_group * 4)) * Int32(4)
+                tile_g = min(Int32(4), groups - g_tile_base)
+                rem = task - g_tile_base * Int32(chunks_per_group)
+                group = g_tile_base + (rem % tile_g)
+                block_base = (rem // tile_g) * Int32(b_chunk_const)
+            else:
+                g_tile_base = (task // Int32(self.blocks * 4)) * Int32(4)
+                tile_g = min(Int32(4), groups - g_tile_base)
+                rem = task - g_tile_base * Int32(self.blocks)
+                group = g_tile_base + (rem % tile_g)
+                block_base = rem // tile_g
+
             expert = group_expert[group]
             num_live_m, live_m, srow = self.prepare_group_tiles(
                 route_slots, group, rows, tid, lane, shared_a, smem_thread_off, True)
-            cute.arch.sync_threads()
 
             if num_live_m > Int32(0):
-                total = cute.make_rmem_tensor((self.mtiles, 8), Float32)
-                total.fill(Float32(0.0))
                 group_inter_base = inter_addr + group.to(Int64) * (
                     unit_limit.to(Int64) * Int64(self.group_rows * 128 * 2))
-
                 owned = unit_count[expert]
-                k = Int32(0)
-                while k < owned:
-                    unit = unit_map[expert.to(Int64) * Int64(self.units) + k.to(Int64)]
-                    desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
-                    width = bits[desc]
-                    if width != Int32(0):
-                        payload = pointers[desc * Int64(3)]
-                        scale = _side_value(pointers[desc * Int64(3) + Int64(2)], block)
-                        unit_addr = group_inter_base + k.to(Int64) * Int64(self.group_rows * 128 * 2)
-                        if width == Int32(2):
-                            self.stage_ab(shared_a, shared_b, unit_addr, payload, srow, num_live_m,
-                                          Int32(0), block, tid, smem_thread_off, col_s, 128, 2)
-                            self.accumulate(total, shared_a, shared_b, lane, warp, 2, scale, num_live_m)
-                        elif width == Int32(3):
-                            self.stage_ab(shared_a, shared_b, unit_addr, payload, srow, num_live_m,
-                                          Int32(0), block, tid, smem_thread_off, col_s, 128, 3)
-                            self.accumulate(total, shared_a, shared_b, lane, warp, 3, scale, num_live_m)
-                        elif width == Int32(4):
-                            self.stage_ab(shared_a, shared_b, unit_addr, payload, srow, num_live_m,
-                                          Int32(0), block, tid, smem_thread_off, col_s, 128, 4)
-                            self.accumulate(total, shared_a, shared_b, lane, warp, 4, scale, num_live_m)
-                        cute.arch.sync_threads()
-                    k += Int32(1)
-
-                col0 = block * Int32(128) + warp * Int32(16) + (lane & Int32(3)) * Int32(2)
                 group_base = group.to(Int64) * Int64(self.group_rows)
+                max_slot = rows * Int32(self.top_k)
+                out_meta = Int32(0)
                 for idx in cutlass.range_constexpr(self.mtiles):
                     if Int32(idx) < num_live_m:
                         m = live_m[idx]
+                        out_meta = out_meta | (m << Int32(idx * 2))
                         for v in cutlass.range_constexpr(2):
-                            local = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
-                            slot = route_slots[group_base + local.to(Int64)]
-                            if slot >= Int32(0) and slot < max_slot:
-                                row_addr = fc2_addr + ((group_base + local.to(Int64)) * Int64(self.hidden_size)
-                                    + col0.to(Int64)) * Int64(4)
-                                st_global_v2_f32(row_addr, total[idx, 2 * v], total[idx, 2 * v + 1])
-                                st_global_v2_f32(row_addr + Int64(32), total[idx, 4 + 2 * v], total[idx, 4 + 2 * v + 1])
+                            local_out = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
+                            slot_out = route_slots[group_base + local_out.to(Int64)]
+                            if slot_out >= Int32(0) and slot_out < max_slot:
+                                out_meta = out_meta | Int32(1 << (8 + idx * 2 + v))
+
+                if owned > Int32(0):
+                    a_slot_stride = (
+                        (Int32(8192) if num_live_m <= Int32(2) else Int32(16384))
+                        if cutlass.const_expr(self.mtiles == 4)
+                        else Int32(self.group_rows * 256)
+                    )
+                    max_a_slots = (
+                        (Int32(4) if num_live_m <= Int32(2) else Int32(2))
+                        if cutlass.const_expr(self.mtiles == 4)
+                        else Int32(2)
+                    )
+                    pin_all_a = owned <= max_a_slots
+
+                    w0, pay0, sc0, ua0 = self.get_fc2_unit_desc(
+                        pointers, bits, unit_map, expert, Int32(0), group_inter_base)
+                    self.stage_a_async(shared_a, ua0, srow, num_live_m,
+                                       Int32(0), smem_thread_off, col_s, 128, self.mtiles)
+                    if pin_all_a:
+                        for u in cutlass.range(Int32(1), owned):
+                            self.zero_invalid_a_tiles(
+                                shared_a + u * a_slot_stride, srow, num_live_m, smem_thread_off)
+                            _, _, _, u_addr = self.get_fc2_unit_desc(
+                                pointers, bits, unit_map, expert, u, group_inter_base)
+                            self.stage_a_async(shared_a + u * a_slot_stride, u_addr, srow,
+                                               num_live_m, Int32(0), smem_thread_off, col_s, 128, self.mtiles)
+                    else:
+                        self.zero_invalid_a_tiles(
+                            shared_a + a_slot_stride, srow, num_live_m, smem_thread_off)
+
+                    self.stage_b_async_dyn(shared_b0, pay0, block_base, tid, w0)
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.sync_threads()
+
+                    packed_scale = ld_global_b16(sc0 + block_base.to(Int64) * Int64(2)) if w0 != Int32(0) else Uint32(0)
+                    cur_w = w0
+                    step_parity = Int32(0)
+
+                    for b_idx in cutlass.range(b_count):
+                        block = block_base + b_idx
+                        total.fill(Float32(0.0))
+                        for k in cutlass.range(owned):
+                            cur_scale = packed_scale
+                            w_k = cur_w
+                            parity = step_parity & Int32(1)
+                            next_parity = (step_parity + Int32(1)) & Int32(1)
+                            cur_b = shared_b0 + parity * Int32(8192)
+                            next_b = shared_b0 + next_parity * Int32(8192)
+                            cur_a = shared_a + (k if pin_all_a else parity) * a_slot_stride
+
+                            next_k = k + Int32(1)
+                            next_b_idx = b_idx
+                            if next_k >= owned:
+                                next_k = Int32(0)
+                                next_b_idx = b_idx + Int32(1)
+                            has_next = next_b_idx < b_count
+
+                            if has_next:
+                                next_block = block_base + next_b_idx
+                                nw, npay, nsc, nua = self.get_fc2_unit_desc(
+                                    pointers, bits, unit_map, expert, next_k, group_inter_base)
+                                cur_w = nw
+                                packed_scale = (
+                                    ld_global_b16(nsc + next_block.to(Int64) * Int64(2))
+                                    if nw != Int32(0) else Uint32(0)
+                                )
+                                self.stage_b_async_dyn(next_b, npay, next_block, tid, nw)
+                                if not pin_all_a:
+                                    self.stage_a_async(
+                                        shared_a + next_parity * a_slot_stride, nua, srow,
+                                        num_live_m, Int32(0), smem_thread_off, col_s, 128, self.mtiles)
+                                cute.arch.cp_async_commit_group()
+
+                            if w_k == Int32(2):
+                                self.accumulate(total, cur_a, cur_b, lane, warp, 2, cur_scale, num_live_m)
+                            elif w_k == Int32(3):
+                                self.accumulate(total, cur_a, cur_b, lane, warp, 3, cur_scale, num_live_m)
+                            elif w_k == Int32(4):
+                                self.accumulate(total, cur_a, cur_b, lane, warp, 4, cur_scale, num_live_m)
+
+                            if has_next:
+                                cute.arch.cp_async_wait_group(0)
+                                cute.arch.sync_threads()
+
+                            step_parity += Int32(1)
+
+                        out_meta_b = bind_loop_i32(out_meta, b_idx)
+                        col0 = block * Int32(128) + warp * Int32(16) + (lane & Int32(3)) * Int32(2)
+                        block_out_base = fc2_addr + (
+                            group_base * Int64(self.hidden_size) + col0.to(Int64)
+                        ) * Int64(4)
+                        for idx in cutlass.range_constexpr(self.mtiles):
+                            if Int32(idx) < num_live_m:
+                                m = (out_meta_b >> Int32(idx * 2)) & Int32(3)
+                                for v in cutlass.range_constexpr(2):
+                                    if (out_meta_b & Int32(1 << (8 + idx * 2 + v))) != Int32(0):
+                                        local = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
+                                        row_addr = block_out_base + local.to(Int64) * Int64(self.hidden_size * 4)
+                                        st_global_v2_f32(row_addr, total[idx, 2 * v], total[idx, 2 * v + 1])
+                                        st_global_v2_f32(row_addr + Int64(32), total[idx, 4 + 2 * v], total[idx, 4 + 2 * v + 1])
+                else:
+                    total.fill(Float32(0.0))
+                    for b_idx in cutlass.range(b_count):
+                        out_meta_b = bind_loop_i32(out_meta, b_idx)
+                        block = block_base + b_idx
+                        col0 = block * Int32(128) + warp * Int32(16) + (lane & Int32(3)) * Int32(2)
+                        block_out_base = fc2_addr + (
+                            group_base * Int64(self.hidden_size) + col0.to(Int64)
+                        ) * Int64(4)
+                        for idx in cutlass.range_constexpr(self.mtiles):
+                            if Int32(idx) < num_live_m:
+                                m = (out_meta_b >> Int32(idx * 2)) & Int32(3)
+                                for v in cutlass.range_constexpr(2):
+                                    if (out_meta_b & Int32(1 << (8 + idx * 2 + v))) != Int32(0):
+                                        local = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
+                                        row_addr = block_out_base + local.to(Int64) * Int64(self.hidden_size * 4)
+                                        st_global_v2_f32(row_addr, total[idx, 2 * v], total[idx, 2 * v + 1])
+                                        st_global_v2_f32(row_addr + Int64(32), total[idx, 4 + 2 * v], total[idx, 4 + 2 * v + 1])
             cute.arch.sync_threads()
             task += step
 
@@ -668,23 +989,41 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         output_address = output.iterator.toint()
         max_packed = groups * Int32(self.group_rows)
 
+        packed_arr = cute.make_rmem_tensor(self.top_k, Int32)
+        valid_arr = cute.make_rmem_tensor(self.top_k, Int32)
+        weight_arr = cute.make_rmem_tensor(self.top_k, Float32)
+        w_buf = cute.make_rmem_tensor((self.top_k, 4), Float32)
+
         while task < rows * Int32(self.blocks):
             row, block = task // Int32(self.blocks), task % Int32(self.blocks)
             col = block * Int32(128) + lane * Int32(4)
             values = cute.make_rmem_tensor(4, Float32)
             values.fill(Float32(0.0))
             row_route_base = row.to(Int64) * Int64(self.top_k)
+
             for slot in cutlass.range_constexpr(self.top_k):
                 route = row_route_base + Int64(slot)
-                packed = route_group_lane[route]
-                if packed >= Int32(0) and packed < max_packed:
-                    weight = route_weights[route]
-                    w0, w1, w2, w3 = ld_global_nc_v4_u32(
-                        fc2_address + (packed.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(4))
-                    values[0] = values[0] + weight * u32_as_f32(w0)
-                    values[1] = values[1] + weight * u32_as_f32(w1)
-                    values[2] = values[2] + weight * u32_as_f32(w2)
-                    values[3] = values[3] + weight * u32_as_f32(w3)
+                p = route_group_lane[route]
+                packed_arr[slot] = p
+                v = ((p >= Int32(0)) & (p < max_packed)).to(Int32)
+                valid_arr[slot] = v
+                weight_arr[slot] = route_weights[route]
+                safe_p = max(p, Int32(0))
+                addr = fc2_address + (safe_p.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(4)
+                w0, w1, w2, w3 = ld_global_nc_v4_u32_pred(addr, v)
+                w_buf[slot, 0] = u32_as_f32(w0)
+                w_buf[slot, 1] = u32_as_f32(w1)
+                w_buf[slot, 2] = u32_as_f32(w2)
+                w_buf[slot, 3] = u32_as_f32(w3)
+
+            for slot in cutlass.range_constexpr(self.top_k):
+                if valid_arr[slot] != Int32(0):
+                    weight = weight_arr[slot]
+                    values[0] = values[0] + weight * w_buf[slot, 0]
+                    values[1] = values[1] + weight * w_buf[slot, 1]
+                    values[2] = values[2] + weight * w_buf[slot, 2]
+                    values[3] = values[3] + weight * w_buf[slot, 3]
+
             h0, h1, h2, h3 = _w4a8_had128_quad(values[0], values[1], values[2], values[3], lane)
             signs = ld_global_nc_u32(signs_address + col.to(Int64))
             store_bf16x4(output_address + (row.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(2),
