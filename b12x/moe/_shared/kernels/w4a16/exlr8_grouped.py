@@ -213,7 +213,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 26
+    CODE_VERSION = 27
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -255,52 +255,41 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 grid=(min(Int32(self.max_groups) * unit_limit, cta_limit), 1, 1),
                 block=(256, 1, 1), stream=stream)
             if cutlass.const_expr(self.blocks == 48):
-                if rows <= Int32(2048):
-                    fc2_cta_limit = max(Int32(1), cta_limit >> Int32(1))
-                    slice_blocks = (
-                        Int32(6) if rows <= Int32(512)
-                        else (Int32(3) if rows <= Int32(1024)
-                              else (Int32(2) if rows <= Int32(1536) else Int32(1)))
-                    )
-                    slice_shift = (
-                        Int32(1) if rows <= Int32(512)
-                        else (Int32(0) if rows <= Int32(1024)
-                              else (Int32(1) if rows <= Int32(1536) else Int32(0)))
-                    )
-                    slice_base = Int32(0)
-                    while slice_base < Int32(48):
-                        self.grouped_fc2_kernel(
-                            pointers, bits, unit_count, unit_map,
-                            group_expert, route_slots, intermediate, fc2,
-                            rows, group_count, unit_limit,
-                            slice_base, slice_blocks, slice_shift
-                        ).launch(
-                            grid=(min(Int32(self.max_groups * self.blocks), fc2_cta_limit), 1, 1),
-                            block=(256, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
-                        self.reduce_kernel(
-                            route_group_lane, route_weights, fc2, signs_out, output,
-                            rows, group_count,
-                            slice_base, slice_blocks, slice_shift
-                        ).launch(
-                            grid=(min((rows * slice_blocks + Int32(7)) // Int32(8), cta_limit), 1, 1),
-                            block=(256, 1, 1), stream=stream)
-                        slice_base += slice_blocks
-                else:
+                fc2_cta_limit = (
+                    max(Int32(1), cta_limit >> Int32(1))
+                    if rows <= Int32(2048)
+                    else cta_limit
+                )
+                slice_blocks = (
+                    Int32(6) if rows <= Int32(512)
+                    else (Int32(3) if rows <= Int32(1024)
+                          else (Int32(2) if rows <= Int32(1536)
+                                else (Int32(1) if rows <= Int32(2048) else Int32(48))))
+                )
+                slice_shift = (
+                    Int32(1) if rows <= Int32(512)
+                    else (Int32(0) if rows <= Int32(1024)
+                          else (Int32(1) if rows <= Int32(1536)
+                                else (Int32(0) if rows <= Int32(2048) else Int32(4))))
+                )
+                slice_base = Int32(0)
+                while slice_base < Int32(48):
                     self.grouped_fc2_kernel(
                         pointers, bits, unit_count, unit_map,
                         group_expert, route_slots, intermediate, fc2,
                         rows, group_count, unit_limit,
-                        Int32(0), Int32(self.blocks), Int32(4)
+                        slice_base, slice_blocks, slice_shift
                     ).launch(
-                        grid=(min(Int32(self.max_groups * self.blocks), cta_limit), 1, 1),
+                        grid=(min(Int32(self.max_groups * self.blocks), fc2_cta_limit), 1, 1),
                         block=(256, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
                     self.reduce_kernel(
                         route_group_lane, route_weights, fc2, signs_out, output,
                         rows, group_count,
-                        Int32(0), Int32(self.blocks), Int32(4)
+                        slice_base, slice_blocks, slice_shift
                     ).launch(
-                        grid=(min((rows * Int32(self.blocks) + Int32(7)) // Int32(8), cta_limit), 1, 1),
+                        grid=(min((rows * slice_blocks + Int32(7)) // Int32(8), cta_limit), 1, 1),
                         block=(256, 1, 1), stream=stream)
+                    slice_base += slice_blocks
             else:
                 self.grouped_fc2_kernel(
                     pointers, bits, unit_count, unit_map,
@@ -912,7 +901,18 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             b_local_base = Int32(0)
             if cutlass.const_expr(self.blocks == 48):
                 if pow2_slice:
-                    group = task if use_chunks else (task >> slice_shift)
+                    task_eff = task
+                    if use_chunks and step == Int32(96):
+                        task_eff = (
+                            ((task + Int32(32)) if (task < Int32(64)) else (task - Int32(64)))
+                            if (task < Int32(96) and limit_tasks >= Int32(96))
+                            else (
+                                ((task + Int32(64)) if (task < Int32(128)) else (task - Int32(32)))
+                                if (task < Int32(192) and limit_tasks >= Int32(192))
+                                else task
+                            )
+                        )
+                    group = task_eff if use_chunks else (task >> slice_shift)
                     b_local_base = Int32(0) if use_chunks else (task & (slice_blocks - Int32(1)))
                 elif sliced:
                     q = task if use_chunks else (task >> slice_shift)
