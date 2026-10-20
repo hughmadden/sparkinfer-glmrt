@@ -45,16 +45,18 @@ def test_grouped_arm_uses_own_ingress_and_source_keys(monkeypatch, tmp_path):
     glue.write_text("from ._common import compile_program\n"
                    "def compile_exlr8_group_aot(**kwargs):\n"
                    "    return compile_program('frozen ingress', key=(64,), **kwargs)\n")
+    (directory / "wrapper.py").write_text("class _Exlr8ServingPointers:\n"
+                                          "    frozen = True\n")
     def manifest():
         result = dict(revision=directory.name, sources={label:
             bench.hashlib.sha256((directory / (label + '.py')).read_bytes()).hexdigest()
-            for label in ('core', 'glue')})
+            for label in ('core', 'glue', 'wrapper')})
         (directory / "manifest.json").write_text(bench.json.dumps(result))
         return result
     manifest()
     geometry = dict(hidden=6144, units=4, top_k=8, max_groups=768, group_rows=64)
-    candidate = SimpleNamespace(geometry=geometry, operands=("operand",),
-                                scalars=("scalar",), scratch={})
+    candidate = SimpleNamespace(geometry=geometry, operands=(SimpleNamespace(name="x"),),
+                                scalars=(SimpleNamespace(name="rows"),), scratch={})
     calls = []
     def compile_program(wrapper, **kwargs):
         calls.append((wrapper, kwargs))
@@ -62,6 +64,7 @@ def test_grouped_arm_uses_own_ingress_and_source_keys(monkeypatch, tmp_path):
     monkeypatch.setattr(_common, "compile_program", compile_program)
     program, ingress, provenance = bench.compile_grouped_arm(directory, candidate)
     assert program.core.geometry == (6144, 4, 8, 768, 64)
+    assert program.frozen
     assert ingress == "frozen ingress"
     assert calls[0][1]["key"][0] == calls[1][1]["key"][0]
     old_key = calls[0][1]["key"]
