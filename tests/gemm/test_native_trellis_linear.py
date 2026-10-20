@@ -129,6 +129,101 @@ def test_bit_exact_decode(bits, codebook):
             np.testing.assert_array_equal(values[:, lane, j], expected[:, r, c])
 
 
+GLM_TP2_SHAPES = (
+    (2048, 16384, 1), (16384, 6144, 2),
+    (6144, 12288, 1), (12288, 6144, 2),
+)
+
+
+@pytest.mark.parametrize("full_k,full_n,side", GLM_TP2_SHAPES)
+@pytest.mark.skipif(__import__("os").environ.get("NATIVE_GLM_TP2_SHAPES") != "1",
+                    reason="opt-in full GLM TP2 geometry gate")
+def test_glm_tp2_native_slices(full_k, full_n, side):
+    """Both checkpoint-unit slices, bounded F64 oracle and frozen ABI-v1 replay."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+
+    rng = np.random.default_rng(408)
+    rows, bits = 4096, 4
+    k, n = (full_k, full_n // 2) if side == 1 else (full_k // 2, full_n)
+    full_raw = rng.integers(0, 256, full_k * full_n // 2, dtype=np.uint8)
+    full_x = rng.normal(0, .05, (rows, full_k)).astype(np.float16)
+    full_scales = rng.uniform(.5, 2., full_k // 128).astype(np.float16)
+    program = compile_trellis_linear_aot(input_features=k, output_features=n,
+        sharded_side=side, bits=bits, codebook="e4m3", rotation_count=4, max_rows=rows)
+    limit = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count * 4
+    partial = torch.empty((rows, (k + 1023) // 1024, n), device="cuda")
+    output = torch.empty((rows, n), device="cuda")
+    ref = reference()
+    blocks = sorted({0, n // 256, n // 128 - 1})
+    cols = torch.tensor([nb * 128 + i for nb in blocks for i in range(128)], device="cuda")
+    sample_rows = [0, 1, 7, 15, 63, 1023, rows - 1]
+
+    for rank in range(2):
+        units = full_raw.reshape((full_n if side == 1 else full_k) // 128, -1)
+        count = (n if side == 1 else k) // 128
+        raw = units[rank * count:(rank + 1) * count].copy()
+        start = rank * k if side == 2 else 0
+        x = torch.tensor(full_x[:, start:start + k].copy(), device="cuda")
+        scales = torch.tensor(full_scales[start // 128:(start + k) // 128].copy(), device="cuda")
+        payload = torch.tensor(raw.flatten(), device="cuda")
+        rotations = (torch.zeros_like(x), x, -x, x * 2)
+        inputs = torch.tensor([v.data_ptr() for v in rotations], device="cuda", dtype=torch.int64)
+        immutable = [v.clone() for v in (*rotations, payload, scales, inputs)]
+        pointers = [v.data_ptr() for v in (*rotations, payload, scales, inputs, partial, output)]
+        weights = []
+        for nb in blocks:
+            if side == 1:
+                w = ref.decode_unit(raw[nb].tobytes(), bits, "gate", k)
+            else:
+                pieces = raw.reshape(k // 128, n // 128, 64 * 32 * bits)[:, nb]
+                w = np.concatenate([ref.decode_unit(u.tobytes(), bits, "down", 128)
+                                    for u in pieces])
+            weights.append(torch.tensor(w, device="cuda"))
+        weight = torch.cat(weights, dim=1) * scales.float().repeat_interleave(128)[:, None]
+
+        def launch(live, rotation=1, ctas=limit):
+            program.launch(inputs, payload, scales, partial.flatten(), output.flatten(),
+                           scalars=(live, rotation, ctas))
+
+        partial.fill_(float("nan"))
+        output.fill_(float("nan"))
+        launch(rows)
+        assert torch.isfinite(output).all() and torch.count_nonzero(output) > 0
+        saved = output[:64].clone()
+        torch.testing.assert_close(output[sample_rows][:, cols].double(),
+            x[sample_rows].double() @ weight.double(), rtol=2e-4, atol=2e-5)
+        torch.cuda.synchronize()
+        with kernel_resolution_guard("GLM TP2 trellis is precompiled"):
+            for live in (*range(1, 65), 127, 128, 129, 256, 1024, 4096):
+                output.fill_(float("nan"))
+                partial.fill_(float("nan"))
+                launch(live, ctas=1 if live % 2 else limit)
+                prefix = min(live, 64)
+                assert torch.equal(output[:prefix].view(torch.int32), saved[:prefix].view(torch.int32))
+                assert torch.isnan(output[live:]).all()
+            for rotation in range(4):
+                launch(17, rotation)
+                torch.testing.assert_close(output[:17, cols].double(),
+                    rotations[rotation][:17].double() @ weight.double(), rtol=2e-4, atol=2e-5)
+            launch(17)
+            graph_expected = output[:17].clone()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(17)
+            for _ in range(3):
+                output.fill_(float("nan"))
+                partial.fill_(float("nan"))
+                graph.replay()
+                assert torch.equal(output[:17].view(torch.int32), graph_expected.view(torch.int32))
+                assert torch.isnan(output[17:]).all()
+        for value, before in zip((*rotations, payload, scales, inputs), immutable):
+            assert torch.equal(value, before)
+        assert [v.data_ptr() for v in (*rotations, payload, scales, inputs, partial, output)] == pointers
+        del graph
+
+
 # Whole matrices and actual TP2 shards; kv_a's stored N640 is trimmed to 576.
 # Latent projections and the vocabulary head stay whole on their owner GPU.
 KIMI_SHAPES = sorted({
