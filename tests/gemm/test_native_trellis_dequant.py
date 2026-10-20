@@ -13,7 +13,7 @@ def test_chunked_composed_forward(side, codebook):
     from b12x.integration.cuteafd.trellis_dequant import compile_trellis_dequant_aot
     from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
     from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
-    k, n, columns, capacity = 1152, 256, 128, 256
+    k, n, columns, capacity = 2048, 256, 128, 256
     torch.manual_seed(273)
     raw = torch.randint(256, (k*n*6//8,), device="cuda", dtype=torch.uint8)
     ref = Reference(codebook)
