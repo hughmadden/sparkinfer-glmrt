@@ -90,6 +90,7 @@ __all__ = [
     "compile_glm_index_producer_aot",
     "compile_glm_o_aot",
     "compile_glm_producer_aot",
+    "compile_glm_attention_stage_aot",
     "index_producer_scratch_bytes",
     "o_scratch_bytes",
     "producer_scratch_bytes",
@@ -130,6 +131,37 @@ def o_scratch_bytes(g: GLMGeometry, rows: int) -> int:
     return _align(max(int(rows), 1) * g.heads * g.v_head_dim * 2)
 
 
+def _rank_pack(g: GLMGeometry):
+    return GlmRankNormPackKV(q_rank=g.q_lora_rank, eps=g.norm_eps,
+                             page_rows=g.page_rows, record_bytes=g.record_bytes)
+
+
+def _query_rope(g: GLMGeometry, query_row: int):
+    return GlmQueryRope(heads=g.heads, qk_nope=g.qk_nope_dim, qk_head=g.qk_head_dim,
+                        latent=g.latent_dim, query_row=query_row)
+
+
+def _index_post(g: GLMGeometry):
+    return GlmIndexPost(heads=g.index_heads, eps=g.index_norm_eps,
+                        weight_scale=float(g.index_heads) ** -0.5 * 128.0 ** -0.5,
+                        page_rows=g.page_rows)
+
+
+def _kv_projection(g: GLMGeometry, kind: str, query_row: int, *, fp8: bool = False,
+                   prefill_rows: int | None = None):
+    core = BatchedFp8Gemm if fp8 else BatchedBf16Gemm
+    warps = _w8_batched_warps(prefill_rows) if fp8 else 4
+    if kind == "absorb":
+        return core(n=g.kv_lora_rank, k=g.qk_nope_dim, batch=g.heads,
+                    a_row=g.heads * g.qk_head_dim, a_batch=g.qk_head_dim,
+                    o_row=query_row, o_batch=g.latent_dim, compute_warps=warps)
+    if kind == "values":
+        return core(n=g.v_head_dim, k=g.kv_lora_rank, batch=g.heads,
+                    a_row=g.heads * g.kv_lora_rank, a_batch=g.kv_lora_rank,
+                    o_row=g.heads * g.v_head_dim, o_batch=g.v_head_dim, compute_warps=warps)
+    raise ValueError("kv projection must be absorb or values")
+
+
 class _Producer:
     def __init__(self, g: GLMGeometry, fp8: bool = False, query_row: int | None = None):
         self.g = g
@@ -138,14 +170,10 @@ class _Producer:
         self.query_row = int(query_row) if query_row is not None else n * g.latent_dim
         self.qkv_a = projection(g.qkv_a_width, g.hidden, fp8)
         self.q_b = projection(n * g.qk_head_dim, q, fp8)
-        self.pack = GlmRankNormPackKV(q_rank=q, eps=g.norm_eps, page_rows=g.page_rows,
-                                      record_bytes=g.record_bytes)
+        self.pack = _rank_pack(g)
         # q_nope [rows, N, 192] (row stride N*256) @ W_UK^T -> query[:, :, :512].
-        self.absorb = BatchedBf16Gemm(
-            n=g.kv_lora_rank, k=g.qk_nope_dim, batch=n, a_row=n * g.qk_head_dim,
-            a_batch=g.qk_head_dim, o_row=self.query_row, o_batch=g.latent_dim)
-        self.rope = GlmQueryRope(heads=n, qk_nope=g.qk_nope_dim, qk_head=g.qk_head_dim,
-                                 latent=g.latent_dim, query_row=self.query_row)
+        self.absorb = _kv_projection(g, "absorb", self.query_row)
+        self.rope = _query_rope(g, self.query_row)
 
     def key(self) -> tuple:
         key = (self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
@@ -198,8 +226,7 @@ class _IndexProducer:
         i = g.index_heads
         self.wq = projection(i * 128, g.q_lora_rank, fp8)
         self.wk = glm_projection(128 + i, g.hidden)
-        self.post = GlmIndexPost(heads=i, eps=g.index_norm_eps,
-                                 weight_scale=float(i) ** -0.5 * 128.0 ** -0.5, page_rows=g.page_rows)
+        self.post = _index_post(g)
 
     def key(self) -> tuple:
         return (self.wq.key(), self.wk.key(), self.g)
@@ -246,8 +273,7 @@ class _Output:
     def __init__(self, g: GLMGeometry, fp8: bool = False):
         self.g = g
         n, v = g.heads, g.v_head_dim
-        self.uv = BatchedBf16Gemm(n=v, k=g.kv_lora_rank, batch=n, a_row=n * g.kv_lora_rank,
-                                  a_batch=g.kv_lora_rank, o_row=n * v, o_batch=v)
+        self.uv = _kv_projection(g, "values", n * g.latent_dim)
         self.o = projection(g.hidden, n * v, fp8)
 
     def key(self) -> tuple:
@@ -315,14 +341,9 @@ class _ProducerW8:
         self.query_row = int(query_row) if query_row is not None else n * g.latent_dim
         self.qkv_a = _w8_projection(g.qkv_a_width, g.hidden, prefill_rows, row_scales=True)
         self.q_b = _w8_projection(n * g.qk_head_dim, q, prefill_rows)
-        self.pack = GlmRankNormPackKV(q_rank=q, eps=g.norm_eps, page_rows=g.page_rows,
-                                      record_bytes=g.record_bytes)
-        self.absorb = BatchedFp8Gemm(
-            n=g.kv_lora_rank, k=g.qk_nope_dim, batch=n, a_row=n * g.qk_head_dim,
-            a_batch=g.qk_head_dim, o_row=self.query_row, o_batch=g.latent_dim,
-            compute_warps=_w8_batched_warps(prefill_rows))
-        self.rope = GlmQueryRope(heads=n, qk_nope=g.qk_nope_dim, qk_head=g.qk_head_dim,
-                                 latent=g.latent_dim, query_row=self.query_row)
+        self.pack = _rank_pack(g)
+        self.absorb = _kv_projection(g, "absorb", self.query_row, fp8=True, prefill_rows=prefill_rows)
+        self.rope = _query_rope(g, self.query_row)
 
     def key(self) -> tuple:
         key = ("w8", self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
@@ -380,8 +401,7 @@ class _IndexProducerW8:
         i = g.index_heads
         self.wq = _w8_projection(i * 128, g.q_lora_rank, prefill_rows)
         self.wk = glm_projection(128 + i, g.hidden)
-        self.post = GlmIndexPost(heads=i, eps=g.index_norm_eps,
-                                 weight_scale=float(i) ** -0.5 * 128.0 ** -0.5, page_rows=g.page_rows)
+        self.post = _index_post(g)
 
     def key(self) -> tuple:
         return ("w8", self.wq.key(), self.wk.key(), self.g)
@@ -432,9 +452,7 @@ class _OutputW8:
     def __init__(self, g: GLMGeometry, prefill_rows: int | None):
         self.g = g
         n, v = g.heads, g.v_head_dim
-        self.uv = BatchedFp8Gemm(n=v, k=g.kv_lora_rank, batch=n, a_row=n * g.kv_lora_rank,
-                                 a_batch=g.kv_lora_rank, o_row=n * v, o_batch=v,
-                                 compute_warps=_w8_batched_warps(prefill_rows))
+        self.uv = _kv_projection(g, "values", n * g.latent_dim, fp8=True, prefill_rows=prefill_rows)
         self.o = _w8_projection(g.hidden, n * v, prefill_rows)
 
     def key(self) -> tuple:
@@ -534,6 +552,86 @@ def _compile_w8(kind: str, g: GLMGeometry, max_rows: int, mode: str, query_row: 
         launch, name=name, operands=operands, scalars=w8_scalars(prefill), key=(int(max_rows), mode, launch.key()),
         geometry=geometry, scratch={"scratch": launch.scratch_bytes}, doc=__doc__,
     )
+
+
+def compile_glm_attention_stage_aot(g: GLMGeometry = GLM53, *, stage: str, max_rows: int,
+                                    fp8_only: str | None = None, query_row: int | None = None):
+    """Expose existing primitive boundaries without splitting official fused launches.
+
+    Projection callers supply BF16 intermediates. No stage owns storage, changes
+    scratch layout, or inserts an activation/output conversion.
+    """
+    max_rows = _check_rows(max_rows)
+    if stage not in ("rank_pack", "query_rope", "index_post", "absorb", "values"):
+        raise ValueError("unknown GLM attention stage")
+    if fp8_only is not None and (stage not in ("absorb", "values")
+                                  or fp8_only not in ("decode", "prefill")):
+        raise ValueError("FP8 mode applies only to absorb/values: decode or prefill")
+    if query_row is not None and stage not in ("query_rope", "absorb"):
+        raise ValueError("query_row applies only to query_rope/absorb")
+    pitch = g.heads * g.latent_dim if query_row is None else int(query_row)
+    if pitch < g.heads * g.latent_dim:
+        raise ValueError("query rows must not overlap")
+    q, n, i = g.q_lora_rank, g.heads, g.index_heads
+    query_shape = f"[rows,{n},{g.latent_dim}]"
+    if query_row is not None:
+        query_shape += f" (rows {pitch} apart)"
+    pos = Operand("positions", torch.int64, "[rows]", align=8)
+    cs = Operand("cos_sin", torch.float32, "[P,64]", align=4)
+    if stage == "rank_pack":
+        launch = _rank_pack(g)
+        operands = (Operand("qkv", torch.bfloat16, f"[rows,{g.qkv_a_width}]"),
+                    Operand("q_a_norm", torch.bfloat16, f"[{q}]"),
+                    Operand("kv_a_norm", torch.bfloat16, "[512]"), pos,
+                    Operand("kv_slots", torch.int64, "[rows]", align=8), cs,
+                    Operand("q_resid", torch.bfloat16, f"[rows,{q}]", "out"),
+                    Operand("kv_cache", torch.uint8, f"[pages,{g.kv_page_bytes}]", "inout"))
+    elif stage == "query_rope":
+        launch = _query_rope(g, pitch)
+        operands = (Operand("q", torch.bfloat16, f"[rows,{n},{g.qk_head_dim}]"), pos, cs,
+                    Operand("query", torch.bfloat16, query_shape, "inout"))
+    elif stage == "index_post":
+        launch = _index_post(g)
+        operands = (Operand("iq", torch.bfloat16, f"[rows,{i},128]"),
+                    Operand("kw", torch.bfloat16, f"[rows,{128 + i}]"), pos,
+                    Operand("index_slots", torch.int64, "[rows]", align=8), cs,
+                    Operand("k_norm_w", torch.bfloat16, "[128]"),
+                    Operand("k_norm_b", torch.bfloat16, "[128]"),
+                    Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{i},128]", "out"),
+                    Operand("head_weights", torch.float32, f"[rows,{i}]", "out"),
+                    Operand("index_cache", torch.uint8, f"[pages,{g.index_page_bytes}]", "inout"))
+    else:
+        prefill_rows = max_rows if fp8_only == "prefill" else None
+        launch = _kv_projection(g, stage, pitch, fp8=fp8_only is not None, prefill_rows=prefill_rows)
+        absorb = stage == "absorb"
+        name = "w_uk" if absorb else "w_uv"
+        weight_shape = f"[{n},512,{g.qk_nope_dim}]" if absorb else f"[{n},{g.v_head_dim},512]"
+        weights = kv_b_fp8_operands(name, g) if fp8_only is not None else (
+            Operand(name, torch.bfloat16, weight_shape),)
+        operands = (Operand("q" if absorb else "attn", torch.bfloat16,
+                            f"[rows,{n},{g.qk_head_dim if absorb else g.kv_lora_rank}]"),
+                    *weights,
+                    Operand("query" if absorb else "values", torch.bfloat16,
+                            query_shape if absorb else f"[rows,{n},{g.v_head_dim}]", "out"))
+    # The exported C wrapper uses the primitive's own argument names.
+    names = {
+        "rank_pack": ("qkv", "q_norm", "kv_norm", "positions", "slots", "cos_sin", "q_resid", "cache"),
+        "query_rope": ("q", "positions", "cos_sin", "query"),
+        "index_post": ("iq", "kw", "positions", "slots", "cos_sin", "k_weight", "k_bias",
+                       "q_fp8", "head_weights", "cache"),
+        "absorb": ("a", "w", "scale", "out") if fp8_only is not None else ("a", "w", "out"),
+        "values": ("a", "w", "scale", "out") if fp8_only is not None else ("a", "w", "out"),
+    }[stage]
+    from dataclasses import replace
+
+    operands = tuple(replace(operand, name=name) for operand, name in zip(operands, names))
+    geometry = dict(stage=stage, max_rows=max_rows, heads=n, index_heads=i,
+                    q_lora_rank=q, record_bytes=g.record_bytes, page_rows=g.page_rows,
+                    norm_eps=g.norm_eps, index_norm_eps=g.index_norm_eps,
+                    fp8_weights=fp8_only is not None, mode=fp8_only, query_row=pitch)
+    return compile_program(launch, name="glm_stage_" + stage, operands=operands,
+                           scalars=(Scalar("rows"),), key=(g, stage, max_rows, fp8_only, pitch),
+                           geometry=geometry, doc=compile_glm_attention_stage_aot.__doc__)
 
 
 def compile_glm_producer_aot(g: GLMGeometry = GLM53, *, max_rows: int, fp8: bool = False,
