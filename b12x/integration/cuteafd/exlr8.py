@@ -107,6 +107,49 @@ class _Exlr8ServingPointers:
                   cute.make_tensor(group_count, cute.make_layout(1, stride=1)), cta_limit, stream)
 
 
+class _Exlr8GroupedServingPointers:
+    """Grouped ABI plus the compact owned-unit tables and runtime unit limit.
+
+    `unit_count[E]` and `unit_map[E,U]` describe, per expert, which unit slots
+    this rank actually owns, in ascending unit order. `unit_limit` is their
+    runtime maximum; it bounds the FC1/activation grids and the compact scratch
+    stride. Descriptor tables stay global, so unowned slots keep their zero
+    `bits` entries and the host descriptor builder is unchanged.
+    """
+
+    def __init__(self, g):
+        from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+        self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
+                                       g["max_groups"], g["group_rows"])
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
+                 group_expert: cute.Pointer, route_slots: cute.Pointer,
+                 route_group_lane: cute.Pointer, route_weights: cute.Pointer,
+                 fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
+                 signs_out: cute.Pointer, output: cute.Pointer, group_count: cute.Pointer,
+                 unit_count: cute.Pointer, unit_map: cute.Pointer,
+                 rows: cutlass.Int32, cta_limit: cutlass.Int32,
+                 unit_limit: cutlass.Int32, stream: cuda.CUstream):
+        self.core.serving(cute.make_tensor(x, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(bits, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(group_expert, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_slots, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_group_lane, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_weights, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(signs_out, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(output, cute.make_layout(1, stride=1)),
+                  rows,
+                  cute.make_tensor(group_count, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(unit_count, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(unit_map, cute.make_layout(1, stride=1)),
+                  cta_limit, unit_limit, stream)
+
+
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                          device_count=False, shared_expert=False, grouped=False, group_rows=64):
     if shared_expert:
@@ -146,12 +189,20 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     sizes = scratch_bytes(g)
     if device_count:
         operands += (Operand("group_count", torch.int32, "[1]"),)
-    return compile_program(_Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
+    if grouped:
+        # Compact owned-unit tables appended after the existing prefix.
+        operands += (Operand("unit_count", torch.int32, "[E]"),
+                     Operand("unit_map", torch.int32, f"[E,{u}]"))
+    return compile_program(_Exlr8GroupedServingPointers(g) if grouped else
+                           _Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
                            name=("exlr8_a16_grouped" if grouped else
                                  "exlr8_shared_a16_serving" if shared_expert else
                                  "exlr8_a16_serving" if device_count else "exlr8_a16_decode"), operands=operands,
-                           scalars=tuple(Scalar(n) for n in (("rows", "cta_limit") if device_count
+                           scalars=tuple(Scalar(n) for n in (("rows", "cta_limit", "unit_limit")
+                                                            if grouped else
+                                                            ("rows", "cta_limit") if device_count
                                                             else ("rows", "groups", "cta_limit"))),
-                           key=(h, u, t, m, g["abi_version"], shared_expert, grouped, r), geometry=g,
+                           key=((h, u, t, m, g["abi_version"], shared_expert, grouped, r)
+                                + (("grouped_compact_units",) if grouped else ())), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)
