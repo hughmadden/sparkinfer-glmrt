@@ -28,7 +28,11 @@ def P(kind, **kw):
               "stage": glm_attention.compile_glm_attention_stage_aot,
               "index_producer": glm_attention.compile_glm_index_producer_aot,
               "o": glm_attention.compile_glm_o_aot, "ffn": glm_ffn.compile_glm_ffn_aot}[kind]
-        _PROGRAMS[key] = fn(GLM53, **kw)
+        from dataclasses import replace
+
+        heads = kw.pop("heads", GLM53.heads)
+        geometry = GLM53 if heads == GLM53.heads else replace(GLM53, heads=heads)
+        _PROGRAMS[key] = fn(geometry, **kw)
     return _PROGRAMS[key]
 
 
@@ -258,17 +262,19 @@ def test_glm_ffn_w8_prefill(layer, inter, rows, fp8):
 
 
 @pytest.mark.parametrize("mode,rows,fp8", STAGE_CASES)
-@pytest.mark.parametrize("split", [False, True])
-def test_glm_producer_stages_match_fused(mode, rows, fp8, split):
+@pytest.mark.parametrize("heads,split", [(64, False), (32, True)])
+def test_glm_producer_stages_match_fused(mode, rows, fp8, heads, split):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.glm_attention import _align
 
     a, names, qkv, scale, qb, qb_scale, norms, x = _producer_inputs(rows)
     uk, uk_scale, _, _ = _kv_b_fp8(a)
+    uk, uk_scale = uk[:heads], uk_scale[:heads]
+    qb, qb_scale = qb[:heads * 256], qb_scale[:heads * 2]
     cap = 4096 if mode == "prefill" else 64
-    pitch = 64 * 576 * (2 if split else 1)
+    pitch = heads * 576 * (2 if split else 1)
     options = {"query_row": pitch} if split else {}
-    fused = P("producer", max_rows=cap, fp8_only=mode, **options)
+    fused = P("producer", max_rows=cap, fp8_only=mode, heads=heads, **options)
     positions = torch.arange(rows, dtype=torch.int64, device="cuda") + 100
     slots = torch.arange(rows, dtype=torch.int64, device="cuda")
     cache = torch.zeros(((rows + 63) // 64 + 1, 64 * 656), dtype=torch.uint8, device="cuda")
@@ -282,13 +288,13 @@ def test_glm_producer_stages_match_fused(mode, rows, fp8, split):
     # Isolate the format-neutral boundaries using the fused projection outputs.
     qkv_out = scratch[:rows * 2624 * 2].view(torch.bfloat16)
     offset = _align(rows * 2624 * 2)
-    qb_out = scratch[offset:offset + rows * 64 * 256 * 2].view(torch.bfloat16)
+    qb_out = scratch[offset:offset + rows * heads * 256 * 2].view(torch.bfloat16)
     result = torch.full_like(query, 7)
     result_qr = torch.empty_like(qr)
     result_cache = torch.zeros_like(cache)
     pack = P("stage", stage="rank_pack", max_rows=cap)
-    absorb = P("stage", stage="absorb", max_rows=cap, fp8_only=mode, **options)
-    rope = P("stage", stage="query_rope", max_rows=cap, **options)
+    absorb = P("stage", stage="absorb", max_rows=cap, fp8_only=mode, heads=heads, **options)
+    rope = P("stage", stage="query_rope", max_rows=cap, heads=heads, **options)
 
     def launch():
         pack.launch(qkv_out, *norms, positions, slots, cs, result_qr, result_cache, scalars=(rows,))
