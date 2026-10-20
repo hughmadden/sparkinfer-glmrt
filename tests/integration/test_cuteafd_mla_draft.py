@@ -16,19 +16,19 @@ import torch
 from b12x.integration.cuteafd import kimi_mla as mla
 
 
+SCORE_SCALE = 192 ** -0.5 * 1.3465735902799727 ** 2
+
+
 def geometry(**kwargs):
-    # Shared loader supplies the checkpoint's mscale_all_dim-adjusted value.
-    return mla.MlaDraftGeometry(attention_scale=192 ** -0.5 * 1.3465735902799727 ** 2, **kwargs)
+    return mla.MlaDraftGeometry(**kwargs)
 
 
 def test_draft_geometry_is_explicit_and_target_unchanged():
     target = mla.KimiMlaGeometry()
     assert (target.heads, target.norm_eps, target.softmax_scale) == (96, 1e-6, 192 ** -0.5)
-    with pytest.raises(TypeError):
-        mla.MlaDraftGeometry()
-    for args in ({"heads": 48}, {"norm_eps": 1e-6}, {"window_size": 2048}, {"attention_scale": float("nan")}):
+    for args in ({"heads": 48}, {"norm_eps": 1e-6}, {"window_size": 2048}):
         with pytest.raises(ValueError):
-            mla.MlaDraftGeometry(**{"attention_scale": 0.1, **args})
+            mla.MlaDraftGeometry(**args)
     assert geometry().record_bytes == target.record_bytes == 1152
 
 
@@ -45,6 +45,8 @@ def test_draft_abi_and_capacity_not_live_counts(monkeypatch):
     assert not hasattr(output, "gate_proj")
     assert o["geometry"]["output_gate"] is False
     assert a["geometry"]["noncausal_block"] is True
+    assert [v.name for v in a["scalars"]][-1] == "attention_scale"
+    assert "attention_scale" not in a["geometry"]
     assert attention.forward.noncausal_block is True
     assert attention.forward.window_size is None
     assert o["scratch"]["scratch"](9) == mla._align(9 * 64 * 128 * 2)
@@ -85,13 +87,13 @@ def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_page
 
     def run():
         p.launch(q, cache, table, lens, cu, out, lse, scratch,
-                 scalars=(11, 2, width, p.geometry["num_splits"]))
+                 scalars=(11, 2, width, p.geometry["num_splits"], SCORE_SCALE))
 
     run()
     torch.cuda.synchronize()
     for index, (count, length, begin) in enumerate(zip(counts, lengths, [0, 8])):
         records = cache[table[index].long()].flatten(0, 1)[:length].float()
-        scores = torch.einsum("thd,sd->hts", q[begin:begin + count].float(), records) * g.softmax_scale
+        scores = torch.einsum("thd,sd->hts", q[begin:begin + count].float(), records) * SCORE_SCALE
         if window:
             positions = torch.arange(length, device="cuda")
             low = length - count + torch.arange(count, device="cuda") - window + 1
@@ -136,7 +138,7 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output():
     mscale = lambda m: 1 + 0.1 * m * math.log(rope["factor"])
     factor = mscale(rope["mscale"]) / mscale(rope["mscale_all_dim"])
     scale = 192 ** -0.5 * mscale(rope["mscale_all_dim"]) ** 2
-    g = mla.MlaDraftGeometry(attention_scale=scale)
+    g = mla.MlaDraftGeometry()
     from safetensors import safe_open
     with safe_open(snapshot / "model.safetensors", framework="pt", device="cpu") as tensors:
         w = {name: tensors.get_tensor("layers.0.self_attn." + name).cuda() for name in (
@@ -167,7 +169,7 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output():
         producer.launch(x, slots, positions, inv, combined, w["q_a_layernorm.weight"], w["kv_a_layernorm.weight"],
                         w["q_b_proj.weight"], uk, cache, query, residual, scratch[0], scalars=(factor, 16))
         attention.launch(query, cache, table, lengths, cu, attn, lse, scratch[1],
-                         scalars=(16, 1, 2, attention.geometry["num_splits"]))
+                         scalars=(16, 1, 2, attention.geometry["num_splits"], scale))
         output.launch(attn, uv, w["o_proj.weight"], out, scratch[2], scalars=(16,))
 
     run()

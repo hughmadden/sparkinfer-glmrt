@@ -6,7 +6,7 @@ full causal dense_mla. No rotary tables, positions, indexer or allocation.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 
 import cuda.bindings.driver as cuda
@@ -62,14 +62,13 @@ class KimiMlaGeometry:
 class MlaDraftGeometry(KimiMlaGeometry):
     """Checkpoint-native block drafter, distinct from the NoPE target.
 
-    The shared loader supplies the YaRN-adjusted score scale. Frequencies and
-    the rotary magnitude factor are device inputs, never inferred here.
+    The shared loader supplies the YaRN-adjusted score scale, frequencies and
+    rotary magnitude factor as runtime inputs, never inferred here.
     """
 
     name: str = "mla_block_draft"
     heads: int = 64
     norm_eps: float = 1e-5
-    attention_scale: float = field(kw_only=True)
     window_size: int | None = None
 
     def __post_init__(self):
@@ -80,12 +79,6 @@ class MlaDraftGeometry(KimiMlaGeometry):
             raise ValueError("unsupported MLA block-draft geometry")
         if self.window_size not in (None, 4096):
             raise ValueError("MLA block draft supports full context or window 4096")
-        if not math.isfinite(self.attention_scale) or self.attention_scale <= 0:
-            raise ValueError("draft attention scale must be finite and positive")
-
-    @property
-    def softmax_scale(self):
-        return self.attention_scale
 
 
 def _align(n):
@@ -309,6 +302,16 @@ class _Attention:
                  cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
                  lse: cute.Pointer, scratch: cute.Pointer, rows: Int32, batch: Int32,
                  page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
+        self.run_attention(query, kv_cache, page_table, cache_seqlens, cu_seqlens_q,
+            attn, lse, scratch, rows, batch, page_table_width, active_splits,
+            Float32(self.g.softmax_scale * math.log2(math.e)), stream)
+
+    @cute.jit
+    def run_attention(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
+                      cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
+                      lse: cute.Pointer, scratch: cute.Pointer, rows: Int32, batch: Int32,
+                      page_table_width: Int64, active_splits: Int32, score_scale_log2: Float32,
+                      stream: cuda.CUstream):
         g = self.g
         q = cute.make_tensor(cute.recast_ptr(query, dtype=cutlass.Uint8), cute.make_layout((1,)))
         kv = cute.make_tensor(cute.recast_ptr(kv_cache, dtype=cutlass.Uint8), cute.make_layout((1,)))
@@ -326,11 +329,23 @@ class _Attention:
         else:
             po, pl = out, lse_out
         self.forward(q, kv, table, lengths, cu, out, lse_out, po, pl, lse_out, lse_out,
-            Float32(g.softmax_scale * math.log2(math.e)), Int64(g.heads * 576 * 2), Int64(576 * 2),
+            score_scale_log2, Int64(g.heads * 576 * 2), Int64(576 * 2),
             Int64(64 * 1152), Int64(1152), page_table_width, rows, batch, active_splits, stream)
         if cutlass.const_expr(self.splits > 1):
             if active_splits > Int32(1):
                 self.merge(po, pl, out, lse_out, active_splits, stream)
+
+
+class _DraftAttention(_Attention):
+    @cute.jit
+    def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
+                 cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
+                 lse: cute.Pointer, scratch: cute.Pointer, rows: Int32, batch: Int32,
+                 page_table_width: Int64, active_splits: Int32, attention_scale: Float32,
+                 stream: cuda.CUstream):
+        self.run_attention(query, kv_cache, page_table, cache_seqlens, cu_seqlens_q,
+            attn, lse, scratch, rows, batch, page_table_width, active_splits,
+            attention_scale * Float32(math.log2(math.e)), stream)
 
 
 def compile_mla_draft_producer_aot(g: MlaDraftGeometry, *, max_rows=64):
@@ -384,9 +399,10 @@ def compile_mla_draft_attention_aot(g: MlaDraftGeometry, *, max_rows=64, max_con
         Operand("attn", torch.bfloat16, f"[rows,{g.heads},512]", "out"),
         Operand("lse", torch.float32, f"[rows,{g.heads}]", "out"),
         Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"))
-    return compile_program(_Attention(g, max_rows, max_context, "verify"), name="mla_draft_attention",
+    return compile_program(_DraftAttention(g, max_rows, max_context, "verify"), name="mla_draft_attention",
         operands=operands,
-        scalars=(Scalar("rows"), Scalar("batch"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
+        scalars=(Scalar("rows"), Scalar("batch"), Scalar("page_table_width", "int64"), Scalar("active_splits"),
+                 Scalar("attention_scale", "float32")),
         key=(g, max_rows, max_context),
         scratch={"scratch": lambda rows: attention_layout(g, rows, max_context=max_context, mode="verify")["scratch_bytes"]},
         geometry={**vars(g), **layout, "noncausal_block": True, "max_context": max_context})
