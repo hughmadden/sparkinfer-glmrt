@@ -68,6 +68,45 @@ def test_companion_bit_exact_rows_graph(dtype, features, output_dtype):
             assert torch.equal(output[:64].view(torch.int16), expected_out[:64].view(torch.int16))
 
 
+def test_ingress_f16_default_export_unchanged(tmp_path):
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd import trellis_transform as module
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    geometry = dict(features=7168, input_dtype="bf16", max_rows=4096)
+    with exportable_compilation():
+        legacy = compile_program(module._Transform(7168, 4096, True), name="trellis_input",
+            operands=(Operand("input", torch.bfloat16, "[rows,7168]"),
+                      Operand("suh", torch.float16, "[7168]"),
+                      Operand("rotated", torch.float16, "[rows,7168]", "out"),
+                      Operand("input_block_scales", torch.float16, "[56]", "out")),
+            scalars=(Scalar("rows"), Scalar("cta_limit")), key=tuple(geometry.values()),
+            geometry=geometry, doc=module.__doc__)
+        default = module.compile_trellis_input_aot(features=7168)
+        explicit = module.compile_trellis_input_aot(features=7168, output_dtype="f16")
+    for name, program in (("legacy", legacy), ("default", default), ("explicit", explicit)):
+        directory = tmp_path/name
+        directory.mkdir()
+        program.export_to_c(str(directory), "ingress", "ingress")
+    for suffix in ("o", "h"):
+        expected = (tmp_path/"legacy"/f"ingress.{suffix}").read_bytes()
+        assert (tmp_path/"default"/f"ingress.{suffix}").read_bytes() == expected
+        assert (tmp_path/"explicit"/f"ingress.{suffix}").read_bytes() == expected
+
+
+@pytest.mark.parametrize("features", [128, 7168])
+def test_bf16_rotated_single_round(features):
+    from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot
+    x = torch.randn(256, features, device="cuda", dtype=torch.bfloat16)*.03
+    suh = torch.randn(features, device="cuda", dtype=torch.float16)*.2
+    rotated = torch.empty_like(x)
+    blocks = torch.empty(features//128, device="cuda", dtype=torch.float16)
+    program = compile_trellis_input_aot(features=features, max_rows=256, output_dtype="bf16")
+    program.launch(x, suh, rotated, blocks, scalars=(256, 752))
+    expected = hadamard(x.float()*suh.float()).bfloat16()
+    torch.testing.assert_close(rotated, expected, rtol=0, atol=0)
+    torch.testing.assert_close(blocks, torch.ones_like(blocks), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("bits", [5, 6])
 @pytest.mark.parametrize("codebook", ["mcg", "mul1"])
 @pytest.mark.parametrize("side", [1, 2])

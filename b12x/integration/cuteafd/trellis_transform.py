@@ -101,15 +101,19 @@ def _geometry(features, max_rows):
         raise ValueError("trellis transform task indexing exceeds signed int32")
 
 
-def compile_trellis_input_aot(*, features, input_dtype="bf16", max_rows=4096):
+def compile_trellis_input_aot(*, features, input_dtype="bf16", max_rows=4096, output_dtype="f16"):
     _geometry(features, max_rows)
     if input_dtype not in ("bf16", "f32"):
         raise ValueError("trellis input transform requires bf16/f32")
+    if output_dtype not in ("f16", "bf16"):
+        raise ValueError("trellis rotated output requires f16/bf16")
     g = dict(features=features, input_dtype=input_dtype, max_rows=max_rows)
+    if output_dtype != "f16":
+        g["output_dtype"] = output_dtype
     return compile_program(_Transform(features, max_rows, True), name="trellis_input",
         operands=(Operand("input", torch.bfloat16 if input_dtype == "bf16" else torch.float32, f"[rows,{features}]"),
                   Operand("suh", torch.float16, f"[{features}]"),
-                  Operand("rotated", torch.float16, f"[rows,{features}]", "out"),
+                  Operand("rotated", torch.float16 if output_dtype == "f16" else torch.bfloat16, f"[rows,{features}]", "out"),
                   Operand("input_block_scales", torch.float16, f"[{features//128}]", "out")),
         scalars=(Scalar("rows"), Scalar("cta_limit")), key=tuple(g.values()), geometry=g, doc=__doc__)
 
