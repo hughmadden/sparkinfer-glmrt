@@ -161,12 +161,12 @@ class _MlaRankNorm:
         self.pack, self.norm = _RankPack(kv_stride), _RankNormPack(g)
 
     @cute.jit
-    def __call__(self, q_a: cute.Pointer, kv_a: cute.Pointer, q_norm: cute.Pointer,
-                 kv_norm: cute.Pointer, slots: cute.Pointer, q_resid: cute.Pointer,
-                 cache: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+    def __call__(self, q_a: cute.Pointer, kv_a: cute.Pointer, q_a_norm: cute.Pointer,
+                 kv_a_norm: cute.Pointer, kv_slots: cute.Pointer, q_resid: cute.Pointer,
+                 kv_cache: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         packed = cute.recast_ptr(scratch, dtype=BFloat16)
         self.pack(q_a, kv_a, packed, rows, stream)
-        self.norm(packed, q_norm, kv_norm, slots, q_resid, cache, rows, stream)
+        self.norm(packed, q_a_norm, kv_a_norm, kv_slots, q_resid, kv_cache, rows, stream)
 
 
 class _MlaQuery:
