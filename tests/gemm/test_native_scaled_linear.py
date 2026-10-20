@@ -120,6 +120,79 @@ def test_fp8_row_prefill_column_tail(n):
             assert torch.isnan(c.output[rows:]).all()
 
 
+@pytest.mark.parametrize("full_k,full_n,side", [(2048, 16384, 1), (16384, 6144, 2)])
+@pytest.mark.skipif(__import__("os").environ.get("NATIVE_GLM_TP2_SHAPES") != "1",
+                    reason="opt-in full GLM TP2 geometry gate")
+def test_glm_tp2_int4_native_slices(full_k, full_n, side):
+    """Slice the physical native layout, not a converted model weight."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.scaled_linear import compile_scaled_linear_aot
+
+    torch.manual_seed(408)
+    rows = 4096
+    k, n = (full_k, full_n // 2) if side == 1 else (full_k // 2, full_n)
+    full_x = (torch.randn(rows, full_k, device="cuda") * .05).bfloat16()
+    packed = torch.randint(0, 256, (full_n, full_k // 2), device="cuda", dtype=torch.uint8)
+    grouped = (torch.rand(full_n, full_k // 32, device="cuda") + .01).half()
+    if side == 2:
+        packed = packed.reshape(full_n, full_k // 128, 64).permute(1, 0, 2).contiguous()
+        grouped = grouped.reshape(full_n, full_k // 128, 4).permute(1, 0, 2).contiguous()
+    program = compile_scaled_linear_aot(input_features=k, output_features=n,
+        encoding="int4_g32", sharded_side=side, max_rows=rows)
+    limit = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count * 4
+    partial = torch.full((1,), float("nan"), device="cuda")  # ABI-v1 unused scratch.
+    output = torch.empty(rows, n, device="cuda")
+    cols = torch.tensor(sorted({0, 1, n // 2, n - 2, n - 1}), device="cuda")
+    sample_rows = [0, 1, 7, 15, 63, 1023, rows - 1]
+    for rank in range(2):
+        count = n if side == 1 else k // 128
+        payload = packed[rank * count:(rank + 1) * count].clone()
+        scales = grouped[rank * count:(rank + 1) * count].clone()
+        x = full_x[:, rank * k:(rank + 1) * k].contiguous() if side == 2 else full_x
+        immutable = [v.clone() for v in (x, payload, scales)]
+        pointers = [v.data_ptr() for v in (x, payload, scales, partial, output)]
+        p = payload if side == 1 else payload.permute(1, 0, 2).reshape(n, k // 2)
+        s = scales if side == 1 else scales.permute(1, 0, 2).reshape(n, k // 32)
+        chosen = p[cols]
+        q = torch.stack((chosen & 15, chosen >> 4), dim=-1).reshape(len(cols), k)
+        weight = (q.float() - 8) * s[cols].float().repeat_interleave(32, dim=1)
+
+        def launch(live, ctas=limit):
+            program.launch(x.flatten(), payload.flatten(), scales.flatten(), partial, output.flatten(),
+                           scalars=(live, ctas))
+
+        output.fill_(float("nan"))
+        launch(rows)
+        assert torch.isfinite(output).all() and torch.count_nonzero(output) > 0
+        saved = output[:64].clone()
+        torch.testing.assert_close(output[sample_rows][:, cols].double(),
+            x[sample_rows].double() @ weight.double().T, rtol=2e-4, atol=2e-5)
+        torch.cuda.synchronize()
+        with kernel_resolution_guard("GLM TP2 int4 is precompiled"):
+            for live in (*range(1, 65), 127, 128, 129, 256, 1024, 4096):
+                output.fill_(float("nan"))
+                launch(live, ctas=1 if live % 2 else limit)
+                prefix = min(live, 64)
+                assert torch.equal(output[:prefix].view(torch.int32), saved[:prefix].view(torch.int32))
+                assert torch.isnan(output[live:]).all()
+            launch(17)
+            graph_expected = output[:17].clone()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(17)
+            for _ in range(3):
+                output.fill_(float("nan"))
+                graph.replay()
+                assert torch.equal(output[:17].view(torch.int32), graph_expected.view(torch.int32))
+                assert torch.isnan(output[17:]).all()
+        assert torch.isnan(partial).all()
+        for value, before in zip((x, payload, scales), immutable):
+            assert torch.equal(value, before)
+        assert [v.data_ptr() for v in (x, payload, scales, partial, output)] == pointers
+        del graph
+
+
 def test_fp8_embedding_gather():
     from b12x.integration.cuteafd.fp8_row_embedding import compile_fp8_row_embedding_aot
     torch.manual_seed(408)
