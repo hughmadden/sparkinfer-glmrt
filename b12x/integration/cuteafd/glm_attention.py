@@ -613,6 +613,18 @@ def compile_glm_attention_stage_aot(g: GLMGeometry = GLM53, *, stage: str, max_r
                     *weights,
                     Operand("query" if absorb else "values", torch.bfloat16,
                             query_shape if absorb else f"[rows,{n},{g.v_head_dim}]", "out"))
+    # The exported C wrapper uses the primitive's own argument names.
+    names = {
+        "rank_pack": ("qkv", "q_norm", "kv_norm", "positions", "slots", "cos_sin", "q_resid", "cache"),
+        "query_rope": ("q", "positions", "cos_sin", "query"),
+        "index_post": ("iq", "kw", "positions", "slots", "cos_sin", "k_weight", "k_bias",
+                       "q_fp8", "head_weights", "cache"),
+        "absorb": ("a", "w", "scale", "out") if fp8_only is not None else ("a", "w", "out"),
+        "values": ("a", "w", "scale", "out") if fp8_only is not None else ("a", "w", "out"),
+    }[stage]
+    from dataclasses import replace
+
+    operands = tuple(replace(operand, name=name) for operand, name in zip(operands, names))
     geometry = dict(stage=stage, max_rows=max_rows, heads=n, index_heads=i,
                     q_lora_rank=q, record_bytes=g.record_bytes, page_rows=g.page_rows,
                     norm_eps=g.norm_eps, index_norm_eps=g.index_norm_eps,

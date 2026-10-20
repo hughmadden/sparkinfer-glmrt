@@ -282,7 +282,11 @@ def test_glm_producer_stages_match_fused(mode, rows, fp8, heads, split):
     qr = torch.empty((rows, 2048), dtype=torch.bfloat16, device="cuda")
     scratch = _scratch(fused, rows)
     scalars = (rows, fp8) if mode == "prefill" else (rows,)
-    cs = cos_sin(8192)
+    import json
+    from ._glm import SNAPSHOT
+
+    cfg = json.loads((SNAPSHOT / "config.json").read_text())
+    cs = cos_sin(8192, theta=cfg["rope_parameters"]["rope_theta"])
     fused.launch(x, positions, slots, cs, qkv, _kscale(names) if mode == "prefill" else scale,
                  *norms, qb, qb_scale, uk, uk_scale, cache, query, qr, scratch, scalars=scalars)
     # Isolate the format-neutral boundaries using the fused projection outputs.
@@ -327,7 +331,11 @@ def test_glm_index_stage_matches_fused(mode, rows, fp8):
     cap = 4096 if mode == "prefill" else 64
     fused = P("index_producer", max_rows=cap, fp8_only=mode)
     positions = torch.arange(rows, dtype=torch.int64, device="cuda")
-    cs = cos_sin(8192)
+    import json
+    from ._glm import SNAPSHOT
+
+    cfg = json.loads((SNAPSHOT / "config.json").read_text())
+    cs = cos_sin(8192, theta=cfg["rope_parameters"]["rope_theta"])
     cache = torch.zeros(((rows + 63) // 64 + 1, 8448), dtype=torch.uint8, device="cuda")
     q8 = torch.empty((rows, 32, 128), dtype=torch.float8_e4m3fn, device="cuda")
     hw = torch.empty((rows, 32), dtype=torch.float32, device="cuda")

@@ -55,13 +55,13 @@ def contract():
 
 
 @pytest.mark.parametrize("stage,pointers", [
-    ("rank_pack", ["qkv", "q_a_norm", "kv_a_norm", "positions", "kv_slots", "cos_sin",
-                   "q_resid", "kv_cache"]),
+    ("rank_pack", ["qkv", "q_norm", "kv_norm", "positions", "slots", "cos_sin",
+                   "q_resid", "cache"]),
     ("query_rope", ["q", "positions", "cos_sin", "query"]),
-    ("index_post", ["iq", "kw", "positions", "index_slots", "cos_sin", "k_norm_w", "k_norm_b",
-                    "q_fp8", "head_weights", "index_cache"]),
-    ("absorb", ["q", "w_uk", "query"]),
-    ("values", ["attn", "w_uv", "values"]),
+    ("index_post", ["iq", "kw", "positions", "slots", "cos_sin", "k_weight", "k_bias",
+                    "q_fp8", "head_weights", "cache"]),
+    ("absorb", ["a", "w", "out"]),
+    ("values", ["a", "w", "out"]),
 ])
 def test_stage_operand_order(stage, pointers):
     result = contract()(stage=stage, max_rows=4096)
