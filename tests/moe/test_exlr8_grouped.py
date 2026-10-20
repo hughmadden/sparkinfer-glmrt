@@ -1,10 +1,12 @@
 """Bitwise K1 contract for expert-major EXLR8 prefill."""
 import os
+from pathlib import Path
 
 import pytest
 import torch
 
 from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
+from benchmarks.benchmark_exlr8_a16 import compact_unit_descriptors, compact_program
 from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
 from b12x._lib.runtime_control import kernel_resolution_guard
 from .exlr8_oracle import Case, make_wire
@@ -23,18 +25,25 @@ def buffers(rows, hidden, units, topk, capacity, group_rows):
 
 
 def programs(hidden, units, topk, capacity, group_rows, grouped):
+    candidate = compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=topk,
+                                      max_groups=capacity, device_count=True,
+                                      grouped=grouped, group_rows=group_rows)
+    frozen = os.environ.get("EXLR8_FROZEN_GROUPED_ARM")
+    if grouped and frozen:
+        from benchmarks.benchmark_exlr8_a16 import compile_grouped_arm
+        kernel, group, _ = compile_grouped_arm(Path(frozen), candidate)
+        return group, kernel
     return (compile_exlr8_group_aot(experts=4, top_k=topk, max_groups=capacity,
                                    hidden=hidden, max_rows=4096 if grouped else 64,
-                                   group_rows=group_rows),
-            compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=topk,
-                                  max_groups=capacity, device_count=True,
-                                  grouped=grouped, group_rows=group_rows))
+                                   group_rows=group_rows), candidate)
 
 
 def compute(k1, state, weights, pointers, bits, signs, rows, limit):
+    extra = state["compact"][:2] if compact_program(k1) else ()
+    scalars = (rows, limit, state["compact"][2]) if extra else (rows, limit)
     k1.launch(state["activation"], pointers, bits, state["group_expert"], state["route_slots"],
               state["inverse"], weights, state["fc1"], state["intermediate"], state["fc2"],
-              signs[1], state["output"], state["count"], scalars=(rows, limit))
+              signs[1], state["output"], state["count"], *extra, scalars=scalars)
 
 
 def run(program, state, wire, ids, weights, pointers, bits, signs, rows, limit):
@@ -76,6 +85,7 @@ def test_checkpoint_grouped_matches_chunks(group_rows, units):
         expected[first:first+live].copy_(base["output"][:live])
     state = buffers(rows, hidden, units, topk, 128, group_rows)
     grouped = programs(hidden, units, topk, 128, group_rows, True)
+    state["compact"] = compact_unit_descriptors(case.bits)
     with kernel_resolution_guard("EXLR8 grouped runtime rows and packing"):
         for live in (1, 8, 16, 17, 32, 63, 64, 65, 127, 128, 129):
             for limit in (1, 48, 188):
@@ -101,22 +111,27 @@ def test_checkpoint_grouped_matches_chunks(group_rows, units):
                 assert torch.equal(actual[first:first+live].view(torch.int16), base["output"][:live].view(torch.int16))
 
 
-def test_every_live_row_count_matches_decode():
+@pytest.mark.parametrize("units", [1, 16])
+def test_every_live_row_count_matches_decode(units):
     torch.cuda.set_per_process_memory_fraction(0.25)
-    hidden, units, topk, rows = 128, 1, 2, 4096
+    hidden, topk, rows = 128, 2, 4096
     gen = torch.Generator(device="cuda").manual_seed(408)
     owners = []
-    pointers = torch.empty((4, units, 3, 3), dtype=torch.int64)
-    bits = torch.empty((4, units, 3), dtype=torch.int32)
+    pointers = torch.zeros((4, units, 3, 3), dtype=torch.int64)
+    bits = torch.zeros((4, units, 3), dtype=torch.int32)
     for e in range(4):
-        for p in range(3):
-            width = 2 + (e+p) % 3
-            ts = (torch.randint(256, (hidden*16*width,), generator=gen, dtype=torch.uint8, device="cuda"),
-                  torch.full((128,), 0.1, dtype=torch.float16, device="cuda"),
-                  torch.full((hidden//128,), 0.1, dtype=torch.float16, device="cuda"))
-            owners.extend(ts)
-            pointers[e, 0, p] = torch.tensor([t.data_ptr() for t in ts])
-            bits[e, 0, p] = width
+        # Include an empty expert and rotated, unequal noncontiguous unit sets.
+        owned = range(units) if units == 1 else (() if e == 3 else
+                (u for u in range(units) if (units * e + u + 3) % 6 == 0))
+        for u in owned:
+            for p in range(3):
+                width = 2 + (e+u+p) % 3
+                ts = (torch.randint(256, (hidden*16*width,), generator=gen, dtype=torch.uint8, device="cuda"),
+                      torch.full((128,), 0.1, dtype=torch.float16, device="cuda"),
+                      torch.full((hidden//128,), 0.1, dtype=torch.float16, device="cuda"))
+                owners.extend(ts)
+                pointers[e, u, p] = torch.tensor([t.data_ptr() for t in ts])
+                bits[e, u, p] = width
     pointers, bits = pointers.cuda(), bits.cuda()
     signs = [torch.ones(hidden, dtype=torch.int8, device="cuda") for _ in range(2)]
     wire, _ = make_wire(torch.randn((rows, hidden), generator=gen, device="cuda") * 0.02)
@@ -124,6 +139,7 @@ def test_every_live_row_count_matches_decode():
     weights = torch.rand((rows, topk), generator=gen, device="cuda") / topk
     base, state = buffers(64, hidden, units, topk, 128, 16), buffers(rows, hidden, units, topk, 132, 64)
     dec, grouped = programs(hidden, units, topk, 128, 16, False), programs(hidden, units, topk, 132, 64, True)
+    state["compact"] = compact_unit_descriptors(bits)
     expected = torch.empty((rows, hidden), dtype=torch.bfloat16, device="cuda")
     for first in range(0, rows, 64):
         run(dec, base, wire[first:], ids[first:], weights[first:], pointers, bits, signs, 64, 48)

@@ -37,6 +37,30 @@ from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
 from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
 
 
+def compact_unit_descriptors(bits):
+    """Build immutable ascending ownership once, before capture or timed work."""
+    if bits.dtype != torch.int32 or bits.ndim != 3 or bits.shape[2] != 3:
+        raise ValueError("EXLR8 bits must be int32 [E,U,3]")
+    host = bits.detach().cpu()
+    if not host.shape[0] or not host.shape[1]:
+        raise ValueError("EXLR8 ownership must have experts and units")
+    active = host != 0
+    if not torch.equal(active, active[..., :1].expand_as(active)):
+        raise ValueError("EXLR8 unit projections must agree on ownership")
+    if not bool(((host == 0) | ((host >= 2) & (host <= 4))).all()):
+        raise ValueError("EXLR8 units support K2, K3 or K4")
+    counts = active[..., 0].sum(1).to(torch.int32)
+    mapping = torch.zeros(host.shape[:2], dtype=torch.int32)
+    for expert in range(host.shape[0]):
+        owned = torch.nonzero(active[expert, :, 0], as_tuple=False).flatten()
+        mapping[expert, :owned.numel()] = owned.to(torch.int32)
+    return (counts.to(bits.device), mapping.to(bits.device), max(1, int(counts.max())))
+
+
+def compact_program(program):
+    return any(operand.name == "unit_count" for operand in program.operands)
+
+
 @triton.jit
 def _wire_decode(wire, out, HIDDEN: tl.constexpr, ROW: tl.constexpr, BLOCK: tl.constexpr):
     # The worker's EXL3 wire decoder: bf16(float(e4m3) * float(ue8m0)).
@@ -254,7 +278,8 @@ def materialize_grouped_arm(revision, directory, repository=None):
         return subprocess.check_output(["git", "-C", str(repository), *args])
     sha = git("rev-parse", "--verify", revision + "^{commit}").decode().strip()
     paths = {"core": "b12x/moe/_shared/kernels/w4a16/exlr8_grouped.py",
-             "glue": "b12x/integration/cuteafd/exlr8_glue.py"}
+             "glue": "b12x/integration/cuteafd/exlr8_glue.py",
+             "wrapper": "b12x/integration/cuteafd/exlr8.py"}
     directory = Path(directory) / sha
     directory.mkdir(parents=True, exist_ok=True)
     manifest = {"revision": sha, "sources": {}}
@@ -287,19 +312,28 @@ def compile_grouped_arm(directory, candidate):
         raise ValueError("frozen grouped revision mismatch")
     modules = {}
     for label, package in (("core", "b12x.moe._shared.kernels.w4a16"),
-                           ("glue", "b12x.integration.cuteafd")):
+                           ("glue", "b12x.integration.cuteafd"),
+                           ("wrapper", "b12x.integration.cuteafd")):
         path = directory / f"{label}.py"
         if hashlib.sha256(path.read_bytes()).hexdigest() != manifest["sources"][label]:
             raise ValueError(f"frozen grouped {label} source digest mismatch")
         modules[label], _ = load_source("grouped_" + label, path, package)
     core, glue = modules["core"], modules["glue"]
     source_key = (manifest["revision"], tuple(sorted(manifest["sources"].items())))
-    g = candidate.geometry
-    wrapper = object.__new__(_Exlr8ServingPointers)
+    g = dict(candidate.geometry)
+    compact = "unit_count" in (directory / "core.py").read_text()
+    g["compact_units"] = compact
+    g["compact_scratch"] = compact and "unit_limit.to(Int64) * Int64(self.group_rows" in (directory / "core.py").read_text()
+    wrapper_type = (getattr(modules["wrapper"], "_Exlr8CompactPointers", None)
+                    or getattr(modules["wrapper"], "_Exlr8GroupedServingPointers", None)
+                    or modules["wrapper"]._Exlr8ServingPointers)
+    wrapper = object.__new__(wrapper_type)
     wrapper.core = core.Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
                                           g["max_groups"], g["group_rows"])
     program = _common.compile_program(wrapper, name="exlr8_frozen_grouped",
-        operands=candidate.operands, scalars=candidate.scalars,
+        operands=tuple(o for o in candidate.operands
+                       if compact or o.name not in ("unit_count", "unit_map")),
+        scalars=tuple(v for v in candidate.scalars if compact or v.name != "unit_limit"),
         key=(source_key, tuple(sorted(g.items()))), geometry=g, scratch=candidate.scratch)
     # Invoke the frozen factory, which selects its own grouping class.
     compile_program = glue.compile_program
@@ -316,18 +350,91 @@ def compile_grouped_arm(directory, candidate):
     return program, group, manifest
 
 
-def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8):
+def rank_geometry(world, rank, layer, experts=256, units=16):
+    """Serving's rotated EXLR8 ownership and contiguous H128 EXL3 slice."""
+    if not 1 <= world <= units or not 0 <= rank < world or layer < 0:
+        raise ValueError("invalid world, rank or layer")
+    owned = [tuple(u for u in range(units)
+                   if (units * e + u + layer) % world == rank) for e in range(experts)]
+    base, extra = divmod(units, world)
+    return owned, 128 * (base + (rank < extra))
+
+
+def serving_k4_options(width):
+    # GLM Spark m4096 package policy; WS supports unequal N tiles.
+    tile = ((64, 192, 64, 256) if width % 256 == 128 and width % 192 == 0
+            else (64, 256, 64, 256) if width % 256 == 0
+            else (64, 128, 64, 128))
+    return dict(force_tile_config=tile, moe_block_size=64, warp_specialized=True,
+                input_format="e4m3_k32", ws_input_stages=3, ws_dynamic_tiles=True,
+                force_blocks_per_sm=1)
+
+
+def prepare_uniform(bits, experts, seed, width):
+    if width == 512:
+        return exl3._prepared(bits, experts, seed, torch.device("cuda"))
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    def scales(shape):
+        return (0.875 + 0.25 * torch.rand(shape, generator=generator, device="cuda")).half()
+    tile = serving_k4_options(width)["force_tile_config"]
+    return exl3.prepare_trellis256_moe_weights(
+        hidden_size=6144, intermediate_size=width, num_experts=experts,
+        activation="silu", fc1_tile_n=tile[1], fc2_tile_n=tile[3],
+        device=torch.device("cuda"), seed=seed, params_dtype=torch.float16,
+        w13_layout="trellis_t256_proj", trellis_bits=bits,
+        gate_suh=scales((experts, 6144)), up_suh=scales((experts, 6144)),
+        intermediate_rotations=scales((experts, 3 * width)),
+        down_svh=scales((experts, 6144)),
+        tile_config=tile)
+
+
+
+def prepare_comparison_layers(copies, width, serving):
+    # Only tier 0 is routed. Its cold copies stay distinct; unused K5 aliases.
+    unused_k5 = prepare_uniform(5, 256, 409, width) if serving else None
+    return [(prepare_uniform(4, 256, 408 + 2*c, width),
+             unused_k5 if serving else prepare_uniform(5, 1, 409 + 2*c, width))
+            for c in range(copies)]
+
+
+def comparison_route_ids(rows, generator):
+    # Global IDs 0..255 map to tier 0; K5 occupies unreachable IDs 256..511.
+    return torch.stack([torch.randperm(256, generator=generator)[:8]
+                        for _ in range(rows)])
+
+
+def serial_scratch(hidden, units, groups, shared=None):
+    shapes = {"fc1": ((groups, units, 2, (hidden+1023)//1024, 16, 128), torch.float32),
+              "intermediate": ((groups, units, 16, 128), torch.float16),
+              "fc2": ((groups, 16, hidden), torch.float32)}
+    if shared is None:
+        return {name: torch.empty(shape, dtype=dtype, device="cuda")
+                for name, (shape, dtype) in shapes.items()}
+    for name, (shape, dtype) in shapes.items():
+        count = 1
+        for extent in shape:
+            count *= extent
+        tensor = shared[name]
+        if tensor.dtype != dtype or not tensor.is_contiguous() or tensor.numel() < count:
+            raise ValueError(f"shared {name} scratch cannot hold the serial arm")
+    # Arms and graph replays run sequentially on one stream; only raw pointers
+    # cross the kernel ABI, so the larger grouped shape needs no serial view.
+    return {name: shared[name] for name in shapes}
+
+
+def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8, owned=None,
+                   scratch=None):
     """Synthetic K4 payloads, replicated into enough distinct layers that a
     replay over them streams every weight from DRAM (cold L2)."""
     owners = []
     unit_bytes = hidden * 16 * 4
-    layer_bytes = experts * units * 3 * unit_bytes
+    layer_bytes = (experts * units if owned is None else sum(map(len, owned))) * 3 * unit_bytes
     copies = max(2, -(-L2_SPAN * l2_bytes // layer_bytes))
     tables = []
     for _ in range(copies):
-        pointers = torch.empty((experts, units, 3, 3), dtype=torch.int64)
+        pointers = torch.zeros((experts, units, 3, 3), dtype=torch.int64)
         for e in range(experts):
-            for u in range(units):
+            for u in (range(units) if owned is None else owned[e]):
                 for p in range(3):
                     tensors = (torch.randint(0, 256, (unit_bytes,), dtype=torch.uint8, device="cuda"),
                                torch.ones(128, dtype=torch.float16, device="cuda"),
@@ -337,17 +444,18 @@ def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8):
         tables.append(pointers.to("cuda"))
     gen = torch.Generator().manual_seed(4080)
     signs = [(torch.randint(2, (hidden,), generator=gen) * 2 - 1).char().cuda() for _ in range(2)]
+    bits = torch.zeros((experts, units, 3), dtype=torch.int32)
+    for e in range(experts):
+        bits[e, list(range(units) if owned is None else owned[e]), :] = 4
     groups = 64*topk
     return dict(tables=tables, owners=owners, signs_in=signs[0], signs_out=signs[1],
-                bits=torch.full((experts,units,3),4,dtype=torch.int32,device="cuda"),
+                bits=bits.cuda(),
                 group_expert=torch.full((groups,),-1,dtype=torch.int32,device="cuda"),
                 route_slots=torch.full((groups,16),-1,dtype=torch.int32,device="cuda"),
                 route_group_lane=torch.full((64,topk),-1,dtype=torch.int32,device="cuda"),
                 group_count=torch.zeros(1,dtype=torch.int32,device="cuda"),
                 activation=torch.empty((64,hidden),dtype=torch.float16,device="cuda"),
-                fc1=torch.empty((groups,units,2,(hidden+1023)//1024,16,128),device="cuda"),
-                intermediate=torch.empty((groups,units,16,128),dtype=torch.float16,device="cuda"),
-                fc2=torch.empty((groups,16,hidden),device="cuda"),
+                **serial_scratch(hidden, units, groups, scratch),
                 output=torch.empty((64,hidden),dtype=torch.bfloat16,device="cuda"),
                 control_output=torch.empty((64,hidden),device="cuda"),
                 control_x=torch.empty((64,hidden),dtype=torch.float16,device="cuda"))
@@ -370,6 +478,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grouped", action="store_true", help="matched grouped prefill gate")
     parser.add_argument("--group-rows", type=int, default=64)
+    parser.add_argument("--world", type=int, default=None,
+                        help="explicit serving geometry; omitted keeps legacy compact TP4 fixture")
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--layer", type=int, default=3)
     parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64,4096")
     parser.add_argument("--replays",type=int,default=20)
     parser.add_argument("--output",type=Path)
@@ -398,6 +510,15 @@ def main():
         parser.error("--grouped-arm names must be unique")
     if args.profile_arm not in {"grouped", "exl3", "mixed", *(name for name, _ in args.grouped_arm)}:
         parser.error("--profile-arm must name an existing benchmark arm")
+    if args.world is not None:
+        if not args.grouped:
+            parser.error("--world requires --grouped")
+        try:
+            rank_geometry(args.world, args.rank, args.layer)
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.rank != 0 or args.layer != 3:
+        parser.error("--rank/--layer require --world")
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
     torch.cuda.set_per_process_memory_fraction(min(
@@ -428,7 +549,7 @@ def main():
     for total in map(int,args.rows.split(",")):
         gen = torch.Generator().manual_seed(408+total)
         chunks = [min(64, total-first) for first in range(0, total, 64)]
-        ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(total)]).cuda().int()
+        ids = comparison_route_ids(total, gen).cuda().int()
         weights = torch.rand((total,8),generator=gen).cuda()/8
         # Master's amplitude: EXL3's FP16 intermediates overflow on random K4
         # payloads at unit-scale activations.
@@ -569,26 +690,31 @@ def main():
         json.dump(result,stream,indent=2)
 
 
-def grouped_mixed_state(rows, tiers, props):
+def grouped_mixed_state(rows, tiers, props, width=512, serving=False, workspace=None):
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     from b12x.moe._shared.kernels.w4a16.host import max_packed_route_slots
     from b12x.moe.fused_moe._impl import _projection_mixed_tile_config
     tile = _projection_mixed_tile_config(None, hidden_size=6144,
-        intermediate_size=512, token_count=4096, direct_topk_routes=False)
+        intermediate_size=width, token_count=4096, direct_topk_routes=False)
+    options = (serving_k4_options(width) if serving else
+               dict(force_tile_config=tile, moe_block_size=32, warp_specialized=True,
+                    input_format="e4m3_k32", ws_input_stages=3, ws_dynamic_tiles=True))
+    block = options["moe_block_size"]
+    tier1_experts = 256 if serving else 1
     launch = mix.compile_mixed_trellis(
-        size_m=4096, hidden_size=6144, intermediate_size=512,
-        tier0_num_experts=256, tier1_num_experts=1, tier0_bits=4, tier1_bits=5,
+        size_m=4096, hidden_size=6144, intermediate_size=width,
+        tier0_num_experts=256, tier1_num_experts=tier1_experts, tier0_bits=4, tier1_bits=5,
         route_num_experts=256,
-        top_k=8, max_m_blocks=(max_packed_route_slots(4096*8, 32, 256)+31)//32,
+        top_k=8, max_m_blocks=(max_packed_route_slots(4096*8, block, 256)+block-1)//block,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
-        force_tile_config=tile, trellis_codebook=tiers[0].trellis_codebook,
-        moe_block_size=32, warp_specialized=True, input_format="e4m3_k32",
-        ws_input_stages=3, ws_dynamic_tiles=True,
+        trellis_codebook=tiers[0].trellis_codebook, **options,
         rotation_input_dtype="bf16", full_rotation_output_dtype="bf16")
-    bufs = mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"), sms=props.multi_processor_count)
-    # The production mixed ABI requires distinct tiers. Every routed expert
-    # is K4; one unreachable K5 slot keeps that ABI without changing its kernels.
-    mapping, desc = mix.build_ordered_maps(256, 1, device=torch.device("cuda"))
+    bufs = (mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"),
+                                         sms=props.multi_processor_count)
+            if workspace is None else workspace)
+    # Every route is K4. Explicit geometry retains the production K5 tier
+    # capacity even though no request in this synthetic K4 arm reaches it.
+    mapping, desc = mix.build_ordered_maps(256, tier1_experts, device=torch.device("cuda"))
     mapping = mapping[:256]
     rotations = mix.MixedTrellisRotations(
         torch.cat([t.intermediate_rotations for t in tiers]),
@@ -598,13 +724,27 @@ def grouped_mixed_state(rows, tiers, props):
     return binding, bufs
 
 
-def grouped_uniform_state(rows, tier, props):
+
+def serving_k4_states(rows, layers, props, width):
+    # Serial cold layers share one stream workspace, as in serving. Bindings
+    # retain distinct K4 pointers; captured work finishes before scratch reuse.
+    states = []
+    workspace = None
+    for tiers in layers:
+        state = grouped_mixed_state(rows, tiers, props, width, serving=True,
+                                    workspace=workspace)
+        states.append(state)
+        workspace = state[1]
+    return states
+
+
+def grouped_uniform_state(rows, tier, props, width=512):
     from b12x.moe._shared.kernels.w4a16.host import (
         make_w4a16_packed_buffers, select_route_block_size_m)
     # Native tiles do not depend on launch K/N geometry. Share their storage,
     # but retain the uniform serving route's historical K64/N256 policy.
-    tile = (64, 256, 64, 256)
-    tier = dataclasses.replace(tier, fc1_tile_n=256, fc2_tile_n=256,
+    tile = (64, 256 if width % 256 == 0 else 128, 64, 256)
+    tier = dataclasses.replace(tier, fc1_tile_n=tile[1], fc2_tile_n=256,
                               trellis=dataclasses.replace(tier.trellis, tile_config=tile))
     block = select_route_block_size_m(rows, 8, 256)
     bufs = make_w4a16_packed_buffers(tier, m=rows, topk=8, dtype=torch.float16,
@@ -612,7 +752,7 @@ def grouped_uniform_state(rows, tier, props):
     bufs = dataclasses.replace(bufs,
         output=torch.empty((rows, 6144), dtype=torch.bfloat16, device="cuda"))
     launch = exl3.compile_w4a16_fused_moe(
-        size_m=rows, hidden_size=6144, intermediate_size=512, num_experts=256,
+        size_m=rows, hidden_size=6144, intermediate_size=width, num_experts=256,
         top_k=8, activation="silu", apply_router_weight_on_input=False,
         zero_fc2_output=False, moe_block_size=block,
         max_m_blocks=int(bufs.block_expert_ids.numel()), element_dtype="fp16",
@@ -651,25 +791,36 @@ def grouped_main(args):
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
     roof = None if args.profile else read_roofline()
-    t = make_candidate(l2)
-    control = compile_control(args.control_core, args.control_glue)
-    limit = int(props.multi_processor_count) * 4
+    owned, width = (rank_geometry(args.world, args.rank, args.layer)
+                    if args.world is not None else (None, 512))
+    units = 16 if owned is not None else 4
     group_rows = args.group_rows
     capacity = (4096*8 + group_rows-1)//group_rows + 256
+    t = make_candidate(l2, units=units, owned=owned)
+    control = ((compile_exlr8_a16_aot(units=units, device_count=True),
+                compile_exlr8_group_aot(hidden=6144, top_k=8, max_groups=512))
+               if owned is not None else compile_control(args.control_core, args.control_glue))
+    limit = int(props.multi_processor_count) * 4
     group = compile_exlr8_group_aot(hidden=6144, top_k=8, max_groups=capacity,
                                     max_rows=4096, group_rows=group_rows)
-    grouped = compile_exlr8_a16_aot(units=4, top_k=8, max_groups=capacity,
+    grouped = compile_exlr8_a16_aot(units=units, top_k=8, max_groups=capacity,
                                     device_count=True, grouped=True, group_rows=group_rows)
     frozen = {name: compile_grouped_arm(grouped_arm_bundle(revision,
                   args.grouped_arm_source_dir), grouped)
               for name, revision in args.grouped_arm}
-    # Secondary only: mixed K4/K5 with an unreachable K5 slot is not the
-    # uniform K4 serving route used for the primary speed bar.
-    exl_layers = [(exl3._prepared(4,256,408+2*c,torch.device("cuda")),
-                   exl3._prepared(5,1,409+2*c,torch.device("cuda")))
-                  for c in range(len(t["tables"]))]
-    state = buffers(4096, 6144, 4, 8, capacity, group_rows)
-    mixed_states = [grouped_mixed_state(4096, ts, props) for ts in exl_layers]
+    # Legacy keeps the historical uniform baseline. Explicit geometry uses
+    # the sealed GLM serving package ABI, with every synthetic route in K4.
+    exl_layers = prepare_comparison_layers(len(t["tables"]), width, owned is not None)
+    # Weight preparation has large transient integer tensors. Allocate grouped
+    # arenas only afterward, replacing rather than retaining serial scratch.
+    for name in ("fc1", "intermediate", "fc2"):
+        del t[name]
+    torch.cuda.empty_cache()
+    state = buffers(4096, 6144, units, 8, capacity, group_rows)
+    t.update(serial_scratch(6144, units, 512, state))
+    compact = compact_unit_descriptors(t["bits"])
+    mixed_states = ([grouped_mixed_state(4096, ts, props) for ts in exl_layers]
+                    if owned is None else [])
     records = []
     for total in map(int, args.rows.split(",")):
         if not 1 <= total <= 4096:
@@ -679,7 +830,9 @@ def grouped_main(args):
         weights = torch.rand((total,8),generator=gen).cuda()/8
         wire = make_wire(torch.randn((total,6144),generator=gen).cuda()*0.02)
         decoded = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
-        uniform_states = [grouped_uniform_state(total, ts[0], props) for ts in exl_layers]
+        uniform_states = ([grouped_uniform_state(total, ts[0], props, width) for ts in exl_layers]
+                          if owned is None else
+                          serving_k4_states(total, exl_layers, props, width))
         chunk_response = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
         chunk_wire = torch.empty((64,6336),dtype=torch.uint8,device="cuda")
         chunk_ids = torch.empty((64,8),dtype=torch.int32,device="cuda")
@@ -707,14 +860,18 @@ def grouped_main(args):
                              state["inverse"],state["count"],state["activation"],scalars=(total,limit))
                 program.launch(state["activation"],table,t["bits"],state["group_expert"],state["route_slots"],
                                state["inverse"],weights,state["fc1"],state["intermediate"],state["fc2"],
-                               t["signs_out"],state["output"],state["count"],scalars=(total,limit))
+                               t["signs_out"],state["output"],state["count"],
+                               *(compact[:2] if compact_program(program) else ()),
+                               scalars=((total,limit,compact[2]) if compact_program(program)
+                                        else (total,limit)))
 
         def baseline():
             for uniform in uniform_states:
-                # Uniform full_rotation accepts BF16/FP16, not FP8 wire rows.
-                # Charge the worker's FP8-K32 -> BF16 conversion in this arm.
-                wire_decode(wire, decoded, total)
-                run_grouped_uniform(uniform, decoded, weights, ids)
+                if owned is None:
+                    wire_decode(wire, decoded, total)
+                    run_grouped_uniform(uniform, decoded, weights, ids)
+                else:
+                    run_bound_mixed_trellis(wire, weights, ids, *uniform)
 
         def mixed():
             for binding, bufs in mixed_states:
@@ -726,8 +883,9 @@ def grouped_main(args):
             n = int((chunk_response.view(torch.int16) != state["output"][:total].view(torch.int16)).sum())
             raise RuntimeError(f"grouped result differs from snapshot chunked K1: {n} BF16 words")
         finite_nonzero(state["output"][:total].float(), "grouped EXLR8")
-        finite_nonzero(uniform_states[-1][1].output.float(), "uniform grouped EXL3")
-        finite_nonzero(mixed_states[-1][1].output[:total].float(), "mixed grouped EXL3")
+        finite_nonzero(uniform_states[-1][1].output[:total].float(), "uniform grouped EXL3")
+        if mixed_states:
+            finite_nonzero(mixed_states[-1][1].output[:total].float(), "mixed grouped EXL3")
         for name, (program, ingress, _) in frozen.items():
             candidate(program, ingress)
             torch.cuda.synchronize()
@@ -744,7 +902,9 @@ def grouped_main(args):
             print(f"profiled arm={args.profile_arm} rows={total}", flush=True)
             continue
         graphs = {"chunked":capture(chunked),"grouped":capture(candidate),
-                  "exl3":capture(baseline),"mixed_unreachable_k5":capture(mixed)}
+                  "exl3":capture(baseline)}
+        if mixed_states:
+            graphs["mixed_unreachable_k5"] = capture(mixed)
         for name, (program, ingress, _) in frozen.items():
             graphs[name] = capture(functools.partial(candidate, program, ingress))
         rounds = {n:[] for n in graphs}
@@ -753,25 +913,38 @@ def grouped_main(args):
             for n in names[r%len(names):]+names[:r%len(names)]:
                 rounds[n].append(timing(graphs[n],args.replays)/copies)
         med = {n:statistics.median(ts) for n,ts in rounds.items()}
-        unique = int(ids.unique().numel()) * 3 * 6144 * 512 * 4//8
+        unique = (int(ids.unique().numel()) * 4 if owned is None else
+                  sum(len(owned[e]) for e in ids.unique().tolist())) * 3 * 6144 * 128 * 4//8
         stages = stage_profile(graphs["grouped"], args.output.parent,
             {"ingress":("_Group",),"fc1":("grouped_fc1_kernel",),"activation":("activation_kernel",),
              "fc2":("grouped_fc2_kernel",),"egress":("reduce_kernel",)})
+        k4_stages = stage_profile(graphs["exl3"], args.output.parent,
+            {"wire_decode": ("_wire_decode",), "fc1_fc2_fused": ("W4A16FusedMoeKernel",),
+             "fc1": ("ws_fc1_kernel",), "activation": ("ws_act_kernel",),
+             "fc2": ("ws_fc2_kernel",), "egress": ("W4A16TopKSumKernel",)})
         rec = dict(rows=total, **{n+"_us":v for n,v in med.items()}, rounds_us=rounds,
+                   exl3_stages={k:v/copies if k.endswith("_us") else v for k,v in k4_stages.items()},
                    chunked_speedup=med["chunked"]/med["grouped"],
                    exl3_speedup=med["exl3"]/med["grouped"], unique_weight_bytes=unique,
                    unique_read_roofline_percent=100*unique/med["grouped"]/1000/roof["gbps"],
                    stages={k:v/copies if k.endswith("_us") else v for k,v in stages.items()},
                    groups=int(state["count"].item()), bitwise_equal=True,
-                   uniform_route_block=uniform_states[0][-1],
-                   uniform_input_conversion="fp8_k32_to_bf16_included")
+                   uniform_route_block=uniform_states[0][-1] if owned is None else 64,
+                   uniform_input_conversion=("fp8_k32_to_bf16_included" if owned is None
+                                             else "serving_ws_direct_fp8_k32"),
+                   k4_options=None if owned is None else serving_k4_options(width))
         records.append(rec)
         print(json.dumps(rec),flush=True)
         del graphs, uniform_states
     if not args.profile:
         args.output.write_text(json.dumps(dict(schema=3, device=props.name, sm_count=props.multi_processor_count,
             l2_bytes=l2, measured_read_roofline=roof, group_rows=group_rows, rows=records,
-            primary_baseline="uniform K4 full_rotation; wire decode included",
+            geometry=dict(world=args.world or 4, rank=args.rank, layer=args.layer,
+                descriptor_units=units, owned_units_per_expert=([4]*256 if owned is None else list(map(len, owned))),
+                unit_ids=owned, exl3_width=width,
+                mode="legacy_compact" if owned is None else "serving_sparse"),
+            primary_baseline=("uniform K4 full_rotation; wire decode included" if owned is None else
+                              "serving GLM K4/K5 WS package geometry; all routes K4"),
             secondary_baseline="mixed K4/K5; K5 descriptor unreachable",
             frozen_grouped_sources={name: manifest for name, (_, _, manifest) in frozen.items()},
             target_met=all(r["exl3_speedup"]>=1.0 for r in records)),indent=2))
