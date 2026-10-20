@@ -210,7 +210,10 @@ class RuntimeAffineNorm(AffineNorm):
                      weight: cute.Tensor, out: cute.Tensor, base: Int64, lane: Int32,
                      mean: Float32, inv: Float32):
         # Per-lane contiguous vector chunks; the per-element math and its
-        # rounding are the scalar path's.
+        # rounding are the scalar path's.  compile_program declares every
+        # operand pointer 16-byte aligned, and width % 256 == 0 makes each row
+        # base a multiple of 1024 B (F32) / 512 B (BF16), so this chunk's
+        # accesses are 16-byte aligned.
         for chunk in cutlass.range_constexpr(self.width // 256):
             first = Int64(chunk * 256) + Int64(lane) * Int64(8)
             x0, x1, x2, x3 = ld_global_v4_f32(x_addr + (base + first) * Int64(4))

@@ -338,7 +338,8 @@ def test_graph_replay_and_dynamic_live_rows():
             assert bool(actual[live:].isnan().all())
 
 
-@pytest.mark.parametrize("kind", ["hidden", "final", "qk_swa", "qk_csa", "index_q", "index_k"])
+@pytest.mark.parametrize("kind", ["hidden", "hidden_mean", "final", "qk_swa", "qk_csa",
+                                  "index_q", "index_k"])
 def test_runtime_norm_epsilon_reuses_callable_and_graph(kind):
     require_b12x()
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -346,11 +347,11 @@ def test_runtime_norm_epsilon_reuses_callable_and_graph(kind):
     gen = torch.Generator(device="cuda").manual_seed(274)
     index = kind.startswith("index_")
     qk = kind.startswith("qk_")
-    width = 256 if index else 192 if qk else 4096
-    heads = 1 if kind in ("hidden", "final", "index_k") else 2
+    width = 512 if kind == "hidden_mean" else 256 if index else 192 if qk else 4096
+    heads = 1 if kind in ("hidden", "hidden_mean", "final", "index_k") else 2
     rotary = 32 if index else (192 if kind == "qk_swa" else 64) if qk else 0
-    subtract = kind == "index_k"
-    dtype = torch.float32 if kind == "hidden" else torch.bfloat16
+    subtract = kind in ("index_k", "hidden_mean")
+    dtype = torch.float32 if kind in ("hidden", "hidden_mean") else torch.bfloat16
     parameter_dtype = torch.bfloat16 if index else torch.float32
     x = (torch.randn(17, heads, width, generator=gen, device="cuda") * 0.003).to(dtype)
     x[1:] = x[:1]
@@ -361,7 +362,8 @@ def test_runtime_norm_epsilon_reuses_callable_and_graph(kind):
     pos = torch.zeros(17, dtype=torch.int64, device="cuda")
     out = torch.empty_like(x, dtype=torch.bfloat16)
     kwargs = dict(width=width, heads=heads, rotary=rotary, zero_centered=not subtract,
-        subtract_mean=subtract, bias=subtract, input_dtype=dtype, parameter_dtype=parameter_dtype)
+        subtract_mean=subtract, bias=kind == "index_k", input_dtype=dtype,
+        parameter_dtype=parameter_dtype)
     program = compile_affine_norm_aot(**kwargs, eps=None)
     assert program.abi["scalars"] == [("rows", "int32"), ("epsilon", "float32")]
     assert program.geometry["epsilon"] == "runtime_float32" and "eps" not in program.geometry
