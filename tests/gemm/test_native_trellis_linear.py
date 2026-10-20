@@ -129,13 +129,13 @@ def test_bit_exact_decode(bits, codebook):
             np.testing.assert_array_equal(values[:, lane, j], expected[:, r, c])
 
 
-# Header-verified whole matrices and TP2 local column/row shards. kv_a's 576
-# outputs require caller-owned padding to 640; a half latent width pads to 1792.
+# Whole matrices and actual TP2 shards; kv_a's stored N640 is trimmed to 576.
+# Latent projections and the vocabulary head stay whole on their owner GPU.
 KIMI_SHAPES = sorted({
     (7168, 12288), (7168, 6144), (12288, 7168), (6144, 7168),
-    (7168, 3584), (3584, 7168), (7168, 1792), (1792, 7168),
-    (7168, 1536), (7168, 768), (1536, 18432), (1536, 9216),
-    (7168, 640), (7168, 163840), (7168, 81920),
+    (7168, 3072), (3072, 7168), (7168, 3584), (3584, 7168),
+    (7168, 1536), (1536, 18432), (1536, 9216),
+    (7168, 640), (7168, 163840),
 })
 
 

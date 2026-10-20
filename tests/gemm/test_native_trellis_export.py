@@ -35,3 +35,21 @@ def test_native_trellis_export(bits, codebook, side, tmp_path):
     checked = validate_exported_header(program, destination / f"{stem}.h", "cuteafd_" + stem)
     assert checked["argument_count"] == 9
     assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("kind", ["bf16", "f32", "output", "output_f32"])
+@pytest.mark.parametrize("features", [7168, 163840])
+def test_trellis_transform_export(kind, features, tmp_path):
+    import torch
+    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
+    from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
+    destination = Path(os.environ.get("TRELLIS_EXPORT_DIR", str(tmp_path)))
+    destination.mkdir(parents=True, exist_ok=True)
+    stem = f"trellis_transform_{kind}_{features}"
+    with exportable_compilation():
+        program = (compile_trellis_output_aot(features=features, output_dtype="f32" if kind == "output_f32" else "bf16") if kind.startswith("output") else
+                   compile_trellis_input_aot(features=features, input_dtype=kind))
+    program.export_to_c(str(destination), stem, "cuteafd_" + stem)
+    checked = validate_exported_header(program, destination / f"{stem}.h", "cuteafd_" + stem)
+    assert checked["argument_count"] == (6 if kind.startswith("output") else 7)
+    assert not torch.cuda.is_initialized()
