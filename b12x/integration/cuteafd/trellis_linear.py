@@ -28,8 +28,8 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
         raise ValueError("trellis geometry must contain positive int32 dimensions")
     if input_features % 128 or output_features % 128:
         raise ValueError("trellis input/output dimensions must be multiples of 128")
-    if bits not in (2, 3, 4) or codebook not in ("e4m3", "f16") or sharded_side not in (1, 2):
-        raise ValueError("trellis requires K2/K3/K4, e4m3/f16 and side 1/2")
+    if type(bits) is not int or bits not in (2, 3, 4, 5, 6) or codebook not in ("e4m3", "f16", "mcg", "mul1") or sharded_side not in (1, 2):
+        raise ValueError("trellis requires K2--K6, mcg/mul1/e4m3/f16 and side 1/2")
     splits = (input_features + 1023) // 1024
     tasks = (max_rows + 15) // 16 * (output_features // 128) * splits
     if max(tasks, max_rows * (output_features // 128), input_features * output_features // 256) > (2**31-1)//2:

@@ -6522,6 +6522,55 @@ def trellis_align_stream_u32x2(z0, z1, z2, shift, word_delta, *, loc=None, ip=No
 
 
 @dsl_user_op
+def packed_dequant_trellis_mul1_to_half2x4(
+    win_a, win_b, bits: int, *, loc=None, ip=None
+):
+    """Native EXL3 MUL1 reconstruction, with a 64-bit stream at K6.
+
+    Match codebook.cuh's byte sum and FP16 FMA, not an FP32 approximation.
+    K2--K5 take two four-weight windows; K6 takes aligned low/high words.
+    """
+    bits = int(bits)
+    if bits not in (2, 3, 4, 5, 6):
+        raise ValueError("MUL1 supports only K2--K6")
+    lines = []
+    for index in range(8):
+        if bits == 6:
+            shift = (7 - index) * bits
+            if shift < 32:
+                extract = f"shf.r.wrap.b32 w{index}, $4, $5, {shift};"
+            else:
+                extract = f"shr.u32 w{index}, $5, {shift - 32};"
+            extract += f" and.b32 w{index}, w{index}, 0xffff;"
+        else:
+            source = "$5" if index < 4 else "$4"
+            shift = (3 - (index & 3)) * bits
+            extract = f"bfe.u32 w{index}, {source}, {shift}, 16;"
+        lines.extend((extract,
+                      f"mul.lo.u32 w{index}, w{index}, {_TRELLIS_MUL1:#x};",
+                      f"dp4a.u32.u32 w{index}, w{index}, ones, acc;"))
+    for pair in range(4):
+        lines.extend((f"prmt.b32 h, w{2*pair}, w{2*pair+1}, 0x5410;",
+                      f"fma.rn.f16x2 ${pair}, h, kinv, kbias;"))
+    asm = """{
+        .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7,h,ones,acc,kinv,kbias;
+        mov.b32 ones, 0x01010101;
+        mov.b32 acc, 0x00006400;
+        mov.b32 kinv, 0x1eee1eee;
+        mov.b32 kbias, 0xc931c931;
+    """ + "\n".join(lines) + "\n}"
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Uint32(win_a).ir_value(loc=loc, ip=ip),
+         Uint32(win_b).ir_value(loc=loc, ip=ip)],
+        asm, "=r,=r,=r,=r,r,r", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+                 for i in range(4))
+
+
+@dsl_user_op
 def packed_decode_trellis_mul1_e4m3_to_e4m3x8(
     win_a, win_b, bits: int = 3, *, loc=None, ip=None
 ):

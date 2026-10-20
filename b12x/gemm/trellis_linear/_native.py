@@ -15,6 +15,8 @@ from cutlass import Float32, Int32, Int64, Uint32
 from b12x._lib.intrinsics import (
     f16_mma_m16n8k16_f32, ld_global_nc_u32,
     packed_dequant_trellis_to_half2x4,
+    packed_dequant_trellis_stream_to_half2x4,
+    packed_dequant_trellis_mul1_to_half2x4, trellis_align_stream_u32x2,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a16.exlr8 import _e4m3_round_half2, _side_value
@@ -22,20 +24,45 @@ from b12x.moe._shared.kernels.w4a16.exlr8 import _e4m3_round_half2, _side_value
 
 @cute.jit
 def decode_tile(address: Int64, tile: Int32, lane: Int32,
-                bits: cutlass.Constexpr, e4m3: cutlass.Constexpr):
+                bits: cutlass.Constexpr, e4m3: cutlass.Constexpr,
+                mul1: cutlass.Constexpr = False):
     base = address + tile.to(Int64) * Int64(32 * bits)
     if cutlass.const_expr(bits == 4):
         b = ld_global_nc_u32(base + lane.to(Int64) * Int64(4))
         a = cute.arch.shuffle_sync(b, (lane + Int32(31)) & Int32(31))
         wa, wb = b, (a << Uint32(16)) | (b >> Uint32(16))
-    else:
+    elif cutlass.const_expr(bits <= 4):
         ia, ib, shift, _ = trellis256_lane_geom_bits(lane, 0, 8, bits)
         a = ld_global_nc_u32(base + ia.to(Int64) * Int64(4))
         b = ld_global_nc_u32(base + ib.to(Int64) * Int64(4))
         window = (a.to(Int64) << Int64(32)) | b.to(Int64)
         wa = (window >> shift.to(Int64)).to(Uint32)
         wb = (window >> (shift + Int32(4 * bits)).to(Int64)).to(Uint32)
-    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, bits)
+    elif cutlass.const_expr(bits == 5):
+        # Four K5 windows span 31 bits; all eight may span three ring words.
+        ib0, ib1, sb, _ = trellis256_lane_geom_bits(lane, 0, 4, bits)
+        ia0, ia1, sa, _ = trellis256_lane_geom_bits(lane, 4, 4, bits)
+        b0 = ld_global_nc_u32(base + ib0.to(Int64) * Int64(4))
+        b1 = ld_global_nc_u32(base + ib1.to(Int64) * Int64(4))
+        a0 = ld_global_nc_u32(base + ia0.to(Int64) * Int64(4))
+        a1 = ld_global_nc_u32(base + ia1.to(Int64) * Int64(4))
+        wa = (((a0.to(Int64) << Int64(32)) | a1.to(Int64)) >> sa.to(Int64)).to(Uint32)
+        wb = (((b0.to(Int64) << Int64(32)) | b1.to(Int64)) >> sb.to(Int64)).to(Uint32)
+    else:
+        # Even four K6 windows need 34 bits. Retain the aligned 64-bit stream.
+        i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, bits)
+        i1 = i0 + Int32(1)
+        i1 -= Int32(8 * bits) * (i1 >= Int32(8 * bits)).to(Int32)
+        z0 = ld_global_nc_u32(base + i0.to(Int64) * Int64(4))
+        z1 = ld_global_nc_u32(base + i1.to(Int64) * Int64(4))
+        z2 = ld_global_nc_u32(base + i2.to(Int64) * Int64(4))
+        wa, wb = trellis_align_stream_u32x2(z0, z1, z2, shift, delta)
+    if cutlass.const_expr(mul1):
+        b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, bits)
+    elif cutlass.const_expr(bits == 6):
+        b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, bits)
+    else:
+        b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, bits)
     if cutlass.const_expr(e4m3):
         b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
         b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
@@ -49,6 +76,9 @@ class NativeTrellisLinear:
     def __init__(self, g):
         self.k, self.n = g["input_features"], g["output_features"]
         self.bits, self.e4m3 = g["bits"], g["codebook"] == "e4m3"
+        self.mul1 = g["codebook"] == "mul1"
+        # High-rate windows need more live registers than the frozen K2--K4 path.
+        self.min_blocks_per_mp = 2 if self.bits >= 5 else self.CTAS_PER_SM
         self.input_units = g["sharded_side"] == 2
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
         self.splits = g["splits"]
@@ -61,7 +91,7 @@ class NativeTrellisLinear:
         if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations) and cta_limit > Int32(0):
             self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
                 grid=(min(((rows + Int32(15)) // Int32(16)) * Int32(self.n // 128 * self.splits), cta_limit), 1, 1),
-                block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
             self.reduce(partial, output, rows).launch(
                 grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
                 block=(128, 1, 1), stream=stream)
@@ -101,7 +131,7 @@ class NativeTrellisLinear:
                             tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                             if cutlass.const_expr(self.input_units):
                                 tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
-                            b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3)
+                            b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1)
                             d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                                 acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                                 a0, a1, a2, a3, b0, b1)

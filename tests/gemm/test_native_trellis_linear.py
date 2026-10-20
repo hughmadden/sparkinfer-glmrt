@@ -1,22 +1,12 @@
 """Shared operand gates against the independent E1 trellis oracle."""
-import importlib.util
-import os
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
 
 
 def reference(codebook="e4m3"):
-    path = Path(os.environ.get("CUTEAFD_EXLR8_REFERENCE", "/workspace/cuteafd/python/reference/exlr8.py"))
-    spec = importlib.util.spec_from_file_location("e1_reference", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if codebook == "f16":
-        # E1 already rounds the MCG half sum; omit only the E4M3 conversion.
-        module.e4m3_round = lambda values: np.asarray(values, dtype=np.float32)
-    return module
+    from tests._reference.native_trellis import Reference
+    return Reference(codebook)
 
 
 class Case:
@@ -48,7 +38,7 @@ class Case:
                             scalars=(rows, rotation, limit))
 
 
-@pytest.mark.parametrize("side,bits,codebook", [(1, 4, "e4m3"), (2, 4, "e4m3"), (1, 2, "e4m3"), (2, 3, "e4m3"), (1, 4, "f16"), (2, 3, "f16")])
+@pytest.mark.parametrize("side,bits,codebook", [(1, 4, "e4m3"), (2, 4, "e4m3"), (1, 2, "e4m3"), (2, 3, "e4m3"), (1, 4, "f16"), (2, 3, "f16"), *[(side, bits, cb) for side in (1, 2) for bits in (5, 6) for cb in ("mcg", "mul1")]])
 def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
     c = Case(side=side, bits=bits, codebook=codebook)
     c.launch(64, rotation=0)
@@ -99,8 +89,8 @@ def test_graph_replay_and_invalid_launch():
         assert torch.isnan(c.output).all()
 
 
-@pytest.mark.parametrize("bits", [2, 3, 4])
-@pytest.mark.parametrize("codebook", ["e4m3", "f16"])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("codebook", ["e4m3", "f16", "mcg", "mul1"])
 def test_bit_exact_decode(bits, codebook):
     import cutlass
     import cutlass.cute as cute
@@ -113,25 +103,127 @@ def test_bit_exact_decode(bits, codebook):
     def decode(payload: cute.Tensor, output: cute.Tensor):
         lane, _, _ = cute.arch.thread_idx()
         tile, _, _ = cute.arch.block_idx()
-        values = decode_tile(Int64(payload.iterator.toint()), Int32(tile), Int32(lane), bits, codebook == "e4m3")
+        values = decode_tile(Int64(payload.iterator.toint()), Int32(tile), Int32(lane), bits, codebook == "e4m3", codebook == "mul1")
         for j in cutlass.range_constexpr(4):
             output[tile*128+lane*4+j] = values[j]
 
     @cute.jit
     def probe(payload: cute.Tensor, output: cute.Tensor, stream):
-        decode(payload, output).launch(grid=(32, 1, 1), block=(32, 1, 1), stream=stream)
+        decode(payload, output).launch(grid=(8192, 1, 1), block=(32, 1, 1), stream=stream)
 
-    raw = np.random.default_rng(408).integers(0, 256, 32*32*bits, dtype=np.uint8)
+    raw = np.random.default_rng(408).integers(0, 256, 8192*32*bits, dtype=np.uint8)
     p = torch.tensor(raw, device="cuda")
-    out = torch.empty(32*128, dtype=torch.uint32, device="cuda")
+    out = torch.empty(8192*128, dtype=torch.uint32, device="cuda")
     pv, ov = from_dlpack(p), from_dlpack(out)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     program = cute.compile(probe, pv, ov, stream)
     program(pv, ov, stream)
-    expected = reference(codebook).decode_tiles(raw.tobytes(), bits)
-    values = out.view(torch.float16).cpu().numpy().reshape(32, 32, 8)
+    ref = reference(codebook)
+    assert np.unique(ref.codewords(raw.tobytes(), bits)).size == 65536
+    expected = ref.decode_tiles(raw.tobytes(), bits)
+    values = out.view(torch.float16).cpu().numpy().reshape(8192, 32, 8)
     for lane in range(32):
         r, c = 2*(lane % 4), lane//4
         positions = ((r,c),(r+1,c),(r+8,c),(r+9,c),(r,c+8),(r+1,c+8),(r+8,c+8),(r+9,c+8))
         for j, (r, c) in enumerate(positions):
             np.testing.assert_array_equal(values[:, lane, j], expected[:, r, c])
+
+
+# Header-verified whole matrices and TP2 local column/row shards. kv_a's 576
+# outputs require caller-owned padding to 640; a half latent width pads to 1792.
+KIMI_SHAPES = sorted({
+    (7168, 12288), (7168, 6144), (12288, 7168), (6144, 7168),
+    (7168, 3584), (3584, 7168), (7168, 1792), (1792, 7168),
+    (7168, 1536), (7168, 768), (1536, 18432), (1536, 9216),
+    (7168, 640), (7168, 163840), (7168, 81920),
+})
+
+
+@pytest.mark.parametrize("bits", [5, 6])
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("k,n", KIMI_SHAPES)
+@pytest.mark.skipif(__import__("os").environ.get("NATIVE_TRELLIS_FULL_SHAPES") != "1",
+                    reason="opt-in full Kimi geometry gate")
+def test_kimi_shapes(k, n, side, bits, codebook):
+    """Full native launch; bounded independent F64 rows/columns, never BF16 math."""
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    rng = np.random.default_rng(273)
+    rows = 64 if n >= 81920 else 4096
+    raw = rng.integers(0, 256, k*n*bits//8, dtype=np.uint8)
+    x = torch.tensor(rng.normal(0, .05, (rows, k)), device="cuda", dtype=torch.float16)
+    inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
+    payload = torch.tensor(raw, device="cuda")
+    scales = torch.tensor(rng.uniform(.5, 2., k//128), device="cuda", dtype=torch.float16)
+    partial = torch.empty((rows, (k+1023)//1024, n), device="cuda", dtype=torch.float32)
+    output = torch.empty((rows, n), device="cuda", dtype=torch.float32)
+    program = compile_trellis_linear_aot(input_features=k, output_features=n,
+        sharded_side=side, bits=bits, codebook=codebook, rotation_count=1, max_rows=rows)
+    # Sample the first, middle and final N128 units, including the final ring.
+    blocks = sorted({0, n//256, n//128-1})
+    ref = reference(codebook)
+    weights = []
+    for nb in blocks:
+        if side == 1:
+            unit = raw.reshape(n//128, -1)[nb]
+            w = ref.decode_unit(unit.tobytes(), bits, "gate", k)
+        else:
+            unit = raw.reshape(k//128, n//128, 64*32*bits)[:, nb]
+            w = np.concatenate([ref.decode_unit(u.tobytes(), bits, "down", 128) for u in unit])
+        weights.append(torch.tensor(w, device="cuda"))
+    weight = torch.cat(weights, dim=1) * scales.float().repeat_interleave(128)[:, None]
+    cols = torch.tensor([nb*128+i for nb in blocks for i in range(128)], device="cuda")
+    sample_rows = sorted({0, 1, 7, 15, 31, rows-1})
+    expected = x[sample_rows].double() @ weight.double()
+    limit = torch.cuda.get_device_properties(0).multi_processor_count * 4
+    program.launch(inputs, payload, scales, partial.flatten(), output.flatten(), scalars=(rows, 0, limit))
+    saved = output[:64].clone()
+    assert torch.isfinite(output).all() and torch.count_nonzero(output) > 0
+    actual = output[sample_rows][:, cols].double()
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+    for live in ((1, 16, 64) if rows == 64 else (1, 8, 16, 64, 256, 1024, 4096)):
+        output.fill_(float("nan"))
+        program.launch(inputs, payload, scales, partial.flatten(), output.flatten(), scalars=(live, 0, limit))
+        assert torch.equal(output[:min(64, live)].view(torch.int32), saved[:min(64, live)].view(torch.int32))
+        assert torch.isnan(output[live:]).all()
+        chosen = [r for r in sample_rows if r < live]
+        torch.testing.assert_close(output[chosen][:, cols].double(),
+                                   x[chosen].double() @ weight.double(), rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("codebook", ["e4m3", "f16", "mcg", "mul1"])
+def test_geometry_codebooks(bits, codebook):
+    from b12x.integration.cuteafd.trellis_linear import geometry
+    g = geometry(7168, 12288, bits=bits, codebook=codebook)
+    assert g["abi_version"] == 1 and g["splits"] == 7
+    assert (g["bits"], g["codebook"]) == (bits, codebook)
+
+
+@pytest.mark.parametrize("bits,codebook", [(1, "mcg"), (7, "mcg"), (6., "mcg"),
+    (True, "mcg"), (6, "sqg_fp16"), (4, "sqg_e4m3"), (6, "3inst"), (6, "unknown")])
+def test_geometry_fails_closed(bits, codebook):
+    from b12x.integration.cuteafd.trellis_linear import geometry
+    with pytest.raises(ValueError, match="trellis requires"):
+        geometry(7168, 12288, bits=bits, codebook=codebook)
+
+
+@pytest.mark.parametrize("bits", [5, 6])
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
+def test_high_rate_graph_replay_and_frozen_resolution(bits, codebook):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    c = Case(k=128, n=128, rows=64, bits=bits, codebook=codebook)
+    c.launch(64)
+    expected = c.output.clone()
+    torch.cuda.synchronize()
+    with kernel_resolution_guard("native high-rate trellis is precompiled"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            c.launch(64)
+        for _ in range(3):
+            c.output.fill_(float("nan"))
+            graph.replay()
+            assert torch.equal(c.output.view(torch.int32), expected.view(torch.int32))
+        for rows in (1, 8, 16, 64):
+            c.launch(rows)
+            assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
