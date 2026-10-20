@@ -213,7 +213,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 19
+    CODE_VERSION = 20
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -1058,8 +1058,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 src_word = slot_hi if (cutlass.const_expr(self.mtiles == 4) and (m >= Int32(2))) else slot_lo
                                 src_base = (m & Int32(1)) * Int32(16) + (lane >> Int32(2))
                                 for v in cutlass.range_constexpr(2):
-                                    slot_out = cute.arch.shuffle_sync(src_word, src_base + Int32(v * 8))
-                                    row_idx = slot_out if sliced else (m * Int32(16) + Int32(v * 8) + (lane >> Int32(2)))
+                                    row_idx = (
+                                        cute.arch.shuffle_sync(src_word, src_base + Int32(v * 8))
+                                        if sliced
+                                        else (m * Int32(16) + Int32(v * 8) + (lane >> Int32(2)))
+                                    )
                                     if (out_meta_b & Int32(1 << (8 + idx * 2 + v))) != Int32(0):
                                         row_addr = block_out_base + row_idx.to(Int64) * row_stride_bytes
                                         st_global_v2_f32(row_addr, total[idx, 2 * v], total[idx, 2 * v + 1])
@@ -1083,8 +1086,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 src_word = slot_hi if (cutlass.const_expr(self.mtiles == 4) and (m >= Int32(2))) else slot_lo
                                 src_base = (m & Int32(1)) * Int32(16) + (lane >> Int32(2))
                                 for v in cutlass.range_constexpr(2):
-                                    slot_out = cute.arch.shuffle_sync(src_word, src_base + Int32(v * 8))
-                                    row_idx = slot_out if sliced else (m * Int32(16) + Int32(v * 8) + (lane >> Int32(2)))
+                                    row_idx = (
+                                        cute.arch.shuffle_sync(src_word, src_base + Int32(v * 8))
+                                        if sliced
+                                        else (m * Int32(16) + Int32(v * 8) + (lane >> Int32(2)))
+                                    )
                                     if (out_meta_b & Int32(1 << (8 + idx * 2 + v))) != Int32(0):
                                         row_addr = block_out_base + row_idx.to(Int64) * row_stride_bytes
                                         st_global_v2_f32(row_addr, total[idx, 2 * v], total[idx, 2 * v + 1])
@@ -1131,6 +1137,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             values.fill(Float32(0.0))
             if groups > Int32(0):
                 row_route_base = row.to(Int64) * Int64(self.top_k)
+                my_weight = (
+                    route_weights[row_route_base + lane.to(Int64)]
+                    if lane < Int32(self.top_k) else Float32(0.0)
+                )
                 if sliced:
                     row_fc2_base = fc2_address + (
                         (b_out * max_slot).to(Int64) * Int64(128)
@@ -1138,25 +1148,28 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         + lane.to(Int64) * Int64(4)
                     ) * Int64(4)
                     for slot in cutlass.range_constexpr(self.top_k):
-                        route = row_route_base + Int64(slot)
-                        weight = route_weights[route]
+                        weight = cute.arch.shuffle_sync(my_weight, Int32(slot))
                         w0, w1, w2, w3 = ld_global_lu_v4_f32_offset(row_fc2_base, slot * 512)
                         values[0] = values[0] + weight * w0
                         values[1] = values[1] + weight * w1
                         values[2] = values[2] + weight * w2
                         values[3] = values[3] + weight * w3
                 else:
-                    for slot in cutlass.range(Int32(self.top_k)):
-                        route = row_route_base + slot.to(Int64)
-                        packed = route_group_lane[route]
+                    my_packed = (
+                        route_group_lane[row_route_base + lane.to(Int64)]
+                        if lane < Int32(self.top_k) else Int32(-1)
+                    )
+                    col_fc2_base = fc2_address + col.to(Int64) * Int64(4)
+                    for slot in cutlass.range_constexpr(self.top_k):
+                        packed = cute.arch.shuffle_sync(my_packed, Int32(slot))
+                        weight = cute.arch.shuffle_sync(my_weight, Int32(slot))
                         if packed >= Int32(0):
-                            weight = route_weights[route]
-                            address = fc2_address + (packed.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(4)
-                            w0, w1, w2, w3 = ld_global_nc_v4_u32(address)
-                            values[0] = values[0] + weight * u32_as_f32(w0)
-                            values[1] = values[1] + weight * u32_as_f32(w1)
-                            values[2] = values[2] + weight * u32_as_f32(w2)
-                            values[3] = values[3] + weight * u32_as_f32(w3)
+                            address = col_fc2_base + packed.to(Int64) * Int64(self.hidden_size * 4)
+                            w0, w1, w2, w3 = ld_global_lu_v4_f32_offset(address, 0)
+                            values[0] = values[0] + weight * w0
+                            values[1] = values[1] + weight * w1
+                            values[2] = values[2] + weight * w2
+                            values[3] = values[3] + weight * w3
             h0, h1, h2, h3 = _w4a8_had128_quad(values[0], values[1], values[2], values[3], lane)
             signs = ld_global_nc_u32(signs_address + col.to(Int64))
             store_bf16x4(output_address + (row.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(2),
