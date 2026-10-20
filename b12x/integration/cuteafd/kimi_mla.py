@@ -6,7 +6,7 @@ full causal dense_mla. No rotary tables, positions, indexer or allocation.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 import cuda.bindings.driver as cuda
@@ -56,6 +56,36 @@ class KimiMlaGeometry:
     @property
     def softmax_scale(self):
         return 192 ** -0.5
+
+
+@dataclass(frozen=True)
+class MlaDraftGeometry(KimiMlaGeometry):
+    """Checkpoint-native block drafter, distinct from the NoPE target.
+
+    The shared loader supplies the YaRN-adjusted score scale. Frequencies and
+    the rotary magnitude factor are device inputs, never inferred here.
+    """
+
+    name: str = "mla_block_draft"
+    heads: int = 64
+    norm_eps: float = 1e-5
+    attention_scale: float = field(kw_only=True)
+    window_size: int | None = None
+
+    def __post_init__(self):
+        if (self.hidden, self.heads, self.q_lora_rank, self.kv_lora_rank,
+            self.qk_nope_dim, self.qk_rope_dim, self.v_head_dim,
+            self.page_rows, self.norm_eps) != (
+                7168, 64, 1536, 512, 128, 64, 128, 64, 1e-5):
+            raise ValueError("unsupported MLA block-draft geometry")
+        if self.window_size not in (None, 4096):
+            raise ValueError("MLA block draft supports full context or window 4096")
+        if not math.isfinite(self.attention_scale) or self.attention_scale <= 0:
+            raise ValueError("draft attention scale must be finite and positive")
+
+    @property
+    def softmax_scale(self):
+        return self.attention_scale
 
 
 def _align(n):
@@ -175,6 +205,69 @@ class _Producer:
         self.tail(q, query, rows, stream)
 
 
+class _DraftRotary:
+    """Interleaved (GPT-J) rotary-64, matching the MLA checkpoint layout."""
+
+    def __init__(self, heads):
+        self.heads = heads
+
+    @cute.jit
+    def __call__(self, query: cute.Pointer, cache: cute.Pointer, slots: cute.Pointer,
+                 positions: cute.Pointer, inv_freq: cute.Pointer, factor: Float32,
+                 rows: Int32, stream: cuda.CUstream):
+        self.kernel(query, cache, slots, positions, inv_freq, factor).launch(
+            grid=(rows, self.heads, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, query: cute.Pointer, cache: cute.Pointer, slots: cute.Pointer,
+               positions: cute.Pointer, inv_freq: cute.Pointer, factor: Float32):
+        row, head, _ = cute.arch.block_idx()
+        pair = Int64(cute.arch.thread_idx()[0])
+        angle = Float32(positions[Int64(row)]) * Float32(inv_freq[pair])
+        c = _bf16(cute.math.cos(angle, fastmath=False) * factor)
+        s = _bf16(cute.math.sin(angle, fastmath=False) * factor)
+        base = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(576) + Int64(512) + pair * Int64(2)
+        x, y = Float32(query[base]), Float32(query[base + Int64(1)])
+        query[base] = (_bf16(x * c) - _bf16(y * s)).to(BFloat16)
+        query[base + Int64(1)] = (_bf16(y * c) + _bf16(x * s)).to(BFloat16)
+        slot = Int64(slots[Int64(row)])
+        if head == Int32(0) and slot >= Int64(0):
+            base = slot * Int64(576) + Int64(512) + pair * Int64(2)
+            x, y = Float32(cache[base]), Float32(cache[base + Int64(1)])
+            cache[base] = (_bf16(x * c) - _bf16(y * s)).to(BFloat16)
+            cache[base + Int64(1)] = (_bf16(y * c) + _bf16(x * s)).to(BFloat16)
+
+
+class _DraftProducer:
+    def __init__(self, g):
+        self.producer = _Producer(g)
+        self.rotary = _DraftRotary(g.heads)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, kv_slots: cute.Pointer, positions: cute.Pointer,
+                 inv_freq: cute.Pointer, w_qkv_a: cute.Pointer, q_a_norm: cute.Pointer,
+                 kv_a_norm: cute.Pointer, w_q_b: cute.Pointer, w_uk: cute.Pointer,
+                 kv_cache: cute.Pointer, query: cute.Pointer, q_resid: cute.Pointer,
+                 scratch: cute.Pointer, rotary_factor: Float32, rows: Int32, stream: cuda.CUstream):
+        self.producer(x, kv_slots, w_qkv_a, q_a_norm, kv_a_norm, w_q_b, w_uk,
+                      kv_cache, query, q_resid, scratch, rows, stream)
+        self.rotary(query, kv_cache, kv_slots, positions, inv_freq, rotary_factor, rows, stream)
+
+
+class _DraftOutput:
+    def __init__(self, g):
+        self.uv = BatchedBf16Gemm(n=128, k=512, batch=g.heads, a_row=g.heads * 512,
+                                   a_batch=512, o_row=g.heads * 128, o_batch=128)
+        self.o = glm_projection(g.hidden, g.heads * 128)
+
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, w_uv: cute.Pointer, w_o: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        values = cute.recast_ptr(scratch, dtype=BFloat16)
+        self.uv(attn, w_uv, values, rows, stream)
+        self.o(values, w_o, out, rows, stream)
+
+
 class _Output:
     def __init__(self, g):
         self.g = g
@@ -206,7 +299,9 @@ class _Attention:
         self.forward = DenseMlaForwardKernel(layout=make_smem_layout(query_tile=1, fp8=False),
             page_size=64, num_heads=g.heads, num_splits=self.splits,
             chunks_per_split=self.layout["chunks_per_split"], query_tile=1, fp8=False,
-            qk_dim=576, value_dim=512, window_size=None)
+            qk_dim=576, value_dim=512,
+            window_size=g.window_size if isinstance(g, MlaDraftGeometry) else None,
+            noncausal_block=isinstance(g, MlaDraftGeometry))
         self.merge = DenseMlaMergeKernel(num_splits=self.splits, value_dim=512) if self.splits > 1 else None
 
     @cute.jit
@@ -236,6 +331,65 @@ class _Attention:
         if cutlass.const_expr(self.splits > 1):
             if active_splits > Int32(1):
                 self.merge(po, pl, out, lse_out, active_splits, stream)
+
+
+def compile_mla_draft_producer_aot(g: MlaDraftGeometry, *, max_rows=64):
+    if not isinstance(g, MlaDraftGeometry):
+        raise TypeError("MLA draft requires MlaDraftGeometry")
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{g.hidden}]"),
+        Operand("kv_slots", torch.int64, "[rows]", align=8),
+        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("inv_freq", torch.float32, "[32]", align=4),
+        Operand("w_qkv_a", torch.bfloat16, f"[{g.qkv_a_width},{g.hidden}]"),
+        Operand("q_a_norm", torch.bfloat16, "[1536]"),
+        Operand("kv_a_norm", torch.bfloat16, "[512]"),
+        Operand("w_q_b", torch.bfloat16, f"[{g.heads * 192},1536]"),
+        Operand("w_uk", torch.bfloat16, f"[{g.heads},512,128]"),
+        Operand("kv_cache", torch.bfloat16, "[pages,64,576]", "inout"),
+        Operand("query", torch.bfloat16, f"[rows,{g.heads},576]", "out"),
+        Operand("q_resid", torch.bfloat16, "[rows,1536]", "out"),
+        Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"))
+    return compile_program(_DraftProducer(g), name="mla_draft_producer", operands=operands,
+        scalars=(Scalar("rotary_factor", "float32"), Scalar("rows")), key=(g, max_rows),
+        scratch={"scratch": lambda rows: producer_scratch_bytes(g, rows)},
+        geometry={**vars(g), "rotary_style": "interleaved", "rotary_dim": 64})
+
+
+def compile_mla_draft_output_aot(g: MlaDraftGeometry, *, max_rows=64):
+    if not isinstance(g, MlaDraftGeometry):
+        raise TypeError("MLA draft requires MlaDraftGeometry")
+    operands = (
+        Operand("attn", torch.bfloat16, f"[rows,{g.heads},512]"),
+        Operand("w_uv", torch.bfloat16, f"[{g.heads},128,512]"),
+        Operand("w_o", torch.bfloat16, f"[{g.hidden},{g.heads * 128}]"),
+        Operand("out", torch.bfloat16, f"[rows,{g.hidden}]", "out"),
+        Operand("scratch", torch.uint8, "[output_scratch_bytes]", "scratch"))
+    return compile_program(_DraftOutput(g), name="mla_draft_output", operands=operands,
+        scalars=(Scalar("rows"),), key=(g, max_rows),
+        scratch={"scratch": lambda rows: _align(rows * g.heads * 128 * 2)},
+        geometry={**vars(g), "output_gate": False})
+
+
+def compile_mla_draft_attention_aot(g: MlaDraftGeometry, *, max_rows=64, max_context=1048576):
+    if not isinstance(g, MlaDraftGeometry):
+        raise TypeError("MLA draft requires MlaDraftGeometry")
+    layout = attention_layout(g, max_rows, max_context=max_context, mode="verify")
+    operands = (
+        Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
+        Operand("kv_cache", torch.bfloat16, "[pages,64,576]"),
+        Operand("page_table", torch.int32, "[batch,page_table_width]", align=4),
+        Operand("cache_seqlens", torch.int32, "[batch]", align=4),
+        Operand("cu_seqlens_q", torch.int32, "[batch+1]", align=4),
+        Operand("attn", torch.bfloat16, f"[rows,{g.heads},512]", "out"),
+        Operand("lse", torch.float32, f"[rows,{g.heads}]", "out"),
+        Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"))
+    return compile_program(_Attention(g, max_rows, max_context, "verify"), name="mla_draft_attention",
+        operands=operands,
+        scalars=(Scalar("rows"), Scalar("batch"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
+        key=(g, max_rows, max_context),
+        scratch={"scratch": lambda rows: attention_layout(g, rows, max_context=max_context, mode="verify")["scratch_bytes"]},
+        geometry={**vars(g), **layout, "noncausal_block": True, "max_context": max_context})
 
 
 def compile_kimi_mla_producer_aot(g=KimiMlaGeometry(), *, max_rows=64):
