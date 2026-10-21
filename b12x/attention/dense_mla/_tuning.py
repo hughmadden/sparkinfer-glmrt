@@ -16,6 +16,7 @@ from b12x.preparation import (
     TuningContract,
 )
 
+from ._layout import SmemLayout, choose_layout
 from .planner import Budget, choose_num_splits
 
 
@@ -83,12 +84,16 @@ class DenseMlaConfig:
         return cls(max_splits=value)
 
 
-def _query_tile(query: DenseMlaQuery) -> int:
-    if query.mode == "decode" or query.max_batch != 1 or query.window_size is not None:
-        return 1
-    if query.kv_dtype == "float8_e4m3fn" and query.query_rows >= 3:
-        return 4
-    return 2
+def _layout(query: DenseMlaQuery) -> SmemLayout:
+    return choose_layout(
+        mode=query.mode,
+        fp8=query.kv_dtype == "float8_e4m3fn",
+        qk_dim=query.qk_head_dim,
+        value_dim=query.v_head_dim,
+        single_request=query.max_batch == 1,
+        windowed=query.window_size is not None,
+        query_rows=query.query_rows,
+    )
 
 
 def _default_config(
@@ -101,13 +106,16 @@ def _default_config(
             query.cache_tokens,
             query.window_size + query.page_size - 1,
         )
+    shared_layout = _layout(query)
     splits = choose_num_splits(
         max_cache_tokens=max_attended_tokens,
         max_total_q=query.query_rows,
         num_q_heads=query.num_q_heads,
-        query_tile=_query_tile(query),
+        query_tile=shared_layout.query_tile,
         sm_count=1 if device is None else device.sm_count,
         budget=Budget(),
+        heads_per_tile=shared_layout.heads_per_tile,
+        candidates_per_chunk=shared_layout.candidates_per_chunk,
     )
     return DenseMlaConfig(max_splits=splits)
 
@@ -126,13 +134,15 @@ def _validate_config(
         raise TypeError("config must be DenseMlaConfig")
     if config.max_splits <= 0:
         raise ValueError("dense MLA max_splits must be positive")
-    max_chunks = max(1, (query.cache_tokens + 63) // 64)
+    chunk = _layout(query).candidates_per_chunk
+    max_chunks = max(1, (query.cache_tokens + chunk - 1) // chunk)
     if config.max_splits > max_chunks:
         raise ValueError("dense MLA max_splits cannot exceed the cache chunk count")
 
 
 def _tuning_parameters(query: DenseMlaQuery, device: DeviceIdentity | None):
-    capacity = max(1, (query.cache_tokens + 63) // 64)
+    chunk = _layout(query).candidates_per_chunk
+    capacity = max(1, (query.cache_tokens + chunk - 1) // chunk)
     splits = set(powers_of_two(capacity))
     divisor = 1
     while divisor <= capacity:

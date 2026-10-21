@@ -24,7 +24,7 @@ from b12x._lib.compile_plan import compile_only_launches_enabled
 
 from .._shared import static_fp8_quant
 from ._forward import DenseMlaForwardKernel
-from ._layout import make_smem_layout
+from ._layout import choose_layout
 from ._merge import DenseMlaMergeKernel
 from ._scratch import Binding
 from b12x._lib.program_cache import register_program_cache
@@ -132,10 +132,14 @@ class _MergeLaunch:
 def _forward_launch(binding: Binding) -> _ForwardLaunch:
     scratch = binding.scratch
     fp8 = binding.q.dtype == _FP8
-    layout = make_smem_layout(
-        query_tile=scratch.query_tile,
-        fp8=fp8,
+    layout = choose_layout(
+        mode=scratch.mode,
+        fp8=binding.kv_cache.dtype == _FP8,
         qk_dim=scratch.head_dim,
+        value_dim=scratch.v_head_dim,
+        single_request=scratch.max_batch == 1,
+        windowed=scratch.window_size is not None,
+        query_rows=scratch.max_total_q,
     )
     entry = DenseMlaForwardKernel(
         layout=layout,
@@ -143,7 +147,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         num_heads=scratch.num_q_heads,
         num_splits=scratch.num_splits,
         chunks_per_split=scratch.chunks_per_split,
-        query_tile=scratch.query_tile,
+        query_tile=layout.query_tile,
         fp8=fp8,
         qk_dim=scratch.head_dim,
         value_dim=scratch.v_head_dim,
@@ -220,13 +224,17 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
     )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.forward",
-        4,
+        5,
         key_field("dtype", "fp8" if fp8 else "bf16"),
         key_field("heads", scratch.num_q_heads),
         key_field("page_size", scratch.page_size),
         key_field("max_total_q", scratch.max_total_q),
         key_field("max_batch", scratch.max_batch),
-        key_field("query_tile", scratch.query_tile),
+        key_field("query_tile", layout.query_tile),
+        key_field("heads_per_tile", layout.heads_per_tile),
+        key_field("candidates_per_chunk", layout.candidates_per_chunk),
+        key_field("math_warps_per_query", layout.math_warps_per_query),
+        key_field("kv_stages", layout.kv_stages),
         key_field("num_splits", scratch.num_splits),
         key_field("chunks_per_split", scratch.chunks_per_split),
         key_field("physical_record_width", scratch.physical_record_width),

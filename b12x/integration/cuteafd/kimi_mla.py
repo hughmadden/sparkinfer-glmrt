@@ -17,7 +17,7 @@ from cutlass import BFloat16, Float32, Int32, Int64
 import torch
 
 from b12x.attention.dense_mla._forward import DenseMlaForwardKernel
-from b12x.attention.dense_mla._layout import make_smem_layout
+from b12x.attention.dense_mla._layout import choose_layout
 from b12x.attention.dense_mla._merge import DenseMlaMergeKernel
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import BatchedBf16Gemm, _bf16, _block_sum, _reduction_storage, _rsqrt, glm_projection
@@ -98,13 +98,28 @@ def output_scratch_bytes(g, rows):
     return 2 * _align(rows * g.heads * 128 * 2)
 
 
+def dense_mla_layout(g, rows, *, mode):
+    """The one specialization this geometry serves in this mode."""
+    return choose_layout(
+        mode=mode,
+        fp8=False,
+        qk_dim=576,
+        value_dim=512,
+        single_request=True,
+        windowed=isinstance(g, MlaDraftGeometry),
+        query_rows=rows,
+    )
+
+
 def attention_layout(g, rows, *, max_context, mode):
     if mode not in ("decode", "extend", "verify"):
         raise ValueError("mode must be decode, extend or verify")
     if not 1 <= int(max_context) <= 1048576 or int(rows) <= 0:
         raise ValueError("invalid context or row capacity")
-    splits = min(16, (max_context + 63) // 64) if mode != "extend" else 1
-    chunks = ((max_context + 63) // 64 + splits - 1) // splits
+    chunk = dense_mla_layout(g, rows, mode=mode).candidates_per_chunk
+    chunks_total = (max_context + chunk - 1) // chunk
+    splits = min(16, chunks_total) if mode != "extend" else 1
+    chunks = (chunks_total + splits - 1) // splits
     part = _align(rows * g.heads * splits * 512 * 2) if splits > 1 else 0
     lse = _align(rows * g.heads * splits * 4) if splits > 1 else 0
     return dict(num_splits=splits, chunks_per_split=chunks,
@@ -288,10 +303,13 @@ class _Attention:
         self.g = g
         self.layout = attention_layout(g, rows, max_context=max_context, mode=mode)
         self.splits = self.layout["num_splits"]
-        # One query per tile supports ragged batches in all three modes.
-        self.forward = DenseMlaForwardKernel(layout=make_smem_layout(query_tile=1, fp8=False),
+        # Decode and verify keep one query row per tile; a prefill tile shares
+        # one gathered KV window across all of its query rows.
+        self.smem = dense_mla_layout(g, rows, mode=mode)
+        self.forward = DenseMlaForwardKernel(layout=self.smem,
             page_size=64, num_heads=g.heads, num_splits=self.splits,
-            chunks_per_split=self.layout["chunks_per_split"], query_tile=1, fp8=False,
+            chunks_per_split=self.layout["chunks_per_split"],
+            query_tile=self.smem.query_tile, fp8=False,
             qk_dim=576, value_dim=512,
             window_size=g.window_size if isinstance(g, MlaDraftGeometry) else None,
             noncausal_block=isinstance(g, MlaDraftGeometry))
@@ -444,6 +462,7 @@ def compile_kimi_mla_output_aot(g=KimiMlaGeometry(), *, max_rows=64):
 
 def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=1048576, mode="decode"):
     layout = attention_layout(g, max_rows, max_context=max_context, mode=mode)
+    smem = dense_mla_layout(g, max_rows, mode=mode)
     operands = (
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
         Operand("kv_cache", torch.bfloat16, "[pages,64,576]"),
@@ -455,6 +474,12 @@ def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=
         Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"))
     return compile_program(_Attention(g, max_rows, max_context, mode), name="kimi_dense_mla",
         operands=operands, scalars=(Scalar("rows"), Scalar("batch"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
-        key=(g, max_rows, max_context, mode),
+        # The tile is part of the compiled kernel, so it has to be part of the
+        # program and disk cache key too: mode and context happen to determine
+        # it today, and a future planner change must not silently reuse a
+        # cubin built for a different tile.
+        key=(g, max_rows, max_context, mode, smem.query_tile, smem.fp8,
+             smem.kv_stages, smem.heads_per_tile, smem.candidates_per_chunk,
+             smem.math_warps_per_query),
         scratch={"scratch": lambda rows: attention_layout(g, rows, max_context=max_context, mode=mode)["scratch_bytes"]},
         geometry={**vars(g), **layout, "mode": mode, "max_context": max_context})

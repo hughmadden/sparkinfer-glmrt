@@ -10,6 +10,7 @@ import torch
 Mode = Literal["decode", "extend", "verify"]
 
 _CANDIDATES_PER_CHUNK = 64
+_HEADS_PER_TILE = 8
 _MAX_CEIL_WAVES = 3
 
 
@@ -90,13 +91,14 @@ def choose_num_splits(
     query_tile: int,
     sm_count: int,
     budget: Budget | None,
+    heads_per_tile: int = _HEADS_PER_TILE,
+    candidates_per_chunk: int = _CANDIDATES_PER_CHUNK,
 ) -> int:
     """Return the capture-static split count for the planned capacity."""
-    num_chunks = (
-        max(int(max_cache_tokens), 1) + _CANDIDATES_PER_CHUNK - 1
-    ) // _CANDIDATES_PER_CHUNK
+    chunk = int(candidates_per_chunk)
+    num_chunks = (max(int(max_cache_tokens), 1) + chunk - 1) // chunk
     query_tiles = (max(int(max_total_q), 1) + int(query_tile) - 1) // int(query_tile)
-    head_tiles = max(1, (int(num_q_heads) + 7) // 8)
+    head_tiles = max(1, (int(num_q_heads) + int(heads_per_tile) - 1) // int(heads_per_tile))
     splits = _wave_balanced_splits(
         num_chunks=num_chunks,
         independent_tiles=query_tiles * head_tiles,
