@@ -513,6 +513,20 @@ def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=
         Operand("attn", torch.bfloat16, f"[rows,{g.heads},512]", "out"),
         Operand("lse", torch.float32, f"[rows,{g.heads}]", "out"),
         Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"))
+    native_fp8_extend = (g.kv_cache == "fp8" and mode == "extend"
+                         and not isinstance(g, MlaDraftGeometry))
+    if native_fp8_extend:
+        # Compact records on the causal extend route read FP8 natively (no
+        # split, no scratch); decode/verify keep the shared widening reader.
+        from .kimi_mla_prefill_fp8 import DEFAULT_FP8_PREFILL_TILE, _Fp8PrefillAsDenseMla
+        layout = {**layout, "num_splits": 1, "chunks_per_split": layout["num_splits"] * layout["chunks_per_split"],
+                  "partial_output_bytes": 0, "partial_lse_bytes": 0, "scratch_bytes": 0}
+        return compile_program(_Fp8PrefillAsDenseMla(g, DEFAULT_FP8_PREFILL_TILE), name="kimi_dense_mla",
+            operands=operands, scalars=(Scalar("rows"), Scalar("batch"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
+            key=(g, max_rows, max_context, mode, "native_fp8_prefill", DEFAULT_FP8_PREFILL_TILE),
+            scratch={"scratch": lambda rows: 0},
+            geometry={**vars(g), **layout, "mode": mode, "max_context": max_context,
+                      "native_fp8_prefill": DEFAULT_FP8_PREFILL_TILE})
     return compile_program(_Attention(g, max_rows, max_context, mode), name="kimi_dense_mla",
         operands=operands, scalars=(Scalar("rows"), Scalar("batch"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
         # The tile is part of the compiled kernel, so it has to be part of the
