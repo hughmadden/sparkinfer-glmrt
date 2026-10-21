@@ -479,11 +479,23 @@ def real_route_ids(rows, wave, generator, experts=256, top_k=8):
     return torch.gather(ids, 1, perm)
 
 
-def load_route_waves(path):
-    data = json.loads(Path(path).read_text())
-    waves = data.get("waves") or []
-    if data.get("schema") != 1 or not waves:
-        raise ValueError(f"{path}: expected schema 1 with waves")
+ROUTE_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+# Realistic content (code, agentic transcript, prose) is the default; filler
+# (the bench's synthetic prefill prompt) is one case, not the reference.
+ROUTE_SETS = {"realistic": ("glm53_prefill_routes_realistic.json",),
+              "filler": ("glm53_prefill_routes_filler.json",)}
+
+
+def load_route_waves(spec):
+    """Route waves from a named set (realistic, filler) or a JSON path."""
+    paths = ([ROUTE_FIXTURES / name for name in ROUTE_SETS[spec]] if spec in ROUTE_SETS
+             else [Path(spec)])
+    waves = []
+    for path in paths:
+        data = json.loads(path.read_text())
+        if data.get("schema") != 1 or not data.get("waves"):
+            raise ValueError(f"{path}: expected schema 1 with waves")
+        waves.extend(data["waves"])
     return waves
 
 
@@ -587,9 +599,10 @@ def main():
                         help="comma list of prompt lengths; benchmark the distinct Spark wave "
                              "row counts GLM serving sends for them (overrides --rows)")
     parser.add_argument("--serving-lanes", type=int, default=SERVING_LANES)
-    parser.add_argument("--routes", type=Path, default=None,
-                        help="recorded serving route histograms (benchmarks/fixtures/"
-                             "glm53_prefill_routes.json); each timed layer copy uses the next wave")
+    parser.add_argument("--routes", default=None,
+                        help="recorded serving route histograms: 'realistic' (code, agentic, prose; "
+                             "the reference), 'filler' (bench filler prompt) or a JSON path; each "
+                             "timed layer copy replays the next wave")
     args = parser.parse_args()
     if args.serving_prompt is not None:
         if not args.grouped:
