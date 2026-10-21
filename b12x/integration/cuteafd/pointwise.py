@@ -13,16 +13,16 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.intrinsics import (
-    div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, rsqrt_approx_ftz_f32,
+    cvt_f32x4_to_e4m3x4, div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, rsqrt_approx_ftz_f32,
     st_global_v4_u32,
 )
 from ._common import Operand, Scalar, compile_program
-from ._glm_kernels import _bf16, _warp_sum
+from ._glm_kernels import _bf16, _fp8_scale, _warp_max, _warp_sum
 from ._fp8_moe_kernels import _post_silu_product
 from ._qwen4_kernels import _sigmoid
 
@@ -407,6 +407,76 @@ class ScaleProjection:
         i = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
         if i < count:
             out[i] = _mul(Float32(projected[i]), Float32(self.prescale))
+
+
+def fp8_kv_plane_bytes(kv_heads, head_dim):
+    """One planar K or V token: E4M3 heads, FP32 descales, zero alignment tail."""
+    if kv_heads <= 0 or head_dim not in (192, 256):
+        raise ValueError("positive KV heads and D192/D256 required")
+    return (int(kv_heads) * (int(head_dim) + 4) + 15) // 16 * 16
+
+
+class PackFp8KvPlane:
+    """Qwen's per-token/head FP8 contract with a planar, aligned storage owner."""
+
+    def __init__(self, kv_heads, head_dim):
+        self.heads, self.dim = int(kv_heads), int(head_dim)
+        self.row_bytes = fp8_kv_plane_bytes(kv_heads, head_dim)
+        self.payload_bytes = self.heads * self.dim
+        self.values_per_lane = self.dim // 32
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.kernel(x, out).launch(grid=(rows, self.heads, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, x: cute.Pointer, out: cute.Pointer):
+        row, head, _ = cute.arch.block_idx()
+        lane, _, _ = cute.arch.thread_idx()
+        source = _view(x)
+        values = cute.make_rmem_tensor(cute.make_layout((self.values_per_lane,)), Float32)
+        base = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(self.dim)
+        amax = Float32(0.0)
+        for item in cutlass.range_constexpr(self.values_per_lane):
+            values[item] = Float32(source[base + Int64(lane) + Int64(item * 32)])
+            amax = cutlass.max(amax, cute.math.abs(values[item]))
+        scale = _fp8_scale(_warp_max(amax))
+        inverse = div_rn_f32(Float32(1.0), scale)
+        row_address = Int64(out.toint()) + Int64(row) * Int64(self.row_bytes)
+        if lane == Int32(0):
+            scales = cute.make_tensor(cute.make_ptr(Float32,
+                row_address + Int64(self.payload_bytes), cute.AddressSpace.gmem, assumed_align=4),
+                cute.make_layout((self.heads,)))
+            scales[head] = scale
+        words = cute.make_tensor(cute.make_ptr(Uint32,
+            row_address + Int64(head) * Int64(self.dim), cute.AddressSpace.gmem, assumed_align=4),
+            cute.make_layout((self.dim // 4,)))
+        # A lane owns one dimension in each 32-wide stripe; shuffle groups of four
+        # into one packed store without requiring D192 to divide into eight lanes.
+        for item in cutlass.range_constexpr(self.values_per_lane):
+            value = values[item] * inverse
+            v1 = cute.arch.shuffle_sync_bfly(value, offset=1)
+            v2 = cute.arch.shuffle_sync_bfly(value, offset=2)
+            v3 = cute.arch.shuffle_sync_bfly(v1, offset=2)
+            if lane % Int32(4) == Int32(0):
+                words[(lane + Int32(item * 32)) // Int32(4)] = cvt_f32x4_to_e4m3x4(value, v1, v2, v3)
+        if head == Int32(0):
+            tail = self.row_bytes - self.payload_bytes - self.heads * 4
+            if lane < Int32(tail):
+                padding = cute.make_tensor(cute.make_ptr(Uint8,
+                    row_address + Int64(self.payload_bytes + self.heads * 4),
+                    cute.AddressSpace.gmem, assumed_align=1), cute.make_layout((max(1, tail),)))
+                padding[lane] = Uint8(0)
+
+
+def compile_pack_fp8_kv_plane_aot(*, kv_heads, head_dim=192):
+    launch = PackFp8KvPlane(kv_heads, head_dim)
+    return compile_program(launch, name="pack_fp8_kv_plane", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{kv_heads},{head_dim}]"),
+        Operand("out", torch.uint8, f"[rows,{launch.row_bytes}]", "out")),
+        scalars=(Scalar("rows"),), key=(int(kv_heads), int(head_dim)),
+        geometry=dict(kv_heads=int(kv_heads), head_dim=int(head_dim), kv_format="fp8",
+                      record_bytes=launch.row_bytes, scale_offset=launch.payload_bytes))
 
 
 def compile_post_silu_aot(*, width, limit):
