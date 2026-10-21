@@ -113,7 +113,10 @@ def test_mla_cache_geometry_and_abi_cpu(monkeypatch, heads, kv_cache):
         assert abi["geometry"]["kv_cache"] == kv_cache
     for mode in ("decode", "verify", "extend"):
         kernel, abi = mla.compile_kimi_dense_mla_aot(g, max_rows=64, max_context=524288, mode=mode)
-        assert kernel.forward.ds_mla_record == (kv_cache == "fp8")
+        if kv_cache == "fp8" and mode == "extend":
+            assert abi["geometry"]["native_fp8_prefill"] and abi["geometry"]["num_splits"] == 1
+        else:
+            assert kernel.forward.ds_mla_record == (kv_cache == "fp8")
         assert abi["geometry"]["max_context"] == 524288
         assert next(v for v in abi["operands"] if v.name == "kv_cache").dtype == dtype
 
@@ -303,9 +306,23 @@ def test_real_mla_gpu_and_graph_replay(heads, rank, mode, rows, kv_cache):
         reference_a, reference_lse = torch.empty_like(a), torch.empty_like(lse)
         bf16_attention.launch(q, widened, table, lengths, cu, reference_a, reference_lse, scratch[1],
             scalars=(rows, 1, table.shape[1], splits))
-        assert torch.equal(a.view(torch.uint8), reference_a.view(torch.uint8))
-        assert torch.equal(lse.view(torch.uint8), reference_lse.view(torch.uint8))
-        print("compact reader equals BF16 reader of widened records byte-for-byte", flush=True)
+        if attention.geometry.get("native_fp8_prefill"):
+            # The native extend route widens E4M3 exactly and applies the FP32
+            # group scale after the MMA, so it is checked against a float32
+            # oracle over the dequantized records, not the BF16-rounded reader.
+            records = unpack_mla_kv_cache_reference(cache.flatten(0, 1)).squeeze(1).float()
+            records = records[physical_slots(prefix + rows)]
+            scores = torch.einsum("thd,sd->hts", q.float(), records) * g.softmax_scale
+            scores += mask(rows, prefix + rows, "cuda", torch.float32)[0]
+            oracle = torch.einsum("hts,sd->thd", scores.softmax(-1), records[:, :512])
+            rel = float((a.float() - oracle).norm() / oracle.norm())
+            print(f"native FP8 extend vs dequantized oracle relative_l2={rel:.6g}", flush=True)
+            assert rel < 0.005
+            torch.testing.assert_close(lse, scores.logsumexp(-1).T, atol=2e-3, rtol=2e-4)
+        else:
+            assert torch.equal(a.view(torch.uint8), reference_a.view(torch.uint8))
+            assert torch.equal(lse.view(torch.uint8), reference_lse.view(torch.uint8))
+            print("compact reader equals BF16 reader of widened records byte-for-byte", flush=True)
     assert torch.isfinite(lse).all()
     baseline = [t.clone() for t in (y, q, cache, lse)]
     graph = torch.cuda.CUDAGraph()
