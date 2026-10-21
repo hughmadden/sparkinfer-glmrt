@@ -22,7 +22,7 @@ from b12x._lib.scratch_layout import (
 
 from .._shared import static_fp8_quant
 from .planner import Budget, choose_num_splits
-from ._layout import make_smem_layout
+from ._layout import SmemLayout, choose_layout
 from ._reference import (
     K3_ABSORBED_DIM,
     K3_SM_SCALE,
@@ -41,12 +41,16 @@ def _canonical_device(device: torch.device | str) -> torch.device:
     return device
 
 
-def _query_tile(caps: Caps) -> int:
-    if caps.mode == "decode" or caps.max_batch != 1 or caps.window_size is not None:
-        return 1
-    if caps.kv_dtype == _FP8 and caps.max_total_q >= 3:
-        return 4
-    return 2
+def _layout(caps: Caps) -> SmemLayout:
+    return choose_layout(
+        mode=caps.mode,
+        fp8=caps.kv_dtype == _FP8,
+        qk_dim=caps.head_dim,
+        value_dim=caps.v_head_dim,
+        single_request=caps.max_batch == 1,
+        windowed=caps.window_size is not None,
+        query_rows=caps.max_total_q,
+    )
 
 
 def _max_attended_tokens(caps: Caps) -> int:
@@ -162,16 +166,12 @@ class _ScratchLayout:
 def _dense_mla_scratch_layout(
     caps: Caps,
 ) -> _ScratchLayout:
-    query_tile = _query_tile(caps)
+    shared_layout = _layout(caps)
+    query_tile = shared_layout.query_tile
     max_attended_tokens = _max_attended_tokens(caps)
     if caps.device.type == "cuda":
         properties = torch.cuda.get_device_properties(caps.device)
         sm_count = int(properties.multi_processor_count)
-        shared_layout = make_smem_layout(
-            query_tile=query_tile,
-            fp8=caps.kv_dtype == _FP8,
-            qk_dim=caps.head_dim,
-        )
         shared_limit = int(properties.shared_memory_per_block_optin)
         if shared_layout.total_bytes > shared_limit:
             raise ValueError(
@@ -188,8 +188,12 @@ def _dense_mla_scratch_layout(
         query_tile=query_tile,
         sm_count=sm_count,
         budget=caps.budget,
+        heads_per_tile=shared_layout.heads_per_tile,
+        candidates_per_chunk=shared_layout.candidates_per_chunk,
     )
-    num_chunks = (max_attended_tokens + 63) // 64
+    num_chunks = (
+        max_attended_tokens + shared_layout.candidates_per_chunk - 1
+    ) // shared_layout.candidates_per_chunk
     chunks_per_split = (num_chunks + num_splits - 1) // num_splits
     partial_rows = caps.max_total_q * num_splits
     if (
@@ -572,7 +576,7 @@ def _materialize(
             shape=(caps.max_total_q, caps.num_q_heads, caps.head_dim),
             dtype=_FP8,
         )
-    query_tile = _query_tile(caps)
+    query_tile = _layout(caps).query_tile
     return Scratch(
         shared_scratch=scratch_storage,
         device=caps.device,
@@ -619,7 +623,7 @@ class Plan:
 
     @property
     def query_tile(self) -> int:
-        return _query_tile(self.caps)
+        return _layout(self.caps).query_tile
 
     @property
     def chunks_per_split(self) -> int:

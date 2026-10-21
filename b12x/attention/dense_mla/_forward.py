@@ -14,9 +14,6 @@ from b12x._lib.intrinsics import shared_ptr_to_u32
 
 from ._io import issue_dense_page_gather
 from ._layout import (
-    CANDIDATES_PER_CHUNK,
-    HEADS_PER_TILE,
-    MATH_WARPS_PER_QUERY,
     SmemLayout,
     get_shared_storage_cls,
 )
@@ -68,19 +65,41 @@ class DenseMlaForwardKernel:
         self.layout = layout
         self.page_size = int(page_size)
         self.num_heads = int(num_heads)
-        self.head_tiles = (self.num_heads + HEADS_PER_TILE - 1) // HEADS_PER_TILE
+        self.heads_per_tile = int(layout.heads_per_tile)
+        self.head_tiles_per_row = self.heads_per_tile // 8
+        self.candidates_per_chunk = int(layout.candidates_per_chunk)
+        self.math_warps_per_query = int(layout.math_warps_per_query)
+        self.head_tiles = (self.num_heads + self.heads_per_tile - 1) // (
+            self.heads_per_tile
+        )
         self.num_splits = int(num_splits)
         self.chunks_per_split = int(chunks_per_split)
         self.query_tile = int(query_tile)
+        if self.query_tile != int(layout.query_tile):
+            raise ValueError("dense MLA query_tile must match the SMEM layout")
+        if self.query_tile not in (1, 2, 3, 4):
+            raise ValueError("dense MLA query_tile must be 1..4")
         self.fp8 = bool(fp8)
+        if self.fp8 and (
+            self.heads_per_tile != 8
+            or self.candidates_per_chunk != 64
+            or self.math_warps_per_query != 4
+        ):
+            raise ValueError("dense MLA FP8 only supports the 8/64/4 tile")
         self.qk_dim = int(qk_dim)
         self.value_dim = int(value_dim)
         self.window_size = None if window_size is None else int(window_size)
         self.noncausal_block = bool(noncausal_block)
         self.kv_stages = int(layout.kv_stages)
-        self.math_warps = MATH_WARPS_PER_QUERY * self.query_tile
+        self.math_warps = self.math_warps_per_query * self.query_tile
         self.math_threads = self.math_warps * 32
+        self.group_threads = self.math_warps_per_query * 32
         self.block_threads = self.math_threads + 32
+        self.value_tiles = self.value_dim // (16 * self.math_warps_per_query)
+        self.accumulator_slots = (
+            4 * self.value_tiles * self.head_tiles_per_row
+        )
+        self.pair_count = self.heads_per_tile // 4
 
     @cute.jit
     def __call__(
@@ -108,6 +127,11 @@ class DenseMlaForwardKernel:
         stream: cuda.CUstream,
     ):
         query_tiles = (total_q + Int32(self.query_tile - 1)) // Int32(self.query_tile)
+        if self.query_tile > 1:
+            # Per-request tiling can need at most one extra partial tile per
+            # request; surplus blocks retire immediately.  Multi-row tiles are
+            # single-request only today, so this costs one retiring block.
+            query_tiles = query_tiles + batch
         self.kernel(
             q_bytes,
             cache_bytes,
@@ -167,26 +191,29 @@ class DenseMlaForwardKernel:
         *,
         barrier_id: cutlass.Constexpr,
     ):
-        accumulator_fragment = cute.make_rmem_tensor(self.value_dim // 16, Float32)
-        global_max_fragment = cute.make_rmem_tensor(2, Float32)
-        global_sum_fragment = cute.make_rmem_tensor(2, Float32)
-        for idx in cutlass.range_constexpr(self.value_dim // 16):
+        accumulator_fragment = cute.make_rmem_tensor(
+            self.accumulator_slots, Float32
+        )
+        global_max_fragment = cute.make_rmem_tensor(self.pair_count, Float32)
+        global_sum_fragment = cute.make_rmem_tensor(self.pair_count, Float32)
+        for idx in cutlass.range_constexpr(self.accumulator_slots):
             accumulator_fragment[idx] = Float32(0.0)
-        global_max_fragment[0] = Float32(-1.0e30)
-        global_max_fragment[1] = Float32(-1.0e30)
-        global_sum_fragment[0] = Float32(0.0)
-        global_sum_fragment[1] = Float32(0.0)
+        for idx in cutlass.range_constexpr(self.pair_count):
+            global_max_fragment[idx] = Float32(-1.0e30)
+            global_sum_fragment[idx] = Float32(0.0)
 
         consumer_phase = Int32(0)
         consumer_index = Int32(0)
-        kv_buffer_bytes = Int32(CANDIDATES_PER_CHUNK * self.layout.record_stride_bytes)
+        kv_buffer_bytes = Int32(
+            self.candidates_per_chunk * self.layout.record_stride_bytes
+        )
 
         for local_chunk in cutlass.range(active_chunks, unroll=1):
             chunk = split_first_chunk + Int32(local_chunk)
-            chunk_begin = chunk * Int32(CANDIDATES_PER_CHUNK)
+            chunk_begin = chunk * Int32(self.candidates_per_chunk)
             buffer = Int32(0)
-            if cutlass.const_expr(self.kv_stages == 2):
-                buffer = Int32(local_chunk) & Int32(1)
+            if cutlass.const_expr(self.kv_stages > 1):
+                buffer = Int32(local_chunk) % Int32(self.kv_stages)
             kv_buffer_addr = kv_smem_addr + buffer * kv_buffer_bytes
             cute.arch.mbarrier_wait(
                 mbar_base + consumer_index,
@@ -194,31 +221,21 @@ class DenseMlaForwardKernel:
             )
             cute.arch.barrier(
                 barrier_id=barrier_id,
-                number_of_threads=128,
+                number_of_threads=self.group_threads,
             )
 
             if query_valid != Int32(0) and chunk_begin < visible_end:
                 accumulator = [
-                    [
-                        accumulator_fragment[tile * 2],
-                        accumulator_fragment[tile * 2 + 1],
-                    ]
-                    for tile in range(self.value_dim // 32)
+                    accumulator_fragment[idx]
+                    for idx in range(self.accumulator_slots)
                 ]
                 global_max = [
-                    global_max_fragment[0],
-                    global_max_fragment[1],
+                    global_max_fragment[idx] for idx in range(self.pair_count)
                 ]
                 global_sum = [
-                    global_sum_fragment[0],
-                    global_sum_fragment[1],
+                    global_sum_fragment[idx] for idx in range(self.pair_count)
                 ]
-                qk = [
-                    Float32(0.0),
-                    Float32(0.0),
-                    Float32(0.0),
-                    Float32(0.0),
-                ]
+                qk = [Float32(0.0) for _ in range(4 * self.head_tiles_per_row)]
                 if cutlass.const_expr(self.fp8):
                     qk = qk_fp8(
                         qk,
@@ -238,6 +255,7 @@ class DenseMlaForwardKernel:
                         lane,
                         record_stride_bytes=self.layout.record_stride_bytes,
                         qk_dim=self.qk_dim,
+                        heads_per_tile=self.heads_per_tile,
                     )
                 qk = mask_and_scale(
                     qk,
@@ -247,14 +265,12 @@ class DenseMlaForwardKernel:
                     score_scale_log2,
                     local_warp,
                     lane,
+                    heads_per_tile=self.heads_per_tile,
                 )
                 probability = [
-                    Float32(0.0),
-                    Float32(0.0),
-                    Float32(0.0),
-                    Float32(0.0),
+                    Float32(0.0) for _ in range(4 * self.head_tiles_per_row)
                 ]
-                probability, warp_scale0, warp_scale1 = online_softmax(
+                probability, warp_scale = online_softmax(
                     qk,
                     probability,
                     accumulator,
@@ -267,12 +283,13 @@ class DenseMlaForwardKernel:
                     local_tid,
                     barrier_id=barrier_id,
                     value_dim=self.value_dim,
+                    heads_per_tile=self.heads_per_tile,
+                    math_warps_per_query=self.math_warps_per_query,
+                    barrier_threads=self.group_threads,
                 )
                 weights = [
-                    probability[0] * warp_scale0,
-                    probability[1] * warp_scale1,
-                    probability[2] * warp_scale0,
-                    probability[3] * warp_scale1,
+                    probability[reg] * warp_scale[(reg // 4) * 2 + reg % 2]
+                    for reg in range(4 * self.head_tiles_per_row)
                 ]
                 if cutlass.const_expr(self.fp8):
                     accumulator = pv_fp8(
@@ -287,6 +304,7 @@ class DenseMlaForwardKernel:
                         record_stride_bytes=self.layout.record_stride_bytes,
                         barrier_id=barrier_id,
                         value_dim=self.value_dim,
+                        barrier_threads=self.group_threads,
                     )
                 else:
                     accumulator = pv_bf16(
@@ -299,18 +317,20 @@ class DenseMlaForwardKernel:
                         record_stride_bytes=self.layout.record_stride_bytes,
                         barrier_id=barrier_id,
                         value_dim=self.value_dim,
+                        heads_per_tile=self.heads_per_tile,
+                        candidates_per_chunk=self.candidates_per_chunk,
+                        math_warps_per_query=self.math_warps_per_query,
+                        barrier_threads=self.group_threads,
                     )
-                for tile in cutlass.range_constexpr(self.value_dim // 32):
-                    accumulator_fragment[tile * 2] = accumulator[tile][0]
-                    accumulator_fragment[tile * 2 + 1] = accumulator[tile][1]
-                global_max_fragment[0] = global_max[0]
-                global_max_fragment[1] = global_max[1]
-                global_sum_fragment[0] = global_sum[0]
-                global_sum_fragment[1] = global_sum[1]
+                for idx in cutlass.range_constexpr(self.accumulator_slots):
+                    accumulator_fragment[idx] = accumulator[idx]
+                for idx in cutlass.range_constexpr(self.pair_count):
+                    global_max_fragment[idx] = global_max[idx]
+                    global_sum_fragment[idx] = global_sum[idx]
 
             cute.arch.barrier(
                 barrier_id=barrier_id,
-                number_of_threads=128,
+                number_of_threads=self.group_threads,
             )
             if local_tid == Int32(0):
                 cute.arch.mbarrier_arrive(
@@ -322,20 +342,10 @@ class DenseMlaForwardKernel:
                 consumer_phase ^= Int32(1)
 
         accumulator = [
-            [
-                accumulator_fragment[tile * 2],
-                accumulator_fragment[tile * 2 + 1],
-            ]
-            for tile in range(self.value_dim // 32)
+            accumulator_fragment[idx] for idx in range(self.accumulator_slots)
         ]
-        global_max = [
-            global_max_fragment[0],
-            global_max_fragment[1],
-        ]
-        global_sum = [
-            global_sum_fragment[0],
-            global_sum_fragment[1],
-        ]
+        global_max = [global_max_fragment[idx] for idx in range(self.pair_count)]
+        global_sum = [global_sum_fragment[idx] for idx in range(self.pair_count)]
         if cutlass.const_expr(self.num_splits > 1):
             if active_splits > Int32(1):
                 write_partial_or_final(
@@ -356,6 +366,8 @@ class DenseMlaForwardKernel:
                     fp8=self.fp8,
                     ln2=0.6931471805599453,
                     value_dim=self.value_dim,
+                    heads_per_tile=self.heads_per_tile,
+                    math_warps_per_query=self.math_warps_per_query,
                 )
             else:
                 write_partial_or_final(
@@ -376,6 +388,8 @@ class DenseMlaForwardKernel:
                     fp8=self.fp8,
                     ln2=0.6931471805599453,
                     value_dim=self.value_dim,
+                    heads_per_tile=self.heads_per_tile,
+                    math_warps_per_query=self.math_warps_per_query,
                 )
         else:
             write_partial_or_final(
@@ -396,6 +410,8 @@ class DenseMlaForwardKernel:
                 fp8=self.fp8,
                 ln2=0.6931471805599453,
                 value_dim=self.value_dim,
+                heads_per_tile=self.heads_per_tile,
+                math_warps_per_query=self.math_warps_per_query,
             )
 
     @cute.kernel
@@ -429,11 +445,13 @@ class DenseMlaForwardKernel:
         query_tile_index = Int32(query_tile_index)
         head_tile = Int32(head_tile)
         split = Int32(split)
-        query_start = query_tile_index * Int32(self.query_tile)
-        head_base = head_tile * Int32(HEADS_PER_TILE)
+        head_base = head_tile * Int32(self.heads_per_tile)
 
         request = Int32(0)
+        query_start = Int32(0)
+        query_valid_tile = Int32(1)
         if cutlass.const_expr(self.query_tile == 1):
+            query_start = query_tile_index
             lower = Int32(0)
             upper = batch
             while lower + Int32(1) < upper:
@@ -443,31 +461,68 @@ class DenseMlaForwardKernel:
                 else:
                     upper = middle
             request = lower
+        else:
+            # Flatten per-request tiles: each request contributes
+            # ceil(rows / query_tile) blocks and a tile never straddles two
+            # requests.  Blocks past the summed tile count do no work.
+            remaining = query_tile_index
+            scan = Int32(0)
+            found = Int32(0)
+            tile_offset = Int32(0)
+            while scan < batch:
+                if found == Int32(0):
+                    scan_begin = Int32(cu_seqlens_q[scan])
+                    scan_end = Int32(cu_seqlens_q[scan + Int32(1)])
+                    scan_tiles = (scan_end - scan_begin + Int32(
+                        self.query_tile - 1
+                    )) // Int32(self.query_tile)
+                    if remaining < scan_tiles:
+                        request = scan
+                        tile_offset = remaining
+                        found = Int32(1)
+                    else:
+                        remaining -= scan_tiles
+                scan += Int32(1)
+            query_valid_tile = found
+            query_start = Int32(cu_seqlens_q[request]) + tile_offset * Int32(
+                self.query_tile
+            )
         query_begin = Int32(cu_seqlens_q[request])
         query_end = Int32(cu_seqlens_q[request + Int32(1)])
         query_length = query_end - query_begin
         cache_length = Int32(cache_seqlens[request])
 
+        # A tile only ever needs cache records below the causal end of its
+        # deepest query row, which removes the redundant tail of early
+        # requests without changing any single row's arithmetic.
+        tile_local_query = query_start - query_begin
+        causal_end = (
+            cache_length
+            - query_length
+            + tile_local_query
+            + Int32(self.query_tile)
+        )
+        if causal_end < Int32(0):
+            causal_end = Int32(0)
+        if causal_end > cache_length:
+            causal_end = cache_length
+
         first_valid_chunk = Int32(0)
-        visible_chunks_end = cache_length
+        visible_chunks_end = causal_end
         if cutlass.const_expr(self.window_size is not None):
-            tile_local_query = query_start - query_begin
-            visible_chunks_end = (
-                cache_length - query_length + tile_local_query + Int32(1)
+            visible_chunks_begin = (
+                causal_end - Int32(self.query_tile - 1) - Int32(self.window_size)
             )
-            if visible_chunks_end < Int32(0):
-                visible_chunks_end = Int32(0)
-            if visible_chunks_end > cache_length:
-                visible_chunks_end = cache_length
-            visible_chunks_begin = visible_chunks_end - Int32(self.window_size)
             if visible_chunks_begin < Int32(0):
                 visible_chunks_begin = Int32(0)
-            first_valid_chunk = visible_chunks_begin // Int32(CANDIDATES_PER_CHUNK)
+            first_valid_chunk = visible_chunks_begin // Int32(
+                self.candidates_per_chunk
+            )
         if cutlass.const_expr(self.noncausal_block):
             visible_chunks_end = cache_length
-        valid_chunks = (visible_chunks_end + Int32(CANDIDATES_PER_CHUNK - 1)) // Int32(
-            CANDIDATES_PER_CHUNK
-        )
+        valid_chunks = (
+            visible_chunks_end + Int32(self.candidates_per_chunk - 1)
+        ) // Int32(self.candidates_per_chunk)
         split_first_chunk = first_valid_chunk + split * Int32(self.chunks_per_split)
         split_last_chunk = split_first_chunk + Int32(self.chunks_per_split)
         if split_last_chunk > valid_chunks:
@@ -476,11 +531,14 @@ class DenseMlaForwardKernel:
         if active_chunks < Int32(0):
             active_chunks = Int32(0)
 
+        if query_valid_tile == Int32(0):
+            _exit_thread()
+
         if active_chunks == Int32(0):
             entry = tid
-            while entry < Int32(self.query_tile * HEADS_PER_TILE):
-                query_slot = entry // Int32(HEADS_PER_TILE)
-                local_head = entry - query_slot * Int32(HEADS_PER_TILE)
+            while entry < Int32(self.query_tile * self.heads_per_tile):
+                query_slot = entry // Int32(self.heads_per_tile)
+                local_head = entry - query_slot * Int32(self.heads_per_tile)
                 query_row = query_start + query_slot
                 if query_row < total_q and head_base + local_head < Int32(
                     self.num_heads
@@ -516,6 +574,8 @@ class DenseMlaForwardKernel:
 
         if tid == Int32(0):
             for stage in cutlass.range_constexpr(self.kv_stages):
+                # The gather arms the barrier with one transaction byte count
+                # and one arrival; completion is the arriving byte total.
                 cute.arch.mbarrier_init(mbar_base + stage, Int32(1))
                 cute.arch.mbarrier_init(
                     mbar_base + Int32(self.kv_stages + stage),
@@ -528,14 +588,14 @@ class DenseMlaForwardKernel:
             producer_phase = Int32(1)
             producer_index = Int32(0)
             kv_buffer_bytes = Int32(
-                CANDIDATES_PER_CHUNK * self.layout.record_stride_bytes
+                self.candidates_per_chunk * self.layout.record_stride_bytes
             )
             for local_chunk in cutlass.range(active_chunks, unroll=1):
                 chunk = split_first_chunk + Int32(local_chunk)
-                token_begin = chunk * Int32(CANDIDATES_PER_CHUNK)
+                token_begin = chunk * Int32(self.candidates_per_chunk)
                 buffer = Int32(0)
-                if cutlass.const_expr(self.kv_stages == 2):
-                    buffer = Int32(local_chunk) & Int32(1)
+                if cutlass.const_expr(self.kv_stages > 1):
+                    buffer = Int32(local_chunk) % Int32(self.kv_stages)
                 cute.arch.mbarrier_wait(
                     mbar_base + Int32(self.kv_stages) + producer_index,
                     phase=producer_phase,
@@ -555,6 +615,8 @@ class DenseMlaForwardKernel:
                     page_size=self.page_size,
                     record_bytes=self.layout.record_bytes,
                     record_stride_bytes=self.layout.record_stride_bytes,
+                    candidates_per_chunk=self.candidates_per_chunk,
+                    io_threads=32,
                 )
                 producer_index += Int32(1)
                 if producer_index == Int32(self.kv_stages):
@@ -572,12 +634,13 @@ class DenseMlaForwardKernel:
                 q_stride_head_bytes,
                 num_heads=self.num_heads,
                 query_tile=self.query_tile,
+                heads_per_tile=self.heads_per_tile,
                 record_bytes=self.layout.record_bytes,
                 record_stride_bytes=self.layout.record_stride_bytes,
                 math_threads=self.math_threads,
             )
-            group = warp // Int32(MATH_WARPS_PER_QUERY)
-            local_warp = warp - group * Int32(MATH_WARPS_PER_QUERY)
+            group = warp // Int32(self.math_warps_per_query)
+            local_warp = warp - group * Int32(self.math_warps_per_query)
             local_tid = local_warp * Int32(32) + lane
             query_row = query_start + group
             query_valid = Int32(1)
@@ -613,14 +676,14 @@ class DenseMlaForwardKernel:
                 score_scale = score_scale * value_scale * Float32(q_scale[Int32(0)])
 
             group_q_addr = q_smem_addr + group * Int32(
-                HEADS_PER_TILE * self.layout.record_stride_bytes
+                self.heads_per_tile * self.layout.record_stride_bytes
             )
             group_reduce_addr = reduce_smem_addr + group * Int32(
                 self.layout.reduce_group_bytes
             )
             reduce_max_addr = group_reduce_addr
             reduce_sum_addr = group_reduce_addr + Int32(
-                MATH_WARPS_PER_QUERY * HEADS_PER_TILE * 4
+                self.math_warps_per_query * self.heads_per_tile * 4
             )
             group_weight_scale_addr = weight_scale_smem_addr + group * Int32(
                 self.layout.weight_scale_group_bytes

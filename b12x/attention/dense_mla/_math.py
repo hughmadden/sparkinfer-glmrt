@@ -1,10 +1,13 @@
 """K3-specific tensor-core math for the standalone dense MLA kernel.
 
 The score fragment is deliberately transposed: a warp places sixteen cache
-records in the hardware-M dimension and the eight K3 query heads in hardware-N.
-Four warps therefore cover one 64-record window without padding away half of an
-MMA tile.  The output fragment is converted back to ordinary head-row ownership
-before the PV epilogue.
+records in the hardware-M dimension and one tile of K3 query heads in
+hardware-N.  With the default eight-head tile four warps cover one 64-record
+window without padding away half of an MMA tile; a sixteen-head tile instead
+keeps all sixteen PV rows live (no half-empty value MMA) and halves the number
+of KV streams, at the cost of two output fragments per lane.  The output
+fragment is converted back to ordinary head-row ownership before the PV
+epilogue.
 """
 
 from __future__ import annotations
@@ -110,19 +113,20 @@ def stage_absorbed_query(
     *,
     num_heads: cutlass.Constexpr,
     query_tile: cutlass.Constexpr,
+    heads_per_tile: cutlass.Constexpr,
     record_bytes: cutlass.Constexpr,
     record_stride_bytes: cutlass.Constexpr,
     math_threads: cutlass.Constexpr,
 ):
     """Asynchronously stage every absorbed query record exactly once."""
     segments_per_record = record_bytes // 16
-    total_segments = query_tile * HEADS_PER_TILE * segments_per_record
+    total_segments = query_tile * heads_per_tile * segments_per_record
     segment = math_tid
     while segment < Int32(total_segments):
         record = segment // Int32(segments_per_record)
         byte_in_record = (segment - record * Int32(segments_per_record)) * Int32(16)
-        query_slot = record // Int32(HEADS_PER_TILE)
-        local_head = record - query_slot * Int32(HEADS_PER_TILE)
+        query_slot = record // Int32(heads_per_tile)
+        local_head = record - query_slot * Int32(heads_per_tile)
         query_row = q_start + query_slot
         safe_row = query_row
         if query_row >= total_q:
@@ -200,13 +204,21 @@ def qk_bf16(
     *,
     record_stride_bytes: cutlass.Constexpr,
     qk_dim: cutlass.Constexpr,
+    heads_per_tile: cutlass.Constexpr,
 ):
-    """Raw BF16 K-by-Q MMA for one 16-candidate warp tile."""
+    """Raw BF16 K-by-Q MMA for one 16-candidate warp tile.
+
+    Register ``qk`` holds ``heads_per_tile // 8`` stacked m16n8k16 fragments:
+    per tile the four accumulators are (row gid, col 2tid), (row gid, col
+    2tid+1), (row gid+8, col 2tid), (row gid+8, col 2tid+1), where gid selects
+    a cache record and the column pair selects two query heads.
+    """
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
     first_candidate = local_warp * Int32(16)
+    head_tiles = heads_per_tile // 8
 
     for ks in cutlass.range_constexpr(qk_dim // 16):
         ko = Int32(ks * 16)
@@ -216,21 +228,28 @@ def qk_bf16(
             + (ko + a_col) * Int32(2)
         )
         a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(a_addr)
-        q_row_addr = q_smem_addr + gid * Int32(record_stride_bytes) + ko * Int32(2)
-        b0 = ld_shared_u32(q_row_addr + tid * Int32(4))
-        b1 = ld_shared_u32(q_row_addr + (tid * Int32(2) + Int32(8)) * Int32(2))
-        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
-            qk[0],
-            qk[1],
-            qk[2],
-            qk[3],
-            a0,
-            a1,
-            a2,
-            a3,
-            b0,
-            b1,
-        )
+        for tile in cutlass.range_constexpr(head_tiles):
+            q_row_addr = (
+                q_smem_addr
+                + (gid + Int32(tile * 8)) * Int32(record_stride_bytes)
+                + ko * Int32(2)
+            )
+            b0 = ld_shared_u32(q_row_addr + tid * Int32(4))
+            b1 = ld_shared_u32(q_row_addr + (tid * Int32(2) + Int32(8)) * Int32(2))
+            qk[tile * 4], qk[tile * 4 + 1], qk[tile * 4 + 2], qk[tile * 4 + 3] = (
+                mma_m16n8k16_f32_bf16(
+                    qk[tile * 4],
+                    qk[tile * 4 + 1],
+                    qk[tile * 4 + 2],
+                    qk[tile * 4 + 3],
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    b0,
+                    b1,
+                )
+            )
     return qk
 
 
@@ -243,19 +262,24 @@ def mask_and_scale(
     scale_log2: Float32,
     local_warp: Int32,
     lane: Int32,
+    *,
+    heads_per_tile: cutlass.Constexpr,
 ):
     """Apply K3 causal bounds and convert scores to the base-2 domain."""
     gid = lane >> Int32(2)
     candidate0 = chunk_begin + local_warp * Int32(16) + gid
     candidate1 = candidate0 + Int32(8)
-    if candidate0 < visible_begin or candidate0 >= visible_end:
-        qk[0] = Float32(_MASK)
-        qk[1] = Float32(_MASK)
-    if candidate1 < visible_begin or candidate1 >= visible_end:
-        qk[2] = Float32(_MASK)
-        qk[3] = Float32(_MASK)
-    for idx in cutlass.range_constexpr(4):
-        qk[idx] = qk[idx] * scale_log2
+    head_tiles = heads_per_tile // 8
+    for tile in cutlass.range_constexpr(head_tiles):
+        if candidate0 < visible_begin or candidate0 >= visible_end:
+            qk[tile * 4] = Float32(_MASK)
+            qk[tile * 4 + 1] = Float32(_MASK)
+        if candidate1 < visible_begin or candidate1 >= visible_end:
+            qk[tile * 4 + 2] = Float32(_MASK)
+            qk[tile * 4 + 3] = Float32(_MASK)
+    for idx in cutlass.range_constexpr(2 * head_tiles):
+        qk[idx * 2] = qk[idx * 2] * scale_log2
+        qk[idx * 2 + 1] = qk[idx * 2 + 1] * scale_log2
     return qk
 
 
@@ -274,109 +298,129 @@ def online_softmax(
     *,
     barrier_id: cutlass.Constexpr,
     value_dim: cutlass.Constexpr,
+    heads_per_tile: cutlass.Constexpr,
+    math_warps_per_query: cutlass.Constexpr,
+    barrier_threads: cutlass.Constexpr,
 ):
-    """Update a base-2 online softmax and rescale persistent PV registers."""
+    """Update a base-2 online softmax and rescale persistent PV registers.
+
+    ``pairs = heads_per_tile // 4`` is the number of (row half, head pair)
+    softmax lanes a thread owns: register ``(pair // 2) * 4 + pair % 2`` and
+    the register two above it hold the two candidate halves of one head.
+    """
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
-    head0 = tid * Int32(2)
-    head1 = head0 + Int32(1)
+    pairs = heads_per_tile // 4
+    head_tiles = heads_per_tile // 8
+    value_slots = (value_dim // (16 * math_warps_per_query)) * 2
 
-    local_max0 = fmax_f32(qk[0], qk[2])
-    local_max1 = fmax_f32(qk[1], qk[3])
-    for offset in (4, 8, 16):
-        local_max0 = fmax_f32(
-            local_max0,
-            cute.arch.shuffle_sync_bfly(local_max0, offset=offset),
-        )
-        local_max1 = fmax_f32(
-            local_max1,
-            cute.arch.shuffle_sync_bfly(local_max1, offset=offset),
-        )
+    local_max = []
+    for pair in cutlass.range_constexpr(pairs):
+        reg = (pair // 2) * 4 + pair % 2
+        value = fmax_f32(qk[reg], qk[reg + 2])
+        for offset in (4, 8, 16):
+            value = fmax_f32(
+                value,
+                cute.arch.shuffle_sync_bfly(value, offset=offset),
+            )
+        local_max.append(value)
 
-    p[0] = exp2_approx(qk[0] - local_max0)
-    p[1] = exp2_approx(qk[1] - local_max1)
-    p[2] = exp2_approx(qk[2] - local_max0)
-    p[3] = exp2_approx(qk[3] - local_max1)
-    local_sum0 = p[0] + p[2]
-    local_sum1 = p[1] + p[3]
+    local_sum = []
+    for pair in cutlass.range_constexpr(pairs):
+        reg = (pair // 2) * 4 + pair % 2
+        p[reg] = exp2_approx(qk[reg] - local_max[pair])
+        p[reg + 2] = exp2_approx(qk[reg + 2] - local_max[pair])
+        local_sum.append(p[reg] + p[reg + 2])
     for offset in (4, 8, 16):
-        local_sum0 = local_sum0 + cute.arch.shuffle_sync_bfly(local_sum0, offset=offset)
-        local_sum1 = local_sum1 + cute.arch.shuffle_sync_bfly(local_sum1, offset=offset)
+        for pair in cutlass.range_constexpr(pairs):
+            local_sum[pair] = local_sum[pair] + cute.arch.shuffle_sync_bfly(
+                local_sum[pair], offset=offset
+            )
 
     if gid == Int32(0):
-        st_shared_f32(
-            reduce_max_addr + (local_warp * Int32(HEADS_PER_TILE) + head0) * Int32(4),
-            local_max0,
-        )
-        st_shared_f32(
-            reduce_max_addr + (local_warp * Int32(HEADS_PER_TILE) + head1) * Int32(4),
-            local_max1,
-        )
-        st_shared_f32(
-            reduce_sum_addr + (local_warp * Int32(HEADS_PER_TILE) + head0) * Int32(4),
-            local_sum0,
-        )
-        st_shared_f32(
-            reduce_sum_addr + (local_warp * Int32(HEADS_PER_TILE) + head1) * Int32(4),
-            local_sum1,
-        )
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
+        for pair in cutlass.range_constexpr(pairs):
+            head = (
+                Int32((pair // 2) * 8)
+                + tid * Int32(2)
+                + Int32(pair % 2)
+            )
+            st_shared_f32(
+                reduce_max_addr
+                + (local_warp * Int32(heads_per_tile) + head) * Int32(4),
+                local_max[pair],
+            )
+            st_shared_f32(
+                reduce_sum_addr
+                + (local_warp * Int32(heads_per_tile) + head) * Int32(4),
+                local_sum[pair],
+            )
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
 
-    if local_tid < Int32(HEADS_PER_TILE):
+    if local_tid < Int32(heads_per_tile):
         head = local_tid
         block_max = Float32(_MASK)
-        for warp in cutlass.range_constexpr(MATH_WARPS_PER_QUERY):
+        for warp in cutlass.range_constexpr(math_warps_per_query):
             block_max = fmax_f32(
                 block_max,
                 ld_shared_f32(
-                    reduce_max_addr + (Int32(warp * HEADS_PER_TILE) + head) * Int32(4)
+                    reduce_max_addr + (Int32(warp * heads_per_tile) + head) * Int32(4)
                 ),
             )
         block_sum = Float32(0.0)
-        for warp in cutlass.range_constexpr(MATH_WARPS_PER_QUERY):
+        for warp in cutlass.range_constexpr(math_warps_per_query):
             warp_max = ld_shared_f32(
-                reduce_max_addr + (Int32(warp * HEADS_PER_TILE) + head) * Int32(4)
+                reduce_max_addr + (Int32(warp * heads_per_tile) + head) * Int32(4)
             )
             warp_sum = ld_shared_f32(
-                reduce_sum_addr + (Int32(warp * HEADS_PER_TILE) + head) * Int32(4)
+                reduce_sum_addr + (Int32(warp * heads_per_tile) + head) * Int32(4)
             )
             block_sum = block_sum + warp_sum * exp2_approx(warp_max - block_max)
         st_shared_f32(reduce_max_addr + head * Int32(4), block_max)
         st_shared_f32(reduce_sum_addr + head * Int32(4), block_sum)
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
 
-    block_max0 = ld_shared_f32(reduce_max_addr + head0 * Int32(4))
-    block_max1 = ld_shared_f32(reduce_max_addr + head1 * Int32(4))
-    block_sum0 = ld_shared_f32(reduce_sum_addr + head0 * Int32(4))
-    block_sum1 = ld_shared_f32(reduce_sum_addr + head1 * Int32(4))
-    new_max0 = fmax_f32(global_max[0], block_max0)
-    new_max1 = fmax_f32(global_max[1], block_max1)
-    alpha0 = Float32(0.0)
-    alpha1 = Float32(0.0)
-    if global_sum[0] > Float32(0.0):
-        alpha0 = exp2_approx(global_max[0] - new_max0)
-    if global_sum[1] > Float32(0.0):
-        alpha1 = exp2_approx(global_max[1] - new_max1)
-    block_scale0 = exp2_approx(block_max0 - new_max0)
-    block_scale1 = exp2_approx(block_max1 - new_max1)
-    warp_scale0 = exp2_approx(local_max0 - new_max0)
-    warp_scale1 = exp2_approx(local_max1 - new_max1)
+    block_max = []
+    block_sum = []
+    new_max = []
+    alpha = []
+    block_scale = []
+    warp_scale = []
+    for pair in cutlass.range_constexpr(pairs):
+        head = Int32((pair // 2) * 8) + tid * Int32(2) + Int32(pair % 2)
+        pair_max = ld_shared_f32(reduce_max_addr + head * Int32(4))
+        pair_sum = ld_shared_f32(reduce_sum_addr + head * Int32(4))
+        updated_max = fmax_f32(global_max[pair], pair_max)
+        rescale = Float32(0.0)
+        if global_sum[pair] > Float32(0.0):
+            rescale = exp2_approx(global_max[pair] - updated_max)
+        block_max.append(pair_max)
+        block_sum.append(pair_sum)
+        new_max.append(updated_max)
+        alpha.append(rescale)
+        block_scale.append(exp2_approx(pair_max - updated_max))
+        warp_scale.append(exp2_approx(local_max[pair] - updated_max))
 
     pair_lane = gid >> Int32(1)
-    row_alpha0 = cute.arch.shuffle_sync(alpha0, pair_lane)
-    row_alpha1 = cute.arch.shuffle_sync(alpha1, pair_lane)
-    row_alpha = row_alpha0
-    if (gid & Int32(1)) != Int32(0):
-        row_alpha = row_alpha1
-    for tile in cutlass.range_constexpr(value_dim // 32):
-        acc[tile][0] = acc[tile][0] * row_alpha
-        acc[tile][1] = acc[tile][1] * row_alpha
+    for tile in cutlass.range_constexpr(head_tiles):
+        alpha0 = cute.arch.shuffle_sync(alpha[tile * 2], pair_lane)
+        alpha1 = cute.arch.shuffle_sync(alpha[tile * 2 + 1], pair_lane)
+        row_alpha = alpha0
+        if (gid & Int32(1)) != Int32(0):
+            row_alpha = alpha1
+        for slot in cutlass.range_constexpr(value_slots):
+            acc[slot * (2 * head_tiles) + 2 * tile] = (
+                acc[slot * (2 * head_tiles) + 2 * tile] * row_alpha
+            )
+            acc[slot * (2 * head_tiles) + 2 * tile + 1] = (
+                acc[slot * (2 * head_tiles) + 2 * tile + 1] * row_alpha
+            )
 
-    global_sum[0] = global_sum[0] * alpha0 + block_sum0 * block_scale0
-    global_sum[1] = global_sum[1] * alpha1 + block_sum1 * block_scale1
-    global_max[0] = new_max0
-    global_max[1] = new_max1
-    return p, warp_scale0, warp_scale1
+    for pair in cutlass.range_constexpr(pairs):
+        global_sum[pair] = (
+            global_sum[pair] * alpha[pair] + block_sum[pair] * block_scale[pair]
+        )
+        global_max[pair] = new_max[pair]
+    return p, warp_scale
 
 
 @cute.jit
@@ -475,6 +519,7 @@ def pv_fp8(
     record_stride_bytes: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
     value_dim: cutlass.Constexpr,
+    barrier_threads: cutlass.Constexpr,
 ):
     """HIGH/LOW E4M3 probability MMA against the raw K3 value prefix."""
     gid = lane >> Int32(2)
@@ -490,7 +535,7 @@ def pv_fp8(
             weight_scale_addr + local_tid * Int32(4),
             Float32(0.0),
         )
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
 
     atomic_max_shared_f32(
         weight_scale_addr + head0 * Int32(4),
@@ -500,7 +545,7 @@ def pv_fp8(
         weight_scale_addr + head1 * Int32(4),
         fmax_f32(fabs_f32(weights[1]), fabs_f32(weights[3])),
     )
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
 
     if local_tid < Int32(HEADS_PER_TILE):
         maximum = fmax_f32(
@@ -513,7 +558,7 @@ def pv_fp8(
             weight_scale_addr + (local_tid + Int32(HEADS_PER_TILE)) * Int32(4),
             Float32(1.0) / scale,
         )
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
 
     inv0 = ld_shared_f32(weight_scale_addr + (head0 + Int32(HEADS_PER_TILE)) * Int32(4))
     inv1 = ld_shared_f32(weight_scale_addr + (head1 + Int32(HEADS_PER_TILE)) * Int32(4))
@@ -561,7 +606,7 @@ def pv_fp8(
         + candidate1,
         l11.to(cutlass.Uint8),
     )
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
 
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(16)
@@ -599,8 +644,8 @@ def pv_fp8(
                     b1,
                 )
             tile = value_chunk * 2 + n_tile
-            acc[tile][0] = acc[tile][0] + (x0 + x2) * row_scale
-            acc[tile][1] = acc[tile][1] + (x1 + x3) * row_scale
+            acc[tile * 2] = acc[tile * 2] + (x0 + x2) * row_scale
+            acc[tile * 2 + 1] = acc[tile * 2 + 1] + (x1 + x3) * row_scale
     return acc
 
 
@@ -616,50 +661,65 @@ def pv_bf16(
     record_stride_bytes: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
     value_dim: cutlass.Constexpr,
+    heads_per_tile: cutlass.Constexpr,
+    candidates_per_chunk: cutlass.Constexpr,
+    math_warps_per_query: cutlass.Constexpr,
+    barrier_threads: cutlass.Constexpr,
 ):
-    """BF16 probability/value MMA for the K3 value prefix."""
+    """BF16 probability/value MMA for the K3 value prefix.
+
+    Probability rows are staged padded by eight elements so that consecutive
+    head rows land on distinct bank groups during the A-operand ldmatrix.
+    """
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
-    head0 = tid * Int32(2)
-    head1 = head0 + Int32(1)
     candidate0 = local_warp * Int32(16) + gid
     candidate1 = candidate0 + Int32(8)
-    weight_stride = CANDIDATES_PER_CHUNK
+    weight_stride = candidates_per_chunk + 8
+    head_tiles = heads_per_tile // 8
 
-    for head, candidate, value in (
-        (head0, candidate0, weights[0]),
-        (head1, candidate0, weights[1]),
-        (head0, candidate1, weights[2]),
-        (head1, candidate1, weights[3]),
-    ):
-        st_shared_bf16_from_f32(
-            weight_addr + (head * Int32(weight_stride) + candidate) * Int32(2),
-            value,
-        )
+    for tile in cutlass.range_constexpr(head_tiles):
+        for half in cutlass.range_constexpr(2):
+            head = Int32(tile * 8) + tid * Int32(2) + Int32(half)
+            reg = tile * 4 + half
+            st_shared_bf16_from_f32(
+                weight_addr + (head * Int32(weight_stride) + candidate0) * Int32(2),
+                weights[reg],
+            )
+            st_shared_bf16_from_f32(
+                weight_addr + (head * Int32(weight_stride) + candidate1) * Int32(2),
+                weights[reg + 2],
+            )
+    if cutlass.const_expr(heads_per_tile < 16):
         # The upper rows are not part of K3 H8, but zeroing them prevents
         # uninitialized values from entering the otherwise-unused MMA fragment.
-        st_shared_bf16_from_f32(
-            weight_addr
-            + ((head + Int32(HEADS_PER_TILE)) * Int32(weight_stride) + candidate)
-            * Int32(2),
-            Float32(0.0),
-        )
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
+        for pad in cutlass.range_constexpr(16 - heads_per_tile):
+            pad_row = Int32(heads_per_tile + pad)
+            st_shared_bf16_from_f32(
+                weight_addr + (pad_row * Int32(weight_stride) + candidate0) * Int32(2),
+                Float32(0.0),
+            )
+            st_shared_bf16_from_f32(
+                weight_addr + (pad_row * Int32(weight_stride) + candidate1) * Int32(2),
+                Float32(0.0),
+            )
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
 
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
-    for value_chunk in cutlass.range_constexpr(value_dim // 64):
+    value_tiles = value_dim // (16 * math_warps_per_query)
+    for value_chunk in cutlass.range_constexpr(value_tiles):
         for n_tile in cutlass.range_constexpr(2):
             column = (
-                Int32(value_chunk * 64)
-                + (Int32(n_tile * MATH_WARPS_PER_QUERY) + local_warp) * Int32(8)
+                Int32(value_chunk * 16 * math_warps_per_query)
+                + (Int32(n_tile * math_warps_per_query) + local_warp) * Int32(8)
                 + gid
             )
             x0 = Float32(0.0)
             x1 = Float32(0.0)
             x2 = Float32(0.0)
             x3 = Float32(0.0)
-            for k_step in cutlass.range_constexpr(4):
+            for k_step in cutlass.range_constexpr(candidates_per_chunk // 16):
                 k_base = Int32(k_step * 16)
                 a_addr = weight_addr + (
                     a_row * Int32(weight_stride) + k_base + a_col
@@ -700,9 +760,13 @@ def pv_bf16(
                     b0,
                     b1,
                 )
-            tile = value_chunk * 2 + n_tile
-            acc[tile][0] = acc[tile][0] + x0
-            acc[tile][1] = acc[tile][1] + x1
+            slot = value_chunk * 2 + n_tile
+            base = slot * (2 * head_tiles)
+            acc[base] = acc[base] + x0
+            acc[base + 1] = acc[base + 1] + x1
+            if cutlass.const_expr(head_tiles > 1):
+                acc[base + 2] = acc[base + 2] + x2
+                acc[base + 3] = acc[base + 3] + x3
     return acc
 
 
@@ -726,76 +790,89 @@ def write_partial_or_final(
     fp8: cutlass.Constexpr,
     ln2: cutlass.Constexpr,
     value_dim: cutlass.Constexpr,
+    heads_per_tile: cutlass.Constexpr,
+    math_warps_per_query: cutlass.Constexpr,
 ):
     """Write a normalized split partial, or the final one-split result."""
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
+    head_tiles = heads_per_tile // 8
     pair_lane = gid >> Int32(1)
-    row_max0 = cute.arch.shuffle_sync(global_max[0], pair_lane)
-    row_max1 = cute.arch.shuffle_sync(global_max[1], pair_lane)
-    row_sum0 = cute.arch.shuffle_sync(global_sum[0], pair_lane)
-    row_sum1 = cute.arch.shuffle_sync(global_sum[1], pair_lane)
-    row_max = row_max0
-    row_sum = row_sum0
-    if (gid & Int32(1)) != Int32(0):
-        row_max = row_max1
-        row_sum = row_sum1
+    value_tiles = value_dim // (16 * math_warps_per_query)
 
-    inverse = Float32(0.0)
-    if row_sum > Float32(0.0):
-        inverse = Float32(1.0) / row_sum
-    scale = inverse
-    if cutlass.const_expr(fp8):
-        scale = scale * value_scale
+    row_max = []
+    row_sum = []
+    for tile in cutlass.range_constexpr(head_tiles):
+        max0 = cute.arch.shuffle_sync(global_max[tile * 2], pair_lane)
+        max1 = cute.arch.shuffle_sync(global_max[tile * 2 + 1], pair_lane)
+        sum0 = cute.arch.shuffle_sync(global_sum[tile * 2], pair_lane)
+        sum1 = cute.arch.shuffle_sync(global_sum[tile * 2 + 1], pair_lane)
+        head_max = max0
+        head_sum = sum0
+        if (gid & Int32(1)) != Int32(0):
+            head_max = max1
+            head_sum = sum1
+        row_max.append(head_max)
+        row_sum.append(head_sum)
 
-    if query_valid != Int32(0) and head_base + gid < Int32(num_heads):
-        for value_chunk in cutlass.range_constexpr(value_dim // 64):
-            for n_tile in cutlass.range_constexpr(2):
-                tile = value_chunk * 2 + n_tile
-                dimension = (
-                    Int32(value_chunk * 64)
-                    + (Int32(n_tile * MATH_WARPS_PER_QUERY) + local_warp) * Int32(8)
-                    + tid * Int32(2)
-                )
+    for tile in cutlass.range_constexpr(head_tiles):
+        head = head_base + Int32(tile * 8) + gid
+        if query_valid != Int32(0) and head < Int32(num_heads):
+            inverse = Float32(0.0)
+            if row_sum[tile] > Float32(0.0):
+                inverse = Float32(1.0) / row_sum[tile]
+            scale = inverse
+            if cutlass.const_expr(fp8):
+                scale = scale * value_scale
+            for value_chunk in cutlass.range_constexpr(value_tiles):
+                for n_tile in cutlass.range_constexpr(2):
+                    slot = value_chunk * 2 + n_tile
+                    base = slot * (2 * head_tiles) + 2 * tile
+                    dimension = (
+                        Int32(value_chunk * 16 * math_warps_per_query)
+                        + (Int32(n_tile * math_warps_per_query) + local_warp)
+                        * Int32(8)
+                        + tid * Int32(2)
+                    )
+                    if cutlass.const_expr(has_splits):
+                        output[
+                            query_row,
+                            head,
+                            split,
+                            dimension,
+                        ] = (acc[base] * scale).to(output.element_type)
+                        output[
+                            query_row,
+                            head,
+                            split,
+                            dimension + Int32(1),
+                        ] = (acc[base + 1] * scale).to(output.element_type)
+                    else:
+                        output[
+                            query_row,
+                            head,
+                            dimension,
+                        ] = (acc[base] * scale).to(output.element_type)
+                        output[
+                            query_row,
+                            head,
+                            dimension + Int32(1),
+                        ] = (acc[base + 1] * scale).to(output.element_type)
+
+            if local_warp == Int32(0) and tid == Int32(0):
+                lse = Float32(-Float32.inf)
+                if row_sum[tile] > Float32(0.0):
+                    lse = log2_approx(row_sum[tile]) + row_max[tile]
+                    if cutlass.const_expr(not has_splits):
+                        lse = lse * Float32(ln2)
                 if cutlass.const_expr(has_splits):
-                    output[
+                    output_lse[
                         query_row,
-                        head_base + gid,
+                        head,
                         split,
-                        dimension,
-                    ] = (acc[tile][0] * scale).to(output.element_type)
-                    output[
-                        query_row,
-                        head_base + gid,
-                        split,
-                        dimension + Int32(1),
-                    ] = (acc[tile][1] * scale).to(output.element_type)
+                    ] = lse
                 else:
-                    output[
-                        query_row,
-                        head_base + gid,
-                        dimension,
-                    ] = (acc[tile][0] * scale).to(output.element_type)
-                    output[
-                        query_row,
-                        head_base + gid,
-                        dimension + Int32(1),
-                    ] = (acc[tile][1] * scale).to(output.element_type)
-
-        if local_warp == Int32(0) and tid == Int32(0):
-            lse = Float32(-Float32.inf)
-            if row_sum > Float32(0.0):
-                lse = log2_approx(row_sum) + row_max
-                if cutlass.const_expr(not has_splits):
-                    lse = lse * Float32(ln2)
-            if cutlass.const_expr(has_splits):
-                output_lse[
-                    query_row,
-                    head_base + gid,
-                    split,
-                ] = lse
-            else:
-                output_lse[query_row, head_base + gid] = lse
+                    output_lse[query_row, head] = lse
 
 
 __all__ = [

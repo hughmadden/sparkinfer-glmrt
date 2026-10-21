@@ -12,8 +12,6 @@ from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
 )
 
-from ._layout import CANDIDATES_PER_CHUNK
-
 
 @cute.jit
 def issue_dense_page_gather(
@@ -32,23 +30,31 @@ def issue_dense_page_gather(
     page_size: cutlass.Constexpr,
     record_bytes: cutlass.Constexpr,
     record_stride_bytes: cutlass.Constexpr,
+    candidates_per_chunk: cutlass.Constexpr,
+    io_threads: cutlass.Constexpr,
 ):
-    """Stage one 64-record dense window with an mbarrier transaction.
+    """Stage one dense window with one bulk transaction per record.
 
     Every pool-scaled product is promoted before multiplication. Invalid tail
     rows copy physical record zero and are masked by the consumer; issuing a
     fixed byte count keeps the full-barrier protocol independent of live
     sequence length and therefore graph-replay stable.
+
+    Lane zero arms the barrier with the chunk's exact byte count and each lane
+    issues ``candidates_per_chunk // io_threads`` bulk copies, so the whole
+    window moves with one instruction per record and the barrier completes on
+    the arriving bytes rather than on a per-lane wait.  The caller therefore
+    initializes the full barrier with a single arrival.
     """
     full_mbar_addr = shared_ptr_to_u32(full_mbar_ptr)
     if io_lane == Int32(0):
         cute.arch.mbarrier_arrive_and_expect_tx(
             full_mbar_ptr,
-            Int32(CANDIDATES_PER_CHUNK * record_bytes),
+            Int32(candidates_per_chunk * record_bytes),
         )
 
     entry = io_lane
-    for _ in cutlass.range_constexpr(CANDIDATES_PER_CHUNK // 32):
+    for _ in cutlass.range_constexpr(candidates_per_chunk // io_threads):
         logical_token = token_begin + entry
         safe_token = logical_token
         if logical_token >= token_end:
@@ -71,7 +77,7 @@ def issue_dense_page_gather(
             Int32(record_bytes),
             full_mbar_addr,
         )
-        entry += Int32(32)
+        entry += Int32(io_threads)
 
 
 __all__ = ["issue_dense_page_gather"]
