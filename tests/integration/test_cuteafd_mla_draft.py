@@ -30,15 +30,24 @@ def test_draft_geometry_is_explicit_and_target_unchanged():
         with pytest.raises(ValueError):
             mla.MlaDraftGeometry(**args)
     assert geometry().record_bytes == target.record_bytes == 1152
+    assert geometry(kv_cache="fp8").record_bytes == mla.KimiMlaGeometry(kv_cache="fp8").record_bytes == 656
+    for cls in (mla.KimiMlaGeometry, mla.MlaDraftGeometry):
+        with pytest.raises(ValueError, match="cache must be"):
+            cls(kv_cache="int8")
 
 
-def test_draft_abi_and_capacity_not_live_counts(monkeypatch):
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+def test_draft_abi_and_capacity_not_live_counts(monkeypatch, kv_cache):
     monkeypatch.setattr(mla, "compile_program", lambda launch, **kwargs: (launch, kwargs))
-    g = geometry()
+    g = geometry(kv_cache=kv_cache)
     producer, p = mla.compile_mla_draft_producer_aot(g, max_rows=64)
     output, o = mla.compile_mla_draft_output_aot(g, max_rows=64)
     attention, a = mla.compile_mla_draft_attention_aot(g, max_rows=64, max_context=8192)
     assert p["geometry"]["rotary_style"] == "interleaved"
+    assert p["geometry"]["kv_cache"] == a["geometry"]["kv_cache"] == kv_cache
+    assert attention.forward.ds_mla_record == (kv_cache == "fp8")
+    cache_operand = next(v for v in p["operands"] if v.name == "kv_cache")
+    assert cache_operand.dtype == (torch.uint8 if kv_cache == "fp8" else torch.bfloat16)
     assert [v.name for v in p["scalars"]] == ["rotary_factor", "rows"]
     assert [v.name for v in p["operands"]][2:4] == ["positions", "inv_freq"]
     assert not any(v.name in ("x", "w_g") for v in o["operands"])
@@ -59,21 +68,31 @@ def test_draft_abi_and_capacity_not_live_counts(monkeypatch):
 
 @pytest.mark.parametrize("window", [None, 4096])
 @pytest.mark.parametrize("high_pages", [False, True])
-def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_pages):
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+@pytest.mark.parametrize("query_amplitude", [0.1, 8.0])
+def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_pages, kv_cache, query_amplitude):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    g = geometry(window_size=window)
+    g = geometry(window_size=window, kv_cache=kv_cache)
     p = mla.compile_mla_draft_attention_aot(g, max_rows=16, max_context=4352)
     counts, lengths = [8, 3], [4101, 65]
     width = 68
     generator = torch.Generator(device="cuda").manual_seed(273)
     cache = (torch.randn(2 * width, 64, 576, generator=generator, device="cuda") * 0.1).bfloat16()
-    q = (torch.randn(11, 64, 576, generator=generator, device="cuda") * 0.1).bfloat16()
+    if kv_cache == "fp8":
+        from b12x.attention._shared.mla.reference import (
+            pack_mla_kv_cache_reference, unpack_mla_kv_cache_reference)
+        packed = pack_mla_kv_cache_reference(cache.flatten(0, 1)[:, :512], cache.flatten(0, 1)[:, 512:])
+        oracle_cache = unpack_mla_kv_cache_reference(packed).bfloat16().reshape_as(cache)
+        cache = packed.reshape(2 * width, 64, 656)
+    else:
+        oracle_cache = cache
+    q = (torch.randn(11, 64, 576, generator=generator, device="cuda") * query_amplitude).bfloat16()
     if high_pages:
         # Tail pages beyond the signed-32-bit byte-offset boundary. Allocate
         # uninitialized prefix storage, never initialize the whole large pool.
-        first_page = 2 ** 31 // (64 * 576 * 2) + 1
-        pool = torch.empty(first_page + 2 * width, 64, 576, device="cuda", dtype=torch.bfloat16)
+        first_page = 2 ** 31 // (64 * g.record_bytes) + 1
+        pool = torch.empty(first_page + 2 * width, *cache.shape[1:], device="cuda", dtype=cache.dtype)
         pool[first_page:].copy_(cache)
         cache = pool
     else:
@@ -92,7 +111,7 @@ def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_page
     run()
     torch.cuda.synchronize()
     for index, (count, length, begin) in enumerate(zip(counts, lengths, [0, 8])):
-        records = cache[table[index].long()].flatten(0, 1)[:length].float()
+        records = oracle_cache[(table[index] - first_page).long()].flatten(0, 1)[:length].float()
         scores = torch.einsum("thd,sd->hts", q[begin:begin + count].float(), records) * SCORE_SCALE
         if window:
             positions = torch.arange(length, device="cuda")
@@ -111,7 +130,8 @@ def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_page
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
-def test_draft_real_weights_gpu_hf_eager_absorption_and_output():
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+def test_draft_real_weights_gpu_hf_eager_absorption_and_output(kv_cache):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     hf = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
@@ -138,7 +158,7 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output():
     mscale = lambda m: 1 + 0.1 * m * math.log(rope["factor"])
     factor = mscale(rope["mscale"]) / mscale(rope["mscale_all_dim"])
     scale = 192 ** -0.5 * mscale(rope["mscale_all_dim"]) ** 2
-    g = mla.MlaDraftGeometry()
+    g = mla.MlaDraftGeometry(kv_cache=kv_cache)
     from safetensors import safe_open
     with safe_open(snapshot / "model.safetensors", framework="pt", device="cpu") as tensors:
         w = {name: tensors.get_tensor("layers.0.self_attn." + name).cuda() for name in (
@@ -154,7 +174,9 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output():
     x = (torch.randn(16, 7168, device="cuda") * 0.2).bfloat16()
     slots = torch.arange(16, device="cuda", dtype=torch.int64)
     positions = slots + 32760
-    cache = torch.full((2, 64, 576), float("nan"), device="cuda", dtype=torch.bfloat16)
+    cache = (torch.full((2, 64, 656), 173, device="cuda", dtype=torch.uint8)
+             if kv_cache == "fp8" else
+             torch.full((2, 64, 576), float("nan"), device="cuda", dtype=torch.bfloat16))
     query = torch.empty(16, 64, 576, device="cuda", dtype=torch.bfloat16)
     residual = torch.empty(16, 1536, device="cuda", dtype=torch.bfloat16)
     attn = torch.empty(16, 64, 512, device="cuda", dtype=torch.bfloat16)
@@ -196,7 +218,21 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output():
     expected = torch.nn.functional.linear(expected.reshape(16, 8192), w["o_proj.weight"])
     relative = (out.float() - expected.float()).norm() / expected.float().norm()
     cosine = torch.nn.functional.cosine_similarity(out.float().flatten(), expected.float().flatten(), dim=0)
-    assert relative < 0.03 and cosine > 0.9995
+    if kv_cache == "bf16":
+        assert relative < 0.03 and cosine > 0.9995
+    else:
+        from dataclasses import replace
+        from b12x.attention._shared.mla.reference import unpack_mla_kv_cache_reference
+        widened = unpack_mla_kv_cache_reference(cache.flatten(0, 1)).bfloat16().reshape(-1, 64, 576)
+        bf16_attention = mla.compile_mla_draft_attention_aot(replace(g, kv_cache="bf16"),
+            max_rows=64, max_context=128)
+        reference_attn, reference_lse = torch.empty_like(attn), torch.empty_like(lse)
+        bf16_attention.launch(query, widened, table, lengths, cu, reference_attn, reference_lse, scratch[1],
+            scalars=(16, 1, 2, attention.geometry["num_splits"], scale))
+        assert torch.equal(attn.view(torch.uint8), reference_attn.view(torch.uint8))
+        assert torch.equal(lse.view(torch.uint8), reference_lse.view(torch.uint8))
+        print(f"draft compact/BF16 widened-record parity exact; FP8 storage delta "
+              f"relative_l2={float(relative):.8g} cosine={float(cosine):.9g} (model fidelity gates)", flush=True)
     assert torch.isfinite(out).all() and out.abs().sum() > 0
     saved = out.clone()
     graph = torch.cuda.CUDAGraph()
@@ -204,22 +240,43 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output():
         run()
     graph.replay()
     assert torch.equal(out.view(torch.uint8), saved.view(torch.uint8))
+    # Restore raw records across a partial-page frontier, then replay a
+    # continuation against the saved native cache, query and output bytes.
+    frontier = cache.clone()
+    slots.add_(16)
+    lengths.fill_(32)
+    positions.add_(16)
+    x.mul_(0.5)
+    run()
+    assert torch.equal(cache.flatten(0, 1)[:16].view(torch.uint8),
+                       frontier.flatten(0, 1)[:16].view(torch.uint8))
+    continued = [v.clone() for v in (cache, query, residual, out, lse)]
+    cache.copy_(frontier)
+    run()
+    for actual, expected in zip((cache, query, residual, out, lse), continued):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
-def test_rotary_gpu_interleaved_table_and_negative_slots():
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+def test_rotary_gpu_interleaved_table_and_negative_slots(kv_cache):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
-    kernel = mla._DraftRotary(64)
+    g = geometry(kv_cache=kv_cache)
+    kernel = mla._DraftRotary(g)
     p = compile_program(kernel, name="test_mla_draft_rotary", operands=(
         Operand("query", torch.bfloat16, "[rows,64,576]", "inout"),
-        Operand("cache", torch.bfloat16, "[pages,64,576]", "inout"),
+        Operand("cache", torch.uint8 if kv_cache == "fp8" else torch.bfloat16,
+                "[pages,64,656]" if kv_cache == "fp8" else "[pages,64,576]", "inout"),
         Operand("slots", torch.int64, "[rows]", align=8),
         Operand("positions", torch.int64, "[rows]", align=8),
         Operand("inv_freq", torch.float32, "[32]", align=4)),
-        scalars=(Scalar("factor", "float32"), Scalar("rows")), key=(64,))
+        scalars=(Scalar("factor", "float32"), Scalar("rows")), key=(g,))
     q = torch.randn(4, 64, 576, device="cuda").bfloat16()
     cache = torch.randn(64, 576, device="cuda").bfloat16()
+    if kv_cache == "fp8":
+        from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
+        cache = pack_mla_kv_cache_reference(cache[:, :512], cache[:, 512:]).squeeze(1)
     slots = torch.tensor([0, 63, -1, 11], device="cuda", dtype=torch.int64)
     positions = torch.tensor([0, 32767, 32768, 1048575], device="cuda", dtype=torch.int64)
     # Deliberately non-default frequencies ensure the kernel consumes the loader table.
@@ -239,8 +296,14 @@ def test_rotary_gpu_interleaved_table_and_negative_slots():
 
     torch.testing.assert_close(q[..., 512:], rotate(before_q[..., 512:], c[:, None], s[:, None]), atol=0.015625, rtol=0.01)
     assert torch.equal(q[..., :512], before_q[..., :512])
-    expected_cache = before_cache.clone()
+    if kv_cache == "fp8":
+        assert torch.equal(cache[:, :528], before_cache[:, :528])
+        tail = cache[:, 528:].contiguous().view(torch.bfloat16)
+        before_tail = before_cache[:, 528:].contiguous().view(torch.bfloat16)
+    else:
+        tail, before_tail = cache[:, 512:], before_cache[:, 512:]
+    expected_tail = before_tail.clone()
     for row, slot in enumerate([0, 63, -1, 11]):
         if slot >= 0:
-            expected_cache[slot, 512:] = rotate(before_cache[slot, 512:], c[row], s[row])
-    torch.testing.assert_close(cache, expected_cache, atol=0.015625, rtol=0.01)
+            expected_tail[slot] = rotate(before_tail[slot], c[row], s[row])
+    torch.testing.assert_close(tail, expected_tail, atol=0.015625, rtol=0.01)
