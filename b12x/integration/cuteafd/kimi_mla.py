@@ -1,8 +1,10 @@
-"""Kimi K3 NoPE MLA: lossless BF16 records and caller-owned AOT storage.
+"""Kimi K3 NoPE MLA with caller-owned BF16 or compact GLM-format records.
 
-Records contain 512 normalized latent values followed by 64 *raw* key values.
+Records hold 512 normalized latents (BF16 or grouped E4M3/FP32 scales) and
+64 raw BF16 key values. The shared MLA drafter additionally rotates the tail.
 The query is absorbed through UK; UV, sigmoid(g_proj(x)) and o_proj follow
-full causal dense_mla. No rotary tables, positions, indexer or allocation.
+full causal dense_mla. Compact storage widens only the current shared-memory
+tile to BF16 arithmetic; native FP8 tensor-core attention is not implemented.
 """
 from __future__ import annotations
 
@@ -13,14 +15,15 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from b12x._lib.intrinsics import cvt_f32x4_to_e4m3x4, div_rn_f32, fabs_f32, fmax_f32
 import torch
 
 from b12x.attention.dense_mla._forward import DenseMlaForwardKernel
 from b12x.attention.dense_mla._layout import choose_layout
 from b12x.attention.dense_mla._merge import DenseMlaMergeKernel
 from ._common import Operand, Scalar, compile_program
-from ._glm_kernels import BatchedBf16Gemm, _bf16, _block_sum, _reduction_storage, _rsqrt, glm_projection
+from ._glm_kernels import BatchedBf16Gemm, _bf16, _block_sum, _fp8_scale, _reduction_storage, _rsqrt, _warp_max, glm_projection
 from ._qwen4_attention_kernels import Qwen4GateMul
 
 
@@ -36,8 +39,11 @@ class KimiMlaGeometry:
     v_head_dim: int = 128
     norm_eps: float = 1e-6
     page_rows: int = 64
+    kv_cache: str = "bf16"
 
     def __post_init__(self):
+        if self.kv_cache not in ("bf16", "fp8"):
+            raise ValueError("MLA KV cache must be bf16 or fp8")
         if self.heads not in (48, 96):
             raise ValueError("Kimi MLA requires 48 or 96 heads")
         if (self.hidden, self.q_lora_rank, self.kv_lora_rank, self.qk_nope_dim,
@@ -51,7 +57,7 @@ class KimiMlaGeometry:
 
     @property
     def record_bytes(self):
-        return 1152
+        return 656 if self.kv_cache == "fp8" else 1152
 
     @property
     def softmax_scale(self):
@@ -72,6 +78,8 @@ class MlaDraftGeometry(KimiMlaGeometry):
     window_size: int | None = None
 
     def __post_init__(self):
+        if self.kv_cache not in ("bf16", "fp8"):
+            raise ValueError("MLA draft KV cache must be bf16 or fp8")
         if (self.hidden, self.heads, self.q_lora_rank, self.kv_lora_rank,
             self.qk_nope_dim, self.qk_rope_dim, self.v_head_dim,
             self.page_rows, self.norm_eps) != (
@@ -165,11 +173,35 @@ class _RankNormPack:
             q_resid[row * Int64(1536) + d] = (Float32(q_norm[d]) * _bf16(q[j] * qi)).to(BFloat16)
         slot = Int64(slots[row])
         if slot >= Int64(0):
-            for j in cutlass.range_constexpr(2):
-                d = Int64(j * 256) + Int64(tid)
-                cache[slot * Int64(576) + d] = (Float32(kv_norm[d]) * _bf16(kv[j] * ki)).to(BFloat16)
-            if tid < Int32(64):
-                cache[slot * Int64(576) + Int64(512) + Int64(tid)] = qkv[row * Int64(2112) + Int64(2048) + Int64(tid)]
+            if cutlass.const_expr(self.g.kv_cache == "fp8"):
+                record = Int64(cache.toint()) + slot * Int64(self.g.record_bytes)
+                # Preserve Kimi's rank-norm sum order; only its rounded result
+                # is regrouped into GLM's four independent 128-value blocks.
+                if tid < Int32(128):
+                    normalized = cute.make_rmem_tensor((4,), Float32)
+                    local = Float32(0)
+                    for j in cutlass.range_constexpr(4):
+                        d = Int64(4) * Int64(tid) + Int64(j)
+                        value = Float32(qkv[row * Int64(2112) + Int64(1536) + d])
+                        normalized[j] = _bf16(Float32(kv_norm[d]) * _bf16(value * ki))
+                        local = fmax_f32(local, fabs_f32(normalized[j]))
+                    scale = _fp8_scale(_warp_max(local))
+                    words = cute.make_ptr(Uint32, record, cute.AddressSpace.gmem, assumed_align=4)
+                    words[tid] = cvt_f32x4_to_e4m3x4(
+                        div_rn_f32(normalized[0], scale), div_rn_f32(normalized[1], scale),
+                        div_rn_f32(normalized[2], scale), div_rn_f32(normalized[3], scale))
+                    if tid % Int32(32) == Int32(0):
+                        scales = cute.make_ptr(Float32, record + Int64(512), cute.AddressSpace.gmem, assumed_align=4)
+                        scales[tid // Int32(32)] = scale
+                if tid < Int32(64):
+                    tail = cute.make_ptr(BFloat16, record + Int64(528), cute.AddressSpace.gmem, assumed_align=2)
+                    tail[tid] = qkv[row * Int64(2112) + Int64(2048) + Int64(tid)]
+            else:
+                for j in cutlass.range_constexpr(2):
+                    d = Int64(j * 256) + Int64(tid)
+                    cache[slot * Int64(576) + d] = (Float32(kv_norm[d]) * _bf16(kv[j] * ki)).to(BFloat16)
+                if tid < Int32(64):
+                    cache[slot * Int64(576) + Int64(512) + Int64(tid)] = qkv[row * Int64(2112) + Int64(2048) + Int64(tid)]
 
 
 class _QueryTail:
@@ -216,8 +248,10 @@ class _Producer:
 class _DraftRotary:
     """Interleaved (GPT-J) rotary-64, matching the MLA checkpoint layout."""
 
-    def __init__(self, heads):
-        self.heads = heads
+    def __init__(self, g):
+        self.heads = g.heads
+        self.record_bytes = g.record_bytes
+        self.tail_offset = 528 if g.kv_cache == "fp8" else 1024
 
     @cute.jit
     def __call__(self, query: cute.Pointer, cache: cute.Pointer, slots: cute.Pointer,
@@ -240,16 +274,18 @@ class _DraftRotary:
         query[base + Int64(1)] = (_bf16(y * c) + _bf16(x * s)).to(BFloat16)
         slot = Int64(slots[Int64(row)])
         if head == Int32(0) and slot >= Int64(0):
-            base = slot * Int64(576) + Int64(512) + pair * Int64(2)
-            x, y = Float32(cache[base]), Float32(cache[base + Int64(1)])
-            cache[base] = (_bf16(x * c) - _bf16(y * s)).to(BFloat16)
-            cache[base + Int64(1)] = (_bf16(y * c) + _bf16(x * s)).to(BFloat16)
+            tail = cute.make_ptr(BFloat16, Int64(cache.toint()) + slot * Int64(self.record_bytes)
+                + Int64(self.tail_offset), cute.AddressSpace.gmem, assumed_align=2)
+            base = pair * Int64(2)
+            x, y = Float32(tail[base]), Float32(tail[base + Int64(1)])
+            tail[base] = (_bf16(x * c) - _bf16(y * s)).to(BFloat16)
+            tail[base + Int64(1)] = (_bf16(y * c) + _bf16(x * s)).to(BFloat16)
 
 
 class _DraftProducer:
     def __init__(self, g):
         self.producer = _Producer(g)
-        self.rotary = _DraftRotary(g.heads)
+        self.rotary = _DraftRotary(g)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, kv_slots: cute.Pointer, positions: cute.Pointer,
@@ -312,7 +348,8 @@ class _Attention:
             query_tile=self.smem.query_tile, fp8=False,
             qk_dim=576, value_dim=512,
             window_size=g.window_size if isinstance(g, MlaDraftGeometry) else None,
-            noncausal_block=isinstance(g, MlaDraftGeometry))
+            noncausal_block=isinstance(g, MlaDraftGeometry),
+            ds_mla_record=g.kv_cache == "fp8")
         self.merge = DenseMlaMergeKernel(num_splits=self.splits, value_dim=512) if self.splits > 1 else None
 
     @cute.jit
@@ -348,7 +385,7 @@ class _Attention:
             po, pl = out, lse_out
         self.forward(q, kv, table, lengths, cu, out, lse_out, po, pl, lse_out, lse_out,
             score_scale_log2, Int64(g.heads * 576 * 2), Int64(576 * 2),
-            Int64(64 * 1152), Int64(1152), page_table_width, rows, batch, active_splits, stream)
+            Int64(64 * g.record_bytes), Int64(g.record_bytes), page_table_width, rows, batch, active_splits, stream)
         if cutlass.const_expr(self.splits > 1):
             if active_splits > Int32(1):
                 self.merge(po, pl, out, lse_out, active_splits, stream)
@@ -379,7 +416,8 @@ def compile_mla_draft_producer_aot(g: MlaDraftGeometry, *, max_rows=64):
         Operand("kv_a_norm", torch.bfloat16, "[512]"),
         Operand("w_q_b", torch.bfloat16, f"[{g.heads * 192},1536]"),
         Operand("w_uk", torch.bfloat16, f"[{g.heads},512,128]"),
-        Operand("kv_cache", torch.bfloat16, "[pages,64,576]", "inout"),
+        Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
+                "[pages,64,656]" if g.kv_cache == "fp8" else "[pages,64,576]", "inout"),
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]", "out"),
         Operand("q_resid", torch.bfloat16, "[rows,1536]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"))
@@ -410,7 +448,8 @@ def compile_mla_draft_attention_aot(g: MlaDraftGeometry, *, max_rows=64, max_con
     layout = attention_layout(g, max_rows, max_context=max_context, mode="verify")
     operands = (
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
-        Operand("kv_cache", torch.bfloat16, "[pages,64,576]"),
+        Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
+                "[pages,64,656]" if g.kv_cache == "fp8" else "[pages,64,576]"),
         Operand("page_table", torch.int32, "[batch,page_table_width]", align=4),
         Operand("cache_seqlens", torch.int32, "[batch]", align=4),
         Operand("cu_seqlens_q", torch.int32, "[batch+1]", align=4),
@@ -435,7 +474,8 @@ def compile_kimi_mla_producer_aot(g=KimiMlaGeometry(), *, max_rows=64):
         Operand("kv_a_norm", torch.bfloat16, "[512]"),
         Operand("w_q_b", torch.bfloat16, f"[{g.heads * 192},1536]"),
         Operand("w_uk", torch.bfloat16, f"[{g.heads},512,128]"),
-        Operand("kv_cache", torch.bfloat16, "[pages,64,576]", "inout"),
+        Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
+                "[pages,64,656]" if g.kv_cache == "fp8" else "[pages,64,576]", "inout"),
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]", "out"),
         Operand("q_resid", torch.bfloat16, "[rows,1536]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"))
@@ -465,7 +505,8 @@ def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=
     smem = dense_mla_layout(g, max_rows, mode=mode)
     operands = (
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
-        Operand("kv_cache", torch.bfloat16, "[pages,64,576]"),
+        Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
+                "[pages,64,656]" if g.kv_cache == "fp8" else "[pages,64,576]"),
         Operand("page_table", torch.int32, "[batch,page_table_width]", align=4),
         Operand("cache_seqlens", torch.int32, "[batch]", align=4),
         Operand("cu_seqlens_q", torch.int32, "[batch+1]", align=4),

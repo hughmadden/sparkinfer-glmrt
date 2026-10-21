@@ -12,7 +12,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 from b12x._lib.intrinsics import shared_ptr_to_u32
 
-from ._io import issue_dense_page_gather
+from ._io import issue_dense_page_gather, issue_ds_mla_page_gather
 from ._layout import (
     SmemLayout,
     get_shared_storage_cls,
@@ -61,6 +61,7 @@ class DenseMlaForwardKernel:
         value_dim: int,
         window_size: int | None,
         noncausal_block: bool = False,
+        ds_mla_record: bool = False,
     ):
         self.layout = layout
         self.page_size = int(page_size)
@@ -86,6 +87,9 @@ class DenseMlaForwardKernel:
             or self.math_warps_per_query != 4
         ):
             raise ValueError("dense MLA FP8 only supports the 8/64/4 tile")
+        self.ds_mla_record = bool(ds_mla_record)
+        if self.ds_mla_record and (self.fp8 or qk_dim != 576 or value_dim != 512):
+            raise ValueError("DS-MLA records require BF16 queries and 576/512 math")
         self.qk_dim = int(qk_dim)
         self.value_dim = int(value_dim)
         self.window_size = None if window_size is None else int(window_size)
@@ -574,9 +578,9 @@ class DenseMlaForwardKernel:
 
         if tid == Int32(0):
             for stage in cutlass.range_constexpr(self.kv_stages):
-                # The gather arms the barrier with one transaction byte count
-                # and one arrival; completion is the arriving byte total.
-                cute.arch.mbarrier_init(mbar_base + stage, Int32(1))
+                # Bulk copies complete on their byte total and one arrival;
+                # compact records publish synchronous stores from all 32 lanes.
+                cute.arch.mbarrier_init(mbar_base + stage, Int32(32 if self.ds_mla_record else 1))
                 cute.arch.mbarrier_init(
                     mbar_base + Int32(self.kv_stages + stage),
                     Int32(self.query_tile),
@@ -600,24 +604,33 @@ class DenseMlaForwardKernel:
                     mbar_base + Int32(self.kv_stages) + producer_index,
                     phase=producer_phase,
                 )
-                issue_dense_page_gather(
-                    cache_bytes,
-                    page_table,
-                    kv_smem_addr + buffer * kv_buffer_bytes,
-                    mbar_base + buffer,
-                    request,
-                    token_begin,
-                    cache_length,
-                    io_lane,
-                    page_stride_bytes,
-                    cache_record_stride_bytes,
-                    page_table_stride,
-                    page_size=self.page_size,
-                    record_bytes=self.layout.record_bytes,
-                    record_stride_bytes=self.layout.record_stride_bytes,
-                    candidates_per_chunk=self.candidates_per_chunk,
-                    io_threads=32,
-                )
+                if cutlass.const_expr(self.ds_mla_record):
+                    issue_ds_mla_page_gather(
+                        cache_bytes, page_table, kv_smem_addr + buffer * kv_buffer_bytes,
+                        mbar_base + buffer, request, token_begin, cache_length, io_lane,
+                        page_stride_bytes, cache_record_stride_bytes, page_table_stride,
+                        page_size=self.page_size, record_stride_bytes=self.layout.record_stride_bytes,
+                        candidates_per_chunk=self.candidates_per_chunk,
+                    )
+                else:
+                    issue_dense_page_gather(
+                        cache_bytes,
+                        page_table,
+                        kv_smem_addr + buffer * kv_buffer_bytes,
+                        mbar_base + buffer,
+                        request,
+                        token_begin,
+                        cache_length,
+                        io_lane,
+                        page_stride_bytes,
+                        cache_record_stride_bytes,
+                        page_table_stride,
+                        page_size=self.page_size,
+                        record_bytes=self.layout.record_bytes,
+                        record_stride_bytes=self.layout.record_stride_bytes,
+                        candidates_per_chunk=self.candidates_per_chunk,
+                        io_threads=32,
+                    )
                 producer_index += Int32(1)
                 if producer_index == Int32(self.kv_stages):
                     producer_index = Int32(0)

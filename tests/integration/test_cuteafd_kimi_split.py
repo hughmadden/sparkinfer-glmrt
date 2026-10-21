@@ -102,10 +102,11 @@ def test_kda_split_bitwise(rows, decode, heads):
 @pytest.mark.parametrize("rows", [1, 16, 64, 4096])
 @pytest.mark.parametrize("heads", [48, 96])
 @pytest.mark.parametrize("kv_stride", [576, 640])
-def test_mla_producer_split_bitwise(rows, heads, kv_stride):
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+def test_mla_producer_split_bitwise(rows, heads, kv_stride, kv_cache):
     from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_mla_producer_aot
     from b12x.integration.cuteafd.kimi_split import compile_kimi_mla_rank_norm_aot, compile_kimi_mla_query_aot
-    g = KimiMlaGeometry(heads=heads)
+    g = KimiMlaGeometry(heads=heads, kv_cache=kv_cache)
     fused = compile_kimi_mla_producer_aot(g, max_rows=4096)
     norm = compile_kimi_mla_rank_norm_aot(g, max_rows=4096, kv_stride=kv_stride)
     query = compile_kimi_mla_query_aot(g, max_rows=4096)
@@ -113,7 +114,8 @@ def test_mla_producer_split_bitwise(rows, heads, kv_stride):
     uk, qn, kn = rand(heads, 512, 128), rand(1536, scale=1), rand(512, scale=1)
     slots = torch.arange(rows-1, -1, -1, dtype=torch.int64, device="cuda")
     slots[-1] = -1
-    cache = rand(max(rows, 1), 576)
+    cache = (torch.full((max(rows, 1), 656), 173, device="cuda", dtype=torch.uint8)
+             if kv_cache == "fp8" else rand(max(rows, 1), 576))
     cref = cache.clone()
     qa, ka = empty(rows, 1536), empty(rows, kv_stride)
     packed = empty(rows, 2112)

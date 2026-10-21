@@ -213,7 +213,8 @@ def compile_kimi_mla_rank_norm_aot(g=KimiMlaGeometry(), *, max_rows=64, kv_strid
         Operand("kv_a_norm", torch.bfloat16, "[512]"),
         Operand("kv_slots", torch.int64, "[rows]", align=8),
         Operand("q_resid", torch.bfloat16, "[rows,1536]", "out"),
-        Operand("kv_cache", torch.bfloat16, "[pages,64,576]", "inout"),
+        Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
+                "[pages,64,656]" if g.kv_cache == "fp8" else "[pages,64,576]", "inout"),
         Operand("scratch", torch.uint8, "[align(rows*2112*2)]", "scratch"))
     return compile_program(_MlaRankNorm(g, kv_stride), name="kimi_mla_rank_norm",
         operands=operands, scalars=(Scalar("rows"),), key=(g, max_rows, kv_stride),

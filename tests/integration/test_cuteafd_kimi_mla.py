@@ -95,6 +95,96 @@ def metrics(a, b):
     assert rel < 0.025 and cos > 0.9997
 
 
+@pytest.mark.parametrize("heads", [48, 96])
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+def test_mla_cache_geometry_and_abi_cpu(monkeypatch, heads, kv_cache):
+    from b12x.integration.cuteafd import kimi_mla as mla, kimi_split
+    monkeypatch.setattr(mla, "compile_program", lambda launch, **kw: (launch, kw))
+    monkeypatch.setattr(kimi_split, "compile_program", lambda launch, **kw: (launch, kw))
+    g = mla.KimiMlaGeometry(heads=heads, kv_cache=kv_cache)
+    record = 656 if kv_cache == "fp8" else 1152
+    dtype = torch.uint8 if kv_cache == "fp8" else torch.bfloat16
+    assert g.record_bytes == record
+    for compile_fn in (mla.compile_kimi_mla_producer_aot, kimi_split.compile_kimi_mla_rank_norm_aot):
+        _, abi = compile_fn(g, max_rows=64)
+        cache = next(v for v in abi["operands"] if v.name == "kv_cache")
+        assert cache.dtype == dtype
+        assert cache.shape == ("[pages,64,656]" if kv_cache == "fp8" else "[pages,64,576]")
+        assert abi["geometry"]["kv_cache"] == kv_cache
+    for mode in ("decode", "verify", "extend"):
+        kernel, abi = mla.compile_kimi_dense_mla_aot(g, max_rows=64, max_context=524288, mode=mode)
+        assert kernel.forward.ds_mla_record == (kv_cache == "fp8")
+        assert abi["geometry"]["max_context"] == 524288
+        assert next(v for v in abi["operands"] if v.name == "kv_cache").dtype == dtype
+
+
+def test_mla_compact_reference_scale_rounding_cpu():
+    from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
+    # Native GLM uses div.rn, not a CUDA scalar divide's reciprocal multiply.
+    maxima = torch.tensor([0.25390625, 0.0, 448.0, 1.0], dtype=torch.bfloat16)
+    latent = maxima.repeat_interleave(128)[None]
+    tail = torch.arange(64, dtype=torch.bfloat16)[None]
+    record = pack_mla_kv_cache_reference(latent, tail).squeeze(1)
+    scales = record[:, 512:528].contiguous().view(torch.float32)
+    expected = torch.tensor([[float(v) / 448.0 if v else 1.0 for v in maxima]])
+    assert torch.equal(scales.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(record[:, 528:], tail.view(torch.uint8))
+    # The observed value/scale is exactly 108, an E4M3 rounding midpoint.
+    # A one-ULP larger reciprocal-derived scale wrongly flips its code.
+    latent.fill_(3.0625)
+    latent[0, 0] = 0.73828125
+    record = pack_mla_kv_cache_reference(latent, tail).squeeze(1)
+    exact_scale = record[0, 512:516].contiguous().view(torch.float32)[0]
+    reciprocal_scale = torch.tensor(3.0625) * torch.tensor(1.0 / 448.0)
+    assert exact_scale == 0.0068359375 and reciprocal_scale > exact_scale
+    assert latent[0, 0].float() / exact_scale == 108
+    reciprocal_code = (latent[0, 0].float() / reciprocal_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    assert record[0, 0] == 110 and reciprocal_code == 109
+
+
+@pytest.mark.parametrize("heads", [48, 96])
+def test_fp8_rank_norm_record_matches_shared_glm_format(heads):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, _RankNormPack
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
+    programs = []
+    for fmt in ("bf16", "fp8"):
+        g = KimiMlaGeometry(heads=heads, kv_cache=fmt)
+        programs.append(compile_program(_RankNormPack(g), name="kimi_norm_record_probe", operands=(
+            Operand("qkv", torch.bfloat16, "[rows,2112]"),
+            Operand("qn", torch.bfloat16, "[1536]"), Operand("kn", torch.bfloat16, "[512]"),
+            Operand("slots", torch.int64, "[rows]", align=8),
+            Operand("qr", torch.bfloat16, "[rows,1536]", "out"),
+            Operand("cache", torch.uint8 if fmt == "fp8" else torch.bfloat16,
+                    "[slots,656]" if fmt == "fp8" else "[slots,576]", "inout")),
+            scalars=(Scalar("rows"),), key=(g,)))
+    torch.manual_seed(273)
+    rows = 16
+    qkv = torch.randn(rows, 2112, device="cuda", dtype=torch.bfloat16)
+    qkv[0].zero_()
+    qn = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+    kn = torch.randn(512, device="cuda", dtype=torch.bfloat16)
+    slots = torch.arange(rows - 1, -1, -1, device="cuda", dtype=torch.int64)
+    slots[-1] = -1
+    bf16 = torch.zeros(rows, 576, device="cuda", dtype=torch.bfloat16)
+    fp8 = torch.full((rows, 656), 173, device="cuda", dtype=torch.uint8)
+    residuals = [torch.empty(rows, 1536, device="cuda", dtype=torch.bfloat16) for _ in programs]
+    for p, cache, qr in zip(programs, (bf16, fp8), residuals):
+        p.launch(qkv, qn, kn, slots, qr, cache, scalars=(rows,))
+    assert torch.equal(residuals[0], residuals[1])
+    # CUDA scalar /448 can multiply by a rounded reciprocal. CPU packing
+    # retains GLM's div.rn scale contract, including quantization midpoints.
+    host = bf16.cpu()
+    expected = pack_mla_kv_cache_reference(host[:, :512], host[:, 512:]).squeeze(1).to(fp8.device)
+    mismatch = (fp8[1:] != expected[1:]).nonzero()
+    assert torch.equal(fp8[1:], expected[1:]), [
+        (int(r + 1), int(c), int(fp8[r + 1, c]), int(expected[r + 1, c]))
+        for r, c in mismatch[:32]]
+    assert (fp8[0] == 173).all(), "negative slots must not write a record"
+
+
 def test_official_norm_and_fp64_absorption_cpu():
     torch.set_num_threads(min(16, torch.get_num_threads()))
     model = module("cpu")
@@ -137,17 +227,18 @@ class History:
         return key, value
 
 
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
 @pytest.mark.parametrize("heads,rank", [(48, 0), (48, 1), (96, 0)])
 @pytest.mark.parametrize("mode,rows", [(mode, rows) for mode in ("decode", "verify", "extend")
                                      for rows in (1, 16, 64)] + [("extend", 4096)])
-def test_real_mla_gpu_and_graph_replay(heads, rank, mode, rows):
+def test_real_mla_gpu_and_graph_replay(heads, rank, mode, rows, kv_cache):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     from b12x.integration.cuteafd.kimi_mla import (KimiMlaGeometry, compile_kimi_mla_producer_aot,
         compile_kimi_dense_mla_aot, compile_kimi_mla_output_aot)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    g = KimiMlaGeometry(heads=heads)
+    g = KimiMlaGeometry(heads=heads, kv_cache=kv_cache)
     model = module("cuda", heads=heads, rank=rank)
     packed = {name: param.detach().bfloat16().contiguous() for name, param in model.named_parameters()}
     w = torch.cat((packed["q_a_proj.weight"], packed["kv_a_proj_with_mqa.weight"])).contiguous()
@@ -159,7 +250,9 @@ def test_real_mla_gpu_and_graph_replay(heads, rank, mode, rows):
     producer = compile_kimi_mla_producer_aot(g, max_rows=capacity)
     attention = compile_kimi_dense_mla_aot(g, max_rows=capacity, max_context=context, mode=mode)
     output = compile_kimi_mla_output_aot(g, max_rows=capacity)
-    cache = torch.full(((context + 63) // 64, 64, 576), float("nan"), dtype=torch.bfloat16, device="cuda")
+    cache = (torch.full(((context + 63) // 64, 64, 656), 173, dtype=torch.uint8, device="cuda")
+        if kv_cache == "fp8" else
+        torch.full(((context + 63) // 64, 64, 576), float("nan"), dtype=torch.bfloat16, device="cuda"))
     table = torch.arange(cache.shape[0] - 1, -1, -1, dtype=torch.int32, device="cuda")[None]
     def physical_slots(count, begin=0):
         logical = torch.arange(begin, begin + count, device="cuda")
@@ -200,7 +293,19 @@ def test_real_mla_gpu_and_graph_replay(heads, rank, mode, rows):
     torch.cuda.synchronize()
     with torch.no_grad():
         expected = model(live.float()[None], attention_mask=mask(rows, prefix + rows, "cuda", torch.float32), past_key_values=history)[0]
-    metrics(y, expected)
+    external_expected = expected
+    if kv_cache == "fp8":
+        from dataclasses import replace
+        from b12x.attention._shared.mla.reference import unpack_mla_kv_cache_reference
+        widened = unpack_mla_kv_cache_reference(cache.flatten(0, 1)).bfloat16().reshape(-1, 64, 576)
+        bf16_attention = compile_kimi_dense_mla_aot(replace(g, kv_cache="bf16"),
+            max_rows=capacity, max_context=context, mode=mode)
+        reference_a, reference_lse = torch.empty_like(a), torch.empty_like(lse)
+        bf16_attention.launch(q, widened, table, lengths, cu, reference_a, reference_lse, scratch[1],
+            scalars=(rows, 1, table.shape[1], splits))
+        assert torch.equal(a.view(torch.uint8), reference_a.view(torch.uint8))
+        assert torch.equal(lse.view(torch.uint8), reference_lse.view(torch.uint8))
+        print("compact reader equals BF16 reader of widened records byte-for-byte", flush=True)
     assert torch.isfinite(lse).all()
     baseline = [t.clone() for t in (y, q, cache, lse)]
     graph = torch.cuda.CUDAGraph()
@@ -223,22 +328,37 @@ def test_real_mla_gpu_and_graph_replay(heads, rank, mode, rows):
     producer.launch(live, slots, w, packed["q_a_layernorm.weight"], packed["kv_a_layernorm.weight"],
                     packed["q_b_proj.weight"], uk, cache, q, qr, scratch[0], scalars=(rows,))
     assert torch.equal(cache.view(torch.uint8), before.view(torch.uint8))
+    if kv_cache == "bf16":
+        metrics(y, external_expected)
+    else:
+        rel = float((y.float() - external_expected.float()).norm() / external_expected.float().norm())
+        cos = float(F.cosine_similarity(y.float().flatten(), external_expected.float().flatten(), dim=0))
+        print(f"FP8 storage delta relative_l2={rel:.8g} cosine={cos:.9g} (model fidelity gates)", flush=True)
 
 
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+@pytest.mark.parametrize("amplitude", [0.1, 8.0])
 @pytest.mark.parametrize("heads", [48, 96])
 @pytest.mark.parametrize("context", [64, 256])
-def test_ragged_mla_gpu_attention_and_merged_lse(heads, context):
+def test_ragged_mla_gpu_attention_and_merged_lse(heads, context, amplitude, kv_cache):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_dense_mla_aot
-    g = KimiMlaGeometry(heads=heads)
+    g = KimiMlaGeometry(heads=heads, kv_cache=kv_cache)
     program = compile_kimi_dense_mla_aot(g, max_rows=16, max_context=context, mode="verify")
     counts = [1, 3, 12]
     lengths = [17, 33, 63] if context == 64 else [65, 129, 200]
     width = (context + 63) // 64
     gen = torch.Generator(device="cuda").manual_seed(3273)
     cache = (torch.randn(3 * width, 64, 576, generator=gen, device="cuda") * 0.1).bfloat16()
-    q = (torch.randn(sum(counts), heads, 576, generator=gen, device="cuda") * 0.1).bfloat16()
+    if kv_cache == "fp8":
+        from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference, unpack_mla_kv_cache_reference
+        packed = pack_mla_kv_cache_reference(cache.flatten(0, 1)[:, :512], cache.flatten(0, 1)[:, 512:])
+        oracle_cache = unpack_mla_kv_cache_reference(packed).bfloat16().reshape_as(cache)
+        cache = packed.reshape(3 * width, 64, 656)
+    else:
+        oracle_cache = cache
+    q = (torch.randn(sum(counts), heads, 576, generator=gen, device="cuda") * amplitude).bfloat16()
     # Each request's physical pages are interleaved, with reversed allocation.
     table = torch.arange(3 * width - 1, -1, -1, dtype=torch.int32, device="cuda").reshape(width, 3).T.contiguous()
     offsets = [0, 1, 4, 16]
@@ -251,7 +371,7 @@ def test_ragged_mla_gpu_attention_and_merged_lse(heads, context):
                    scalars=(16, 3, width, program.geometry["num_splits"]))
     for request, (count, length) in enumerate(zip(counts, lengths)):
         query = q[offsets[request]:offsets[request + 1]].float()
-        records = cache[table[request].long()].flatten(0, 1)[:length].float()
+        records = oracle_cache[table[request].long()].flatten(0, 1)[:length].float()
         scores = torch.einsum("thd,sd->hts", query, records) * g.softmax_scale
         scores += mask(count, length, "cuda", torch.float32)[0]
         expected_lse = scores.logsumexp(-1).T

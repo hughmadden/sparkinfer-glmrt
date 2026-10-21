@@ -1,15 +1,18 @@
-"""Dense page-table traversal and asynchronous K3 record staging."""
+"""Dense page-table traversal and BF16/compact-MLA record staging."""
 
 from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64
+from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
     cp_async_bulk_g2s_mbar,
+    cvt_e4m3x4_to_f32x4,
     get_ptr_as_int64,
+    pack_f32x2_to_bfloat2,
     shared_ptr_to_u32,
+    st_shared_u32,
 )
 
 
@@ -80,4 +83,40 @@ def issue_dense_page_gather(
         entry += Int32(io_threads)
 
 
-__all__ = ["issue_dense_page_gather"]
+@cute.jit
+def issue_ds_mla_page_gather(
+    cache_bytes: cute.Tensor, page_table: cute.Tensor, kv_dst_addr: Int32,
+    full_mbar_ptr, request: Int32, token_begin: Int32, token_end: Int32,
+    io_lane: Int32, page_stride_bytes: Int64, record_stride_bytes_global: Int64,
+    page_table_stride: Int64, *, page_size: cutlass.Constexpr,
+    record_stride_bytes: cutlass.Constexpr, candidates_per_chunk: cutlass.Constexpr,
+):
+    """Read GLM's 656-byte record directly into the existing BF16 math tile.
+
+    Only the current shared-memory window is widened; no global BF16 cache or
+    query conversion is needed. Every producer lane publishes its own stores.
+    """
+    for entry in cutlass.range(candidates_per_chunk, unroll=1):
+        token = token_begin + Int32(entry)
+        if token >= token_end:
+            token = Int32(0)
+        page = token // Int32(page_size)
+        physical = Int32(page_table[request.to(Int64) * page_table_stride + page.to(Int64)])
+        source = get_ptr_as_int64(cache_bytes, physical.to(Int64) * page_stride_bytes
+            + (token - page * Int32(page_size)).to(Int64) * record_stride_bytes_global)
+        words = cute.make_ptr(Uint32, source, cute.AddressSpace.gmem, assumed_align=4)
+        scales = cute.make_ptr(Float32, source + Int64(512), cute.AddressSpace.gmem, assumed_align=4)
+        destination = kv_dst_addr + Int32(entry) * Int32(record_stride_bytes)
+        for j in cutlass.range_constexpr(4):
+            group = Int32(j)
+            packed = words[group * Int32(32) + io_lane]
+            a, b, c, d = cvt_e4m3x4_to_f32x4(packed)
+            scale = Float32(scales[group])
+            offset = destination + (group * Int32(128) + io_lane * Int32(4)) * Int32(2)
+            st_shared_u32(offset, pack_f32x2_to_bfloat2(a * scale, b * scale))
+            st_shared_u32(offset + Int32(4), pack_f32x2_to_bfloat2(c * scale, d * scale))
+        st_shared_u32(destination + Int32(1024) + io_lane * Int32(4), words[Int32(132) + io_lane])
+    cute.arch.mbarrier_arrive(full_mbar_ptr)
+
+
+__all__ = ["issue_dense_page_gather", "issue_ds_mla_page_gather"]
