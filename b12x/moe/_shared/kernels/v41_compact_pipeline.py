@@ -13,11 +13,12 @@ from b12x.moe._shared.kernels.w4a8_compact_micro import _DirectW4A8CompactLaunch
 
 
 class V41CompactPipeline:
-    def __init__(self, capacity, *, kernel_intermediate=1152):
+    def __init__(self, capacity, *, kernel_intermediate=1152, scale_codes=False, scale_columns=None):
         self.compact = _DirectW4A8CompactLaunch(
             max_tokens=capacity, num_topk=6, k=5120, n=kernel_intermediate, experts=384,
             input_scale_count=384, down_scale_count=384, swiglu_limit=10,
-            fast_math=False, native_v41=True, wire_rows=True, unit_scales=True)
+            fast_math=False, native_v41=True, wire_rows=True, unit_scales=True,
+            scale_codes=scale_codes, scale_columns=scale_columns)
 
     @cute.jit
     def __call__(
@@ -48,14 +49,16 @@ class V41HybridPipeline:
     in the FP32 slice partial arena. Neither path retains state between calls.
     """
 
-    def __init__(self, capacity, width, *, intermediate, cutoff, exact_storage=False):
+    def __init__(self, capacity, width, *, intermediate, cutoff, exact_storage=False, scale_codes=False):
         from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
         if intermediate not in (576, 1152) or not 1 <= cutoff <= capacity:
             raise ValueError("invalid native hybrid geometry or cutoff")
         self.cutoff = int(cutoff)
         self.compact = V41CompactPipeline(capacity,
-            kernel_intermediate=intermediate if exact_storage else (intermediate + 127) // 128 * 128)
-        self.grouped = V41SlicePipeline(capacity, width, intermediate=intermediate, exact_storage=exact_storage)
+            kernel_intermediate=intermediate if exact_storage else (intermediate + 127) // 128 * 128,
+            scale_codes=scale_codes, scale_columns=intermediate // 32)
+        self.grouped = V41SlicePipeline(capacity, width, intermediate=intermediate,
+            exact_storage=exact_storage, scale_codes=scale_codes)
 
     @cute.jit
     def __call__(

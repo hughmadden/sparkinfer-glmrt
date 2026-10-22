@@ -87,8 +87,14 @@ def test_v4_checkpoint_scale_code_span_survey(environment):
     _scan_scale_code_spans(Path(path))
 
 
-@pytest.mark.parametrize("prefix,intermediate", [("layers.3.ffn.experts.0", 384), ("layers.3.ffn.experts.0", 576), ("mtp.0.ffn.experts.0", 2304)])
-def test_real_weights_scale_code_gemm_bitwise(prefix, intermediate):
+@pytest.mark.parametrize("prefix,intermediate,compact", [
+    ("layers.3.ffn.experts.0", 384, False),
+    ("layers.3.ffn.experts.0", 576, False),
+    ("mtp.0.ffn.experts.0", 2304, False),
+    ("layers.3.ffn.experts.0", 576, True),
+    ("layers.3.ffn.experts.0", 1152, True),
+])
+def test_real_weights_scale_code_gemm_bitwise(prefix, intermediate, compact):
     snapshot = _snapshot()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("Blackwell GPU required")
@@ -132,7 +138,26 @@ def test_real_weights_scale_code_gemm_bitwise(prefix, intermediate):
     metadata = torch.full((6, 19), -1, dtype=torch.int32, device="cuda")
     outputs = [torch.empty(((intermediate + width - 1)//width, capacity, hidden), device="cuda") for _ in range(2)]
     compiled, arguments = [], []
-    for coded, scale_pair, output in zip((False, True), (raw, compressed), outputs):
+    if compact:
+        from b12x.moe._shared.kernels.w4a8_compact_micro import _DirectW4A8CompactLaunch
+        ids = torch.zeros(capacity, dtype=torch.int32, device="cuda")
+        ones = torch.ones(1, device="cuda")
+        outputs = [torch.empty((capacity, hidden), device="cuda") for _ in range(2)]
+        intermediates = [torch.empty(capacity * (stored + (stored // 128) * 4) // 4,
+                                    device="cuda", dtype=torch.uint32) for _ in range(2)]
+        projections = [torch.empty((capacity, 2 * stored), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+        for coded, scale_pair, output, mid, projected in zip((False, True), (raw, compressed), outputs, intermediates, projections):
+            tensors = [qa.view(torch.uint8).flatten(), qs.flatten(), payload[0].view(torch.uint32).flatten(),
+                       scale_pair[0].view(torch.uint32).flatten(), mid, projected, routing, ids, ones, ones,
+                       payload[1].view(torch.uint32).flatten(), scale_pair[1].view(torch.uint32).flatten(), output, ones, ones]
+            args = [from_dlpack(t, assumed_align=16).iterator for t in tensors]
+            kernel = _DirectW4A8CompactLaunch(max_tokens=capacity, num_topk=1, k=hidden, n=stored,
+                experts=1, input_scale_count=1, down_scale_count=1, swiglu_limit=10,
+                fast_math=False, native_v41=True, unit_scales=True, scale_codes=coded,
+                scale_columns=intermediate // 32)
+            compiled.append(cute.compile(kernel, *args, cutlass.Int32(capacity), cutlass.Int32(1), current_cuda_stream()))
+            arguments.append(args)
+    for coded, scale_pair, output in zip((False, True), (raw, compressed), outputs) if not compact else ():
         operands = [qa, qs, payload[0], scale_pair[0], payload[1], scale_pair[1], routing, output]
         args = [from_dlpack(t.view(torch.uint32).flatten() if i in (2, 3, 4, 5) else t, assumed_align=16)
                 for i, t in enumerate(operands)]
@@ -148,20 +173,26 @@ def test_real_weights_scale_code_gemm_bitwise(prefix, intermediate):
             metadata[group, :3] = torch.tensor((0, count, group*16), device="cuda")
             metadata[group, 3:3+count] = torch.arange(group*16, group*16+count, device="cuda")
         graphs = []
-        for launch, (args, meta) in zip(compiled, arguments):
-            launch(*args, rows, current_cuda_stream(), meta, groups)
+        for launch, arguments_for_arm in zip(compiled, arguments):
+            if compact:
+                launch_args = (*arguments_for_arm, rows, 1, current_cuda_stream())
+            else:
+                args, meta = arguments_for_arm
+                launch_args = (*args, rows, current_cuda_stream(), meta, groups)
+            launch(*launch_args)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                launch(*args, rows, current_cuda_stream(), meta, groups)
+                launch(*launch_args)
             graphs.append(graph)
         allocated = torch.cuda.memory_allocated()
         for graph in graphs:
             graph.replay()
         torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() == allocated
-        assert torch.isfinite(outputs[0][:, :rows]).all()
-        assert torch.count_nonzero(outputs[0][:, :rows]) > 0
-        assert torch.equal(outputs[0][:, :rows].view(torch.uint8), outputs[1][:, :rows].view(torch.uint8)), (prefix, intermediate, rows)
-        print(json.dumps({"prefix": prefix, "intermediate": intermediate, "rows": rows, "byte_identical": True,
+        selected = [output[:rows] if compact else output[:, :rows] for output in outputs]
+        assert torch.isfinite(selected[0]).all()
+        assert torch.count_nonzero(selected[0]) > 0
+        assert torch.equal(selected[0].view(torch.uint8), selected[1].view(torch.uint8)), (prefix, intermediate, compact, rows)
+        print(json.dumps({"prefix": prefix, "intermediate": intermediate, "compact": compact, "rows": rows, "byte_identical": True,
                           "raw_scale_bytes": sum(t.numel()*t.element_size() for t in raw),
                           "code_scale_bytes": sum(t.numel() for t in compressed)}), flush=True)
