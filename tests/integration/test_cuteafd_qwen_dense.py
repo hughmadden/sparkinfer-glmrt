@@ -20,6 +20,37 @@ def test_dense_geometry_has_no_fabricated_moe_or_hc():
     assert g.hc_width == 10240 and g.sparse_topk == 2112
 
 
+@pytest.mark.parametrize("head,v_head", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("kv8", [None, "e4m3", "s8"])
+@pytest.mark.parametrize("tokens", [1, 4, 16])
+def test_shared_compact_wide_tile_preserves_narrow_and_bf16_geometry(head, v_head, kv8, tokens):
+    from b12x.integration.cuteafd._mimo_kernels import MimoGqaAttention
+    attention = MimoGqaAttention(heads=16, kv_heads=4, tokens=tokens, window=0,
+        paged=True, sink=False, direct=False, softmax_scale=head ** -0.5,
+        head=head, v_head=v_head, kv8=kv8, kv_group=0)
+    original_warps = (tokens * 4 + 15) // 16
+    wide_compact = kv8 is not None and head >= 256 and v_head >= 256
+    expected_warps = max(2, 1 << (original_warps - 1).bit_length()) if wide_compact else original_warps
+    assert attention.tile_n == (32 if wide_compact and tokens == 1 else 64)
+    assert attention.qk_warps == expected_warps
+    assert attention.tile_m == 16 * expected_warps
+    assert attention.threads == 128 * expected_warps
+
+
+@pytest.mark.parametrize("heads", [16, 24])
+@pytest.mark.parametrize("max_rows", [8, 64, 4096])
+@pytest.mark.parametrize("kv_format", ["bf16", "fp8"])
+def test_dense_full_attention_query_reuse_geometry(heads, max_rows, kv_format):
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import _FullAttention
+    attention = _FullAttention(QwenDenseGeometry(heads=heads), 32, kv_format, max_rows=max_rows).attn
+    prefill = kv_format == "fp8" and max_rows > 64
+    assert attention.tokens == ((8 if heads == 16 else 4) if prefill else 1)
+    assert attention.tile_n == (32 if kv_format == "fp8" and not prefill else 64)
+    expected_groups = 2 if kv_format == "fp8" else 1
+    assert attention.qk_warps == expected_groups
+
+
 @pytest.mark.parametrize("hidden", [4096, 5120])
 def test_dense_norm_and_residual(hidden):
     require_b12x()
@@ -150,12 +181,13 @@ def test_dense_gdn_native_norm_and_silu(hidden, heads, values, norm_dtype, rows)
 
 
 @pytest.mark.parametrize("heads", [16, 24])
-def test_dense_producer(heads):
+@pytest.mark.parametrize("kv_format", ["bf16", "fp8"])
+def test_dense_producer(heads, kv_format):
     require_b12x()
     from b12x.integration.cuteafd._common import QwenDenseGeometry
     from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_producer_aot
     g = QwenDenseGeometry(heads=heads)
-    program = compile_qwen_dense_producer_aot(g, max_rows=64)
+    program = compile_qwen_dense_producer_aot(g, max_rows=64, kv_format=kv_format)
     x = torch.randn(3, g.hidden, device="cuda", dtype=torch.bfloat16) * 0.1
     weight = torch.randn(g.attn_in_width, g.hidden, device="cuda", dtype=torch.bfloat16) * 0.01
     qw = (0.1 * torch.randn(256, device="cuda")).bfloat16()
@@ -166,6 +198,24 @@ def test_dense_producer(heads):
     query = torch.empty(3, heads, 256, device="cuda", dtype=torch.bfloat16)
     gate = torch.empty_like(query)
     scratch = torch.empty(program.scratch_bytes(64)["scratch"], device="cuda", dtype=torch.uint8)
+    if kv_format == "fp8":
+        from .test_cuteafd_qwen4_fp8_kv import _pack
+        reference = compile_qwen_dense_producer_aot(g, max_rows=64, kv_format="bf16")
+        bf16 = torch.full((4, 2, g.kv_heads, 256), 123, device="cuda", dtype=torch.bfloat16)
+        reference.launch(x, weight, qw, kw, positions, slots, bf16, query, gate, scratch, scalars=[3])
+        expected, _ = _pack(bf16[[0, 2]])
+        record_bytes = g.kv_record_bytes(kv_format)
+        packed = torch.full((4, record_bytes), 123, device="cuda", dtype=torch.uint8)
+        program.launch(x, weight, qw, kw, positions, slots, packed, query, gate, scratch, scalars=[3])
+        assert torch.equal(packed[[0, 2]], expected)
+        assert torch.all(packed[[1, 3]] == 123)
+        high_slot = (1 << 31) // record_bytes + 1
+        high = torch.empty((high_slot + 4, record_bytes), device="cuda", dtype=torch.uint8)
+        high[high_slot:].fill_(123)
+        high_slots = torch.tensor([high_slot, high_slot + 2, -1], device="cuda", dtype=torch.int64)
+        program.launch(x, weight, qw, kw, positions, high_slots, high, query, gate, scratch, scalars=[3])
+        assert torch.equal(high[high_slot:], packed)
+        return
     program.launch(x, weight, qw, kw, positions, slots, cache, query, gate, scratch, scalars=[3])
     projected = torch.nn.functional.linear(x, weight)
     qg = projected[:, :2 * heads * 256].reshape(3, heads, 512)
@@ -313,3 +363,146 @@ def test_dense_full_gqa_is_unrestricted_and_causal(heads):
     assert torch.equal(out[[0, 2]], baseline[[0, 2]])
     assert torch.equal(out[1], torch.zeros_like(out[1]))
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("heads", [16, 24])
+@pytest.mark.parametrize("amplitude", [0.1, 8.0])
+@pytest.mark.parametrize("start", [1, 63, 65])
+def test_dense_compact_prefill_query_reuse(heads, amplitude, start, monkeypatch):
+    require_b12x()
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_full_gqa_aot
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from .test_cuteafd_qwen4_fp8_kv import _pack
+    import b12x.integration.cuteafd.qwen_dense as dense
+    g = QwenDenseGeometry(heads=heads)
+    compact = compile_qwen_dense_full_gqa_aot(g, max_rows=4096, max_splits=4, kv_format="fp8")
+    shared_attention = dense.MimoGqaAttention
+
+    def reference_attention(**kwargs):
+        attention = shared_attention(**{**kwargs, "tokens": 8 if heads == 16 else 4, "kv8": "e4m3"})
+        attention.kv8, attention.kv_fp8 = None, False
+        attention.record_bytes = attention.record * 2
+        return attention
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dense, "MimoGqaAttention", reference_attention)
+        reference = compile_qwen_dense_full_gqa_aot(g, max_rows=4096, max_splits=4)
+    torch.manual_seed(595)
+    rows, pages = 19, 5
+    kv = torch.randn(pages * 64, 2, g.kv_heads, g.head_dim, device="cuda").bfloat16()
+    packed, scales = _pack(kv)
+    payload_bytes = 2 * g.kv_heads * g.head_dim
+    decoded = (packed[:, :payload_bytes].contiguous().view(torch.float8_e4m3fn).float().reshape_as(kv)
+               * scales).bfloat16()
+    query = (torch.randn(rows, heads, g.head_dim, device="cuda") * amplitude).bfloat16()
+    positions = torch.arange(start, start + rows, device="cuda", dtype=torch.int64)
+    table = torch.arange(pages - 1, -1, -1, device="cuda", dtype=torch.int32)
+    output_guard = torch.full((rows + 8, heads, g.head_dim), 123, device="cuda", dtype=torch.bfloat16)
+    out, expected = output_guard[:rows], torch.empty_like(query)
+    scratch_bytes = compact.scratch_bytes(rows)["scratch"]
+    scratch_guard = torch.full((scratch_bytes + 4096,), 165, device="cuda", dtype=torch.uint8)
+    scratch = scratch_guard[:scratch_bytes]
+    for splits in (1, 4):
+        reference.launch(query, decoded, positions, table, expected, scratch, scalars=[rows, 0, splits])
+        compact.launch(query, packed, positions, table, out, scratch, scalars=[rows, 0, splits])
+        assert torch.equal(out, expected)
+        assert torch.isfinite(out).all() and torch.count_nonzero(out) > 0
+        assert torch.all(output_guard[rows:] == 123)
+        assert torch.all(scratch_guard[scratch_bytes:] == 165)
+        for row, position in enumerate(positions.tolist()):
+            indices = table[(torch.arange(position + 1, device="cuda") // 64)].long() * 64
+            indices += torch.arange(position + 1, device="cuda") % 64
+            k, v = decoded[indices].unbind(1)
+            k = k.repeat_interleave(heads // g.kv_heads, 1).transpose(0, 1).float()
+            v = v.repeat_interleave(heads // g.kv_heads, 1).transpose(0, 1).float()
+            scores = (query[row].float()[:, None] * k).sum(-1) * g.softmax_scale
+            if amplitude > 1:
+                assert (scores.max(-1).values - scores.min(-1).values).max() > 5
+            oracle = (scores.softmax(-1)[..., None] * v).sum(1)
+            assert (out[row].float() - oracle).norm() / oracle.norm().clamp_min(1e-8) < 0.01
+    with kernel_resolution_guard("dense compact multi-query prefill"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compact.launch(query, packed, positions, table, out, scratch, scalars=[rows, 0, 4])
+        graph.replay()
+        compact.launch(query, packed, positions, table, out, scratch, scalars=[1, 0, 1])
+        graph.replay()
+    assert torch.equal(out, expected)
+    # A later tile's future keys cannot affect earlier queries, even inside a CTA.
+    before = out[:8].clone()
+    future = torch.arange(start + 8, pages * 64, device="cuda")
+    slots = table[future // 64].long() * 64 + future % 64
+    kv[slots] = 100
+    poisoned, _ = _pack(kv)
+    compact.launch(query, poisoned, positions, table, out, scratch, scalars=[rows, 0, 4])
+    assert torch.equal(out[:8], before)
+
+
+@pytest.mark.parametrize("heads", [16, 24])
+@pytest.mark.parametrize("amplitude", [0.1, 8.0])
+def test_dense_compact_paged_reader_matches_dequantized_bf16(heads, amplitude, monkeypatch):
+    require_b12x()
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_full_gqa_aot
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from .test_cuteafd_qwen4_fp8_kv import _pack
+    g = QwenDenseGeometry(heads=heads)
+    compact = compile_qwen_dense_full_gqa_aot(g, max_rows=64, max_splits=4, kv_format="fp8")
+    # Keep the dequantized oracle's reduction geometry identical: compact
+    # storage changes the key tile, not the expected reconstructed values.
+    import b12x.integration.cuteafd.qwen_dense as dense
+    shared_attention = dense.MimoGqaAttention
+
+    def reference_attention(**kwargs):
+        attention = shared_attention(**kwargs)
+        attention.tile_n = min(attention.tile_n, 32)
+        attention.qk_warps = max(attention.qk_warps, 2)
+        attention.tile_m = 16 * attention.qk_warps
+        attention.pv_warps = 4 * attention.qk_warps
+        attention.threads = 32 * attention.pv_warps
+        attention.k_iters = attention.tile_n * attention.head // attention.chunk // attention.threads
+        attention.v_iters = attention.tile_n * attention.v_head // attention.chunk // attention.threads
+        return attention
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dense, "MimoGqaAttention", reference_attention)
+        reference = compile_qwen_dense_full_gqa_aot(g, max_rows=64, max_splits=4, kv_format="bf16")
+    torch.manual_seed(595)
+    rows, pages = 8, 35
+    kv = torch.randn(pages * 64, 2, g.kv_heads, g.head_dim, device="cuda").bfloat16()
+    kv[0].zero_()
+    cache, scales = _pack(kv)
+    payload_bytes = 2 * g.kv_heads * g.head_dim
+    decoded = (cache[:, :payload_bytes].contiguous().view(torch.float8_e4m3fn).float().reshape_as(kv)
+               * scales).bfloat16()
+    query = (torch.randn(rows, heads, 256, device="cuda") * amplitude).bfloat16()
+    positions = torch.tensor([0, 63, 64, 65, 127, 128, 2113, -1], device="cuda", dtype=torch.int64)
+    query[-1].fill_(float("nan"))
+    table = torch.arange(pages - 1, -1, -1, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    table[-1].fill_(-1)
+    out, expected = torch.empty_like(query), torch.empty_like(query)
+    scratch = torch.empty(compact.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
+    assert compact.scratch_bytes(rows) == reference.scratch_bytes(rows)
+    for splits in (1, 4):
+        reference.launch(query, decoded, positions, table, expected, scratch, scalars=[rows, pages, splits])
+        compact.launch(query, cache, positions, table, out, scratch, scalars=[rows, pages, splits])
+        assert torch.equal(out, expected)
+        assert torch.isfinite(out).all() and torch.count_nonzero(out[:-1]) > 0
+        assert torch.equal(out[-1], torch.zeros_like(out[-1]))
+    with kernel_resolution_guard("dense compact paged GQA"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compact.launch(query, cache, positions, table, out, scratch, scalars=[rows, pages, 4])
+        graph.replay()
+        compact.launch(query, cache, positions, table, out, scratch, scalars=[1, pages, 1])
+        graph.replay()
+    assert torch.equal(out, expected)
+    high_page = (1 << 31) // (64 * g.kv_record_bytes("fp8")) + 1
+    high = torch.empty(((high_page + pages) * 64, g.kv_record_bytes("fp8")),
+                       device="cuda", dtype=torch.uint8)
+    high[high_page * 64:].copy_(cache)
+    high_table = table + high_page
+    high_table[-1].fill_(-1)
+    compact.launch(query, high, positions, high_table, out, scratch, scalars=[rows, pages, 4])
+    assert torch.equal(out, expected)
