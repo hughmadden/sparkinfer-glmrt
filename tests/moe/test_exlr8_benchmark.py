@@ -89,6 +89,28 @@ def test_grouped_arm_materialization_uses_git_revision(monkeypatch, tmp_path):
     assert all(call[1].startswith('b' * 40 + ':') for call in calls[1:])
 
 
+def test_default_grouped_half_partials_report_real_error():
+    expected = torch.full((2, 128), 1e-7, dtype=torch.bfloat16)
+    actual = (expected.float() + 2.0 ** -27).bfloat16()
+    weights = torch.ones((2, 2)) / 2
+    metrics = bench.grouped_error(actual, expected, weights, half_partials=True)
+    assert not metrics["bitwise_equal"]
+    assert metrics["relative_l2"] > 0.01
+    assert metrics["max_abs"] == float((actual.float() - expected.float()).abs().max())
+    with pytest.raises(RuntimeError, match="differs from snapshot chunked K1"):
+        bench.grouped_error(actual, expected, weights, half_partials=False)
+    exact = bench.grouped_error(expected, expected, weights, half_partials=False)
+    assert exact["bitwise_equal"] and exact["relative_l2"] == exact["max_abs"] == 0
+
+
+@pytest.mark.parametrize("value", [1.0, float("nan"), float("inf")])
+def test_default_grouped_half_partials_reject_bad_output(value):
+    expected = torch.full((2, 128), 1e-7, dtype=torch.bfloat16)
+    actual = torch.full_like(expected, value)
+    with pytest.raises(RuntimeError, match="differs from snapshot chunked K1"):
+        bench.grouped_error(actual, expected, torch.ones((2, 2)) / 2, half_partials=True)
+
+
 def test_stage_needles_cover_every_step_kernel():
     assert set(bench.STAGES) == {"ingress", "fc1", "activation", "fc2", "egress"}
 

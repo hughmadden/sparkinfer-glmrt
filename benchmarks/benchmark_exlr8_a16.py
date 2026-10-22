@@ -415,6 +415,35 @@ def comparison_route_ids(rows, generator):
                         for _ in range(rows)])
 
 
+def grouped_error(actual, expected, weights, *, half_partials):
+    """Check default-route fidelity without claiming FP16 partials are exact."""
+    exact = torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    reference = expected.float()
+    difference = actual.float() - reference
+    error = torch.linalg.vector_norm(difference)
+    reference_norm = torch.linalg.vector_norm(reference)
+    row_relative = (torch.linalg.vector_norm(difference, dim=1)
+                    / torch.linalg.vector_norm(reference, dim=1).clamp_min(1e-30))
+    metrics = dict(bitwise_equal=exact,
+        relative_l2=float(error / reference_norm.clamp_min(1e-30)),
+        max_row_relative_l2=float(row_relative.max()),
+        mean_row_relative_l2=float(row_relative.mean()),
+        max_abs=float(difference.abs().max()))
+    if half_partials:
+        # Match the serving fixture: a 1% normal-range guard plus half an
+        # FP16 subnormal ULP per route element; H128 preserves the L2 norm.
+        subnormal_row = (2.0 ** -25 * actual.shape[-1] ** 0.5
+                         * weights.float().abs().sum(-1))
+        bound = 0.01 * reference_norm + torch.linalg.vector_norm(subnormal_row)
+        metrics["l2_bound"] = float(bound)
+        valid = bool(torch.isfinite(actual).all() and error <= bound)
+    else:
+        valid = exact and bool(torch.isfinite(actual).all())
+    if not valid:
+        raise RuntimeError(f"grouped result differs from snapshot chunked K1: {metrics}")
+    return metrics
+
+
 SERVING_LANES = 3        # CUTEAFD_GLM_PREFILL_LANES default (cuteafd glm5/engine.rs)
 SERVING_LANE_ROWS = 4096  # GLM prefill rows per lane; a chunk is lanes x this
 SERVING_PAGE_ROWS = 64
@@ -1079,9 +1108,9 @@ def grouped_main(args):
 
         chunked(); candidate(); baseline(); mixed()
         torch.cuda.synchronize()
-        if not torch.equal(chunk_response.view(torch.int16),state["output"][:total].view(torch.int16)):
-            n = int((chunk_response.view(torch.int16) != state["output"][:total].view(torch.int16)).sum())
-            raise RuntimeError(f"grouped result differs from snapshot chunked K1: {n} BF16 words")
+        from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+        default_error = grouped_error(state["output"][:total], chunk_response, weights,
+                                      half_partials=Exlr8GroupedKernel.FC2_HALF)
         finite_nonzero(state["output"][:total].float(), "grouped EXLR8")
         finite_nonzero(uniform_states[-1][1].output[:total].float(), "uniform grouped EXL3")
         if mixed_states:
@@ -1220,7 +1249,8 @@ def grouped_main(args):
                    cta96_arm_stages=cta96_arm_stages,
                    exchange_cta96_stages=exch_cta96_stages,
                    exchange_cta96_arm_stages=exch_cta96_arm_stages,
-                   groups=int(state["count"].item()), bitwise_equal=True, arm_errors=errors,
+                   groups=int(state["count"].item()), bitwise_equal=default_error["bitwise_equal"],
+                   grouped_error=default_error, arm_errors=errors,
                    uniform_route_block=uniform_states[0][-1] if owned is None else 64,
                    uniform_input_conversion=("fp8_k32_to_bf16_included" if owned is None
                                              else "serving_ws_direct_fp8_k32"),
