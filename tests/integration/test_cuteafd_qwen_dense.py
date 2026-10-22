@@ -20,6 +20,23 @@ def test_dense_geometry_has_no_fabricated_moe_or_hc():
     assert g.hc_width == 10240 and g.sparse_topk == 2112
 
 
+@pytest.mark.parametrize("head,v_head", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("kv8", [None, "e4m3", "s8"])
+@pytest.mark.parametrize("tokens", [1, 4, 16])
+def test_shared_compact_wide_tile_preserves_narrow_and_bf16_geometry(head, v_head, kv8, tokens):
+    from b12x.integration.cuteafd._mimo_kernels import MimoGqaAttention
+    attention = MimoGqaAttention(heads=16, kv_heads=4, tokens=tokens, window=0,
+        paged=True, sink=False, direct=False, softmax_scale=head ** -0.5,
+        head=head, v_head=v_head, kv8=kv8, kv_group=0)
+    original_warps = (tokens * 4 + 15) // 16
+    wide_compact = kv8 is not None and head >= 256 and v_head >= 256
+    expected_warps = max(original_warps, 2) if wide_compact else original_warps
+    assert attention.tile_n == (32 if wide_compact else 64)
+    assert attention.qk_warps == expected_warps
+    assert attention.tile_m == 16 * expected_warps
+    assert attention.threads == 128 * expected_warps
+
+
 @pytest.mark.parametrize("hidden", [4096, 5120])
 def test_dense_norm_and_residual(hidden):
     require_b12x()
