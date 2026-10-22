@@ -29,12 +29,26 @@ def test_shared_compact_wide_tile_preserves_narrow_and_bf16_geometry(head, v_hea
         paged=True, sink=False, direct=False, softmax_scale=head ** -0.5,
         head=head, v_head=v_head, kv8=kv8, kv_group=0)
     original_warps = (tokens * 4 + 15) // 16
-    wide_compact = kv8 is not None and head >= 256 and v_head >= 256
+    wide_compact = kv8 is not None and head >= 256 and v_head >= 256 and tokens * 4 < 32
     expected_warps = max(original_warps, 2) if wide_compact else original_warps
     assert attention.tile_n == (32 if wide_compact else 64)
     assert attention.qk_warps == expected_warps
     assert attention.tile_m == 16 * expected_warps
     assert attention.threads == 128 * expected_warps
+
+
+@pytest.mark.parametrize("heads", [16, 24])
+@pytest.mark.parametrize("max_rows", [8, 64, 4096])
+@pytest.mark.parametrize("kv_format", ["bf16", "fp8"])
+def test_dense_full_attention_query_reuse_geometry(heads, max_rows, kv_format):
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import _FullAttention
+    attention = _FullAttention(QwenDenseGeometry(heads=heads), 32, kv_format, max_rows=max_rows).attn
+    prefill = kv_format == "fp8" and max_rows > 64
+    assert attention.tokens == (8 if prefill else 1)
+    assert attention.tile_n == (32 if kv_format == "fp8" and not prefill else 64)
+    expected_groups = (heads * 2 + 15) // 16 if prefill else (2 if kv_format == "fp8" else 1)
+    assert attention.qk_warps == expected_groups
 
 
 @pytest.mark.parametrize("hidden", [4096, 5120])
@@ -349,6 +363,72 @@ def test_dense_full_gqa_is_unrestricted_and_causal(heads):
     assert torch.equal(out[[0, 2]], baseline[[0, 2]])
     assert torch.equal(out[1], torch.zeros_like(out[1]))
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("heads", [16, 24])
+@pytest.mark.parametrize("amplitude", [0.1, 8.0])
+@pytest.mark.parametrize("start", [1, 63, 65])
+def test_dense_compact_prefill_query_reuse(heads, amplitude, start, monkeypatch):
+    require_b12x()
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_full_gqa_aot
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from .test_cuteafd_qwen4_fp8_kv import _pack
+    import b12x.integration.cuteafd.qwen_dense as dense
+    g = QwenDenseGeometry(heads=heads)
+    compact = compile_qwen_dense_full_gqa_aot(g, max_rows=4096, max_splits=4, kv_format="fp8")
+    shared_attention = dense.MimoGqaAttention
+
+    def reference_attention(**kwargs):
+        return shared_attention(**{**kwargs, "tokens": 8})
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dense, "MimoGqaAttention", reference_attention)
+        reference = compile_qwen_dense_full_gqa_aot(g, max_rows=4096, max_splits=4)
+    torch.manual_seed(595)
+    rows, pages = 19, 5
+    kv = torch.randn(pages * 64, 2, g.kv_heads, g.head_dim, device="cuda").bfloat16()
+    packed, scales = _pack(kv)
+    payload_bytes = 2 * g.kv_heads * g.head_dim
+    decoded = (packed[:, :payload_bytes].contiguous().view(torch.float8_e4m3fn).float().reshape_as(kv)
+               * scales).bfloat16()
+    query = (torch.randn(rows, heads, g.head_dim, device="cuda") * amplitude).bfloat16()
+    positions = torch.arange(start, start + rows, device="cuda", dtype=torch.int64)
+    table = torch.arange(pages - 1, -1, -1, device="cuda", dtype=torch.int32)
+    out, expected = torch.empty_like(query), torch.empty_like(query)
+    scratch = torch.empty(compact.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
+    for splits in (1, 4):
+        reference.launch(query, decoded, positions, table, expected, scratch, scalars=[rows, 0, splits])
+        compact.launch(query, packed, positions, table, out, scratch, scalars=[rows, 0, splits])
+        assert torch.equal(out, expected)
+        assert torch.isfinite(out).all() and torch.count_nonzero(out) > 0
+        for row, position in enumerate(positions.tolist()):
+            indices = table[(torch.arange(position + 1, device="cuda") // 64)].long() * 64
+            indices += torch.arange(position + 1, device="cuda") % 64
+            k, v = decoded[indices].unbind(1)
+            k = k.repeat_interleave(heads // g.kv_heads, 1).transpose(0, 1).float()
+            v = v.repeat_interleave(heads // g.kv_heads, 1).transpose(0, 1).float()
+            scores = (query[row].float()[:, None] * k).sum(-1) * g.softmax_scale
+            if amplitude > 1:
+                assert (scores.max(-1).values - scores.min(-1).values).max() > 5
+            oracle = (scores.softmax(-1)[..., None] * v).sum(1)
+            assert (out[row].float() - oracle).norm() / oracle.norm().clamp_min(1e-8) < 0.01
+    with kernel_resolution_guard("dense compact multi-query prefill"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compact.launch(query, packed, positions, table, out, scratch, scalars=[rows, 0, 4])
+        graph.replay()
+        compact.launch(query, packed, positions, table, out, scratch, scalars=[1, 0, 1])
+        graph.replay()
+    assert torch.equal(out, expected)
+    # A later tile's future keys cannot affect earlier queries, even inside a CTA.
+    before = out[:8].clone()
+    future = torch.arange(start + 8, pages * 64, device="cuda")
+    slots = table[future // 64].long() * 64 + future % 64
+    kv[slots] = 100
+    poisoned, _ = _pack(kv)
+    compact.launch(query, poisoned, positions, table, out, scratch, scalars=[rows, 0, 4])
+    assert torch.equal(out[:8], before)
 
 
 @pytest.mark.parametrize("heads", [16, 24])

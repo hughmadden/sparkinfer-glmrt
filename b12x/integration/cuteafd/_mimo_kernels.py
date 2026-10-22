@@ -388,9 +388,9 @@ class MimoGqaAttention:
             else self.record * 2
         self.tile_n = 16 * int(kv_warps)
         self.qk_warps = _ceil(self.tokens * self.group, 16)
-        # Wide compact heads prefetch both K/V into registers. Bound the
-        # key tile and spread its vectors to keep that prefetch spill-free.
-        if self.kv_fp8 and self.head >= 256 and self.v_head >= 256:
+        # Wide compact decode prefetches both K/V into registers. Multi-query
+        # tiles already spread those vectors and reuse each 64-key tile.
+        if self.kv_fp8 and self.head >= 256 and self.v_head >= 256 and self.tokens * self.group < 32:
             self.tile_n = min(self.tile_n, 32)
             self.qk_warps = max(self.qk_warps, 2)
         self.tile_m = 16 * self.qk_warps

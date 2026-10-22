@@ -106,11 +106,13 @@ def full_attention_scratch_bytes(g: QwenDenseGeometry, rows: int, max_splits: in
 
 
 class _FullAttention:
-    def __init__(self, g: QwenDenseGeometry, max_splits: int, kv_format: str = "bf16"):
+    def __init__(self, g: QwenDenseGeometry, max_splits: int, kv_format: str = "bf16", *, max_rows: int):
         self.g, self.max_splits = g, max_splits
         g.kv_record_bytes(kv_format)
-        # One query token per CTA permits arbitrary mixed lanes and verify widths.
-        self.attn = MimoGqaAttention(heads=g.heads, kv_heads=g.kv_heads, tokens=1,
+        # Large programs serve one contiguous prefill; decode keeps mixed-lane
+        # queries independent. Preserve the existing BF16 reduction geometry.
+        tokens = 8 if kv_format == "fp8" and max_rows > 64 else 1
+        self.attn = MimoGqaAttention(heads=g.heads, kv_heads=g.kv_heads, tokens=tokens,
             window=0, paged=True, sink=False, direct=False, softmax_scale=g.softmax_scale,
             page_rows=g.page_rows, head=g.head_dim, v_head=g.head_dim,
             kv8="e4m3" if kv_format == "fp8" else None, kv_group=0)
@@ -149,7 +151,7 @@ def compile_qwen_dense_full_gqa_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_row
     if not 1 <= int(max_splits) <= MAX_SPLITS:
         raise ValueError(f"max_splits must be in 1..{MAX_SPLITS}")
     record_bytes = g.kv_record_bytes(kv_format)
-    launch = _FullAttention(g, int(max_splits), kv_format)
+    launch = _FullAttention(g, int(max_splits), kv_format, max_rows=max_rows)
     return compile_program(launch, name="qwen_dense_full_gqa", operands=(
         Operand("query", torch.bfloat16, f"[rows,{g.heads},{g.head_dim}]"),
         Operand("kv_cache", torch.uint8, f"[record_slots,{record_bytes}]"),
