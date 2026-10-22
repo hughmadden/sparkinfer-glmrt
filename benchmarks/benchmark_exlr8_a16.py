@@ -587,6 +587,8 @@ def main():
                         help="master's grouping source (b12x/integration/cuteafd/exlr8_glue.py)")
     parser.add_argument("--grouped-arm", action="append", type=parse_grouped_arm, default=[],
                         help="repeatable NAME:REV frozen grouped core and ingress")
+    parser.add_argument("--approximate-arm", action="append", default=[],
+                        help="named grouped arm allowed non-bitwise output; report error, still require finite output")
     parser.add_argument("--grouped-arm-source-dir", type=Path,
                         help="pre-materialized git-source bundles for metadata-free runs")
     parser.add_argument("--repeats",type=int,default=1,
@@ -628,6 +630,8 @@ def main():
         parser.error("--output is required unless --profile")
     if bool(args.control_core) != bool(args.control_glue):
         parser.error("--control-core and --control-glue go together")
+    if set(args.approximate_arm) - {name for name, _ in args.grouped_arm}:
+        parser.error("--approximate-arm must name a --grouped-arm")
     if args.grouped_arm and not args.grouped:
         parser.error("--grouped-arm requires --grouped")
     if len({name for name, _ in args.grouped_arm}) != len(args.grouped_arm):
@@ -1082,11 +1086,22 @@ def grouped_main(args):
         finite_nonzero(uniform_states[-1][1].output[:total].float(), "uniform grouped EXL3")
         if mixed_states:
             finite_nonzero(mixed_states[-1][1].output[:total].float(), "mixed grouped EXL3")
+        errors = {}
         for name, (program, ingress, _) in frozen.items():
             candidate(program, ingress)
             torch.cuda.synchronize()
-            if not torch.equal(chunk_response.view(torch.int16), state["output"][:total].view(torch.int16)):
+            actual = state["output"][:total].float()
+            finite_nonzero(actual, name)
+            exact = torch.equal(chunk_response.view(torch.int16), state["output"][:total].view(torch.int16))
+            if name not in args.approximate_arm and not exact:
                 raise RuntimeError(f"frozen grouped arm {name} differs from snapshot chunked K1")
+            reference = chunk_response.float()
+            difference = (actual - reference).abs()
+            row_relative = torch.linalg.vector_norm(difference, dim=1) / torch.linalg.vector_norm(reference, dim=1).clamp_min(1e-30)
+            errors[name] = dict(bitwise_equal=exact,
+                relative_l2=float(torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(reference).clamp_min(1e-30)),
+                max_row_relative_l2=float(row_relative.max()), mean_row_relative_l2=float(row_relative.mean()),
+                max_abs=float(difference.max()), fixture="synthetic weights and activations; recorded route distribution")
         if args.profile:
             torch.cuda.cudart().cudaProfilerStart()
             profile_arms = {"grouped": candidate, "exl3": baseline, "mixed": mixed}
@@ -1145,7 +1160,7 @@ def grouped_main(args):
         unique = (int(ids.unique().numel()) * 4 if owned is None else
                   sum(len(owned[e]) for e in ids.unique().tolist())) * 3 * 6144 * 128 * 4//8
         grouped_stage_map = {"ingress":("_Group",),"fc1":("grouped_fc1_kernel",),
-                             "activation":("activation_kernel",),"fc2":("grouped_fc2_kernel",),
+                             "activation":("activation_kernel",),"fc2":("grouped_fc2_kernel", "grouped_fc2_ws_kernel"),
                              "egress":("reduce_kernel",),"exchange":("_exchange_traffic",)}
         stages = stage_profile(graphs["grouped"], args.output.parent, grouped_stage_map)
         arm_stages = {
@@ -1205,7 +1220,7 @@ def grouped_main(args):
                    cta96_arm_stages=cta96_arm_stages,
                    exchange_cta96_stages=exch_cta96_stages,
                    exchange_cta96_arm_stages=exch_cta96_arm_stages,
-                   groups=int(state["count"].item()), bitwise_equal=True,
+                   groups=int(state["count"].item()), bitwise_equal=True, arm_errors=errors,
                    uniform_route_block=uniform_states[0][-1] if owned is None else 64,
                    uniform_input_conversion=("fp8_k32_to_bf16_included" if owned is None
                                              else "serving_ws_direct_fp8_k32"),
