@@ -29,9 +29,9 @@ def test_shared_compact_wide_tile_preserves_narrow_and_bf16_geometry(head, v_hea
         paged=True, sink=False, direct=False, softmax_scale=head ** -0.5,
         head=head, v_head=v_head, kv8=kv8, kv_group=0)
     original_warps = (tokens * 4 + 15) // 16
-    wide_compact = kv8 is not None and head >= 256 and v_head >= 256 and tokens * 4 < 32
-    expected_warps = max(original_warps, 2) if wide_compact else original_warps
-    assert attention.tile_n == (32 if wide_compact else 64)
+    wide_compact = kv8 is not None and head >= 256 and v_head >= 256
+    expected_warps = max(2, 1 << (original_warps - 1).bit_length()) if wide_compact else original_warps
+    assert attention.tile_n == (32 if wide_compact and tokens * 4 < 32 else 64)
     assert attention.qk_warps == expected_warps
     assert attention.tile_m == 16 * expected_warps
     assert attention.threads == 128 * expected_warps
@@ -47,7 +47,7 @@ def test_dense_full_attention_query_reuse_geometry(heads, max_rows, kv_format):
     prefill = kv_format == "fp8" and max_rows > 64
     assert attention.tokens == (8 if prefill else 1)
     assert attention.tile_n == (32 if kv_format == "fp8" and not prefill else 64)
-    expected_groups = (heads * 2 + 15) // 16 if prefill else (2 if kv_format == "fp8" else 1)
+    expected_groups = (2 if heads == 16 else 4) if prefill else (2 if kv_format == "fp8" else 1)
     assert attention.qk_warps == expected_groups
 
 
@@ -380,7 +380,10 @@ def test_dense_compact_prefill_query_reuse(heads, amplitude, start, monkeypatch)
     shared_attention = dense.MimoGqaAttention
 
     def reference_attention(**kwargs):
-        return shared_attention(**{**kwargs, "tokens": 8})
+        attention = shared_attention(**{**kwargs, "tokens": 8, "kv8": "e4m3"})
+        attention.kv8, attention.kv_fp8 = None, False
+        attention.record_bytes = attention.record * 2
+        return attention
 
     with monkeypatch.context() as patch:
         patch.setattr(dense, "MimoGqaAttention", reference_attention)
@@ -395,13 +398,18 @@ def test_dense_compact_prefill_query_reuse(heads, amplitude, start, monkeypatch)
     query = (torch.randn(rows, heads, g.head_dim, device="cuda") * amplitude).bfloat16()
     positions = torch.arange(start, start + rows, device="cuda", dtype=torch.int64)
     table = torch.arange(pages - 1, -1, -1, device="cuda", dtype=torch.int32)
-    out, expected = torch.empty_like(query), torch.empty_like(query)
-    scratch = torch.empty(compact.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
+    output_guard = torch.full((rows + 8, heads, g.head_dim), 123, device="cuda", dtype=torch.bfloat16)
+    out, expected = output_guard[:rows], torch.empty_like(query)
+    scratch_bytes = compact.scratch_bytes(rows)["scratch"]
+    scratch_guard = torch.full((scratch_bytes + 4096,), 165, device="cuda", dtype=torch.uint8)
+    scratch = scratch_guard[:scratch_bytes]
     for splits in (1, 4):
         reference.launch(query, decoded, positions, table, expected, scratch, scalars=[rows, 0, splits])
         compact.launch(query, packed, positions, table, out, scratch, scalars=[rows, 0, splits])
         assert torch.equal(out, expected)
         assert torch.isfinite(out).all() and torch.count_nonzero(out) > 0
+        assert torch.all(output_guard[rows:] == 123)
+        assert torch.all(scratch_guard[scratch_bytes:] == 165)
         for row, position in enumerate(positions.tolist()):
             indices = table[(torch.arange(position + 1, device="cuda") // 64)].long() * 64
             indices += torch.arange(position + 1, device="cuda") % 64
