@@ -54,7 +54,7 @@ def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
     error = torch.linalg.vector_norm(expected.double()-ref)
     bound = torch.linalg.vector_norm(baseline-ref)
     assert error <= 1.01 * bound, (error.item(), bound.item())
-    for rows in (1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64):
+    for rows in (1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 36, 63, 64):
         for limit in (1, 48, 170*4, 188*4):
             c.partial.fill_(float("nan"))
             c.output.fill_(float("nan"))
@@ -276,7 +276,7 @@ def test_kimi_shapes(k, n, side, bits, codebook):
     assert torch.isfinite(output).all() and torch.count_nonzero(output) > 0
     actual = output[sample_rows][:, cols].double()
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
-    for live in ((1, 16, 64) if rows == 64 else (1, 8, 16, 64, 256, 1024, 4096)):
+    for live in ((1, 8, 16, 36, 64) if rows == 64 else (1, 8, 16, 36, 64, 256, 1024, 4096)):
         output.fill_(float("nan"))
         program.launch(inputs, payload, scales, partial.flatten(), output.flatten(), scalars=(live, 0, limit))
         assert torch.equal(output[:min(64, live)].view(torch.int32), saved[:min(64, live)].view(torch.int32))
@@ -319,6 +319,52 @@ def test_high_rate_graph_replay_and_frozen_resolution(bits, codebook):
             c.output.fill_(float("nan"))
             graph.replay()
             assert torch.equal(c.output.view(torch.int32), expected.view(torch.int32))
-        for rows in (1, 8, 16, 64):
+        for rows in (1, 8, 16, 36, 64):
             c.launch(rows)
             assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
+
+
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("bits", [5, 6])
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
+def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32
+    from cuda.bindings import driver as cuda
+    from b12x.gemm.trellis_linear import _native
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    class Base(_native.NativeTrellisLinear):
+        @cute.jit
+        def __call__(self, inputs: cute.Tensor, payload: cute.Tensor,
+                     scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                     rows: Int32, rotation_id: Int32, cta_limit: Int32,
+                     stream: cuda.CUstream):
+            tiles = Int32(self.n // 128 * self.splits)
+            self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+                grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+            self.reduce(partial, output, rows).launch(
+                grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                block=(128, 1, 1), stream=stream)
+
+    # Compile the shipping base schedule only as a test oracle, not a runtime toggle.
+    with exportable_compilation(), monkeypatch.context() as patch:
+        patch.setattr(_native, "NativeTrellisLinear", Base)
+        base = Case(k=1152, n=256, side=side, bits=bits, rows=129, codebook=codebook)
+    wide = Case(k=1152, n=256, side=side, bits=bits, rows=129, codebook=codebook)
+    for rows in (1, 8, 16, 17, 32, 33, 36, 48, 49, 63, 64, 65, 127, 128, 129):
+        base.partial.fill_(float("nan"))
+        base.output.fill_(float("nan"))
+        wide.partial.fill_(float("nan"))
+        wide.output.fill_(float("nan"))
+        with kernel_resolution_guard("row dispatch uses precompiled kernels"):
+            base.launch(rows)
+            wide.launch(rows)
+        assert torch.equal(wide.output[:rows].view(torch.int32), base.output[:rows].view(torch.int32))
+        assert torch.equal(wide.partial[:rows].view(torch.int32), base.partial[:rows].view(torch.int32))
+        assert torch.isnan(wide.output[rows:]).all()
+        assert torch.isnan(wide.partial[rows:]).all()
+
