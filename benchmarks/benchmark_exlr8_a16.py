@@ -519,13 +519,13 @@ def serial_scratch(hidden, units, groups, shared=None):
 
 
 def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8, owned=None,
-                   scratch=None):
+                   scratch=None, min_copies=2):
     """Synthetic K4 payloads, replicated into enough distinct layers that a
     replay over them streams every weight from DRAM (cold L2)."""
     owners = []
     unit_bytes = hidden * 16 * 4
     layer_bytes = (experts * units if owned is None else sum(map(len, owned))) * 3 * unit_bytes
-    copies = max(2, -(-L2_SPAN * l2_bytes // layer_bytes))
+    copies = max(min_copies, -(-L2_SPAN * l2_bytes // layer_bytes))
     tables = []
     for _ in range(copies):
         pointers = torch.zeros((experts, units, 3, 3), dtype=torch.int64)
@@ -599,6 +599,9 @@ def main():
                         help="comma list of prompt lengths; benchmark the distinct Spark wave "
                              "row counts GLM serving sends for them (overrides --rows)")
     parser.add_argument("--serving-lanes", type=int, default=SERVING_LANES)
+    parser.add_argument("--layer-copies", type=int, default=2,
+                        help="minimum cold layer copies per replay; with --routes each copy "
+                             "replays a different recorded wave (6 covers two waves per content)")
     parser.add_argument("--routes", default=None,
                         help="recorded serving route histograms: 'realistic' (code, agentic, prose; "
                              "the reference), 'filler' (bench filler prompt) or a JSON path; each "
@@ -914,7 +917,7 @@ def grouped_main(args):
     units = 16 if owned is not None else 4
     group_rows = args.group_rows
     capacity = (4096*8 + group_rows-1)//group_rows + 256
-    t = make_candidate(l2, units=units, owned=owned)
+    t = make_candidate(l2, units=units, owned=owned, min_copies=args.layer_copies)
     control = ((compile_exlr8_a16_aot(units=units, device_count=True),
                 compile_exlr8_group_aot(hidden=6144, top_k=8, max_groups=512))
                if owned is not None else compile_control(args.control_core, args.control_glue))
