@@ -119,6 +119,18 @@ def _read_stream(src, sums, BLOCK: tl.constexpr):
     tl.store(sums + tl.program_id(0), tl.sum(values, axis=0))
 
 
+@triton.jit
+def _exchange_traffic(src, dst, n_elements, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    step = tl.num_programs(0) * BLOCK
+    base = pid * BLOCK
+    while base < n_elements:
+        offsets = base + tl.arange(0, BLOCK)
+        values = tl.load(src + offsets, mask=offsets < n_elements, other=0.0)
+        tl.store(dst + offsets, values, mask=offsets < n_elements)
+        base += step
+
+
 def read_roofline():
     size = 256 * 1024 * 1024
     block = 4096
@@ -403,6 +415,119 @@ def comparison_route_ids(rows, generator):
                         for _ in range(rows)])
 
 
+def grouped_error(actual, expected, weights, *, half_partials):
+    """Check default-route fidelity without claiming FP16 partials are exact."""
+    exact = torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    reference = expected.float()
+    difference = actual.float() - reference
+    error = torch.linalg.vector_norm(difference)
+    reference_norm = torch.linalg.vector_norm(reference)
+    row_relative = (torch.linalg.vector_norm(difference, dim=1)
+                    / torch.linalg.vector_norm(reference, dim=1).clamp_min(1e-30))
+    metrics = dict(bitwise_equal=exact,
+        relative_l2=float(error / reference_norm.clamp_min(1e-30)),
+        max_row_relative_l2=float(row_relative.max()),
+        mean_row_relative_l2=float(row_relative.mean()),
+        max_abs=float(difference.abs().max()))
+    if half_partials:
+        # Match the serving fixture: a 1% normal-range guard plus half an
+        # FP16 subnormal ULP per route element; H128 preserves the L2 norm.
+        subnormal_row = (2.0 ** -25 * actual.shape[-1] ** 0.5
+                         * weights.float().abs().sum(-1))
+        bound = 0.01 * reference_norm + torch.linalg.vector_norm(subnormal_row)
+        metrics["l2_bound"] = float(bound)
+        valid = bool(torch.isfinite(actual).all() and error <= bound)
+    else:
+        valid = exact and bool(torch.isfinite(actual).all())
+    if not valid:
+        raise RuntimeError(f"grouped result differs from snapshot chunked K1: {metrics}")
+    return metrics
+
+
+SERVING_LANES = 3        # CUTEAFD_GLM_PREFILL_LANES default (cuteafd glm5/engine.rs)
+SERVING_LANE_ROWS = 4096  # GLM prefill rows per lane; a chunk is lanes x this
+SERVING_PAGE_ROWS = 64
+SERVING_MIN_LANE_ROWS = 256
+
+
+def serving_waves(prompt, lanes=SERVING_LANES, lane_rows=SERVING_LANE_ROWS):
+    """Spark wave row counts GLM serving sends for one cold prompt.
+
+    Mirrors the engine: chunks of lanes * lane_rows tokens; a chunk of at
+    least 2 * 256 rows splits into min(lanes, rows // 256) lanes of
+    ceil(rows / count) rounded up to a 64-row page. An 8046-token prompt is
+    one chunk of 2688 + 2688 + 2670 rows, not 1408-row waves.
+    """
+    if prompt < 1 or lanes < 1:
+        raise ValueError("prompt and lanes must be positive")
+    waves = []
+    for start in range(0, prompt, lanes * lane_rows):
+        rows = min(lanes * lane_rows, prompt - start)
+        if lanes > 1 and rows >= 2 * SERVING_MIN_LANE_ROWS:
+            count = min(lanes, rows // SERVING_MIN_LANE_ROWS)
+            per = -(-(-(-rows // count)) // SERVING_PAGE_ROWS) * SERVING_PAGE_ROWS
+            waves.extend(min(per, rows - first) for first in range(0, rows, per))
+        else:
+            waves.append(rows)
+    return waves
+
+
+def real_route_ids(rows, wave, generator, experts=256, top_k=8):
+    """Top-k ids with a recorded serving wave's per-expert histogram, rescaled
+    to `rows` (largest-remainder rounding, at most `rows` per expert), then
+    assigned so no token repeats an expert. Deterministic per generator."""
+    counts = torch.zeros(experts, dtype=torch.float64)
+    for expert, n in wave["expert_rows"]:
+        counts[expert] = n
+    target = counts * (rows * top_k / counts.sum())
+    alloc = target.floor().clamp(max=rows)
+    order = torch.argsort(target - alloc, descending=True)
+    for e in order.tolist():
+        if int(alloc.sum()) >= rows * top_k:
+            break
+        if alloc[e] < rows:
+            alloc[e] += 1
+    alloc = alloc.long()
+    if int(alloc.sum()) != rows * top_k:
+        raise ValueError("route histogram cannot fill the wave")
+    # Fill tokens largest expert first, each expert onto the tokens with the
+    # fewest assigned routes, so every token ends with top_k distinct experts.
+    ids = torch.full((rows, top_k), -1, dtype=torch.int64)
+    fill = torch.zeros(rows, dtype=torch.int64)
+    for e in torch.argsort(alloc, descending=True).tolist():
+        n = int(alloc[e])
+        if not n:
+            break
+        jitter = torch.rand(rows, generator=generator)
+        pick = torch.argsort(fill.double() + jitter)[:n]
+        ids[pick, fill[pick]] = e
+        fill[pick] += 1
+    if bool((fill != top_k).any()):
+        raise ValueError("route assignment left a token short")
+    perm = torch.argsort(torch.rand((rows, top_k), generator=generator), dim=1)
+    return torch.gather(ids, 1, perm)
+
+
+ROUTE_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+# Realistic content (code, agentic transcript, prose) is the default; filler
+# (the bench's synthetic prefill prompt) is one case, not the reference.
+ROUTE_SETS = {"realistic": ("glm53_prefill_routes_realistic.json",),
+              "filler": ("glm53_prefill_routes_filler.json",)}
+
+
+def load_route_waves(spec):
+    """Route waves from a named set (realistic, filler) or a JSON path."""
+    paths = ([ROUTE_FIXTURES / name for name in ROUTE_SETS[spec]] if spec in ROUTE_SETS
+             else [Path(spec)])
+    waves = []
+    for path in paths:
+        data = json.loads(path.read_text())
+        if data.get("schema") != 1 or not data.get("waves"):
+            raise ValueError(f"{path}: expected schema 1 with waves")
+        waves.extend(data["waves"])
+    return waves
+
+
 def serial_scratch(hidden, units, groups, shared=None):
     shapes = {"fc1": ((groups, units, 2, (hidden+1023)//1024, 16, 128), torch.float32),
               "intermediate": ((groups, units, 16, 128), torch.float16),
@@ -423,13 +548,13 @@ def serial_scratch(hidden, units, groups, shared=None):
 
 
 def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8, owned=None,
-                   scratch=None):
+                   scratch=None, min_copies=2):
     """Synthetic K4 payloads, replicated into enough distinct layers that a
     replay over them streams every weight from DRAM (cold L2)."""
     owners = []
     unit_bytes = hidden * 16 * 4
     layer_bytes = (experts * units if owned is None else sum(map(len, owned))) * 3 * unit_bytes
-    copies = max(2, -(-L2_SPAN * l2_bytes // layer_bytes))
+    copies = max(min_copies, -(-L2_SPAN * l2_bytes // layer_bytes))
     tables = []
     for _ in range(copies):
         pointers = torch.zeros((experts, units, 3, 3), dtype=torch.int64)
@@ -482,7 +607,7 @@ def main():
                         help="explicit serving geometry; omitted keeps legacy compact TP4 fixture")
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--layer", type=int, default=3)
-    parser.add_argument("--rows",default="1,2,3,4,5,6,7,8,16,64,4096")
+    parser.add_argument("--rows",default=None)
     parser.add_argument("--replays",type=int,default=20)
     parser.add_argument("--output",type=Path)
     parser.add_argument("--control-core",type=Path,
@@ -491,6 +616,8 @@ def main():
                         help="master's grouping source (b12x/integration/cuteafd/exlr8_glue.py)")
     parser.add_argument("--grouped-arm", action="append", type=parse_grouped_arm, default=[],
                         help="repeatable NAME:REV frozen grouped core and ingress")
+    parser.add_argument("--approximate-arm", action="append", default=[],
+                        help="named grouped arm allowed non-bitwise output; report error, still require finite output")
     parser.add_argument("--grouped-arm-source-dir", type=Path,
                         help="pre-materialized git-source bundles for metadata-free runs")
     parser.add_argument("--repeats",type=int,default=1,
@@ -499,11 +626,41 @@ def main():
                         help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
     parser.add_argument("--profile-arm", default="grouped",
                         help="grouped benchmark arm inside cudaProfilerStart/Stop")
+    parser.add_argument("--serving-prompt", default=None,
+                        help="comma list of prompt lengths; benchmark the distinct Spark wave "
+                             "row counts GLM serving sends for them (overrides --rows)")
+    parser.add_argument("--serving-lanes", type=int, default=SERVING_LANES)
+    parser.add_argument("--memory-cap-gib", type=int, default=12,
+                        help="per-process CUDA cap (also at most 25%% of device memory); more "
+                             "--layer-copies need more")
+    parser.add_argument("--layer-copies", type=int, default=2,
+                        help="minimum cold layer copies per replay; with --routes each copy "
+                             "replays a different recorded wave (6 covers two waves per content)")
+    parser.add_argument("--routes", default=None,
+                        help="recorded serving route histograms: 'realistic' (code, agentic, prose; "
+                             "the reference), 'filler' (bench filler prompt) or a JSON path; each "
+                             "timed layer copy replays the next wave")
     args = parser.parse_args()
+    if args.serving_prompt is not None:
+        if not args.grouped:
+            parser.error("--serving-prompt requires --grouped")
+        rows = []
+        for prompt in map(int, args.serving_prompt.split(",")):
+            for wave in serving_waves(prompt, args.serving_lanes):
+                if wave not in rows:
+                    rows.append(wave)
+        args.rows = ",".join(map(str, rows))
+        print(f"serving waves for prompts {args.serving_prompt}: rows {args.rows}", flush=True)
+    if args.routes is not None and not args.grouped:
+        parser.error("--routes requires --grouped")
+    if args.rows is None:
+        args.rows = "512,1408,2048,4096" if args.grouped else "1,2,3,4,5,6,7,8,16,64,4096"
     if not args.profile and args.output is None:
         parser.error("--output is required unless --profile")
     if bool(args.control_core) != bool(args.control_glue):
         parser.error("--control-core and --control-glue go together")
+    if set(args.approximate_arm) - {name for name, _ in args.grouped_arm}:
+        parser.error("--approximate-arm must name a --grouped-arm")
     if args.grouped_arm and not args.grouped:
         parser.error("--grouped-arm requires --grouped")
     if len({name for name, _ in args.grouped_arm}) != len(args.grouped_arm):
@@ -522,7 +679,7 @@ def main():
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
     torch.cuda.set_per_process_memory_fraction(min(
-        0.25, (12 << 30) / torch.cuda.get_device_properties(0).total_memory))
+        0.25, (args.memory_cap_gib << 30) / torch.cuda.get_device_properties(0).total_memory))
     if args.grouped:
         return grouped_main(args)
     props = torch.cuda.get_device_properties(0)
@@ -796,7 +953,7 @@ def grouped_main(args):
     units = 16 if owned is not None else 4
     group_rows = args.group_rows
     capacity = (4096*8 + group_rows-1)//group_rows + 256
-    t = make_candidate(l2, units=units, owned=owned)
+    t = make_candidate(l2, units=units, owned=owned, min_copies=args.layer_copies)
     control = ((compile_exlr8_a16_aot(units=units, device_count=True),
                 compile_exlr8_group_aot(hidden=6144, top_k=8, max_groups=512))
                if owned is not None else compile_control(args.control_core, args.control_glue))
@@ -805,6 +962,7 @@ def grouped_main(args):
                                     max_rows=4096, group_rows=group_rows)
     grouped = compile_exlr8_a16_aot(units=units, top_k=8, max_groups=capacity,
                                     device_count=True, grouped=True, group_rows=group_rows)
+    serving_limit = int(props.multi_processor_count) * int(grouped.geometry.get("ctas_per_sm", 2))
     frozen = {name: compile_grouped_arm(grouped_arm_bundle(revision,
                   args.grouped_arm_source_dir), grouped)
               for name, revision in args.grouped_arm}
@@ -821,12 +979,34 @@ def grouped_main(args):
     compact = compact_unit_descriptors(t["bits"])
     mixed_states = ([grouped_mixed_state(4096, ts, props) for ts in exl_layers]
                     if owned is None else [])
+    exchange_stream = torch.cuda.Stream(priority=-1)
+    exch_pulses = 12
+    exch_slice_floats = max(65536, l2 // (4 * exch_pulses))
+    exch_ring_src = torch.full((exch_pulses, exch_slice_floats), 1.0,
+                               dtype=torch.float32, device="cuda")
+    exch_ring_dst = torch.empty_like(exch_ring_src)
+    fork_events = [torch.cuda.Event() for _ in t["tables"]]
+    join_events = [torch.cuda.Event() for _ in t["tables"]]
+    route_waves = load_route_waves(args.routes) if args.routes is not None else None
     records = []
     for total in map(int, args.rows.split(",")):
         if not 1 <= total <= 4096:
             raise ValueError("grouped benchmark rows must be 1..4096")
         gen = torch.Generator().manual_seed(408+total)
-        ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(total)]).cuda().int()
+        copies = len(t["tables"])
+        if route_waves:
+            # Each cold layer copy replays a different recorded serving wave,
+            # spread across the fixture's layers, rescaled to this row count.
+            picks = [route_waves[(i * len(route_waves)) // copies] for i in range(copies)]
+            ids_list = [real_route_ids(total, wave, gen).cuda().int() for wave in picks]
+            route_meta = [dict(layer=w["layer"], lane=w["lane"], recorded_rows=w["rows"],
+                               max_expert_share=max(n for _, n in w["expert_rows"]) / w["rows"])
+                          for w in picks]
+        else:
+            ids_list = [torch.stack([torch.randperm(256,generator=gen)[:8]
+                                     for _ in range(total)]).cuda().int()] * copies
+            route_meta = None
+        ids = ids_list[-1]
         weights = torch.rand((total,8),generator=gen).cuda()/8
         wire = make_wire(torch.randn((total,6144),generator=gen).cuda()*0.02)
         decoded = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
@@ -837,15 +1017,18 @@ def grouped_main(args):
         chunk_wire = torch.empty((64,6336),dtype=torch.uint8,device="cuda")
         chunk_ids = torch.empty((64,8),dtype=torch.int32,device="cuda")
         chunk_weights = torch.empty((64,8),device="cuda")
-        copies = len(t["tables"])
+        exch_wire = torch.empty_like(wire)
+        exch_ids = torch.empty_like(ids)
+        exch_weights = torch.empty_like(weights)
+        exch_response = torch.empty((total, 6144), dtype=torch.bfloat16, device="cuda")
 
         def chunked():
             k1c, gc = control
-            for table in t["tables"]:
+            for idx, table in enumerate(t["tables"]):
                 for first in range(0,total,64):
                     live = min(64,total-first)
                     chunk_wire[:live].copy_(wire[first:first+live])
-                    chunk_ids[:live].copy_(ids[first:first+live])
+                    chunk_ids[:live].copy_(ids_list[idx][first:first+live])
                     chunk_weights[:live].copy_(weights[first:first+live])
                     gc.launch(chunk_ids,chunk_wire,t["signs_in"],t["group_expert"],t["route_slots"],
                               t["route_group_lane"],t["group_count"],t["activation"],scalars=(live,limit))
@@ -854,24 +1037,70 @@ def grouped_main(args):
                                t["signs_out"],t["output"],t["group_count"],scalars=(live,limit))
                     chunk_response[first:first+live].copy_(t["output"][:live])
 
-        def candidate(program=grouped, ingress=group):
-            for table in t["tables"]:
-                ingress.launch(ids,wire,t["signs_in"],state["group_expert"],state["route_slots"],
+        def candidate(program=grouped, ingress=group, cta_lim=limit):
+            for idx, table in enumerate(t["tables"]):
+                # Serving launches ingress at its own SM x 4 limit; only K1 takes cta_lim.
+                ingress.launch(ids_list[idx],wire,t["signs_in"],state["group_expert"],state["route_slots"],
                              state["inverse"],state["count"],state["activation"],scalars=(total,limit))
                 program.launch(state["activation"],table,t["bits"],state["group_expert"],state["route_slots"],
                                state["inverse"],weights,state["fc1"],state["intermediate"],state["fc2"],
                                t["signs_out"],state["output"],state["count"],
                                *(compact[:2] if compact_program(program) else ()),
-                               scalars=((total,limit,compact[2]) if compact_program(program)
-                                        else (total,limit)))
+                               scalars=((total,cta_lim,compact[2]) if compact_program(program)
+                                        else (total,cta_lim)))
+
+        def candidate_exchange(program=grouped, ingress=group, cta_lim=limit):
+            main_stream = torch.cuda.current_stream()
+            for idx, table in enumerate(t["tables"]):
+                exch_wire.copy_(wire)
+                exch_ids.copy_(ids_list[idx])
+                exch_weights.copy_(weights)
+                fork_events[idx].record(main_stream)
+                with torch.cuda.stream(exchange_stream):
+                    exchange_stream.wait_event(fork_events[idx])
+                    for p in range(exch_pulses):
+                        _exchange_traffic[(8,)](exch_ring_src[p], exch_ring_dst[p],
+                                                exch_slice_floats, BLOCK=1024)
+                    join_events[idx].record(exchange_stream)
+                ingress.launch(exch_ids,exch_wire,t["signs_in"],state["group_expert"],state["route_slots"],
+                               state["inverse"],state["count"],state["activation"],scalars=(total,limit))
+                program.launch(state["activation"],table,t["bits"],state["group_expert"],state["route_slots"],
+                               state["inverse"],exch_weights,state["fc1"],state["intermediate"],state["fc2"],
+                               t["signs_out"],state["output"],state["count"],
+                               *(compact[:2] if compact_program(program) else ()),
+                               scalars=((total,cta_lim,compact[2]) if compact_program(program)
+                                        else (total,cta_lim)))
+                exch_response.copy_(state["output"][:total])
+                main_stream.wait_event(join_events[idx])
 
         def baseline():
-            for uniform in uniform_states:
+            for idx, uniform in enumerate(uniform_states):
                 if owned is None:
                     wire_decode(wire, decoded, total)
-                    run_grouped_uniform(uniform, decoded, weights, ids)
+                    run_grouped_uniform(uniform, decoded, weights, ids_list[idx])
                 else:
-                    run_bound_mixed_trellis(wire, weights, ids, *uniform)
+                    run_bound_mixed_trellis(wire, weights, ids_list[idx], *uniform)
+
+        def baseline_exchange():
+            main_stream = torch.cuda.current_stream()
+            for idx, uniform in enumerate(uniform_states):
+                exch_wire.copy_(wire)
+                exch_ids.copy_(ids_list[idx])
+                exch_weights.copy_(weights)
+                fork_events[idx].record(main_stream)
+                with torch.cuda.stream(exchange_stream):
+                    exchange_stream.wait_event(fork_events[idx])
+                    for p in range(exch_pulses):
+                        _exchange_traffic[(8,)](exch_ring_src[p], exch_ring_dst[p],
+                                                exch_slice_floats, BLOCK=1024)
+                    join_events[idx].record(exchange_stream)
+                if owned is None:
+                    wire_decode(exch_wire, decoded, total)
+                    run_grouped_uniform(uniform, decoded, exch_weights, exch_ids)
+                else:
+                    run_bound_mixed_trellis(exch_wire, exch_weights, exch_ids, *uniform)
+                exch_response.copy_(uniform[1].output[:total])
+                main_stream.wait_event(join_events[idx])
 
         def mixed():
             for binding, bufs in mixed_states:
@@ -879,18 +1108,29 @@ def grouped_main(args):
 
         chunked(); candidate(); baseline(); mixed()
         torch.cuda.synchronize()
-        if not torch.equal(chunk_response.view(torch.int16),state["output"][:total].view(torch.int16)):
-            n = int((chunk_response.view(torch.int16) != state["output"][:total].view(torch.int16)).sum())
-            raise RuntimeError(f"grouped result differs from snapshot chunked K1: {n} BF16 words")
+        from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+        default_error = grouped_error(state["output"][:total], chunk_response, weights,
+                                      half_partials=Exlr8GroupedKernel.FC2_HALF)
         finite_nonzero(state["output"][:total].float(), "grouped EXLR8")
         finite_nonzero(uniform_states[-1][1].output[:total].float(), "uniform grouped EXL3")
         if mixed_states:
             finite_nonzero(mixed_states[-1][1].output[:total].float(), "mixed grouped EXL3")
+        errors = {}
         for name, (program, ingress, _) in frozen.items():
             candidate(program, ingress)
             torch.cuda.synchronize()
-            if not torch.equal(chunk_response.view(torch.int16), state["output"][:total].view(torch.int16)):
+            actual = state["output"][:total].float()
+            finite_nonzero(actual, name)
+            exact = torch.equal(chunk_response.view(torch.int16), state["output"][:total].view(torch.int16))
+            if name not in args.approximate_arm and not exact:
                 raise RuntimeError(f"frozen grouped arm {name} differs from snapshot chunked K1")
+            reference = chunk_response.float()
+            difference = (actual - reference).abs()
+            row_relative = torch.linalg.vector_norm(difference, dim=1) / torch.linalg.vector_norm(reference, dim=1).clamp_min(1e-30)
+            errors[name] = dict(bitwise_equal=exact,
+                relative_l2=float(torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(reference).clamp_min(1e-30)),
+                max_row_relative_l2=float(row_relative.max()), mean_row_relative_l2=float(row_relative.mean()),
+                max_abs=float(difference.max()), fixture="synthetic weights and activations; recorded route distribution")
         if args.profile:
             torch.cuda.cudart().cudaProfilerStart()
             profile_arms = {"grouped": candidate, "exl3": baseline, "mixed": mixed}
@@ -913,32 +1153,116 @@ def grouped_main(args):
             for n in names[r%len(names):]+names[:r%len(names)]:
                 rounds[n].append(timing(graphs[n],args.replays)/copies)
         med = {n:statistics.median(ts) for n,ts in rounds.items()}
+
+        exch_graphs = {"grouped": capture(candidate_exchange),
+                       "exl3": capture(baseline_exchange)}
+        for name, (program, ingress, _) in frozen.items():
+            exch_graphs[name] = capture(functools.partial(candidate_exchange, program, ingress))
+        exch_rounds = {n: [] for n in exch_graphs}
+        exch_names = list(exch_graphs)
+        for r in range(min(3, args.repeats)):
+            for n in exch_names[r % len(exch_names):] + exch_names[:r % len(exch_names)]:
+                exch_rounds[n].append(timing(exch_graphs[n], args.replays) / copies)
+        exch_med = {n: statistics.median(ts) for n, ts in exch_rounds.items()}
+
+        cta96_graphs = {"grouped": capture(functools.partial(candidate, grouped, group, serving_limit))}
+        for name, (program, ingress, _) in frozen.items():
+            cta96_graphs[name] = capture(functools.partial(candidate, program, ingress, serving_limit))
+        cta96_rounds = {n: [] for n in cta96_graphs}
+        cta96_names = list(cta96_graphs)
+        for r in range(min(3, args.repeats)):
+            for n in cta96_names[r % len(cta96_names):] + cta96_names[:r % len(cta96_names)]:
+                cta96_rounds[n].append(timing(cta96_graphs[n], args.replays) / copies)
+        cta96_med = {n: statistics.median(ts) for n, ts in cta96_rounds.items()}
+
+        exch_cta96_graphs = {"grouped": capture(functools.partial(candidate_exchange, grouped, group, serving_limit)),
+                             "exl3": exch_graphs["exl3"]}
+        for name, (program, ingress, _) in frozen.items():
+            exch_cta96_graphs[name] = capture(functools.partial(candidate_exchange, program, ingress, serving_limit))
+        exch_cta96_rounds = {n: [] for n in exch_cta96_graphs}
+        exch_cta96_names = list(exch_cta96_graphs)
+        for r in range(min(3, args.repeats)):
+            for n in exch_cta96_names[r % len(exch_cta96_names):] + exch_cta96_names[:r % len(exch_cta96_names)]:
+                exch_cta96_rounds[n].append(timing(exch_cta96_graphs[n], args.replays) / copies)
+        exch_cta96_med = {n: statistics.median(ts) for n, ts in exch_cta96_rounds.items()}
+
         unique = (int(ids.unique().numel()) * 4 if owned is None else
                   sum(len(owned[e]) for e in ids.unique().tolist())) * 3 * 6144 * 128 * 4//8
-        stages = stage_profile(graphs["grouped"], args.output.parent,
-            {"ingress":("_Group",),"fc1":("grouped_fc1_kernel",),"activation":("activation_kernel",),
-             "fc2":("grouped_fc2_kernel",),"egress":("reduce_kernel",)})
+        grouped_stage_map = {"ingress":("_Group",),"fc1":("grouped_fc1_kernel",),
+                             "activation":("activation_kernel",),"fc2":("grouped_fc2_kernel", "grouped_fc2_ws_kernel"),
+                             "egress":("reduce_kernel",),"exchange":("_exchange_traffic",)}
+        stages = stage_profile(graphs["grouped"], args.output.parent, grouped_stage_map)
+        arm_stages = {
+            name: {k: v / copies if k.endswith("_us") else v
+                   for k, v in stage_profile(graphs[name], args.output.parent, grouped_stage_map).items()}
+            for name in frozen
+        }
+        exch_stages = {
+            k: v / copies if k.endswith("_us") else v
+            for k, v in stage_profile(exch_graphs["grouped"], args.output.parent, grouped_stage_map).items()
+        }
+        exch_arm_stages = {
+            name: {k: v / copies if k.endswith("_us") else v
+                   for k, v in stage_profile(exch_graphs[name], args.output.parent, grouped_stage_map).items()}
+            for name in frozen
+        }
+        cta96_stages = {
+            k: v / copies if k.endswith("_us") else v
+            for k, v in stage_profile(cta96_graphs["grouped"], args.output.parent, grouped_stage_map).items()
+        }
+        cta96_arm_stages = {
+            name: {k: v / copies if k.endswith("_us") else v
+                   for k, v in stage_profile(cta96_graphs[name], args.output.parent, grouped_stage_map).items()}
+            for name in frozen
+        }
+        exch_cta96_stages = {
+            k: v / copies if k.endswith("_us") else v
+            for k, v in stage_profile(exch_cta96_graphs["grouped"], args.output.parent, grouped_stage_map).items()
+        }
+        exch_cta96_arm_stages = {
+            name: {k: v / copies if k.endswith("_us") else v
+                   for k, v in stage_profile(exch_cta96_graphs[name], args.output.parent, grouped_stage_map).items()}
+            for name in frozen
+        }
         k4_stages = stage_profile(graphs["exl3"], args.output.parent,
             {"wire_decode": ("_wire_decode",), "fc1_fc2_fused": ("W4A16FusedMoeKernel",),
              "fc1": ("ws_fc1_kernel",), "activation": ("ws_act_kernel",),
              "fc2": ("ws_fc2_kernel",), "egress": ("W4A16TopKSumKernel",)})
-        rec = dict(rows=total, **{n+"_us":v for n,v in med.items()}, rounds_us=rounds,
+        rec = dict(rows=total, routes=route_meta, **{n+"_us":v for n,v in med.items()}, rounds_us=rounds,
+                   **{n+"_exchange_us": v for n, v in exch_med.items()},
+                   exchange_rounds_us=exch_rounds,
+                   exl3_exchange_speedup=exch_med["exl3"] / exch_med["grouped"],
+                   **{n+"_cta96_us": v for n, v in cta96_med.items()},
+                   cta96_rounds_us=cta96_rounds,
+                   **{n+"_exchange_cta96_us": v for n, v in exch_cta96_med.items()},
+                   exchange_cta96_rounds_us=exch_cta96_rounds,
+                   exl3_exchange_cta96_speedup=exch_cta96_med["exl3"] / exch_cta96_med["grouped"],
                    exl3_stages={k:v/copies if k.endswith("_us") else v for k,v in k4_stages.items()},
                    chunked_speedup=med["chunked"]/med["grouped"],
                    exl3_speedup=med["exl3"]/med["grouped"], unique_weight_bytes=unique,
                    unique_read_roofline_percent=100*unique/med["grouped"]/1000/roof["gbps"],
                    stages={k:v/copies if k.endswith("_us") else v for k,v in stages.items()},
-                   groups=int(state["count"].item()), bitwise_equal=True,
+                   arm_stages=arm_stages,
+                   exchange_stages=exch_stages,
+                   exchange_arm_stages=exch_arm_stages,
+                   cta96_stages=cta96_stages,
+                   cta96_arm_stages=cta96_arm_stages,
+                   exchange_cta96_stages=exch_cta96_stages,
+                   exchange_cta96_arm_stages=exch_cta96_arm_stages,
+                   groups=int(state["count"].item()), bitwise_equal=default_error["bitwise_equal"],
+                   grouped_error=default_error, arm_errors=errors,
                    uniform_route_block=uniform_states[0][-1] if owned is None else 64,
                    uniform_input_conversion=("fp8_k32_to_bf16_included" if owned is None
                                              else "serving_ws_direct_fp8_k32"),
                    k4_options=None if owned is None else serving_k4_options(width))
         records.append(rec)
         print(json.dumps(rec),flush=True)
-        del graphs, uniform_states
+        del graphs, exch_graphs, cta96_graphs, exch_cta96_graphs, uniform_states
     if not args.profile:
         args.output.write_text(json.dumps(dict(schema=3, device=props.name, sm_count=props.multi_processor_count,
             l2_bytes=l2, measured_read_roofline=roof, group_rows=group_rows, rows=records,
+            serving_prompts=args.serving_prompt, serving_lanes=args.serving_lanes,
+            routes=str(args.routes) if args.routes else None,
             geometry=dict(world=args.world or 4, rank=args.rank, layer=args.layer,
                 descriptor_units=units, owned_units_per_expert=([4]*256 if owned is None else list(map(len, owned))),
                 unit_ids=owned, exl3_width=width,
