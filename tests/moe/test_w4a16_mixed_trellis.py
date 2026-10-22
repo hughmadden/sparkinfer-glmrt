@@ -2389,3 +2389,97 @@ def test_kimi_real_experts_e896_situ_cpu_reference(kimi_exl3_checkpoint, width, 
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(eager, replay)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize(
+    "tile,blocks,schedule",
+    [
+        ((64, 128, 64, 128), 2, None),
+        ((64, 128, 64, 128), 2, "gb10"),
+    ],
+)
+def test_kimi_2cta_residency_bitwise_equality(tile, blocks, schedule):
+    """Kimi K3 TP6 Spark 128-thread 2-CTA variants must be bit-identical to 1-CTA."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    hidden, width, experts, topk, rows = 3584, 512, 896, 16, 8
+    tier0 = _prepared(
+        experts=16,
+        hidden=hidden,
+        intermediate=width,
+        bits=2,
+        seed=2730,
+        device=device,
+        tile_config=(64, 128, 64, 128),
+    )
+    tier1 = _prepared(
+        experts=1,
+        hidden=hidden,
+        intermediate=width,
+        bits=3,
+        seed=2731,
+        device=device,
+        tile_config=(64, 128, 64, 128),
+    )
+    route_map = torch.full((experts,), -1, dtype=torch.int32, device=device)
+    chosen_globals = torch.tensor(
+        [0, 1, 2, 3, 127, 255, 383, 511, 512, 513, 640, 767, 800, 850, 894, 895],
+        dtype=torch.int64,
+        device=device,
+    )
+    route_map[chosen_globals] = torch.arange(16, dtype=torch.int32, device=device)
+    descriptor_row = torch.cat(
+        (
+            torch.arange(16, dtype=torch.int32, device=device),
+            torch.tensor([1 << 10], dtype=torch.int32, device=device),
+        )
+    )
+    descriptor = descriptor_row.repeat(3).contiguous()
+    descriptor._mt_projection_counts = ((16, 1), (16, 1))
+    rotations = combine_trellis_rotations(tier0, tier1)
+
+    gen = torch.Generator(device="cpu").manual_seed(273)
+    x = (torch.randn((rows, hidden), generator=gen) * 0.25).to(torch.bfloat16).to(device)
+    ids = chosen_globals[
+        torch.stack([torch.randperm(16, generator=gen) for _ in range(rows)]).to(device)
+    ].to(torch.int32)
+    weights = torch.softmax(torch.randn((rows, topk), generator=gen).to(device), dim=-1)
+
+    def run_variant(v_tile, v_blocks, v_schedule):
+        launch = compile_mixed_trellis(
+            size_m=rows,
+            hidden_size=hidden,
+            intermediate_size=width,
+            tier0_num_experts=16,
+            tier1_num_experts=1,
+            route_num_experts=experts,
+            top_k=topk,
+            max_m_blocks=rows * topk + 16,
+            sms=int(props.multi_processor_count),
+            max_shared_mem=int(props.shared_memory_per_block_optin),
+            force_tile_config=v_tile,
+            tier0_bits=2,
+            tier1_bits=3,
+            activation="situ",
+            swiglu_limit=None,
+            route_ids_dtype=torch.int32,
+            full_rotation_output_dtype="bf16",
+            force_blocks_per_sm=v_blocks,
+            decode_schedule=v_schedule,
+        )
+        binding = bind_mixed_trellis(
+            tier0, tier1, route_map, descriptor, rotations, launch
+        )
+        buffers = make_mixed_trellis_buffers(
+            launch, device=device, sms=int(props.multi_processor_count)
+        )
+        out = run_bound_mixed_trellis(x, weights, ids, binding, buffers).clone()
+        torch.cuda.synchronize()
+        return launch, out
+
+    _, ref_out = run_variant((64, 256, 64, 256), 1, None)
+    cand_launch, cand_out = run_variant(tile, blocks, schedule)
+    assert cand_launch.blocks_per_sm == 2
+    assert torch.equal(cand_out, ref_out)
+

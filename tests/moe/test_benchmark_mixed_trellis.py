@@ -61,3 +61,21 @@ def test_benchmark_materializes_full_abi5_tier_storage(monkeypatch) -> None:
     assert torch.count_nonzero(padded_w2[materialized:]) == 0
     assert torch.equal(padded.w13_global_scale, torch.tensor([2.0, 3.0, 1.0]))
     assert torch.equal(padded.w2_global_scale, torch.tensor([4.0, 5.0, 1.0]))
+
+
+def test_benchmark_kimi_variant_parsing_and_geometry() -> None:
+    benchmark = _load_benchmark_module()
+    assert (
+        benchmark.KIMI_HIDDEN,
+        benchmark.KIMI_INTERMEDIATE,
+        benchmark.KIMI_EXPERTS,
+        benchmark.KIMI_TOPK,
+        benchmark.KIMI_BITS,
+    ) == (3584, 512, 896, 16, (2, 3))
+    parsed = [
+        benchmark._parse_kimi_variant(v) for v in benchmark.KIMI_DEFAULT_VARIANTS
+    ]
+    assert parsed == [
+        ("old", None, (64, 256, 64, 256), 1),
+        ("n128-2cta", None, (64, 128, 64, 128), 2),
+    ]
