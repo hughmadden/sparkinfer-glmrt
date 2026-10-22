@@ -1,9 +1,8 @@
-"""Exhaustive termination and accuracy checks for the opt-in EXLR8 V3 FC2 arm (#499).
+"""Exhaustive termination and accuracy checks for the serving EXLR8 V3 FC2 (#499).
 
 V3 is the warp-specialized FC2 with FP16 route partials and the K4-style TopKSum
-reduce (``FC2_WS``/``REDUCE_MLP``/``FC2_HALF``). It is not a serving default: these
-tests compile it explicitly as a subclass so a branch that carries the deadlock fix
-can prove termination without changing what serving selects.
+reduce (``FC2_WS``/``REDUCE_MLP``/``FC2_HALF``). Compile the previous FP32 route as
+an explicit reference so default selection cannot turn this into a self-comparison.
 
 The deadlock this guards against was a full-mask ``shfl.sync`` executed under the
 per-quad output-liveness predicate: warp-divergent collectives never complete. Any
@@ -33,24 +32,24 @@ from tests.moe.exlr8_oracle import make_wire
 from tests.moe.test_exlr8_grouped import buffers, compute, programs, reverse_packing, run
 
 
-class V3OptInKernel(Exlr8GroupedKernel):
-    """The opt-in arm: V3 flags without changing serving's class defaults."""
+class FP32ReferenceKernel(Exlr8GroupedKernel):
+    """The pre-V3 grouped route with FP32 partials and the original FC2."""
 
-    CODE_VERSION = 102
-    FC2_WS = True
-    REDUCE_MLP = True
-    FC2_HALF = True
+    CODE_VERSION = 100
+    FC2_WS = False
+    REDUCE_MLP = False
+    FC2_HALF = False
 
 
-def compile_v3_optin(candidate):
-    """Compile the opt-in arm against ``candidate``'s ABI, operands and scratch."""
+def compile_fp32_reference(candidate):
+    """Compile the previous route with the serving ABI, operands and scratch."""
     g = dict(candidate.geometry)
     wrapper = _Exlr8GroupedServingPointers(g)
-    wrapper.core = V3OptInKernel(g["hidden"], g["units"], g["top_k"],
+    wrapper.core = FP32ReferenceKernel(g["hidden"], g["units"], g["top_k"],
                                  g["max_groups"], g["group_rows"])
     source = Path(inspect.getsourcefile(Exlr8GroupedKernel)).read_bytes()
     digest = hashlib.sha256(source).hexdigest()
-    return _common.compile_program(wrapper, name="exlr8_v3_optin_grouped",
+    return _common.compile_program(wrapper, name="exlr8_fp32_reference_grouped",
         operands=candidate.operands, scalars=candidate.scalars,
         key=(digest, tuple(sorted(g.items()))), geometry=g, scratch=candidate.scratch)
 
@@ -96,7 +95,8 @@ def test_exhaustive_1_to_4096():
     state_base = buffers(rows, hidden, units, topk, 132, 64)
     state_v3 = buffers(rows, hidden, units, topk, 132, 64)
     base_group, base_k1 = programs(hidden, units, topk, 132, 64, True)
-    v3_k1 = compile_v3_optin(base_k1)
+    v3_k1 = base_k1
+    base_k1 = compile_fp32_reference(v3_k1)
     state_base["compact"] = compact_unit_descriptors(bits)
     state_v3["compact"] = compact_unit_descriptors(bits)
 
@@ -163,7 +163,8 @@ def test_hidden6144_sliced_and_unsliced():
     state["compact"] = compact_unit_descriptors(bits)
     base_k1 = compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=topk, max_groups=capacity, device_count=True, grouped=True, group_rows=64)
     base_group = compile_exlr8_group_aot(experts=256, hidden=hidden, top_k=topk, max_groups=capacity, max_rows=4096, group_rows=64)
-    v3_k1 = compile_v3_optin(base_k1)
+    v3_k1 = base_k1
+    base_k1 = compile_fp32_reference(v3_k1)
 
     step_rows = [1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 255, 511, 512, 513, 768, 1023, 1024, 1025, 1408, 2048, 2688, 3328, 4095, 4096]
     max_rel_l2 = 0.0

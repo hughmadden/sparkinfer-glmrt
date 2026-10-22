@@ -1,4 +1,4 @@
-"""Bitwise K1 contract for expert-major EXLR8 prefill."""
+"""Decode fidelity and bitwise row/packing invariance for grouped EXLR8."""
 import os
 from pathlib import Path
 
@@ -10,6 +10,18 @@ from benchmarks.benchmark_exlr8_a16 import compact_unit_descriptors, compact_pro
 from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
 from b12x._lib.runtime_control import kernel_resolution_guard
 from .exlr8_oracle import Case, make_wire
+
+
+def assert_matches_decode(actual, expected):
+    from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+    if Exlr8GroupedKernel.FC2_HALF and not os.environ.get("EXLR8_FROZEN_GROUPED_ARM"):
+        # V3 rounds FC2 route partials to FP16; frozen exact experiment arms
+        # retain the original bitwise contract.
+        diff = actual.float() - expected.float()
+        relative = torch.linalg.vector_norm(diff) / torch.linalg.vector_norm(expected.float()).clamp_min(1e-30)
+        assert torch.isfinite(actual).all() and relative < 0.01, float(relative)
+    else:
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 def buffers(rows, hidden, units, topk, capacity, group_rows):
@@ -86,15 +98,18 @@ def test_checkpoint_grouped_matches_chunks(group_rows, units):
     state = buffers(rows, hidden, units, topk, 128, group_rows)
     grouped = programs(hidden, units, topk, 128, group_rows, True)
     state["compact"] = compact_unit_descriptors(case.bits)
+    run(grouped, state, wire, ids, weights, case.pointers, case.bits, signs, rows, 48)
+    grouped_expected = state["output"][:rows].clone()
+    assert_matches_decode(grouped_expected, expected)
     with kernel_resolution_guard("EXLR8 grouped runtime rows and packing"):
         for live in (1, 8, 16, 17, 32, 63, 64, 65, 127, 128, 129):
             for limit in (1, 48, 188):
                 state["output"].fill_(float("nan"))
                 run(grouped, state, wire, ids, weights, case.pointers, case.bits, signs, live, limit)
-                assert torch.equal(state["output"][:live].view(torch.int16), expected[:live].view(torch.int16))
+                assert torch.equal(state["output"][:live].view(torch.int16), grouped_expected[:live].view(torch.int16))
                 reverse_packing(state, live)
                 compute(grouped[1], state, weights, case.pointers, case.bits, signs, live, limit)
-                assert torch.equal(state["output"][:live].view(torch.int16), expected[:live].view(torch.int16))
+                assert torch.equal(state["output"][:live].view(torch.int16), grouped_expected[:live].view(torch.int16))
                 assert torch.isnan(state["output"][live:]).all()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -108,7 +123,7 @@ def test_checkpoint_grouped_matches_chunks(group_rows, units):
             for first in range(0, rows, 64):
                 live = min(rows-first, 64)
                 run(dec, base, wire[first:], ids[first:], weights[first:], case.pointers, case.bits, signs, live, 48)
-                assert torch.equal(actual[first:first+live].view(torch.int16), base["output"][:live].view(torch.int16))
+                assert_matches_decode(actual[first:first+live], base["output"][:live])
 
 
 @pytest.mark.parametrize("units", [1, 16])
@@ -149,14 +164,17 @@ def test_every_live_row_count_matches_decode(units):
         run(dec, base, wire[first:], ids[first:], weights[first:], pointers, bits, signs, 64, 48)
         expected[first:first+64].copy_(base["output"][:64])
     assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
+    run(grouped, state, wire, ids, weights, pointers, bits, signs, rows, 48)
+    grouped_expected = state["output"][:rows].clone()
+    assert_matches_decode(grouped_expected, expected)
     live_counts = range(1, rows+1) if os.environ.get("EXLR8_EXHAUSTIVE") else (1, 16, 64, 65, 512, 1024, 4096)
     with kernel_resolution_guard("EXLR8 grouped exhaustive row invariance"):
         for live in live_counts:
             for limit in (1, 48, 188):
                 state["output"].fill_(float("nan"))
                 run(grouped, state, wire, ids, weights, pointers, bits, signs, live, limit)
-                assert torch.equal(state["output"][:live].view(torch.int16), expected[:live].view(torch.int16)), (live, limit)
+                assert torch.equal(state["output"][:live].view(torch.int16), grouped_expected[:live].view(torch.int16)), (live, limit)
                 reverse_packing(state, live)
                 compute(grouped[1], state, weights, pointers, bits, signs, live, limit)
-                assert torch.equal(state["output"][:live].view(torch.int16), expected[:live].view(torch.int16)), (live, limit, "reverse")
+                assert torch.equal(state["output"][:live].view(torch.int16), grouped_expected[:live].view(torch.int16)), (live, limit, "reverse")
                 assert torch.isnan(state["output"][live:]).all()
