@@ -7,8 +7,6 @@ the E4M3/F16 decoded fragments. Live rows never select a different arithmetic.
 """
 from __future__ import annotations
 
-import os
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -86,10 +84,6 @@ class NativeTrellisLinear:
         self.input_units = g["sharded_side"] == 2
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
         self.splits = g["splits"]
-        wide = g.get("wide")
-        if wide is None:
-            wide = os.environ.get("TRELLIS_WIDE", "0") != "0"
-        self.wide = bool(wide) and self.bits >= 5
 
     def _storage(self, active: int):
         class Storage:
@@ -106,16 +100,12 @@ class NativeTrellisLinear:
                  stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations) and cta_limit > Int32(0):
             tiles = Int32(self.n // 128 * self.splits)
-            if cutlass.const_expr(not self.wide):
+            if cutlass.const_expr(self.bits < 5):
                 self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
                     grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
                     block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            elif rows <= Int32(1):
-                self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
-                    grid=(min(tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
             elif rows <= Int32(16):
-                self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 1, 8).launch(
+                self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
                     grid=(min(tiles, cta_limit), 1, 1),
                     block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
             elif rows <= Int32(32):

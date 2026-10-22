@@ -79,5 +79,5 @@ def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
     pointers = _Pointers(g)
     return compile_program(pointers, name="trellis_linear", operands=operands,
                            scalars=tuple(Scalar(name) for name in SCALARS),
-                           key=(*g.values(), pointers.core.wide), geometry=g,
+                           key=tuple(g.values()), version=2, geometry=g,
                            scratch={"partial": lambda rows: rows*s*n*4}, doc=__doc__)
