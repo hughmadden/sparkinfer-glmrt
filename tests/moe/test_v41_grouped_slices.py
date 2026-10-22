@@ -60,15 +60,24 @@ def test_grouped_slices(width, h, n, topk):
     _check_grouped_slices(width, n=n, topk=topk, h=h)
 
 
+@pytest.mark.parametrize("routing_case", ["shared", "unique"])
+def test_grouped_exact_slices(routing_case):
+    _check_grouped_slices(192, capacity=17, row_counts=[1, 2, 16, 17],
+                          experts=24, exact_storage=True, routing_case=routing_case)
+
+
 def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
-                          capacity=80, row_counts=None, experts=None):
+                          capacity=80, row_counts=None, experts=None,
+                          exact_storage=False, routing_case="shared"):
     if -(-n // width) * width > (n + 127) // 128 * 128:
         pytest.skip("slice width does not tile this intermediate within its packed storage")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("Blackwell GPU required")
     torch.manual_seed(4164)
-    experts = experts or (128 if n == 2304 else 32)
+    experts = (128 if n == 2304 else 32) if experts is None else experts
     assert capacity > 0 and 0 < topk <= experts
+    assert routing_case in ("shared", "unique")
+    assert not exact_storage or (h, n) == (5120, 576)
     weights = {}
     scales = {}
     for name, shape in [
@@ -80,24 +89,28 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
         scales[name] = torch.randint(
             121, 124, (*shape[:-1], shape[-1] // 16), device="cuda", dtype=torch.uint8
         )
-    w13 = _logical_weight_to_w4a8_rp_inplace(
-        torch.cat([weights["w3"], weights["w1"]], 1),
-        size_k=h,
-        size_n=n * 2,
-        gated_half_rows=n,
-    )
-    s13 = _e8m0_scale_to_w4a8_sfb_inplace(
-        torch.cat([scales["w3"], scales["w1"]], 1),
-        weight_E=experts,
-        rows=n * 2,
-        k_dim=h,
-        gated_half_rows=n,
-    )
-    w2 = _logical_weight_to_w4a8_rp_inplace(weights["w2"].clone(), size_k=n, size_n=h)
-    s2 = _e8m0_scale_to_w4a8_sfb_inplace(
-        scales["w2"].clone(), weight_E=experts, rows=h, k_dim=n
-    )
-    packed = [t.view(torch.uint32).flatten() for t in [w13, s13, w2, s2]]
+    if exact_storage:
+        from tests.moe.test_v41_exact_slices import pack
+        packed = pack(weights, scales, True)
+    else:
+        w13 = _logical_weight_to_w4a8_rp_inplace(
+            torch.cat([weights["w3"], weights["w1"]], 1),
+            size_k=h,
+            size_n=n * 2,
+            gated_half_rows=n,
+        )
+        s13 = _e8m0_scale_to_w4a8_sfb_inplace(
+            torch.cat([scales["w3"], scales["w1"]], 1),
+            weight_E=experts,
+            rows=n * 2,
+            k_dim=h,
+            gated_half_rows=n,
+        )
+        w2 = _logical_weight_to_w4a8_rp_inplace(weights["w2"].clone(), size_k=n, size_n=h)
+        s2 = _e8m0_scale_to_w4a8_sfb_inplace(
+            scales["w2"].clone(), weight_E=experts, rows=h, k_dim=n
+        )
+        packed = [t.view(torch.uint32).flatten() for t in [w13, s13, w2, s2]]
     x = torch.randn(capacity, h, device="cuda").mul_(0.5).bfloat16()
     wire = torch.empty((capacity, h + h // 32), device="cuda", dtype=torch.uint8)
     qa = wire[:, :h].view(torch.uint32)
@@ -109,7 +122,8 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
     args = [from_dlpack(t, assumed_align=16) for t in [qa, qs, *packed, routing, out]]
     meta_view = from_dlpack(metadata, assumed_align=16)
     compiled = cute.compile(
-        V41FusedSliceKernel(width, grouped=True, intermediate=n, hidden=h),
+        V41FusedSliceKernel(width, grouped=True, intermediate=n, hidden=h,
+                            exact_storage=exact_storage),
         *args,
         cutlass.Int32(capacity),
         current_cuda_stream(),
@@ -123,6 +137,9 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
     cases = (_routing_cases() if row_counts is None else
              [(f"shared{m}", torch.arange(topk).expand(m, topk).clone())
               for m in row_counts])
+    if row_counts is not None and routing_case == "unique":
+        cases = [(f"unique{m}", torch.arange(m * topk).reshape(m, topk) % experts)
+                 for m in row_counts]
     cases = [(name, ids) for name, ids in cases if ids.shape[0] <= capacity]
     if n == 2304 and row_counts is None:
         cases += [(f"draft{m}", torch.arange(m * topk).reshape(m, topk) % experts)
