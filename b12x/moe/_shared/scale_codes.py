@@ -2,7 +2,7 @@
 
 Each expert stores uint16 codes in the existing scale-word order, followed by
 one uint8 base per resident row. Padding is excluded from the exponent range.
-A caller must retain raw scales when validation refuses a tensor.
+Unsupported exponent spans fail the load before any execution views publish.
 """
 
 import torch
@@ -15,8 +15,8 @@ class ScaleCodeRangeError(ValueError):
 def pack_scale_codes(scales, *, tensor_name, gated_half_rows=None):
     """Pack logical uint8 [experts, rows, K/32] scales without changing bytes.
 
-    Validation precedes output allocation. A failed tensor is never partially
-    packed, so the owner can keep its raw UE8M0 path and admission unchanged.
+    Validation precedes output allocation. A failed tensor never becomes
+    execution-visible; resident admission always uses the shape-derived size.
     """
     if scales.dtype != torch.uint8 or scales.ndim != 3 or not scales.shape[-1]:
         raise ValueError(f"{tensor_name}: expected uint8 [experts, rows, K/32]")
@@ -29,7 +29,7 @@ def pack_scale_codes(scales, *, tensor_name, gated_half_rows=None):
         span = int(high[expert, row]) - int(low[expert, row])
         raise ScaleCodeRangeError(
             f"{tensor_name}: expert {expert} row {row} UE8M0 span {span} exceeds 15; "
-            "retain raw UE8M0 scales"
+            "unsupported V4.1 scale codes"
         )
     if gated_half_rows is not None:
         if rows != 2 * gated_half_rows:

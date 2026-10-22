@@ -28,7 +28,7 @@ def test_scale_code_roundtrip(rows, columns, half):
 
 def test_scale_codes_refuse_span_16():
     scales = torch.tensor([[[111, 127, 111, 111]]], dtype=torch.uint8)
-    with pytest.raises(ScaleCodeRangeError, match=r"fixture\.w2\.scale: expert 0 row 0 UE8M0 span 16 exceeds 15; retain raw UE8M0"):
+    with pytest.raises(ScaleCodeRangeError, match=r"fixture\.w2\.scale: expert 0 row 0 UE8M0 span 16 exceeds 15; unsupported V4.1 scale codes"):
         pack_scale_codes(scales, tensor_name="fixture.w2.scale")
 
 
@@ -39,8 +39,7 @@ def _snapshot():
     return Path(path)
 
 
-def test_full_checkpoint_scale_code_spans():
-    snapshot = _snapshot()
+def _scan_scale_code_spans(snapshot):
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
     selected = {}
     for name, shard in index.items():
@@ -64,7 +63,6 @@ def test_full_checkpoint_scale_code_spans():
                 assert scales.ndim == 2, (name, scales.shape)
                 span = scales.max(-1).astype(np.int16) - scales.min(-1).astype(np.int16)
                 maximum = int(span.max())
-                assert maximum <= 15, (name, int(span.argmax()), maximum)
                 kind = "dspark" if name.startswith("mtp.") else "backbone"
                 result = totals[kind]
                 result["tensors"] += 1
@@ -72,7 +70,21 @@ def test_full_checkpoint_scale_code_spans():
                 result["maximum_span"] = max(result["maximum_span"], maximum)
         print(json.dumps({"shard": shard, "totals": totals}), flush=True)
     assert all(value["tensors"] and value["rows"] for value in totals.values())
-    print("full_checkpoint_scale_codes " + json.dumps(totals), flush=True)
+    print("full_checkpoint_scale_codes " + json.dumps({"snapshot": snapshot.name, "totals": totals}), flush=True)
+    return totals
+
+
+def test_full_checkpoint_scale_code_spans():
+    totals = _scan_scale_code_spans(_snapshot())
+    assert all(value["maximum_span"] <= 15 for value in totals.values()), totals
+
+
+@pytest.mark.parametrize("environment", ["V4_FLASH_SCALE_CODES_SNAPSHOT", "V4_PRO_SCALE_CODES_SNAPSHOT"])
+def test_v4_checkpoint_scale_code_span_survey(environment):
+    path = os.environ.get(environment)
+    if not path:
+        pytest.skip(f"{environment} is required for the optional V4 survey")
+    _scan_scale_code_spans(Path(path))
 
 
 @pytest.mark.parametrize("prefix,intermediate", [("layers.3.ffn.experts.0", 384), ("layers.3.ffn.experts.0", 576), ("mtp.0.ffn.experts.0", 2304)])
