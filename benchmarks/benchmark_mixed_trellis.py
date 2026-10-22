@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import statistics
 from dataclasses import replace
 
@@ -12,6 +13,7 @@ import torch
 from b12x.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
     max_packed_route_slots,
+    route_pack_capacity,
 )
 from b12x.moe._shared.kernels.w4a16.kernel import (
     compile_w4a16_fused_moe,
@@ -22,8 +24,11 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     MixedTrellisRotations,
     bind_mixed_trellis,
     build_ordered_maps,
+    build_projection_tiered_maps,
+    combine_trellis_rotations,
     compile_mixed_trellis,
     make_mixed_trellis_buffers,
+    parse_decode_schedule,
     run_bound_mixed_trellis,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
@@ -38,6 +43,18 @@ K3_EXPERTS = 192
 K4_EXPERTS = 64
 TOTAL_EXPERTS = K3_EXPERTS + K4_EXPERTS
 TILE_CONFIG = (128, 128, 32, 512)
+
+KIMI_HIDDEN = 3584
+KIMI_INTERMEDIATE = 512
+KIMI_EXPERTS = 896
+KIMI_TOPK = 16
+KIMI_BITS = (2, 3)
+KIMI_DEFAULT_TILE = (64, 256, 64, 256)
+KIMI_DEFAULT_ROWS = (1, 2, 4, 6, 8, 12, 16, 24, 32, 36)
+KIMI_DEFAULT_VARIANTS = (
+    "old:default:64,256,64,256:1",
+    "n128-2cta:default:64,128,64,128:2",
+)
 
 
 def _prepared(bits: int, experts: int, seed: int, device: torch.device):
@@ -272,6 +289,429 @@ def _pad_exact_tier_storage(tier, compiled_experts: int):
     )
 
 
+def _parse_kimi_variant(text: str):
+    if ":" not in text:
+        name, schedule, tile, blocks = text, text, KIMI_DEFAULT_TILE, None
+    else:
+        name, schedule, tile_text, blocks_text = text.split(":")
+        tile = (
+            tuple(int(v) for v in tile_text.split(","))
+            if tile_text
+            else KIMI_DEFAULT_TILE
+        )
+        blocks = int(blocks_text) if blocks_text else None
+    parse_decode_schedule(schedule)
+    return name, (None if schedule in ("", "default") else schedule), tile, blocks
+
+
+def _output_digest(output: torch.Tensor) -> str:
+    return hashlib.sha256(
+        output.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    ).hexdigest()[:16]
+
+
+def _kernel_resource_info(launch, max_shared_mem: int) -> dict[str, int | float]:
+    cta_threads = (int(launch.fc1_tile_k) * int(launch.fc1_tile_n)) // 64
+    dyn_smem = int(launch.shared_memory_bytes)
+    regs = -1
+    local_bytes = -1
+    static_smem = 1024
+    occ_ctas = -1
+
+    try:
+        from cuda.bindings import driver, runtime
+
+        executable = getattr(launch.compiled, "_executable", launch.compiled)
+        module = getattr(executable, "jit_module", None)
+        if module is not None:
+            err, dev_id = runtime.cudaGetDevice()
+            if int(err) == 0:
+                cu_dev = driver.CUdevice(int(dev_id))
+                kernels = [
+                    entry.kernel for entry in getattr(module, "cuda_modules", ())
+                ]
+                for library in getattr(module, "cuda_library", ()):
+                    err_c, count = runtime.cudaLibraryGetKernelCount(library)
+                    if int(err_c) == 0:
+                        err_k, enum_k = runtime.cudaLibraryEnumerateKernels(
+                            count, library
+                        )
+                        if int(err_k) == 0:
+                            kernels.extend(enum_k)
+                if kernels:
+                    cu_kernel = driver.CUkernel(int(kernels[0]))
+                    err_r, r_val = driver.cuKernelGetAttribute(
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS,
+                        cu_kernel,
+                        cu_dev,
+                    )
+                    if int(err_r) == 0:
+                        regs = int(r_val)
+                    err_l, l_val = driver.cuKernelGetAttribute(
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                        cu_kernel,
+                        cu_dev,
+                    )
+                    if int(err_l) == 0:
+                        local_bytes = int(l_val)
+                    err_s, s_val = driver.cuKernelGetAttribute(
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                        cu_kernel,
+                        cu_dev,
+                    )
+                    if int(err_s) == 0:
+                        static_smem = int(s_val)
+                    try:
+                        err_o, o_val = (
+                            runtime.cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                                kernels[0], cta_threads, dyn_smem
+                            )
+                        )
+                        if int(err_o) == 0 and int(o_val) > 0:
+                            occ_ctas = int(o_val)
+                    except Exception:
+                        pass
+                    if occ_ctas < 0:
+                        try:
+                            err_f, cu_func = driver.cuKernelGetFunction(cu_kernel)
+                            if int(err_f) == 0:
+                                err_o, o_val = (
+                                    driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                                        cu_func, cta_threads, dyn_smem
+                                    )
+                                )
+                                if int(err_o) == 0 and int(o_val) > 0:
+                                    occ_ctas = int(o_val)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    if regs < 0:
+        try:
+            import re
+            import subprocess
+            import tempfile
+
+            with tempfile.TemporaryDirectory(prefix="b12x_res_") as tmpdir:
+                launch.compiled.export_to_c(tmpdir, "core", "cuteafd_core")
+                ru = subprocess.run(
+                    ["cuobjdump", "-res-usage", f"{tmpdir}/core.o"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                m_res = re.search(
+                    r"REG:(\d+)\s+STACK:(\d+)\s+SHARED:(\d+)\s+LOCAL:(\d+)",
+                    ru.stdout,
+                )
+                if m_res:
+                    regs = int(m_res.group(1))
+                    local_bytes = int(m_res.group(2)) + int(m_res.group(4))
+                    static_smem = int(m_res.group(3))
+        except Exception:
+            pass
+    if occ_ctas < 0 and regs > 0:
+        alloc_regs = ((regs + 7) // 8) * 8
+        reg_ctas = 65536 // (alloc_regs * cta_threads)
+        smem_ctas = int(max_shared_mem) // max(dyn_smem + static_smem, 1)
+        warp_ctas = 48 // (cta_threads // 32)
+        occ_ctas = max(1, min(reg_ctas, smem_ctas, warp_ctas))
+    warps_per_sm = occ_ctas * (cta_threads // 32) if occ_ctas > 0 else -1
+    occ_pct = (100.0 * warps_per_sm / 48.0) if warps_per_sm > 0 else -1.0
+    return {
+        "cta_threads": cta_threads,
+        "blocks_per_sm": int(launch.blocks_per_sm),
+        "regs": regs,
+        "spills_local_bytes": local_bytes,
+        "static_smem_bytes": static_smem,
+        "dyn_smem_bytes": dyn_smem,
+        "occ_ctas_per_sm": occ_ctas,
+        "occ_warps_per_sm": warps_per_sm,
+        "occ_pct": occ_pct,
+    }
+
+
+def _make_kimi_layer(seed: int, device: torch.device):
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (
+            0.875 + 0.25 * torch.rand(shape, generator=generator, device=device)
+        ).to(torch.float16)
+
+    tier0 = prepare_trellis256_moe_weights(
+        hidden_size=KIMI_HIDDEN,
+        intermediate_size=KIMI_INTERMEDIATE,
+        num_experts=KIMI_EXPERTS,
+        activation="situ",
+        fc1_tile_n=128,
+        fc2_tile_n=128,
+        device=device,
+        seed=seed,
+        params_dtype=torch.float16,
+        w13_layout="trellis_t256_proj",
+        trellis_bits=KIMI_BITS[0],
+        codebook="mcg",
+        gate_suh=scales((KIMI_EXPERTS, KIMI_HIDDEN)),
+        up_suh=scales((KIMI_EXPERTS, KIMI_HIDDEN)),
+        intermediate_rotations=scales((KIMI_EXPERTS, 3 * KIMI_INTERMEDIATE)),
+        down_svh=scales((KIMI_EXPERTS, KIMI_HIDDEN)),
+        tile_config=(64, 128, 64, 128),
+    )
+    tier1_full = prepare_trellis256_moe_weights(
+        hidden_size=KIMI_HIDDEN,
+        intermediate_size=KIMI_INTERMEDIATE,
+        num_experts=1,
+        activation="situ",
+        fc1_tile_n=128,
+        fc2_tile_n=128,
+        device=device,
+        seed=seed + 1,
+        params_dtype=torch.float16,
+        w13_layout="trellis_t256_proj",
+        trellis_bits=KIMI_BITS[1],
+        codebook="mcg",
+        gate_suh=scales((1, KIMI_HIDDEN)),
+        up_suh=scales((1, KIMI_HIDDEN)),
+        intermediate_rotations=scales((1, 3 * KIMI_INTERMEDIATE)),
+        down_svh=scales((1, KIMI_HIDDEN)),
+        tile_config=(64, 128, 64, 128),
+    )
+    # Tier 1 has 0 routed experts in Kimi K2; projection-tight storage holds 1 dummy plane.
+    tier1 = replace(
+        tier1_full,
+        w13=tier1_full.w13[: tier1_full.w13.numel() // 2].contiguous(),
+    )
+    global_to_combined, descriptor = build_projection_tiered_maps(
+        (0,) * KIMI_EXPERTS,
+        (0,) * KIMI_EXPERTS,
+        (0,) * KIMI_EXPERTS,
+        tier_slots=(KIMI_EXPERTS, 1),
+        device=device,
+    )
+    rotations = combine_trellis_rotations(tier0, tier1)
+    return tier0, tier1, global_to_combined, descriptor, rotations
+
+
+def _run_kimi_benchmark(args, device: torch.device, props) -> None:
+    variant_specs = [_parse_kimi_variant(v) for v in (args.kimi_variant or KIMI_DEFAULT_VARIANTS)]
+    names = [name for name, *_ in variant_specs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"kimi variant names must be unique: {names}")
+    rows_list = (
+        [int(v) for v in args.rows.split(",")]
+        if args.rows
+        else list(KIMI_DEFAULT_ROWS)
+    )
+    if any(r < 1 or r > 80 for r in rows_list):
+        raise ValueError("Kimi decode rows must be in 1..80")
+    sms = int(props.multi_processor_count)
+    max_shared_mem = int(props.shared_memory_per_block_optin)
+    layers = [_make_kimi_layer(1000 * (i + 1), device) for i in range(args.layers)]
+    generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    max_rows = max(rows_list)
+    ids = torch.stack(
+        [
+            torch.randperm(KIMI_EXPERTS, generator=generator)[:KIMI_TOPK]
+            for _ in range(max_rows)
+        ]
+    ).to(dtype=torch.int32, device=device)
+    weights = torch.rand((max_rows, KIMI_TOPK), generator=generator).to(device=device)
+    weights = 2.5 * weights / weights.sum(dim=-1, keepdim=True)
+    x = (
+        (torch.randn((max_rows, KIMI_HIDDEN), generator=generator) * 0.25)
+        .to(torch.bfloat16)
+        .to(device)
+    )
+    expert_k2_bytes = 3 * KIMI_HIDDEN * KIMI_INTERMEDIATE * KIMI_BITS[0] // 8
+    print(
+        f"device={props.name} sms={sms} H={KIMI_HIDDEN} I={KIMI_INTERMEDIATE} "
+        f"experts={KIMI_EXPERTS}xK2 top{KIMI_TOPK} activation=situ "
+        f"layers={args.layers} calls/graph={args.calls_per_graph} "
+        f"replays={args.replays} rounds={args.rounds}",
+        flush=True,
+    )
+
+    def build(capacity: int, schedule: str | None, tile: tuple[int, int, int, int], blocks: int | None):
+        import os
+
+        os.environ.setdefault("B12X_COMPILE_DISK_CACHE", "0")
+        slots = route_pack_capacity(
+            capacity * KIMI_TOPK, 8, KIMI_EXPERTS, topk=KIMI_TOPK
+        )[1]
+        launch = compile_mixed_trellis(
+            size_m=capacity,
+            hidden_size=KIMI_HIDDEN,
+            intermediate_size=KIMI_INTERMEDIATE,
+            tier0_num_experts=KIMI_EXPERTS,
+            tier1_num_experts=1,
+            top_k=KIMI_TOPK,
+            route_num_experts=KIMI_EXPERTS,
+            max_m_blocks=(slots + 7) // 8,
+            sms=sms,
+            max_shared_mem=max_shared_mem,
+            force_tile_config=tile,
+            tier0_bits=KIMI_BITS[0],
+            tier1_bits=KIMI_BITS[1],
+            trellis_codebook="mcg",
+            swiglu_limit=None,
+            activation="situ",
+            moe_block_size=8,
+            rotation_input_dtype="bf16",
+            full_rotation_output_dtype="bf16",
+            route_ids_dtype=torch.int32,
+            force_blocks_per_sm=blocks,
+            decode_schedule=schedule,
+        )
+        buffers = make_mixed_trellis_buffers(launch, device=device, sms=sms)
+        bindings = [
+            bind_mixed_trellis(
+                t0,
+                t1,
+                g2c,
+                desc,
+                rot,
+                launch,
+                gate_experts=(KIMI_EXPERTS, 0),
+                up_experts=(KIMI_EXPERTS, 0),
+            )
+            for t0, t1, g2c, desc, rot in layers
+        ]
+        return launch, buffers, bindings
+
+    printed_resources: set[tuple[str, int]] = set()
+    for rows in rows_list:
+        capacity = 1 if rows == 1 else 80
+        xs = x[:rows].contiguous()
+        ws = weights[:rows].contiguous()
+        ks = ids[:rows].contiguous()
+        distinct_experts = int(torch.unique(ks).numel())
+        weight_bytes = distinct_experts * expert_k2_bytes
+        state = {}
+        ref_eager_tensors: list[torch.Tensor] | None = None
+        for name, schedule, tile, blocks in variant_specs:
+            launch, buffers, bindings = build(capacity, schedule, tile, blocks)
+            res_info = _kernel_resource_info(launch, max_shared_mem)
+            if (name, capacity) not in printed_resources:
+                printed_resources.add((name, capacity))
+                print(
+                    f"resource m{capacity:<2d} variant={name:<16s} "
+                    f"tile={','.join(map(str, tile))} threads={res_info['cta_threads']} "
+                    f"blocks/SM_req={res_info['blocks_per_sm']} "
+                    f"occ_ctas/SM={res_info['occ_ctas_per_sm']} "
+                    f"occ_warps/SM={res_info['occ_warps_per_sm']} ({res_info['occ_pct']:.1f}%) "
+                    f"regs={res_info['regs']} spills_B={res_info['spills_local_bytes']} "
+                    f"dyn_smem_B={res_info['dyn_smem_bytes']} static_smem_B={res_info['static_smem_bytes']} "
+                    f"schedule={launch.decode_schedule}",
+                    flush=True,
+                )
+            layer_buffers = [
+                replace(buffers, output=torch.empty_like(buffers.output))
+                for _ in bindings
+            ]
+            eager_outputs = [
+                run_bound_mixed_trellis(xs, ws, ks, binding, layer_buffer).clone()
+                for binding, layer_buffer in zip(bindings, layer_buffers)
+            ]
+            if ref_eager_tensors is None:
+                ref_eager_tensors = eager_outputs
+            eager_digests = [_output_digest(out) for out in eager_outputs]
+
+            def calls(bindings=bindings, layer_buffers=layer_buffers):
+                for call in range(args.calls_per_graph):
+                    layer = call % len(bindings)
+                    run_bound_mixed_trellis(
+                        xs, ws, ks, bindings[layer], layer_buffers[layer]
+                    )
+
+            for _ in range(3):
+                calls()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                calls()
+            for layer_buffer in layer_buffers:
+                layer_buffer.output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            state[name] = {
+                "graph": graph,
+                "eager": eager_digests,
+                "eager_tensors": eager_outputs,
+                "times_ms": [],
+                "keep": (launch, buffers, layer_buffers, bindings, calls),
+                "res": res_info,
+                "tile": tile,
+                "schedule": launch.decode_schedule,
+            }
+
+        for _ in range(args.rounds):
+            for name, *_ in variant_specs:
+                graph = state[name]["graph"]
+                starts = [
+                    torch.cuda.Event(enable_timing=True) for _ in range(args.replays)
+                ]
+                ends = [
+                    torch.cuda.Event(enable_timing=True) for _ in range(args.replays)
+                ]
+                for start, end in zip(starts, ends, strict=True):
+                    start.record()
+                    graph.replay()
+                    end.record()
+                torch.cuda.synchronize()
+                state[name]["times_ms"] += [
+                    s.elapsed_time(e) / args.calls_per_graph
+                    for s, e in zip(starts, ends, strict=True)
+                ]
+
+        assert ref_eager_tensors is not None
+        reference = state[variant_specs[0][0]]
+        ref_min_ms = min(reference["times_ms"])
+        ref_med_ms = statistics.median(reference["times_ms"])
+        for name, *_ in variant_specs:
+            entry = state[name]
+            replay_tensors = [
+                lb.output[:rows].clone() for lb in entry["keep"][2]
+            ]
+            replay_digests = [_output_digest(t) for t in replay_tensors]
+            bitwise_eager = all(
+                torch.equal(r, e)
+                for r, e in zip(replay_tensors, entry["eager_tensors"], strict=True)
+            )
+            bitwise_ref = all(
+                torch.equal(r, ref)
+                for r, ref in zip(replay_tensors, ref_eager_tensors, strict=True)
+            )
+            if not bitwise_eager:
+                status = "REPLAY-DIFFERS"
+            elif not bitwise_ref or replay_digests != reference["eager"]:
+                status = "DIFFERENT"
+            else:
+                status = "BITWISE-EQUAL"
+            min_ms = min(entry["times_ms"])
+            med_ms = statistics.median(entry["times_ms"])
+            res = entry["res"]
+            print(
+                f"rows={rows:2d} m{capacity:<2d} variant={name:<16s} "
+                f"experts={distinct_experts:3d} "
+                f"min={min_ms * 1000.0:7.1f}us ({min_ms:.4f}ms) "
+                f"med={med_ms * 1000.0:7.1f}us ({med_ms:.4f}ms) "
+                f"GB/s={weight_bytes / min_ms / 1e6:6.1f} "
+                f"speedup_min={ref_min_ms / min_ms:6.3f}x "
+                f"speedup_med={ref_med_ms / med_ms:6.3f}x "
+                f"occ={res['occ_ctas_per_sm']}cta/SM regs={res['regs']} "
+                f"spills={res['spills_local_bytes']}B "
+                f"bits={'/'.join(replay_digests)} {status}",
+                flush=True,
+            )
+            if status != "BITWISE-EQUAL":
+                raise RuntimeError(
+                    f"Kimi bitwise equality check failed for variant {name} at rows={rows}: {status}"
+                )
+        del state
+        torch.cuda.empty_cache()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, nargs="+", default=[1, 2, 4, 8, 32])
@@ -288,9 +728,34 @@ def main() -> None:
         action="store_true",
         help="A/B control: replace the aliased FC2 output with separate storage",
     )
+    parser.add_argument(
+        "--kimi",
+        action="store_true",
+        help="Benchmark Kimi K3 TP6 Spark geometry (E896, top-16, I=512, EXL3 K2, situ) across 1-CTA and 2-CTA variants",
+    )
+    parser.add_argument(
+        "--rows",
+        default=None,
+        help="Comma-separated decode row counts for --kimi (default: 1,2,4,6,8,12,16,24,32,36)",
+    )
+    parser.add_argument(
+        "--kimi-variant",
+        action="append",
+        default=[],
+        help="Variant spec NAME:SCHEDULE:TILE:BLOCKS_PER_SM for --kimi",
+    )
+    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--calls-per-graph", type=int, default=8)
+    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=20261022)
     args = parser.parse_args()
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
+    if args.kimi:
+        if args.replays == 100:
+            args.replays = 20
+        _run_kimi_benchmark(args, device, props)
+        return
     torch.manual_seed(20260730)
     materialized = int(args.materialized_experts)
     if materialized < 6 or materialized > K4_EXPERTS:
