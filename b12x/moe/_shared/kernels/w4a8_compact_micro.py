@@ -95,6 +95,8 @@ class _DirectW4A8CompactLaunch:
         native_v41: bool = False,
         wire_rows: bool = False,
         unit_scales: bool = False,
+        scale_codes: bool = False,
+        scale_columns: int | None = None,
     ):
         self.wire_rows = bool(wire_rows)
         self.native_v41 = bool(native_v41)
@@ -105,7 +107,12 @@ class _DirectW4A8CompactLaunch:
         self.experts = experts
         self.input_scale_count = input_scale_count
         self.down_scale_count = down_scale_count
-        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk, wire_rows=wire_rows, unit_scales=unit_scales)
+        self.scale_codes = bool(scale_codes)
+        self.scale_columns = n // 32 if scale_columns is None else int(scale_columns)
+        if not 0 < self.scale_columns <= n // 32:
+            raise ValueError("logical scale columns exceed the prepared intermediate extent")
+        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk, wire_rows=wire_rows,
+            unit_scales=unit_scales, scale_codes=scale_codes)
         self.activation = W4A8CompactMicroActivationKernel(
             n,
             experts,
@@ -121,6 +128,9 @@ class _DirectW4A8CompactLaunch:
             native_v41=native_v41,
             n64_repacked=self.n % 128 == 64,
             n64_tail=self.n % 128 == 64,
+            scale_codes=scale_codes,
+            scale_rows=k,
+            scale_columns=self.scale_columns,
         )
 
     @cute.jit
@@ -159,17 +169,21 @@ class _DirectW4A8CompactLaunch:
             w13_ptr,
             cute.make_layout((self.experts * self.n * self.k // 4,)),
         )
+        s13_words = (2 * self.n * (2 * ((self.k // 32 + 3) // 4) + 1) // 4
+                     if self.scale_codes else self.n * self.k // 64)
         w13_scales = cute.make_tensor(
             w13_scales_ptr,
-            cute.make_layout((self.experts * self.n * self.k // 64,)),
+            cute.make_layout((self.experts * s13_words,)),
         )
         w2 = cute.make_tensor(
             w2_ptr,
             cute.make_layout((self.experts * self.k * self.n // 8,)),
         )
+        s2_words = (self.k * (2 * ((self.scale_columns + 3) // 4) + 1) // 4
+                    if self.scale_codes else self.k * self.n // 128)
         w2_scales = cute.make_tensor(
             w2_scales_ptr,
-            cute.make_layout((self.experts * self.k * self.n // 128,)),
+            cute.make_layout((self.experts * s2_words,)),
         )
         intermediate = cute.make_tensor(
             intermediate_ptr,

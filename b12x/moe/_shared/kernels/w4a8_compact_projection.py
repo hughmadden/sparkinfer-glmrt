@@ -20,6 +20,8 @@ from b12x._lib.intrinsics import (
     st_shared_u32,
 )
 
+from b12x.moe._shared.kernels.w4a8_staging import stage_scale_codes_slice
+
 
 class W4A8CompactMicroProjectionKernel:
     """Project N128 channels, broadcasting one staged activation row into QMMA."""
@@ -31,7 +33,7 @@ class W4A8CompactMicroProjectionKernel:
     num_warps = 4
     threads_per_cta = 128
 
-    def __init__(self, k: int, n: int, num_topk: int, *, wire_rows: bool = False, unit_scales: bool = False):
+    def __init__(self, k: int, n: int, num_topk: int, *, wire_rows: bool = False, unit_scales: bool = False, scale_codes: bool = False):
         if k <= 0 or n < 64 or k % 128 or n % 64:
             raise ValueError(
                 "compact W4A8 projection requires K divisible by 128 and "
@@ -48,6 +50,9 @@ class W4A8CompactMicroProjectionKernel:
         self.num_topk = int(num_topk)
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
         self.n64_tail = self.n % self.tile_n == 64
+        self.scale_codes = bool(scale_codes)
+        if self.scale_codes and self.n64_tail:
+            raise ValueError("coded scales require independently padded N128 projection halves")
         self.b_payload_bytes = self.tile_n * self.tile_k // 2
         self.sfb_bytes = (self.tile_n // 8) * 8 * 4
         self.a_offset = 0
@@ -286,14 +291,19 @@ class W4A8CompactMicroProjectionKernel:
                 k64_slice & Int32(1),
                 tid,
             )
-            scale_word_base = packed_tile_index * Int64(256)
-            self._stage_sfb(
-                w13_sfb,
-                sfb_base,
-                scale_word_base,
-                packed_half,
-                tid,
-            )
+            if cutlass.const_expr(self.scale_codes):
+                stage_scale_codes_slice(w13_sfb, sfb_base, Int64(expert),
+                    k128_slice, projection_tile * Int32(128), tid,
+                    128, 2 * self.n, self.k // 32)
+            else:
+                scale_word_base = packed_tile_index * Int64(256)
+                self._stage_sfb(
+                    w13_sfb,
+                    sfb_base,
+                    scale_word_base,
+                    packed_half,
+                    tid,
+                )
 
     @cute.jit
     def _run_task(

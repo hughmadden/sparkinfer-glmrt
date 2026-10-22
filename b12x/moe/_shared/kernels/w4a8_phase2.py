@@ -41,6 +41,8 @@ from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_trellis_pair_words_both,
 )
 
+from b12x.moe._shared.kernels.w4a8_staging import stage_scale_codes_slice
+
 
 class W4A8MaterializedPhase2Kernel:
     """Consume materialized source tiles through compact FC2 CTAs."""
@@ -80,12 +82,21 @@ class W4A8MaterializedPhase2Kernel:
         direct_routes: bool = False,
         native_v41: bool = False,
         unit_scales: bool = False,
+        scale_codes: bool = False,
+        scale_rows: int = 0,
+        scale_columns: int = 0,
     ):
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
         self.direct_routes = bool(direct_routes)
         self.unit_scales = bool(unit_scales)
         self.native_v41 = bool(native_v41)
+        self.scale_codes = bool(scale_codes)
+        self.scale_rows = int(scale_rows)
+        self.scale_columns = int(scale_columns)
+        if self.scale_codes and (n64_repacked or trellis_bits is not None
+                or self.scale_rows <= 0 or self.scale_rows % 256 or self.scale_columns <= 0):
+            raise ValueError("coded scales require N256 rows and a positive logical K32 extent")
         if self.native_v41 and not (direct_routes and deterministic_output):
             raise ValueError("native V4.1 phase 2 requires deterministic direct routes")
         if self.direct_routes:
@@ -441,21 +452,26 @@ class W4A8MaterializedPhase2Kernel:
                         get_ptr_as_int64(down_rp, src_word),
                     )
 
-            # An N32 chunk has four N8 scale rows, each with eight K16 words.
-            sfb_word_base = Int64(b_tile) * Int64(256)
-            for i in cutlass.range_constexpr(
-                (((self.tile_n // 8) * 8) // 4 + self.threads_per_cta - 1)
-                // self.threads_per_cta
-            ):
-                idx = tid + Int32(i * self.threads_per_cta)
-                if idx < Int32(((self.tile_n // 8) * 8) // 4):
-                    src_word = sfb_word_base + Int64(
-                        packed_n32 * Int32(4 * 8) + idx * 4
-                    )
-                    cp_async4_shared_global(
-                        sfb_base + (idx << Int32(4)),
-                        get_ptr_as_int64(down_sfb_rp, src_word),
-                    )
+            if cutlass.const_expr(self.scale_codes):
+                stage_scale_codes_slice(down_sfb_rp, sfb_base, Int64(expert_idx),
+                    intermediate_slice, output_tile * Int32(128), tid,
+                    128, self.scale_rows, self.scale_columns)
+            else:
+                # An N32 chunk has four N8 scale rows, each with eight K16 words.
+                sfb_word_base = Int64(b_tile) * Int64(256)
+                for i in cutlass.range_constexpr(
+                    (((self.tile_n // 8) * 8) // 4 + self.threads_per_cta - 1)
+                    // self.threads_per_cta
+                ):
+                    idx = tid + Int32(i * self.threads_per_cta)
+                    if idx < Int32(((self.tile_n // 8) * 8) // 4):
+                        src_word = sfb_word_base + Int64(
+                            packed_n32 * Int32(4 * 8) + idx * 4
+                        )
+                        cp_async4_shared_global(
+                            sfb_base + (idx << Int32(4)),
+                            get_ptr_as_int64(down_sfb_rp, src_word),
+                        )
 
     @cute.jit
     def _run_task(
