@@ -54,7 +54,7 @@ def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
     error = torch.linalg.vector_norm(expected.double()-ref)
     bound = torch.linalg.vector_norm(baseline-ref)
     assert error <= 1.01 * bound, (error.item(), bound.item())
-    for rows in (1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64):
+    for rows in (1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 36, 63, 64):
         for limit in (1, 48, 170*4, 188*4):
             c.partial.fill_(float("nan"))
             c.output.fill_(float("nan"))
@@ -276,7 +276,7 @@ def test_kimi_shapes(k, n, side, bits, codebook):
     assert torch.isfinite(output).all() and torch.count_nonzero(output) > 0
     actual = output[sample_rows][:, cols].double()
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
-    for live in ((1, 16, 64) if rows == 64 else (1, 8, 16, 64, 256, 1024, 4096)):
+    for live in ((1, 8, 16, 36, 64) if rows == 64 else (1, 8, 16, 36, 64, 256, 1024, 4096)):
         output.fill_(float("nan"))
         program.launch(inputs, payload, scales, partial.flatten(), output.flatten(), scalars=(live, 0, limit))
         assert torch.equal(output[:min(64, live)].view(torch.int32), saved[:min(64, live)].view(torch.int32))
@@ -319,6 +319,6 @@ def test_high_rate_graph_replay_and_frozen_resolution(bits, codebook):
             c.output.fill_(float("nan"))
             graph.replay()
             assert torch.equal(c.output.view(torch.int32), expected.view(torch.int32))
-        for rows in (1, 8, 16, 64):
+        for rows in (1, 8, 16, 36, 64):
             c.launch(rows)
             assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
