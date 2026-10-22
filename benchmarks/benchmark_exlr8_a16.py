@@ -599,6 +599,9 @@ def main():
                         help="comma list of prompt lengths; benchmark the distinct Spark wave "
                              "row counts GLM serving sends for them (overrides --rows)")
     parser.add_argument("--serving-lanes", type=int, default=SERVING_LANES)
+    parser.add_argument("--memory-cap-gib", type=int, default=12,
+                        help="per-process CUDA cap (also at most 25%% of device memory); more "
+                             "--layer-copies need more")
     parser.add_argument("--layer-copies", type=int, default=2,
                         help="minimum cold layer copies per replay; with --routes each copy "
                              "replays a different recorded wave (6 covers two waves per content)")
@@ -643,7 +646,7 @@ def main():
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
     torch.cuda.set_per_process_memory_fraction(min(
-        0.25, (12 << 30) / torch.cuda.get_device_properties(0).total_memory))
+        0.25, (args.memory_cap_gib << 30) / torch.cuda.get_device_properties(0).total_memory))
     if args.grouped:
         return grouped_main(args)
     props = torch.cuda.get_device_properties(0)
