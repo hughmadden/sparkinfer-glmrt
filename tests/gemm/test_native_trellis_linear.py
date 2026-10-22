@@ -322,3 +322,23 @@ def test_high_rate_graph_replay_and_frozen_resolution(bits, codebook):
         for rows in (1, 8, 16, 36, 64):
             c.launch(rows)
             assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
+
+
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("bits", [5, 6])
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
+def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
+    monkeypatch.setenv("TRELLIS_WIDE", "0")
+    base = Case(k=1152, n=256, side=side, bits=bits, rows=128, codebook=codebook)
+    monkeypatch.setenv("TRELLIS_WIDE", "1")
+    wide = Case(k=1152, n=256, side=side, bits=bits, rows=128, codebook=codebook)
+    for rows in (1, 8, 16, 36, 64, 128):
+        base.partial.fill_(float("nan"))
+        base.output.fill_(float("nan"))
+        wide.partial.fill_(float("nan"))
+        wide.output.fill_(float("nan"))
+        base.launch(rows)
+        wide.launch(rows)
+        assert torch.equal(wide.output[:rows].view(torch.int32), base.output[:rows].view(torch.int32))
+        assert torch.isnan(wide.output[rows:]).all()
+
