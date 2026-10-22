@@ -52,13 +52,13 @@ def compile_qwen_dense_gdn_commit_aot(g: QwenDenseGeometry = QWEN35_9B):
 
 
 class _Producer:
-    def __init__(self, g: QwenDenseGeometry):
-        self.g = g
+    def __init__(self, g: QwenDenseGeometry, kv_format: str = "bf16"):
+        self.g, self.kv_format = g, kv_format
         self.proj = projection(g.attn_in_width, g.hidden, False)
-        self.post = Qwen4AttnPost(g, indexed=False)
+        self.post = Qwen4AttnPost(g, kv_format=kv_format, indexed=False)
 
     def key(self) -> tuple:
-        return (self.g, self.proj.key(), "unrestricted")
+        return (self.g, self.kv_format, self.proj.key(), "unrestricted")
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w_in: cute.Pointer, q_norm: cute.Pointer, k_norm: cute.Pointer,
@@ -72,14 +72,16 @@ class _Producer:
                   query, query, gate, query, rows, stream)
 
 
-def compile_qwen_dense_producer_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_rows: int):
+def compile_qwen_dense_producer_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_rows: int,
+                                     kv_format: str = "bf16"):
     """Q/gate packed per head, zero-centered Q/K norm and checkpoint M-RoPE.
 
     kv_slots is an Int64 record offset (page*page_rows+in_page); negative
     slots suppress writes. The target owns causal positions and cache pages.
     """
     max_rows = _rows(max_rows)
-    launch = _Producer(g)
+    record_bytes = g.kv_record_bytes(kv_format)
+    launch = _Producer(g, kv_format)
     return compile_program(launch, name="qwen_dense_producer", operands=(
         Operand("x", torch.bfloat16, f"[rows,{g.hidden}]"),
         Operand("w_in", torch.bfloat16, f"[{g.attn_in_width},{g.hidden}]"),
@@ -87,13 +89,13 @@ def compile_qwen_dense_producer_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_row
         Operand("k_norm", torch.bfloat16, f"[{g.head_dim}]"),
         Operand("rope_positions", torch.int32, "[rows,3]", align=4),
         Operand("kv_slots", torch.int64, "[rows]", align=8),
-        Operand("kv_cache", torch.uint8, f"[record_slots,{g.record_bytes}]", "inout"),
+        Operand("kv_cache", torch.uint8, f"[record_slots,{record_bytes}]", "inout"),
         Operand("query", torch.bfloat16, f"[rows,{g.heads},{g.head_dim}]", "out"),
         Operand("gate", torch.bfloat16, f"[rows,{g.heads * g.head_dim}]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch")),
         scalars=(Scalar("rows"),), key=(max_rows, launch.key()),
         geometry={"hidden": g.hidden, "heads": g.heads, "kv_heads": g.kv_heads, "head_dim": g.head_dim,
-                  "in_width": g.attn_in_width, "record_bytes": g.record_bytes, "max_rows": max_rows,
+                  "in_width": g.attn_in_width, "record_bytes": record_bytes, "kv_format": kv_format, "max_rows": max_rows,
                   "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "indexed": False},
         scratch={"scratch": lambda rows: _align(max(rows, 1) * g.attn_in_width * 2)})
 
@@ -104,12 +106,14 @@ def full_attention_scratch_bytes(g: QwenDenseGeometry, rows: int, max_splits: in
 
 
 class _FullAttention:
-    def __init__(self, g: QwenDenseGeometry, max_splits: int):
+    def __init__(self, g: QwenDenseGeometry, max_splits: int, kv_format: str = "bf16"):
         self.g, self.max_splits = g, max_splits
+        g.kv_record_bytes(kv_format)
         # One query token per CTA permits arbitrary mixed lanes and verify widths.
         self.attn = MimoGqaAttention(heads=g.heads, kv_heads=g.kv_heads, tokens=1,
             window=0, paged=True, sink=False, direct=False, softmax_scale=g.softmax_scale,
-            page_rows=g.page_rows, head=g.head_dim, v_head=g.head_dim)
+            page_rows=g.page_rows, head=g.head_dim, v_head=g.head_dim,
+            kv8="e4m3" if kv_format == "fp8" else None, kv_group=0)
         self.merge = MimoSplitMerge(heads=g.heads, v_head=g.head_dim, empty_rows_zero=True)
 
     def key(self) -> tuple:
@@ -129,8 +133,12 @@ class _FullAttention:
         self.merge(partial, lse, query, out, rows, splits, stream)
 
 
-def compile_qwen_dense_full_gqa_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_rows: int, max_splits: int = 32):
-    """Unrestricted causal paged GQA over K|V BF16 records, including long context.
+def compile_qwen_dense_full_gqa_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_rows: int, max_splits: int = 32,
+                                     kv_format: str = "bf16"):
+    """Unrestricted causal paged GQA over BF16 or per-head E4M3 records.
+
+    Compact records use the shared MiMo reader: on-chip reconstruction only,
+    with no global BF16 shadow or context-sized widening allocation.
 
     positions is Int64 per physical query. page_table is Int32 [rows,stride],
     or a single shared row when table_stride=0. All page-scaled addresses are
@@ -140,10 +148,11 @@ def compile_qwen_dense_full_gqa_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_row
     max_rows = _rows(max_rows)
     if not 1 <= int(max_splits) <= MAX_SPLITS:
         raise ValueError(f"max_splits must be in 1..{MAX_SPLITS}")
-    launch = _FullAttention(g, int(max_splits))
+    record_bytes = g.kv_record_bytes(kv_format)
+    launch = _FullAttention(g, int(max_splits), kv_format)
     return compile_program(launch, name="qwen_dense_full_gqa", operands=(
         Operand("query", torch.bfloat16, f"[rows,{g.heads},{g.head_dim}]"),
-        Operand("kv_cache", torch.uint8, f"[record_slots,{g.record_bytes}]"),
+        Operand("kv_cache", torch.uint8, f"[record_slots,{record_bytes}]"),
         Operand("positions", torch.int64, "[rows]", align=8),
         Operand("page_table", torch.int32, "[rows|1,table_stride]", align=4),
         Operand("out", torch.bfloat16, f"[rows,{g.heads},{g.head_dim}]", "out"),
@@ -151,7 +160,7 @@ def compile_qwen_dense_full_gqa_aot(g: QwenDenseGeometry = QWEN35_9B, *, max_row
         scalars=(Scalar("rows"), Scalar("table_stride"), Scalar("splits")),
         key=(max_rows, launch.key()),
         geometry={"heads": g.heads, "kv_heads": g.kv_heads, "head_dim": g.head_dim,
-                  "page_rows": g.page_rows, "record_bytes": g.record_bytes, "max_rows": max_rows,
+                  "page_rows": g.page_rows, "record_bytes": record_bytes, "kv_format": kv_format, "max_rows": max_rows,
                   "max_splits": int(max_splits), "causal": True, "indexed": False,
                   "empty_rows_zero": True},
         scratch={"scratch": lambda rows: full_attention_scratch_bytes(g, rows, int(max_splits))})
