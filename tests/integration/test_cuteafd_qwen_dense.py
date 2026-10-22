@@ -336,7 +336,7 @@ def test_dense_full_gqa_is_unrestricted_and_causal(heads):
 
 @pytest.mark.parametrize("heads", [16, 24])
 @pytest.mark.parametrize("amplitude", [0.1, 8.0])
-def test_dense_compact_paged_reader_matches_dequantized_bf16(heads, amplitude):
+def test_dense_compact_paged_reader_matches_dequantized_bf16(heads, amplitude, monkeypatch):
     require_b12x()
     from b12x.integration.cuteafd._common import QwenDenseGeometry
     from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_full_gqa_aot
@@ -344,7 +344,25 @@ def test_dense_compact_paged_reader_matches_dequantized_bf16(heads, amplitude):
     from .test_cuteafd_qwen4_fp8_kv import _pack
     g = QwenDenseGeometry(heads=heads)
     compact = compile_qwen_dense_full_gqa_aot(g, max_rows=64, max_splits=4, kv_format="fp8")
-    reference = compile_qwen_dense_full_gqa_aot(g, max_rows=64, max_splits=4, kv_format="bf16")
+    # Keep the dequantized oracle's reduction geometry identical: compact
+    # storage changes the key tile, not the expected reconstructed values.
+    import b12x.integration.cuteafd.qwen_dense as dense
+    shared_attention = dense.MimoGqaAttention
+
+    def reference_attention(**kwargs):
+        attention = shared_attention(**kwargs)
+        attention.tile_n = min(attention.tile_n, 32)
+        attention.qk_warps = max(attention.qk_warps, 2)
+        attention.tile_m = 16 * attention.qk_warps
+        attention.pv_warps = 4 * attention.qk_warps
+        attention.threads = 32 * attention.pv_warps
+        attention.k_iters = attention.tile_n * attention.head // attention.chunk // attention.threads
+        attention.v_iters = attention.tile_n * attention.v_head // attention.chunk // attention.threads
+        return attention
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dense, "MimoGqaAttention", reference_attention)
+        reference = compile_qwen_dense_full_gqa_aot(g, max_rows=64, max_splits=4, kv_format="bf16")
     torch.manual_seed(595)
     rows, pages = 8, 35
     kv = torch.randn(pages * 64, 2, g.kv_heads, g.head_dim, device="cuda").bfloat16()
