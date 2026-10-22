@@ -1063,24 +1063,25 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 for v in cutlass.range_constexpr(2):
                                     slot_out = cute.arch.shuffle_sync(src_word, src_base + Int32(v * 8))
                                     row_idx = slot_out if sliced else (m * Int32(16) + Int32(v * 8) + (lane >> Int32(2)))
-                                    if (out_meta_b & Int32(1 << (8 + idx * 2 + v))) != Int32(0):
-                                        row_addr = block_out_base + row_idx.to(Int64) * row_stride_bytes
-                                        if cutlass.const_expr(self.FC2_HALF):
-                                            lo = _f32x2_to_f16x2(total[idx, 2 * v], total[idx, 2 * v + 1])
-                                            hi = _f32x2_to_f16x2(total[idx, 4 + 2 * v], total[idx, 4 + 2 * v + 1])
-                                            base_lane = lane & Int32(28)
-                                            l0 = cute.arch.shuffle_sync(lo, base_lane)
-                                            l1 = cute.arch.shuffle_sync(lo, base_lane + Int32(1))
-                                            l2 = cute.arch.shuffle_sync(lo, base_lane + Int32(2))
-                                            l3 = cute.arch.shuffle_sync(lo, base_lane + Int32(3))
-                                            h0 = cute.arch.shuffle_sync(hi, base_lane)
-                                            h1 = cute.arch.shuffle_sync(hi, base_lane + Int32(1))
-                                            h2 = cute.arch.shuffle_sync(hi, base_lane + Int32(2))
-                                            h3 = cute.arch.shuffle_sync(hi, base_lane + Int32(3))
-                                            if (lane & Int32(3)) == Int32(0):
-                                                st_global_v4_u32(row_addr, l0, l1, l2, l3)
-                                                st_global_v4_u32(row_addr + Int64(16), h0, h1, h2, h3)
-                                        else:
+                                    if cutlass.const_expr(self.FC2_HALF):
+                                        lo = _f32x2_to_f16x2(total[idx, 2 * v], total[idx, 2 * v + 1])
+                                        hi = _f32x2_to_f16x2(total[idx, 4 + 2 * v], total[idx, 4 + 2 * v + 1])
+                                        base_lane = lane & Int32(28)
+                                        l0 = cute.arch.shuffle_sync(lo, base_lane)
+                                        l1 = cute.arch.shuffle_sync(lo, base_lane + Int32(1))
+                                        l2 = cute.arch.shuffle_sync(lo, base_lane + Int32(2))
+                                        l3 = cute.arch.shuffle_sync(lo, base_lane + Int32(3))
+                                        h0 = cute.arch.shuffle_sync(hi, base_lane)
+                                        h1 = cute.arch.shuffle_sync(hi, base_lane + Int32(1))
+                                        h2 = cute.arch.shuffle_sync(hi, base_lane + Int32(2))
+                                        h3 = cute.arch.shuffle_sync(hi, base_lane + Int32(3))
+                                        if (out_meta_b & Int32(1 << (8 + idx * 2 + v))) != Int32(0) and (lane & Int32(3)) == Int32(0):
+                                            row_addr = block_out_base + row_idx.to(Int64) * row_stride_bytes
+                                            st_global_v4_u32(row_addr, l0, l1, l2, l3)
+                                            st_global_v4_u32(row_addr + Int64(16), h0, h1, h2, h3)
+                                    else:
+                                        if (out_meta_b & Int32(1 << (8 + idx * 2 + v))) != Int32(0):
+                                            row_addr = block_out_base + row_idx.to(Int64) * row_stride_bytes
                                             st_global_v2_f32(row_addr, total[idx, 2 * v], total[idx, 2 * v + 1])
                                             st_global_v2_f32(row_addr + Int64(32), total[idx, 4 + 2 * v], total[idx, 4 + 2 * v + 1])
             cute.arch.sync_threads()
@@ -1382,7 +1383,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     row_fc2_base = fc2_address + (
                         (b_out * max_slot).to(Int64) * Int64(128)
                         + row_route_base * Int64(128)
-                        + lane.to(Int64) * Int64(2 if self.FC2_HALF else 4)
+                        + lane.to(Int64) * Int64(4)
                     ) * Int64(2 if self.FC2_HALF else 4)
                     for slot in cutlass.range_constexpr(self.top_k):
                         route = row_route_base + Int64(slot)
