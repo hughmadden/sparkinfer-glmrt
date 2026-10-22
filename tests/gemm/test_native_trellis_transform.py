@@ -216,3 +216,61 @@ def test_real_writer_fixture(side):
         # Weight-side F16 reconstruction rounds at additional boundaries. Near
         # cancellation, use a scale-relative max bound rather than relative error.
         assert maximum < .01 * expected.abs().max().item()
+
+
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
+@pytest.mark.parametrize("side", [1, 2])
+def test_grouped_companion_bitwise_equality_and_composed_qkvg(codebook, side):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
+
+    k, n, max_rows = 1152, 256, 64
+    splits = (k + 1023) // 1024
+    rng = np.random.default_rng(273)
+    x = torch.tensor(rng.normal(0, 0.03, (max_rows, k)), device="cuda", dtype=torch.bfloat16)
+    suh = [torch.tensor(rng.normal(0, 0.2, k), device="cuda", dtype=torch.float16) for _ in range(4)]
+    svh = [torch.tensor(rng.normal(0, 0.2, n), device="cuda", dtype=torch.float16) for _ in range(4)]
+    payloads = [torch.tensor(rng.integers(0, 256, k * n * 6 // 8, dtype=np.uint8), device="cuda") for _ in range(4)]
+
+    rot_s = [torch.empty((max_rows, k), device="cuda", dtype=torch.float16) for _ in range(4)]
+    blk_s = [torch.empty(k // 128, device="cuda", dtype=torch.float16) for _ in range(4)]
+    ptr_s = [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in rot_s]
+    part_s = torch.empty((max_rows, splits, n), device="cuda", dtype=torch.float32)
+    acc_s = [torch.empty((max_rows, n), device="cuda", dtype=torch.float32) for _ in range(4)]
+    out_s = [torch.empty((max_rows, n), device="cuda", dtype=torch.bfloat16) for _ in range(4)]
+
+    rot_g = [torch.empty((max_rows, k), device="cuda", dtype=torch.float16) for _ in range(4)]
+    blk_g = [torch.empty(k // 128, device="cuda", dtype=torch.float16) for _ in range(4)]
+    ptr_g = torch.tensor([t.data_ptr() for t in rot_g], device="cuda", dtype=torch.int64)
+    part_g = torch.empty((4, max_rows, splits, n), device="cuda", dtype=torch.float32)
+    acc_g = [torch.empty((max_rows, n), device="cuda", dtype=torch.float32) for _ in range(4)]
+    out_g = [torch.empty((max_rows, n), device="cuda", dtype=torch.bfloat16) for _ in range(4)]
+
+    inp_s = compile_trellis_input_aot(features=k, max_rows=max_rows)
+    core_s = compile_trellis_linear_aot(input_features=k, output_features=n, bits=6, codebook=codebook, sharded_side=side, rotation_count=1, max_rows=max_rows)
+    eg_s = compile_trellis_output_aot(features=n, max_rows=max_rows)
+
+    inp_g = compile_trellis_input_aot(features=k, max_rows=max_rows, groups=4)
+    core_g = compile_trellis_linear_aot(input_features=k, output_features=n, bits=6, codebook=codebook, sharded_side=side, rotation_count=4, max_rows=max_rows, groups=4)
+    eg_g = compile_trellis_output_aot(features=n, max_rows=max_rows, groups=4)
+
+    limit = torch.cuda.get_device_properties(0).multi_processor_count * 4
+    with kernel_resolution_guard("grouped transforms and core are precompiled"):
+        for rows in (1, 8, 16, 36, 64):
+            for t in rot_s + blk_s + acc_s + out_s + rot_g + blk_g + acc_g + out_g:
+                t.fill_(float("nan"))
+            for i in range(4):
+                inp_s.launch(x, suh[i], rot_s[i], blk_s[i], scalars=(rows, limit))
+                core_s.launch(ptr_s[i], payloads[i], blk_s[i], part_s.flatten(), acc_s[i].flatten(), scalars=(rows, 0, limit))
+                eg_s.launch(acc_s[i], svh[i], out_s[i], scalars=(rows, limit))
+            inp_g.launch(x, *suh, *rot_g, *blk_g, scalars=(rows, limit))
+            core_g.launch(ptr_g, *payloads, *blk_g, part_g.flatten(), *(a.flatten() for a in acc_g), scalars=(rows, 0, limit))
+            eg_g.launch(*acc_g, *svh, *out_g, scalars=(rows, limit))
+            for i in range(4):
+                assert torch.equal(rot_g[i][:rows].view(torch.int16), rot_s[i][:rows].view(torch.int16))
+                assert torch.equal(blk_g[i].view(torch.int16), blk_s[i].view(torch.int16))
+                assert torch.equal(acc_g[i][:rows].view(torch.int32), acc_s[i][:rows].view(torch.int32))
+                assert torch.equal(out_g[i][:rows].view(torch.int16), out_s[i][:rows].view(torch.int16))
+                assert torch.isnan(rot_g[i][rows:]).all() and torch.isnan(out_g[i][rows:]).all()
+

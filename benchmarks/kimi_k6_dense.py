@@ -73,23 +73,27 @@ def main():
                     samples=args.samples, kernel_path="exported shared trellis ABI v1",
                     transforms_included=args.transforms, decode_cache="cold, 2x runtime L2 bytes")
     for shape in args.shapes.split(","):
-        k, n, side = map(int, shape.split(":"))
+        parts = [int(x) for x in shape.split(":")]
+        k, n, side = parts[:3]
+        grouped = (parts[3] == 4) if len(parts) > 3 else (k == 7168 and n == 6144 and side == 1)
         directory = args.output_dir / f"k{k}_n{n}_s{side}"
         directory.mkdir(exist_ok=True)
         capacity = max(rows_list)
+        splits = (k + 1023) // 1024
         x_bf16 = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
         x = x_bf16.half()
         inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
         payload = torch.randint(256, (k*n*6//8,), device="cuda", dtype=torch.uint8)
         scales = torch.ones(k//128, device="cuda", dtype=torch.float16)
-        partial = torch.empty(capacity*((k+1023)//1024)*n, device="cuda", dtype=torch.float32)
+        partial = torch.empty(capacity*splits*n, device="cuda", dtype=torch.float32)
         output = torch.empty(capacity*n, device="cuda", dtype=torch.float32)
         bf16_output = torch.empty(capacity*n, device="cuda", dtype=torch.bfloat16)
         weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
         arms = {}
         suh=torch.ones(k,device="cuda",dtype=torch.float16)
         svh=torch.ones(n,device="cuda",dtype=torch.float16)
-        transformed_output=torch.empty(capacity*n,device="cuda",dtype=torch.float32 if n==163840 else torch.bfloat16)
+        out_dtype = torch.float32 if n==163840 else torch.bfloat16
+        transformed_output=torch.empty(capacity*n,device="cuda",dtype=out_dtype)
         if args.transforms:
             with exportable_compilation():
                 ingress=compile_trellis_input_aot(features=k,max_rows=capacity)
@@ -103,8 +107,38 @@ def main():
                     compile_trellis_linear_aot(input_features=k, output_features=n, bits=6,
                         codebook=codebook, sharded_side=side, rotation_count=1, max_rows=capacity)
             arms[codebook] = exported(program, directory, codebook)
+        if grouped:
+            qkvg_suh = [torch.randn(k, device="cuda", dtype=torch.float16) * 0.2 for _ in range(4)]
+            qkvg_svh = [torch.randn(n, device="cuda", dtype=torch.float16) * 0.2 for _ in range(4)]
+            qkvg_x_4x = [(x_bf16.float() * s.float()).half() for s in qkvg_suh]
+            qkvg_x_grp = [t.clone() for t in qkvg_x_4x]
+            qkvg_inputs_4x = [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in qkvg_x_4x]
+            qkvg_inputs_grp = torch.tensor([t.data_ptr() for t in qkvg_x_grp], device="cuda", dtype=torch.int64)
+            qkvg_payloads = [torch.randint(256, (k*n*6//8,), device="cuda", dtype=torch.uint8) for _ in range(4)]
+            qkvg_scales_4x = [torch.ones(k//128, device="cuda", dtype=torch.float16) * (0.75 + 0.25 * i) for i in range(4)]
+            qkvg_scales_grp = [t.clone() for t in qkvg_scales_4x]
+            qkvg_partial = torch.empty(4*capacity*splits*n, device="cuda", dtype=torch.float32)
+            qkvg_out_4x = [torch.empty(capacity*n, device="cuda", dtype=torch.float32) for _ in range(4)]
+            qkvg_out_grp = [torch.empty(capacity*n, device="cuda", dtype=torch.float32) for _ in range(4)]
+            qkvg_trans_4x = [torch.empty(capacity*n, device="cuda", dtype=out_dtype) for _ in range(4)]
+            qkvg_trans_grp = [torch.empty(capacity*n, device="cuda", dtype=out_dtype) for _ in range(4)]
+            if args.transforms:
+                with exportable_compilation():
+                    grp_in = compile_trellis_input_aot(features=k, max_rows=capacity, groups=4)
+                    grp_out = compile_trellis_output_aot(features=n, output_dtype="f32" if n==163840 else "bf16", max_rows=capacity, groups=4)
+                grp_ingress = exported(grp_in, directory, "input_transform_qkvg")
+                grp_egress = exported(grp_out, directory, "output_transform_qkvg")
+            grp_libs = {}
+            for codebook in ("mcg", "mul1"):
+                print(f"compiling {shape} {codebook}_qkvg", flush=True)
+                with exportable_compilation():
+                    program = compile_trellis_linear_aot(
+                        input_features=k, output_features=n, bits=6, codebook=codebook,
+                        sharded_side=side, rotation_count=4, max_rows=capacity, groups=4)
+                grp_libs[codebook] = exported(program, directory, f"{codebook}_qkvg")
         for rows in rows_list:
-            graphs = {}
+            runners = {}
+            targets = {}
             for name, lib in arms.items():
                 values = [x_bf16.data_ptr(), weight.data_ptr(), bf16_output.data_ptr(), rows] if name == "bf16" else \
                     [t.data_ptr() for t in (inputs, payload, scales, partial, output)] + [rows, 0, sms*4]
@@ -121,22 +155,72 @@ def main():
                         result=egress.run(output.data_ptr(),svh.data_ptr(),transformed_output.data_ptr(),rows,sms*4,stream)
                         if result:
                             raise RuntimeError(f"output transform returned {result}")
+                runners[name] = run
+                targets[name] = [bf16_output[:rows*n] if name=="bf16" else transformed_output[:rows*n] if args.transforms else output[:rows*n]]
+            if grouped:
+                for codebook in ("mcg", "mul1"):
+                    lib = arms[codebook]
+                    grp_lib = grp_libs[codebook]
+                    def run_4x(lib=lib):
+                        stream = torch.cuda.current_stream().cuda_stream
+                        for i in range(4):
+                            if args.transforms:
+                                res = ingress.run(x_bf16.data_ptr(), qkvg_suh[i].data_ptr(), qkvg_x_4x[i].data_ptr(), qkvg_scales_4x[i].data_ptr(), rows, sms*4, stream)
+                                if res:
+                                    raise RuntimeError(f"input transform 4x[{i}] returned {res}")
+                            res = lib.run(qkvg_inputs_4x[i].data_ptr(), qkvg_payloads[i].data_ptr(), qkvg_scales_4x[i].data_ptr(), partial.data_ptr(), qkvg_out_4x[i].data_ptr(), rows, 0, sms*4, stream)
+                            if res:
+                                raise RuntimeError(f"exported wrapper 4x[{i}] returned {res}")
+                            if args.transforms:
+                                res = egress.run(qkvg_out_4x[i].data_ptr(), qkvg_svh[i].data_ptr(), qkvg_trans_4x[i].data_ptr(), rows, sms*4, stream)
+                                if res:
+                                    raise RuntimeError(f"output transform 4x[{i}] returned {res}")
+                    def run_qkvg(grp_lib=grp_lib):
+                        stream = torch.cuda.current_stream().cuda_stream
+                        if args.transforms:
+                            res = grp_ingress.run(x_bf16.data_ptr(), *(s.data_ptr() for s in qkvg_suh), *(r.data_ptr() for r in qkvg_x_grp), *(s.data_ptr() for s in qkvg_scales_grp), rows, sms*4, stream)
+                            if res:
+                                raise RuntimeError(f"grouped input transform returned {res}")
+                        res = grp_lib.run(qkvg_inputs_grp.data_ptr(), *(p.data_ptr() for p in qkvg_payloads), *(s.data_ptr() for s in qkvg_scales_grp), qkvg_partial.data_ptr(), *(o.data_ptr() for o in qkvg_out_grp), rows, 0, sms*4, stream)
+                        if res:
+                            raise RuntimeError(f"grouped exported wrapper returned {res}")
+                        if args.transforms:
+                            res = grp_egress.run(*(o.data_ptr() for o in qkvg_out_grp), *(s.data_ptr() for s in qkvg_svh), *(t.data_ptr() for t in qkvg_trans_grp), rows, sms*4, stream)
+                            if res:
+                                raise RuntimeError(f"grouped output transform returned {res}")
+                    runners[f"{codebook}_4x"] = run_4x
+                    runners[f"{codebook}_qkvg"] = run_qkvg
+                    targets[f"{codebook}_4x"] = [t[:rows*n] for t in (qkvg_trans_4x if args.transforms else qkvg_out_4x)]
+                    targets[f"{codebook}_qkvg"] = [t[:rows*n] for t in (qkvg_trans_grp if args.transforms else qkvg_out_grp)]
+            graphs = {}
+            saved_outputs = {}
+            for name, run in runners.items():
                 run()
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     run()
-                target=bf16_output[:rows*n] if name=="bf16" else transformed_output[:rows*n] if args.transforms else output[:rows*n]
-                target.fill_(float("nan"))
+                for target in targets[name]:
+                    target.fill_(float("nan"))
                 graph.replay()
                 torch.cuda.synchronize()
-                if not torch.isfinite(target).all().item():
-                    raise RuntimeError(f"{name} graph did not overwrite poisoned output")
+                for target in targets[name]:
+                    if not torch.isfinite(target).all().item():
+                        raise RuntimeError(f"{name} graph did not overwrite poisoned output")
+                if name.endswith(("_4x", "_qkvg")):
+                    saved_outputs[name] = [t.clone() for t in targets[name]]
                 graphs[name] = graph
+            if grouped:
+                view_dtype = torch.int16 if (args.transforms and out_dtype == torch.bfloat16) else torch.int32
+                for codebook in ("mcg", "mul1"):
+                    for i in range(4):
+                        if not torch.equal(saved_outputs[f"{codebook}_qkvg"][i].view(view_dtype),
+                                           saved_outputs[f"{codebook}_4x"][i].view(view_dtype)):
+                            raise RuntimeError(f"{codebook} projection {i} bitwise mismatch at rows={rows}")
             torch.cuda.synchronize()
-            samples = {name: [] for name in arms}
+            samples = {name: [] for name in graphs}
             for repeat in range(args.samples):
-                order = list(arms) if repeat % 2 == 0 else list(reversed(arms))
+                order = list(graphs) if repeat % 2 == 0 else list(reversed(graphs))
                 for name in order:
                     if rows <= 64:
                         flush.zero_()
@@ -149,10 +233,14 @@ def main():
             medians = {name: statistics.median(values) for name, values in samples.items()}
             record = dict(k=k, n=n, side=side, rows=rows, us=medians, samples_us=samples,
                           speedup={name: medians["bf16"]/medians[name] for name in ("mcg", "mul1")})
+            if grouped:
+                record["saved_us"] = {name: medians[f"{name}_4x"] - medians[f"{name}_qkvg"] for name in ("mcg", "mul1")}
+                record["saved_vs_4x_single_us"] = {name: 4 * medians[name] - medians[f"{name}_qkvg"] for name in ("mcg", "mul1")}
+                record["bitwise_equal"] = True
             records.append(record)
             print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
             (args.output_dir / "report.json").write_text(json.dumps(dict(metadata=metadata, records=records), indent=2)+"\n")
-        del graphs, arms, x_bf16, x, inputs, payload, scales, partial, output, bf16_output, weight
+        del graphs, runners, arms, x_bf16, x, inputs, payload, scales, partial, output, bf16_output, weight
         torch.cuda.empty_cache()
 
 

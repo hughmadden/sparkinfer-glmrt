@@ -368,3 +368,93 @@ def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
         assert torch.isnan(wide.output[rows:]).all()
         assert torch.isnan(wide.partial[rows:]).all()
 
+
+@pytest.mark.parametrize("groups,rotation_count", [(0, 4), (2, 4), (3, 4), (True, 4), (4, 1), (4, 3)])
+def test_grouped_geometry_fails_closed(groups, rotation_count):
+    from b12x.integration.cuteafd.trellis_linear import geometry
+    with pytest.raises(ValueError, match="trellis requires"):
+        geometry(7168, 6144, bits=6, codebook="mcg", rotation_count=rotation_count, groups=groups)
+
+
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("bits", [5, 6])
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
+def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+
+    rng = np.random.default_rng(273)
+    k, n, max_rows = 1152, 256, 129
+    splits = (k + 1023) // 1024
+    rotations = [torch.tensor(rng.normal(0, 0.1, (max_rows, k)), device="cuda", dtype=torch.float16) for _ in range(4)]
+    inputs = torch.tensor([t.data_ptr() for t in rotations], device="cuda", dtype=torch.int64)
+    payloads = [torch.tensor(rng.integers(0, 256, k * n * bits // 8, dtype=np.uint8), device="cuda") for _ in range(4)]
+    scales = [torch.tensor(rng.uniform(0.5, 2.0, k // 128), device="cuda", dtype=torch.float16) for _ in range(4)]
+    standalone_partial = torch.empty((max_rows, splits, n), device="cuda", dtype=torch.float32)
+    standalone_outputs = [torch.empty((max_rows, n), device="cuda", dtype=torch.float32) for _ in range(4)]
+    grouped_partial = torch.empty((4, max_rows, splits, n), device="cuda", dtype=torch.float32)
+    grouped_outputs = [torch.empty((max_rows, n), device="cuda", dtype=torch.float32) for _ in range(4)]
+
+    standalone = compile_trellis_linear_aot(
+        input_features=k, output_features=n, bits=bits, codebook=codebook,
+        sharded_side=side, rotation_count=4, max_rows=max_rows, groups=1,
+    )
+    grouped = compile_trellis_linear_aot(
+        input_features=k, output_features=n, bits=bits, codebook=codebook,
+        sharded_side=side, rotation_count=4, max_rows=max_rows, groups=4,
+    )
+
+    def run_standalone(rows, limit):
+        for i in range(4):
+            standalone.launch(
+                inputs, payloads[i], scales[i],
+                standalone_partial.flatten(), standalone_outputs[i].flatten(),
+                scalars=(rows, i, limit),
+            )
+
+    def run_grouped(rows, limit, rotation_id=0):
+        grouped.launch(
+            inputs, *payloads, *scales, grouped_partial.flatten(),
+            *(out.flatten() for out in grouped_outputs),
+            scalars=(rows, rotation_id, limit),
+        )
+
+    with kernel_resolution_guard("grouped trellis linear uses precompiled kernels"):
+        for rows in (1, 8, 16, 17, 32, 33, 36, 48, 49, 63, 64, 129):
+            for limit in (48, 170 * 4, 188 * 4):
+                for out in standalone_outputs + grouped_outputs:
+                    out.fill_(float("nan"))
+                standalone_partial.fill_(float("nan"))
+                grouped_partial.fill_(float("nan"))
+                run_standalone(rows, limit)
+                run_grouped(rows, limit)
+                for i in range(4):
+                    assert torch.equal(
+                        grouped_outputs[i][:rows].view(torch.int32),
+                        standalone_outputs[i][:rows].view(torch.int32),
+                    )
+                    assert torch.isnan(grouped_outputs[i][rows:]).all()
+        for graph_rows in (8, 36):
+            run_standalone(graph_rows, 188 * 4)
+            expected = [out[:graph_rows].clone() for out in standalone_outputs]
+            run_grouped(graph_rows, 188 * 4)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run_grouped(graph_rows, 188 * 4)
+            for _ in range(3):
+                grouped_partial.fill_(float("nan"))
+                for out in grouped_outputs:
+                    out.fill_(float("nan"))
+                graph.replay()
+                for i in range(4):
+                    assert torch.equal(grouped_outputs[i][:graph_rows].view(torch.int32), expected[i].view(torch.int32))
+                    assert torch.isnan(grouped_outputs[i][graph_rows:]).all()
+        for bad_rows, bad_rot, bad_limit in ((0, 0, 1), (max_rows + 1, 0, 1), (1, -1, 1), (1, 1, 1), (1, 0, 0)):
+            for out in grouped_outputs:
+                out.fill_(float("nan"))
+            run_grouped(bad_rows, bad_limit, bad_rot)
+            for out in grouped_outputs:
+                assert torch.isnan(out).all()
+
+
