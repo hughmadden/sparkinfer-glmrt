@@ -31,7 +31,7 @@ def test_shared_compact_wide_tile_preserves_narrow_and_bf16_geometry(head, v_hea
     original_warps = (tokens * 4 + 15) // 16
     wide_compact = kv8 is not None and head >= 256 and v_head >= 256
     expected_warps = max(2, 1 << (original_warps - 1).bit_length()) if wide_compact else original_warps
-    assert attention.tile_n == (32 if wide_compact and tokens * 4 < 32 else 64)
+    assert attention.tile_n == (32 if wide_compact and tokens == 1 else 64)
     assert attention.qk_warps == expected_warps
     assert attention.tile_m == 16 * expected_warps
     assert attention.threads == 128 * expected_warps
@@ -45,9 +45,9 @@ def test_dense_full_attention_query_reuse_geometry(heads, max_rows, kv_format):
     from b12x.integration.cuteafd.qwen_dense import _FullAttention
     attention = _FullAttention(QwenDenseGeometry(heads=heads), 32, kv_format, max_rows=max_rows).attn
     prefill = kv_format == "fp8" and max_rows > 64
-    assert attention.tokens == (8 if prefill else 1)
+    assert attention.tokens == ((8 if heads == 16 else 4) if prefill else 1)
     assert attention.tile_n == (32 if kv_format == "fp8" and not prefill else 64)
-    expected_groups = (2 if heads == 16 else 4) if prefill else (2 if kv_format == "fp8" else 1)
+    expected_groups = 2 if kv_format == "fp8" else 1
     assert attention.qk_warps == expected_groups
 
 
@@ -380,7 +380,7 @@ def test_dense_compact_prefill_query_reuse(heads, amplitude, start, monkeypatch)
     shared_attention = dense.MimoGqaAttention
 
     def reference_attention(**kwargs):
-        attention = shared_attention(**{**kwargs, "tokens": 8, "kv8": "e4m3"})
+        attention = shared_attention(**{**kwargs, "tokens": 8 if heads == 16 else 4, "kv8": "e4m3"})
         attention.kv8, attention.kv_fp8 = None, False
         attention.record_bytes = attention.record * 2
         return attention

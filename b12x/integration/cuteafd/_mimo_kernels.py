@@ -391,7 +391,7 @@ class MimoGqaAttention:
         # Wide compact decode prefetches both K/V into registers. Multi-query
         # tiles already spread those vectors and reuse each 64-key tile.
         if self.kv_fp8 and self.head >= 256 and self.v_head >= 256:
-            if self.tokens * self.group < 32:
+            if self.tokens == 1:
                 self.tile_n = min(self.tile_n, 32)
             # Power-of-two CTA widths divide the K/V vector loads; extra M
             # rows are masked by the existing tokens*group predicates.

@@ -111,7 +111,9 @@ class _FullAttention:
         g.kv_record_bytes(kv_format)
         # Large programs serve one contiguous prefill; decode keeps mixed-lane
         # queries independent. Preserve the existing BF16 reduction geometry.
-        tokens = 8 if kv_format == "fp8" and max_rows > 64 else 1
+        tokens = 1
+        if kv_format == "fp8" and max_rows > 64:
+            tokens = 1 << (max(1, 32 // (g.heads // g.kv_heads)).bit_length() - 1)
         self.attn = MimoGqaAttention(heads=g.heads, kv_heads=g.kv_heads, tokens=tokens,
             window=0, paged=True, sink=False, direct=False, softmax_scale=g.softmax_scale,
             page_rows=g.page_rows, head=g.head_dim, v_head=g.head_dim,
