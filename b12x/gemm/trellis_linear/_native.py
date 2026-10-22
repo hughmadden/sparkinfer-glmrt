@@ -88,7 +88,7 @@ class NativeTrellisLinear:
         self.splits = g["splits"]
         wide = g.get("wide")
         if wide is None:
-            wide = os.environ.get("TRELLIS_WIDE", "1") != "0"
+            wide = os.environ.get("TRELLIS_WIDE", "0") != "0"
         self.wide = bool(wide) and self.bits >= 5
 
     def _storage(self, active: int):
@@ -350,7 +350,7 @@ class NativeTrellisLinear:
         while task < rows * Int32(self.n // 128):
             row, col = task // Int32(self.n // 128), (task % Int32(self.n // 128)) * Int32(128) + Int32(tid)
             total = Float32(0.0)
-            for split in cutlass.range(self.splits, unroll_full=True):
+            for split in cutlass.range(self.splits):
                 total += partial[(row.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col.to(Int64)]
             output[row.to(Int64) * Int64(self.n) + col.to(Int64)] = total
             task += step
