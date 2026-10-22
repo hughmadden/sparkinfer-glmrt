@@ -1,6 +1,9 @@
 """Compare native slice widths on identical encoded inputs and weights.
 
 Includes ordered CuTe FP32 slice reduction and GPU oracle checks before timing.
+For the exact Spark TP4 workload, pass --exact-storage --live-groups --experts 384
+--routing-case unique --rows 2 3 4 5 6 7 16 32 48 54 56 64. Distinct route IDs
+(up to the expert count) expose sparse-wave occupancy rather than repeated experts.
 This is a synchronous-kernel diagnostic, not a serving benchmark.
 Run with the repository root on PYTHONPATH; the tests package supplies fixtures.
 """
@@ -45,7 +48,9 @@ class OrderedReduce:
             dest[row, col] = value
 
 
-def measure_factory(widths, iterations, replays, fc2_n_splits=(1,), *, cache="warm", l2_flush_bytes=0):
+def measure_factory(widths, iterations, replays, fc2_n_splits=(1,), *, cache="warm",
+                    l2_flush_bytes=0, exact_storage=False, live_groups=False,
+                    components=("compute", "reduce", "combined")):
     state = {}
 
     def measure(**case):
@@ -53,12 +58,17 @@ def measure_factory(widths, iterations, replays, fc2_n_splits=(1,), *, cache="wa
         m, routes = case["rows"], case["routes"]
         h, n, topk, capacity = (case[k] for k in ("hidden", "intermediate", "topk", "capacity"))
         launch_groups = case["group_capacity"]
+        if live_groups:
+            # Match the pipeline's runtime bound, not the number of nonempty groups.
+            launch_groups = max(1, min(m * topk, case["experts"] +
+                                      max(m * topk - case["experts"], 0) // 16))
         if not state:
             for width, splits in [(w, s) for w in widths for s in fc2_n_splits]:
                 out = torch.empty(((n + width - 1) // width, capacity * topk, h), device="cuda")
                 alt_args = [*args[:-1], from_dlpack(out, assumed_align=16)]
                 compiled = cute.compile(
-                    V41FusedSliceKernel(width, grouped=True, intermediate=n, hidden=h, fc2_n_splits=splits),
+                    V41FusedSliceKernel(width, grouped=True, intermediate=n, hidden=h,
+                                        fc2_n_splits=splits, exact_storage=exact_storage),
                     *alt_args, cutlass.Int32(capacity), current_cuda_stream(), meta,
                     cutlass.Int32(launch_groups))
                 reduced = torch.empty((capacity * topk, h), device="cuda")
@@ -85,7 +95,7 @@ def measure_factory(widths, iterations, replays, fc2_n_splits=(1,), *, cache="wa
             rel = ((actual - case["expected"]).norm() / case["expected"].norm()).item()
             assert torch.isfinite(actual).all() and actual.norm() > 0 and rel < 0.01
             assert bool((out[:, routes:] == 12345).all())
-            for component in ("compute", "reduce", "combined"):
+            for component in components:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     if component != "reduce":
@@ -133,9 +143,9 @@ def measure_factory(widths, iterations, replays, fc2_n_splits=(1,), *, cache="wa
                 case=case["case"], rows=m, hidden=h, intermediate=n, capacity=capacity,
                 groups=case["groups"], launch_group_capacity=launch_groups, routes=routes,
                 cache=cache_mode, l2_flush_bytes=resolve_l2_flush_bytes(l2_flush_bytes) if cache_mode == "cold" else 0,
-                gpu=gpu, graph_us={f"w{w}/n{s}/{c}": v for (w, s, c), v in samples.items()},
-                replay_us={f"w{w}/n{s}/{c}": v for (w, s, c), v in raw.items()},
-                median_us={f"w{w}/n{s}/{c}": statistics.median(v) for (w, s, c), v in samples.items()},
+                gpu=gpu, graph_us={f"w{w}/n{s}/{c}": times for (w, s, c), times in samples.items()},
+                replay_us={f"w{w}/n{s}/{c}": times for (w, s, c), times in raw.items()},
+                median_us={f"w{w}/n{s}/{c}": statistics.median(times) for (w, s, c), times in samples.items()},
                 scope="fused compute and ordered CuTe FP32 fold; excludes route planning, encoding and transport")), flush=True)
         for graph in graphs.values():
             graph.reset()
@@ -153,6 +163,12 @@ def main():
     parser.add_argument("--hidden", type=int)
     parser.add_argument("--intermediate", type=int)
     parser.add_argument("--topk", type=int)
+    parser.add_argument("--exact-storage", action="store_true")
+    parser.add_argument("--live-groups", action="store_true")
+    parser.add_argument("--experts", type=int)
+    parser.add_argument("--routing-case", choices=("shared", "unique"), default="shared")
+    parser.add_argument("--components", nargs="+", choices=("compute", "reduce", "combined"),
+                        default=["compute", "reduce", "combined"])
     parser.add_argument("--capacity", type=int, default=80)
     parser.add_argument("--rows", type=int, nargs="+")
     parser.add_argument("--widths", type=int, nargs="+")
@@ -172,20 +188,30 @@ def main():
         parser.error("FC2 N splits must divide hidden tile count")
     if options.rows and any(m < 1 or m > options.capacity for m in options.rows):
         parser.error("rows must fit capacity")
+    if options.experts is not None and options.experts < topk:
+        parser.error("expert count must be at least topk")
+    if options.routing_case != "shared" and not options.rows:
+        parser.error("unique routing requires explicit row counts")
+    if options.exact_storage and (h, n) != (5120, 576):
+        parser.error("exact storage requires V4.1 TP4 geometry")
     if options.l2_flush_bytes < 0:
         parser.error("L2 flush bytes must be non-negative")
     print("SOURCE " + json.dumps(dict(
         geometry=options.geometry, hidden=h, intermediate=n, topk=topk,
         capacity=options.capacity, widths=widths, fc2_n_splits=options.fc2_n_splits,
+        exact_storage=options.exact_storage, live_groups=options.live_groups,
+        experts=options.experts, routing_case=options.routing_case,
         cache=options.cache, l2_flush_bytes=options.l2_flush_bytes,
         device=torch.cuda.get_device_name(),
         capability=torch.cuda.get_device_capability(),
         sha256={name: hashlib.sha256(Path(inspect.getsourcefile(obj)).read_bytes()).hexdigest()
                 for name, obj in [("kernel", V41FusedSliceKernel), ("fixture", _check_grouped_slices),
                                   ("benchmark", measure_factory)]})), flush=True)
-    _check_grouped_slices(128, measure_factory(widths, options.iterations, options.replays,
-        options.fc2_n_splits, cache=options.cache, l2_flush_bytes=options.l2_flush_bytes),
-        n=n, topk=topk, h=h, capacity=options.capacity, row_counts=options.rows)
+    _check_grouped_slices(widths[0], measure_factory(widths, options.iterations, options.replays,
+        options.fc2_n_splits, cache=options.cache, l2_flush_bytes=options.l2_flush_bytes,
+        exact_storage=options.exact_storage, live_groups=options.live_groups, components=options.components),
+        n=n, topk=topk, h=h, capacity=options.capacity, row_counts=options.rows,
+        experts=options.experts, exact_storage=options.exact_storage, routing_case=options.routing_case)
 
 
 if __name__ == "__main__":
