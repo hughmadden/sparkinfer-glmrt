@@ -16,7 +16,7 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 
 class V41SlicePipeline:
     def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576,
-                 hidden=5120, exact_storage=False, fc2_n_splits=1):
+                 hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False):
         self.capacity = capacity
         self.hidden = hidden
         self.atomic_tokens = atomic_tokens
@@ -25,7 +25,7 @@ class V41SlicePipeline:
         self.plan = V41RoutePlan(capacity, experts, topk)
         self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=atomic_tokens,
                                            intermediate=intermediate, hidden=hidden, exact_storage=exact_storage,
-                                           fc2_n_splits=fc2_n_splits)
+                                           fc2_n_splits=fc2_n_splits, scale_codes=scale_codes)
         self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate, hidden=hidden)
 
     @cute.jit
@@ -112,13 +112,14 @@ class V41DraftSlicePipeline:
     # Qualified model recipe; explicit widths remain available for comparison.
     DEFAULT_WIDTH = 192
 
-    def __init__(self, capacity, width):
+    def __init__(self, capacity, width, *, scale_codes=False):
         from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch
         self.quant = _MXFP8RowsQuantLaunch(
             5120, cutlass.BFloat16, 4, 256, 32, False, 1e-4, wire_rows=True
         )
         self.pipeline = V41SlicePipeline(
-            capacity, width, experts=128, topk=3, intermediate=2304
+            capacity, width, experts=128, topk=3, intermediate=2304,
+            scale_codes=scale_codes
         )
 
     @cute.jit

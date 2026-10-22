@@ -147,6 +147,64 @@ def stage_repacked_sfb_k_slice(
 
 
 @cute.jit
+def scale_code_word(source: cute.Tensor, expert: Int64, row: Int64,
+                    tile: Int64, rows: cutlass.Constexpr, columns: cutlass.Constexpr):
+    """Rebuild one raw UE8M0x4 word; padded K groups stay exactly zero."""
+    tiles = (columns + 3) // 4
+    stride = rows * (tiles * 2 + 1)
+    codes = cute.recast_tensor(source, cutlass.Uint16)
+    bases = cute.recast_tensor(source, cutlass.Uint8)
+    index = expert * Int64(stride // 2) + (row // Int64(256) * Int64(tiles) + tile) * Int64(256) + row % Int64(256)
+    code = cutlass.Uint32(codes[index])
+    base = cutlass.Uint32(bases[expert * Int64(stride) + Int64(rows * tiles * 2) + row])
+    word = ((code & cutlass.Uint32(15))
+            | ((code & cutlass.Uint32(240)) << cutlass.Uint32(4))
+            | ((code & cutlass.Uint32(3840)) << cutlass.Uint32(8))
+            | ((code & cutlass.Uint32(61440)) << cutlass.Uint32(12)))
+    word += base * cutlass.Uint32(0x01010101)
+    if cutlass.const_expr(columns % 4):
+        if tile == Int64(tiles - 1):
+            word &= cutlass.Uint32((1 << (8 * (columns % 4))) - 1)
+    return word
+
+
+@cute.jit
+def stage_scale_codes_slice(source: cute.Tensor, shared_base: Int32,
+                            expert: Int64, k_tile: Int32, n_start: Int32,
+                            thread: Int32, width: cutlass.Constexpr,
+                            rows: cutlass.Constexpr, columns: cutlass.Constexpr):
+    for iteration in cutlass.range_constexpr((width + 127) // 128):
+        index = thread + Int32(iteration * 128)
+        if index < Int32(width):
+            word = scale_code_word(source, expert, Int64(n_start) + Int64(index),
+                                   Int64(k_tile), rows, columns)
+            st_shared_u32(shared_base + index * Int32(4), word)
+
+
+@cute.jit
+def stage_scale_codes_k_slice(source: cute.Tensor, destination: cute.Tensor,
+                              expert: Int64, k_start: Int32, n_start: Int32,
+                              thread: Int32, depth: cutlass.Constexpr,
+                              rows: cutlass.Constexpr, columns: cutlass.Constexpr):
+    for group in cutlass.range_constexpr((depth + 127) // 128):
+        k = k_start // Int32(32) + Int32(group * 4)
+        phase = k % Int32(4)
+        tile = k // Int32(4)
+        row = Int64(n_start) + Int64(thread)
+        packed = cutlass.Uint32(0)
+        if k < Int32(columns):
+            packed = scale_code_word(source, expert, row, Int64(tile), rows, columns)
+            packed >>= cutlass.Uint32(phase * 8)
+            if cutlass.const_expr(min(4, depth // 32 - group * 4) == 4):
+                if phase > Int32(0) and k + Int32(4) - phase < Int32(columns):
+                    next_word = scale_code_word(source, expert, row, Int64(tile + 1), rows, columns)
+                    packed |= next_word << cutlass.Uint32((4 - phase) * 8)
+            else:
+                packed &= cutlass.Uint32(65535)
+        destination[thread + Int32(group * 128)] = packed.to(destination.element_type)
+
+
+@cute.jit
 def stage_v41_exact_b(source: cute.Tensor, shared_base: Int32,
                       expert_word_base: Int64, n_start: Int32, k_start: Int32,
                       thread: Int32, width: cutlass.Constexpr,

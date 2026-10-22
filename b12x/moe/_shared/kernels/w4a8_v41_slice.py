@@ -48,12 +48,14 @@ from b12x.moe._shared.kernels.w4a8_staging import (
     stage_repacked_sfb_k_slice,
     stage_v41_exact_b,
     stage_v41_exact_sfb,
+    stage_scale_codes_slice,
+    stage_scale_codes_k_slice,
 )
 
 
 class V41FusedSliceKernel:
     def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576, hidden=5120,
-                 exact_storage=False, fc2_n_splits=1):
+                 exact_storage=False, fc2_n_splits=1, scale_codes=False):
         assert width in (64, 128, 192)
         assert hidden > 0 and hidden % 128 == 0
         self.hidden = hidden
@@ -67,6 +69,8 @@ class V41FusedSliceKernel:
         assert intermediate > 0 and intermediate % 32 == 0
         self.intermediate = intermediate
         self.exact_storage = bool(exact_storage)
+        self.scale_codes = bool(scale_codes)
+        assert not (self.scale_codes and self.exact_storage), "scale codes use the N256 resident layout"
         if self.exact_storage:
             assert intermediate == 576 and hidden == 5120, "exact tail layout is the V4.1 TP4 contract"
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
@@ -214,7 +218,11 @@ class V41FusedSliceKernel:
                         128,
                         self.width,
                     )
-                if cutlass.const_expr(self.exact_storage):
+                if cutlass.const_expr(self.scale_codes):
+                    stage_scale_codes_slice(s13, sb, expert, kt, start, tid,
+                                            self.width, 2 * self.kernel_intermediate,
+                                            self.hidden // 32)
+                elif cutlass.const_expr(self.exact_storage):
                     stage_v41_exact_sfb(
                         s13,
                         sb,
@@ -239,7 +247,12 @@ class V41FusedSliceKernel:
                         128,
                         self.width,
                     )
-                if cutlass.const_expr(self.exact_storage):
+                if cutlass.const_expr(self.scale_codes):
+                    stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
+                                            start + self.kernel_intermediate, tid,
+                                            self.width, 2 * self.kernel_intermediate,
+                                            self.hidden // 32)
+                elif cutlass.const_expr(self.exact_storage):
                     stage_v41_exact_sfb(
                         s13,
                         sb + self.width * 4,
@@ -391,7 +404,11 @@ class V41FusedSliceKernel:
                         128,
                         self.width,
                     )
-                if cutlass.const_expr(self.exact_storage):
+                if cutlass.const_expr(self.scale_codes):
+                    stage_scale_codes_k_slice(s2, sf, expert, start, ot * 128, tid,
+                                              self.width, self.hidden,
+                                              self.intermediate // 32)
+                elif cutlass.const_expr(self.exact_storage):
                     stage_v41_exact_sfb(
                         s2,
                         sf,
