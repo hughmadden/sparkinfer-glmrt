@@ -14,7 +14,8 @@ import cutlass.utils as cutlass_utils
 from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
-    f16_mma_m16n8k16_f32, ld_global_nc_u32, ld_global_nc_v4_u32,
+    f16_mma_m16n8k16_f32, ld_global_nc_u32, ld_global_nc_u32_l2hint, ld_global_nc_v4_u32,
+    weight_stream_policy,
     ld_shared_u32, packed_dequant_trellis_to_half2x4,
     packed_dequant_trellis_stream_to_half2x4,
     packed_dequant_trellis_mul1_to_half2x4,
@@ -24,19 +25,29 @@ from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a16.exlr8 import _e4m3_round_half2, _side_value
 
 
+def _load_word(address, policy):
+    """A trellis payload word, with ``policy`` as its L2 cache policy when given."""
+    if policy is None:
+        return ld_global_nc_u32(address)
+    return ld_global_nc_u32_l2hint(address, policy)
+
+
 @cute.jit
 def decode_tile(address: Int64, tile: Int32, lane: Int32,
                 bits: cutlass.Constexpr, e4m3: cutlass.Constexpr,
-                mul1: cutlass.Constexpr = False):
+                mul1: cutlass.Constexpr = False, policy=None):
+    """One warp's 16x16 trellis tile. ``policy``: an L2 cache policy for the
+    payload words (``weight_stream_policy``), or None for plain loads."""
     base = address + tile.to(Int64) * Int64(32 * bits)
+
     if cutlass.const_expr(bits == 4):
-        b = ld_global_nc_u32(base + lane.to(Int64) * Int64(4))
+        b = _load_word(base + lane.to(Int64) * Int64(4), policy)
         a = cute.arch.shuffle_sync(b, (lane + Int32(31)) & Int32(31))
         wa, wb = b, (a << Uint32(16)) | (b >> Uint32(16))
     elif cutlass.const_expr(bits <= 4):
         ia, ib, shift, _ = trellis256_lane_geom_bits(lane, 0, 8, bits)
-        a = ld_global_nc_u32(base + ia.to(Int64) * Int64(4))
-        b = ld_global_nc_u32(base + ib.to(Int64) * Int64(4))
+        a = _load_word(base + ia.to(Int64) * Int64(4), policy)
+        b = _load_word(base + ib.to(Int64) * Int64(4), policy)
         window = (a.to(Int64) << Int64(32)) | b.to(Int64)
         wa = (window >> shift.to(Int64)).to(Uint32)
         wb = (window >> (shift + Int32(4 * bits)).to(Int64)).to(Uint32)
@@ -44,10 +55,10 @@ def decode_tile(address: Int64, tile: Int32, lane: Int32,
         # Four K5 windows span 31 bits; all eight may span three ring words.
         ib0, ib1, sb, _ = trellis256_lane_geom_bits(lane, 0, 4, bits)
         ia0, ia1, sa, _ = trellis256_lane_geom_bits(lane, 4, 4, bits)
-        b0 = ld_global_nc_u32(base + ib0.to(Int64) * Int64(4))
-        b1 = ld_global_nc_u32(base + ib1.to(Int64) * Int64(4))
-        a0 = ld_global_nc_u32(base + ia0.to(Int64) * Int64(4))
-        a1 = ld_global_nc_u32(base + ia1.to(Int64) * Int64(4))
+        b0 = _load_word(base + ib0.to(Int64) * Int64(4), policy)
+        b1 = _load_word(base + ib1.to(Int64) * Int64(4), policy)
+        a0 = _load_word(base + ia0.to(Int64) * Int64(4), policy)
+        a1 = _load_word(base + ia1.to(Int64) * Int64(4), policy)
         wa = (((a0.to(Int64) << Int64(32)) | a1.to(Int64)) >> sa.to(Int64)).to(Uint32)
         wb = (((b0.to(Int64) << Int64(32)) | b1.to(Int64)) >> sb.to(Int64)).to(Uint32)
     else:
@@ -55,9 +66,9 @@ def decode_tile(address: Int64, tile: Int32, lane: Int32,
         i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, bits)
         i1 = i0 + Int32(1)
         i1 -= Int32(8 * bits) * (i1 >= Int32(8 * bits)).to(Int32)
-        z0 = ld_global_nc_u32(base + i0.to(Int64) * Int64(4))
-        z1 = ld_global_nc_u32(base + i1.to(Int64) * Int64(4))
-        z2 = ld_global_nc_u32(base + i2.to(Int64) * Int64(4))
+        z0 = _load_word(base + i0.to(Int64) * Int64(4), policy)
+        z1 = _load_word(base + i1.to(Int64) * Int64(4), policy)
+        z2 = _load_word(base + i2.to(Int64) * Int64(4), policy)
         wa, wb = trellis_align_stream_u32x2(z0, z1, z2, shift, delta)
     if cutlass.const_expr(mul1):
         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, bits)
@@ -137,6 +148,8 @@ class NativeTrellisLinear:
             split = task % Int32(self.splits)
             nb = (task // Int32(self.splits)) % Int32(self.n // 128)
             group = task // Int32(self.splits * (self.n // 128))
+            # Each 16-row group re-reads the weights; the last one evicts them first.
+            policy = weight_stream_policy((group + Int32(1) == (rows + Int32(15)) // Int32(16)).to(Int32))
             row0 = group * Int32(16) + lane // Int32(4)
             row1 = row0 + Int32(8)
             total = cute.make_rmem_tensor((4, 4), Float32)
@@ -159,7 +172,7 @@ class NativeTrellisLinear:
                             tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                             if cutlass.const_expr(self.input_units):
                                 tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
-                            b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1)
+                            b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
                             d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                                 acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                                 a0, a1, a2, a3, b0, b1)
@@ -207,6 +220,11 @@ class NativeTrellisLinear:
             split = task % Int32(self.splits)
             nb = (task // Int32(self.splits)) % Int32(self.n // 128)
             group = Int32(0) if cutlass.const_expr(active < 4) else task // tiles
+            # One pass over the weights below 49 rows; else the last 64-row group evicts.
+            last_reader = Int32(1)
+            if cutlass.const_expr(active == 4):
+                last_reader = (group + Int32(1) == (rows + Int32(M - 1)) // Int32(M)).to(Int32)
+            policy = weight_stream_policy(last_reader)
             row_base = (lane >> Int32(2)) if cutlass.const_expr(active < 4) else group * Int32(M) + (lane >> Int32(2))
             total = cute.make_rmem_tensor((active, 4, 4), Float32)
             total.fill(Float32(0.0))
@@ -240,7 +258,7 @@ class NativeTrellisLinear:
                                 tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                                 if cutlass.const_expr(self.input_units):
                                     tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
-                                b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1)
+                                b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
                                 for mb in cutlass.range_constexpr(active):
                                     d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                                         acc[mb, 2 * n16, 0], acc[mb, 2 * n16, 1], acc[mb, 2 * n16, 2], acc[mb, 2 * n16, 3],
@@ -264,7 +282,7 @@ class NativeTrellisLinear:
                                 tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                                 if cutlass.const_expr(self.input_units):
                                     tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
-                                b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1)
+                                b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
                                 for mb in cutlass.range_constexpr(active):
                                     a0 = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16) * 16))
                                     a1 = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16 + 8) * 16))
@@ -294,7 +312,7 @@ class NativeTrellisLinear:
                                     tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + k16) * Int32(8) + warp * Int32(2) + Int32(n16)
                                     if cutlass.const_expr(self.input_units):
                                         tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + k16 * Int32(8) + warp * Int32(2) + Int32(n16)
-                                    b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1)
+                                    b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
                                     for mb in cutlass.range_constexpr(active):
                                         a0 = ld_shared_u32(sx_k + Int32(((2 * ki) * M_PAD + mb * 16) * 16))
                                         a1 = ld_shared_u32(sx_k + Int32(((2 * ki) * M_PAD + mb * 16 + 8) * 16))
@@ -392,6 +410,7 @@ class NativeTrellisLinear:
         group_tiles = Int32(4 * (self.n // 128) * self.splits)
         while task < ((rows + Int32(15)) // Int32(16)) * group_tiles:
             group = task // group_tiles
+            policy = weight_stream_policy((group + Int32(1) == (rows + Int32(15)) // Int32(16)).to(Int32))
             rem = task % group_tiles
             proj = rem // tiles
             tile_in_proj = rem % tiles
@@ -429,7 +448,7 @@ class NativeTrellisLinear:
                             tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                             if cutlass.const_expr(self.input_units):
                                 tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
-                            b0, b1, b2, b3 = decode_tile(payload_ptr, tile, lane, self.bits, self.e4m3, self.mul1)
+                            b0, b1, b2, b3 = decode_tile(payload_ptr, tile, lane, self.bits, self.e4m3, self.mul1, policy)
                             d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                                 acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                                 a0, a1, a2, a3, b0, b1)
@@ -476,6 +495,10 @@ class NativeTrellisLinear:
         sx_read = sx + lane * Int32(4)
         while task < limit:
             group = Int32(0) if cutlass.const_expr(active < 4) else task // group_tiles
+            last_reader = Int32(1)
+            if cutlass.const_expr(active == 4):
+                last_reader = (group + Int32(1) == (rows + Int32(M - 1)) // Int32(M)).to(Int32)
+            policy = weight_stream_policy(last_reader)
             rem = task if cutlass.const_expr(active < 4) else task % group_tiles
             proj = rem // tiles
             tile_in_proj = rem % tiles
@@ -516,7 +539,7 @@ class NativeTrellisLinear:
                                 tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                                 if cutlass.const_expr(self.input_units):
                                     tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
-                                b0, b1, b2, b3 = decode_tile(payload_ptr, tile, lane, self.bits, self.e4m3, self.mul1)
+                                b0, b1, b2, b3 = decode_tile(payload_ptr, tile, lane, self.bits, self.e4m3, self.mul1, policy)
                                 for mb in cutlass.range_constexpr(active):
                                     a0 = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16) * 16))
                                     a1 = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16 + 8) * 16))
@@ -538,7 +561,7 @@ class NativeTrellisLinear:
                                     tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + k16) * Int32(8) + warp * Int32(2) + Int32(n16)
                                     if cutlass.const_expr(self.input_units):
                                         tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + k16 * Int32(8) + warp * Int32(2) + Int32(n16)
-                                    b0, b1, b2, b3 = decode_tile(payload_ptr, tile, lane, self.bits, self.e4m3, self.mul1)
+                                    b0, b1, b2, b3 = decode_tile(payload_ptr, tile, lane, self.bits, self.e4m3, self.mul1, policy)
                                     for mb in cutlass.range_constexpr(active):
                                         a0 = ld_shared_u32(sx_k + Int32(((2 * ki) * M_PAD + mb * 16) * 16))
                                         a1 = ld_shared_u32(sx_k + Int32(((2 * ki) * M_PAD + mb * 16 + 8) * 16))

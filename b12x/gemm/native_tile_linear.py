@@ -5,7 +5,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
-from cutlass import Float32, Int32, Int64, Uint32
+from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -13,9 +13,10 @@ from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32, cp_async4_shared_global_pred, cp_async_u32_shared_global,
     ld_global_nc_u32, ld_global_nc_v2_u32, ld_global_v2_u32, ld_shared_u32, ld_shared_v2_u32,
     ld_shared_v4_u32, shared_ptr_to_u32, st_global_v2_f32, u32_as_f32,
-    ldmatrix_m8n8x4_b16, ldmatrix_m8n8x2_b16,
+    ldmatrix_m8n8x4_b16, ldmatrix_m8n8x2_b16, ld_global_nc_u32_l2hint, ld_global_nc_v2_u32_l2hint,
+    ld_global_nc_v4_u32_l2hint, weight_stream_policy,
 )
-from b12x.gemm.bf16_gemv._skinny import _ld_cached, _ld_stream
+from b12x.gemm.bf16_gemv._skinny import _ld_cached
 
 DECODE_ROWS = 64           # decode route capacity (four 16-row tiles per warp)
 PREFILL_BM = 128           # rows of one prefill CTA tile
@@ -376,23 +377,24 @@ class NativeTileLinear:
 
     @cute.jit
     def _decode_load(self, wdst: cute.Tensor, sdst: cute.Tensor, payload: cute.Tensor,
-                     scales: cute.Tensor, n0: Int32, g: Int32, j: Int32, kb: Int32):
+                     scales: cute.Tensor, n0: Int32, g: Int32, j: Int32, kb: Int32, policy: Uint64):
         for c in cutlass.range_constexpr(2):
             for gi in cutlass.range_constexpr(self.groups):
                 col = n0 + Int32(8 * gi) + g
                 k0 = kb * Int32(128) + Int32(64 * c)
                 if cutlass.const_expr(not self.grouped):
-                    words = _ld_stream(self._w_addr(payload, col, k0 + Int32(16) * j))
+                    words = ld_global_nc_v4_u32_l2hint(
+                        self._w_addr(payload, col, k0 + Int32(16) * j), policy, no_allocate=True)
                     for t in cutlass.range_constexpr(4):
                         wdst[(c * self.groups + gi) * 4 + t] = words[t]
                 elif cutlass.const_expr(self.int4):
                     for h in cutlass.range_constexpr(2):
-                        wdst[(c * self.groups + gi) * 2 + h] = ld_global_nc_u32(
-                            self._w_addr(payload, col, k0 + Int32(32 * h) + Int32(8) * j))
+                        wdst[(c * self.groups + gi) * 2 + h] = ld_global_nc_u32_l2hint(
+                            self._w_addr(payload, col, k0 + Int32(32 * h) + Int32(8) * j), policy)
                 else:
                     for h in cutlass.range_constexpr(2):
-                        w0, w1 = ld_global_nc_v2_u32(
-                            self._w_addr(payload, col, k0 + Int32(32 * h) + Int32(8) * j))
+                        w0, w1 = ld_global_nc_v2_u32_l2hint(
+                            self._w_addr(payload, col, k0 + Int32(32 * h) + Int32(8) * j), policy)
                         wdst[(c * self.groups + gi) * 4 + 2 * h] = w0
                         wdst[(c * self.groups + gi) * 4 + 2 * h + 1] = w1
         if cutlass.const_expr(self.grouped):
@@ -419,9 +421,12 @@ class NativeTileLinear:
             block_cta = Int32(cta) // row_tiles
             tile = Int32(cta) - block_cta * row_tiles
             row0 = tile * rows_per
+            # Row tiles of a column block each stream its weights; the last evicts them.
+            policy = weight_stream_policy((tile + Int32(1) == row_tiles).to(Int32))
         else:
             block_cta = Int32(cta)
             row0 = Int32(0)
+            policy = weight_stream_policy(Int32(1))
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._decode_storage())
         fold = shared_ptr_to_u32(storage.fold.data_ptr())
@@ -463,11 +468,11 @@ class NativeTileLinear:
                 nxt = cute.make_rmem_tensor((self.wpb,), Uint32)
                 scur = cute.make_rmem_tensor((self.spb,), Uint32)
                 snxt = cute.make_rmem_tensor((self.spb,), Uint32)
-                self._decode_load(cur, scur, payload, scales, n0, g, j, kb0)
+                self._decode_load(cur, scur, payload, scales, n0, g, j, kb0, policy)
                 for b in cutlass.range(self.seg_blocks, unroll=1):
                     kb = kb0 + b
                     if b + Int32(1) < Int32(self.seg_blocks):
-                        self._decode_load(nxt, snxt, payload, scales, n0, g, j, kb + Int32(1))
+                        self._decode_load(nxt, snxt, payload, scales, n0, g, j, kb + Int32(1), policy)
                     for c in cutlass.range_constexpr(2):
                         k0 = kb * Int32(128) + Int32(64 * c)
                         if cutlass.const_expr(self.grouped):
