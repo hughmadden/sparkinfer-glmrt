@@ -373,7 +373,7 @@ class NativeTileLinear:
     def _scale(self, raw: Uint32, h):
         sh = (Int32(16 if self.int4 else 8) * Int32(h)).to(Uint32)
         if cutlass.const_expr(self.int4):
-            value = _f16_to_f32(raw >> sh)
+            value = _f16_to_f32((raw >> sh) & Uint32(0xFFFF))
         else:
             value = _e8m0((raw >> sh) & Uint32(0xFF))
         return value
@@ -1028,8 +1028,8 @@ class NativeTileLinear:
                             b_off = wide + (b_lane_off ^ h_xor)
                             for gi in cutlass.range_constexpr(NG):
                                 b = ldmatrix_m8n8x4_b16(b_off + Int32(gi * 1024))
-                                bw_h[4 * gi], bw_h[4 * gi + 1], bw_h[4 * gi + 2], bw_h[4 * gi + 3] = _quad_transpose_x4(
-                                    b[0], b[1], b[2], b[3], j)
+                                for i in cutlass.range_constexpr(4):
+                                    bw_h[4 * gi + i] = b[i]
                                 sc_h[2 * gi] = self._scale(s_raw[2 * gi], h)
                                 sc_h[2 * gi + 1] = self._scale(s_raw[2 * gi + 1], h)
                             a_off0 = sa + (a_lane_off ^ h_xor)
@@ -1038,8 +1038,9 @@ class NativeTileLinear:
                                 xa_h = cute.make_rmem_tensor((8,), Uint32)
                                 a0 = ldmatrix_m8n8x4_b16(a_off0 + Int32(mt * 2048))
                                 a1 = ldmatrix_m8n8x4_b16(a_off1 + Int32(mt * 2048))
-                                xa_h[0], xa_h[2], xa_h[4], xa_h[6] = _quad_transpose_x4(a0[0], a0[2], a1[0], a1[2], j)
-                                xa_h[1], xa_h[3], xa_h[5], xa_h[7] = _quad_transpose_x4(a0[1], a0[3], a1[1], a1[3], j)
+                                for i in cutlass.range_constexpr(4):
+                                    xa_h[i] = a0[i]
+                                    xa_h[4 + i] = a1[i]
                                 for gi in cutlass.range_constexpr(NG):
                                     f = 4 * (mt * NG + gi)
                                     acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
