@@ -1311,6 +1311,95 @@ def create_l2_evict_first_policy(*, loc=None, ip=None) -> Uint64:
 
 
 @dsl_user_op
+def create_l2_evict_unchanged_policy(*, loc=None, ip=None) -> Uint64:
+    """Create an L2 evict-unchanged policy: a load carrying it keeps the line's
+    current priority. The no-op arm of a runtime-selected weight policy."""
+    return Uint64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_unchanged.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def weight_stream_policy(last_reader, *, loc=None, ip=None) -> Uint64:
+    """The L2 policy for a register-loaded weight stream: evict-first when this
+    CTA is the last reader of the weights it loads (``last_reader`` != 0),
+    evict-unchanged otherwise. Register loads only (``ld.global.nc...
+    L2::cache_hint``): on SM121 the cp.async/bulk/TMA cache-hint forms depend on
+    ptxas uniform-register allocation, these do not."""
+    first = create_l2_evict_first_policy(loc=loc, ip=ip)
+    unchanged = create_l2_evict_unchanged_policy(loc=loc, ip=ip)
+    return Uint64(
+        llvm.inline_asm(
+            T.i64(),
+            [Int32(last_reader).ir_value(loc=loc, ip=ip), first.ir_value(loc=loc, ip=ip),
+             unchanged.ir_value(loc=loc, ip=ip)],
+            "{ .reg .pred p; setp.ne.s32 p, $1, 0; selp.b64 $0, $2, $3, p; }",
+            "=l,r,l,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ld_global_nc_v2_u32_l2hint(
+    base_ptr: Int64, cache_policy: Uint64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32]:
+    """64-bit ``ld.global.nc`` with an L2 cache policy."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip), Uint64(cache_policy).ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L2::cache_hint.v2.u32 {$0, $1}, [$2], $3;",
+        "=r,=r,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def ld_global_nc_v4_u32_l2hint(
+    base_ptr: Int64, cache_policy: Uint64, *, no_allocate: bool = False, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """128-bit ``ld.global.nc`` with an L2 cache policy (``no_allocate``: also
+    ``L1::no_allocate``, the streamed-weight form)."""
+    l1 = ".L1::no_allocate" if no_allocate else ""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip), Uint64(cache_policy).ir_value(loc=loc, ip=ip)],
+        f"ld.global.nc{l1}.L2::cache_hint.v4.u32 {{$0, $1, $2, $3}}, [$4], $5;",
+        "=r,=r,=r,=r,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4)
+    )
+
+
+@dsl_user_op
 def cp_async_bulk_g2s_mbar_l2hint(
     smem_dst_u32: Int32,
     gmem_src_i64: Int64,
