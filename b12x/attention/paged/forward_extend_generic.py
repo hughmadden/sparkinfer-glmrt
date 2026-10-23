@@ -6428,15 +6428,8 @@ class PagedForwardKernel:
                             )
                         d_frag[mma_q, 0] = d0
                         d_frag[mma_q, 1] = d1
-                if const_expr(self.kv_is_fp8 and self.traits.num_warps_kv > 1):
-                    if warp_kv_base >= tile_tokens:
-                        for mma_q in cutlass.range_constexpr(num_mma_q):
-                            for row_slot in cutlass.range_constexpr(2):
-                                m_frag[mma_q, row_slot] = Float32(-Float32.inf)
-                                d_frag[mma_q, row_slot] = Float32(1.0)
-                            for mma_d in cutlass.range_constexpr(num_mma_d_vo):
-                                for reg_id in cutlass.range_constexpr(8):
-                                    o_frag[mma_q, mma_d, reg_id] = Float32(0.0)
+                # A warp whose KV slice lies past this tile's live tokens skipped
+                # the state update above and keeps the state of earlier tiles.
 
                 if const_expr(self.debug_dump_paged_kv_extend_state):
                     if (
