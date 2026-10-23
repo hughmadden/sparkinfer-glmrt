@@ -38,7 +38,7 @@ class Case:
                             scalars=(rows, rotation, limit))
 
 
-@pytest.mark.parametrize("side,bits,codebook", [(1, 4, "e4m3"), (2, 4, "e4m3"), (1, 2, "e4m3"), (2, 3, "e4m3"), (1, 4, "f16"), (2, 3, "f16"), *[(side, bits, cb) for side in (1, 2) for bits in (5, 6) for cb in ("mcg", "mul1")]])
+@pytest.mark.parametrize("side,bits,codebook", [(1, 4, "e4m3"), (2, 4, "e4m3"), (1, 2, "e4m3"), (2, 3, "e4m3"), (1, 4, "f16"), (2, 3, "f16"), *[(side, bits, cb) for side in (1, 2) for bits in (2, 3, 4, 5, 6) for cb in ("mcg", "mul1")]])
 def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
     c = Case(side=side, bits=bits, codebook=codebook)
     c.launch(64, rotation=0)
@@ -384,7 +384,7 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
 
     rng = np.random.default_rng(273)
-    k, n, max_rows = 1152, 256, 129
+    k, n, max_rows = 1152, 256, 512
     splits = (k + 1023) // 1024
     rotations = [torch.tensor(rng.normal(0, 0.1, (max_rows, k)), device="cuda", dtype=torch.float16) for _ in range(4)]
     inputs = torch.tensor([t.data_ptr() for t in rotations], device="cuda", dtype=torch.int64)
@@ -420,7 +420,7 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
         )
 
     with kernel_resolution_guard("grouped trellis linear uses precompiled kernels"):
-        for rows in (1, 8, 16, 17, 32, 33, 36, 48, 49, 63, 64, 129):
+        for rows in (1, 8, 16, 17, 32, 33, 36, 48, 49, 63, 64, 129, 130, 255, 256, 257, 512):
             for limit in (48, 170 * 4, 188 * 4):
                 for out in standalone_outputs + grouped_outputs:
                     out.fill_(float("nan"))
@@ -434,7 +434,7 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
                         standalone_outputs[i][:rows].view(torch.int32),
                     )
                     assert torch.isnan(grouped_outputs[i][rows:]).all()
-        for graph_rows in (8, 36):
+        for graph_rows in (8, 36, 130, 257):
             run_standalone(graph_rows, 188 * 4)
             expected = [out[:graph_rows].clone() for out in standalone_outputs]
             run_grouped(graph_rows, 188 * 4)
@@ -458,3 +458,44 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
                 assert torch.isnan(out).all()
 
 
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("bits,codebook", [(4, "e4m3"), (6, "mcg"), (6, "mul1")])
+def test_prefill_vs_base_bitwise_and_row_invariance(side, bits, codebook, monkeypatch):
+    import cutlass.cute as cute
+    from cutlass import Int32
+    from cuda.bindings import driver as cuda
+    from b12x.gemm.trellis_linear import _native
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    class Base(_native.NativeTrellisLinear):
+        @cute.jit
+        def __call__(self, inputs: cute.Tensor, payload: cute.Tensor,
+                     scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                     rows: Int32, rotation_id: Int32, cta_limit: Int32,
+                     stream: cuda.CUstream):
+            tiles = Int32(self.n // 128 * self.splits)
+            self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+                grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+            self.reduce(partial, output, rows).launch(
+                grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                block=(128, 1, 1), stream=stream)
+
+    max_rows = 512
+    with exportable_compilation(), monkeypatch.context() as patch:
+        patch.setattr(_native, "NativeTrellisLinear", Base)
+        base = Case(k=1152, n=256, side=side, bits=bits, rows=max_rows, codebook=codebook)
+    prefill = Case(k=1152, n=256, side=side, bits=bits, rows=max_rows, codebook=codebook)
+    base.launch(max_rows)
+    full_expected = base.output.clone()
+    for rows in (1, 16, 64, 129, 130, 192, 255, 256, 257, 512):
+        for limit in (4, 188 * 4):
+            prefill.partial.fill_(float("nan"))
+            prefill.output.fill_(float("nan"))
+            with kernel_resolution_guard("prefill row dispatch uses precompiled kernels"):
+                prefill.launch(rows, limit=limit)
+            assert torch.equal(prefill.output[:rows].view(torch.int32), full_expected[:rows].view(torch.int32))
+            assert torch.isnan(prefill.output[rows:]).all()
+            if rows >= 130:
+                assert torch.isnan(prefill.partial).all()
