@@ -494,7 +494,7 @@ def test_prefill_vs_base_bitwise_and_row_invariance(side, bits, codebook, monkey
             prefill.partial.fill_(float("nan"))
             prefill.output.fill_(float("nan"))
             with kernel_resolution_guard("prefill row dispatch uses precompiled kernels"):
-                prefill.launch(rows, cta_limit=limit)
+                prefill.launch(rows, limit=limit)
             assert torch.equal(prefill.output[:rows].view(torch.int32), full_expected[:rows].view(torch.int32))
             assert torch.isnan(prefill.output[rows:]).all()
             if rows >= 130:

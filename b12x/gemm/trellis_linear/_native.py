@@ -37,11 +37,22 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis_ws import (
 
 _PREFILL_BM = 128
 _PREFILL_BN = 64
+_PREFILL_STAGES = 4
 _PREFILL_CONSUMER_THREADS = 256
 _PREFILL_PRODUCER_THREADS = 128
 _PREFILL_PRODUCER_REGS = 104
 _PREFILL_CONSUMER_REGS = 192
 _PREFILL_MIN_ROWS = 130
+
+
+@dsl_user_op
+def _ld_global_nc_u32_offset(base_ptr: Int64, offset: int, *, loc=None, ip=None) -> Uint32:
+    return Uint32(llvm.inline_asm(
+        T.i32(),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        f"ld.global.nc.u32 $0, [$1 + {int(offset)}];",
+        "=r,l", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
 
 
 @dsl_user_op
@@ -69,15 +80,17 @@ def _e4m3x4_to_f16x2x2(word: Uint32, *, loc=None, ip=None) -> tuple[Uint32, Uint
 
 
 @dsl_user_op
-def _cp_async4_zfill_offset(smem_addr: Int32, offset: int, gmem_addr: Int64, pred: Int32,
+def _cp_async4_zfill_offset(smem_addr: Int32, smem_offset: int,
+                            gmem_addr: Int64, gmem_offset: int,
+                            rem_rows: Int32, row_off: int,
                             *, loc=None, ip=None):
     llvm.inline_asm(
         None,
         [Int32(smem_addr).ir_value(loc=loc, ip=ip),
          Int64(gmem_addr).ir_value(loc=loc, ip=ip),
-         Int32(pred).ir_value(loc=loc, ip=ip)],
-        f"{{ .reg .pred p; .reg .b32 sz; setp.ne.b32 p, $2, 0; selp.b32 sz, 16, 0, p; "
-        f"cp.async.cg.shared.global [$0 + {int(offset)}], [$1], 16, sz; }}",
+         Int32(rem_rows).ir_value(loc=loc, ip=ip)],
+        f"{{ .reg .pred p; .reg .b32 sz; setp.gt.s32 p, $2, {int(row_off)}; selp.b32 sz, 16, 0, p; "
+        f"cp.async.cg.shared.global [$0 + {int(smem_offset)}], [$1 + {int(gmem_offset)}], 16, sz; }}",
         "r,l,r", has_side_effects=True, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
@@ -240,7 +253,7 @@ class NativeTrellisLinear:
     def _prefill_storage(self):
         w_tile_bytes = 256 if self.e4m3 else 512
         stage_bytes = _PREFILL_BM * 64 * 2 + 16 * w_tile_bytes
-        total_bytes = 2 * stage_bytes + 128
+        total_bytes = _PREFILL_STAGES * stage_bytes + 128
         class Storage:
             pass
         Storage.__annotations__ = {
@@ -543,64 +556,138 @@ class NativeTrellisLinear:
     def _prefill_produce_tile(self, p_tid: Int32, base: Int32,
                               x_ptr: Int64, payload_ptr: Int64,
                               rows: Int32, m0: Int32, nb64: Int32,
-                              phase: Int32) -> Int32:
+                              stage_cnt: Int32) -> Int32:
         w_tile_bytes = 256 if self.e4m3 else 512
         a_stage_bytes = _PREFILL_BM * 64 * 2
         stage_bytes = a_stage_bytes + 16 * w_tile_bytes
-        bar_full = base + Int32(2 * stage_bytes)
-        bar_empty = bar_full + Int32(16)
+        bar_full = base + Int32(_PREFILL_STAGES * stage_bytes)
+        bar_empty = bar_full + Int32(8 * _PREFILL_STAGES)
         lane, pw = p_tid & Int32(31), p_tid >> Int32(5)
         r0, c = p_tid >> Int32(3), p_tid & Int32(7)
         sa_lane_off = r0 * Int32(128) + ((c ^ (r0 & Int32(7))) << Int32(4))
         sw_pw_off = Int32(a_stage_bytes) + pw * Int32(w_tile_bytes) + lane * Int32(8 if self.e4m3 else 16)
         nb128 = nb64 >> Int32(1)
         n16_in_128 = (nb64 & Int32(1)) * Int32(4) + pw
+        tile_init = nb128 * Int32(64 if self.input_units else (self.k // 16 * 8)) + n16_in_128
+        kb_w_stride = Int64((self.n // 2 if self.input_units else 64) * 32 * self.bits)
+        w_tile_base = payload_ptr + tile_init.to(Int64) * Int64(32 * self.bits)
+        prev_lane = (lane + Int32(31)) & Int32(31)
+        i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, self.bits)
+        i1 = i0 + Int32(1)
+        i1 -= Int32(8 * self.bits) * (i1 >= Int32(8 * self.bits)).to(Int32)
+        p0_cur = w_tile_base + (lane if self.bits == 4 else i0).to(Int64) * Int64(4)
+        p1_cur = w_tile_base + i1.to(Int64) * Int64(4)
+        p2_cur = w_tile_base + i2.to(Int64) * Int64(4)
+        rem_rows = rows - (m0 + r0)
+        x_cur = x_ptr + (m0 + r0).to(Int64) * Int64(self.k * 2) + (c * Int32(8)).to(Int64) * Int64(2)
+        w_words = 1 if self.bits == 4 else 3
+        w_s0 = cute.make_rmem_tensor((4, w_words), Uint32)
+        w_s1 = cute.make_rmem_tensor((4, w_words), Uint32)
+        for k16_in_64 in cutlass.range_constexpr(4):
+            off = k16_in_64 * 256 * self.bits
+            w_s0[k16_in_64, 0] = _ld_global_nc_u32_offset(p0_cur, off)
+            if cutlass.const_expr(self.bits != 4):
+                w_s0[k16_in_64, 1] = _ld_global_nc_u32_offset(p1_cur, off)
+                w_s0[k16_in_64, 2] = _ld_global_nc_u32_offset(p2_cur, off)
+        num_kb = Int32(self.k // 128)
         for kb in cutlass.range(self.k // 128, unroll=1):
-            for s in cutlass.range_constexpr(2):
-                _mbar_wait(bar_empty + Int32(8 * s), phase ^ Int32(1))
-                sa_base = base + Int32(s * stage_bytes) + sa_lane_off
-                k_col = kb * Int32(128) + Int32(s * 64) + c * Int32(8)
-                x_col_base = x_ptr + k_col.to(Int64) * Int64(2)
-                for i in cutlass.range_constexpr(8):
-                    row = m0 + r0 + Int32(i * 16)
-                    pred = Int32(0)
-                    if row < rows:
-                        pred = Int32(1)
-                    _cp_async4_zfill_offset(
-                        sa_base, i * 2048,
-                        x_col_base + row.to(Int64) * Int64(self.k * 2), pred)
-                _cp_async_mbar_arrive_noinc(bar_full + Int32(8 * s))
-                sw_base = base + Int32(s * stage_bytes) + sw_pw_off
-                for k16_in_64 in cutlass.range_constexpr(4):
-                    k16 = Int32(s * 4 + k16_in_64)
-                    tile = nb128 * Int32(self.k // 16 * 8) + (kb * Int32(8) + k16) * Int32(8) + n16_in_128
-                    if cutlass.const_expr(self.input_units):
-                        tile = kb * Int32(self.n // 16 * 8) + nb128 * Int32(64) + k16 * Int32(8) + n16_in_128
-                    b0, b1, b2, b3 = decode_tile_raw(payload_ptr, tile, lane, self.bits, self.mul1)
-                    if cutlass.const_expr(self.e4m3):
-                        e01 = _f16x2x2_to_e4m3x4(b0, b1)
-                        e23 = _f16x2x2_to_e4m3x4(b2, b3)
-                        _st_shared_v2_u32_offset(sw_base, k16_in_64 * 4 * w_tile_bytes, e01, e23)
+            # Stage s = 0: wait bar_empty[slot0], issue LDGSTS for A(s=0), prefetch W(s=1), then decode W(s=0)
+            slot0 = stage_cnt & Int32(2)
+            phase = ((stage_cnt >> Int32(2)) & Int32(1)) ^ Int32(1)
+            _mbar_wait(bar_empty + slot0 * Int32(8), phase)
+            sa_base0 = base + slot0 * Int32(stage_bytes) + sa_lane_off
+            for i in cutlass.range_constexpr(8):
+                _cp_async4_zfill_offset(
+                    sa_base0, i * 2048,
+                    x_cur, i * 32 * self.k, rem_rows, i * 16)
+            _cp_async_mbar_arrive_noinc(bar_full + slot0 * Int32(8))
+            for k16_in_64 in cutlass.range_constexpr(4):
+                off1 = (4 + k16_in_64) * 256 * self.bits
+                w_s1[k16_in_64, 0] = _ld_global_nc_u32_offset(p0_cur, off1)
+                if cutlass.const_expr(self.bits != 4):
+                    w_s1[k16_in_64, 1] = _ld_global_nc_u32_offset(p1_cur, off1)
+                    w_s1[k16_in_64, 2] = _ld_global_nc_u32_offset(p2_cur, off1)
+            sw_base0 = base + slot0 * Int32(stage_bytes) + sw_pw_off
+            for k16_in_64 in cutlass.range_constexpr(4):
+                if cutlass.const_expr(self.bits == 4):
+                    b = w_s0[k16_in_64, 0]
+                    a = cute.arch.shuffle_sync(b, prev_lane)
+                    wa, wb = b, (a << Uint32(16)) | (b >> Uint32(16))
+                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
+                else:
+                    wa, wb = trellis_align_stream_u32x2(
+                        w_s0[k16_in_64, 0], w_s0[k16_in_64, 1], w_s0[k16_in_64, 2], shift, delta)
+                    if cutlass.const_expr(self.mul1):
+                        b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, self.bits)
                     else:
-                        _st_shared_v4_u32_offset(sw_base, k16_in_64 * 4 * w_tile_bytes, b0, b1, b2, b3)
-                _mbar_arrive(bar_full + Int32(8 * s))
-            phase = phase ^ Int32(1)
-        return phase
+                        b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, self.bits)
+                if cutlass.const_expr(self.e4m3):
+                    e01 = _f16x2x2_to_e4m3x4(b0, b1)
+                    e23 = _f16x2x2_to_e4m3x4(b2, b3)
+                    _st_shared_v2_u32_offset(sw_base0, k16_in_64 * 4 * w_tile_bytes, e01, e23)
+                else:
+                    _st_shared_v4_u32_offset(sw_base0, k16_in_64 * 4 * w_tile_bytes, b0, b1, b2, b3)
+            _mbar_arrive(bar_full + slot0 * Int32(8))
+
+            # Stage s = 1: wait bar_empty[slot1], issue LDGSTS for A(s=1), prefetch W(kb+1, s=0), then decode W(s=1)
+            slot1 = slot0 + Int32(1)
+            _mbar_wait(bar_empty + slot1 * Int32(8), phase)
+            sa_base1 = base + slot1 * Int32(stage_bytes) + sa_lane_off
+            for i in cutlass.range_constexpr(8):
+                _cp_async4_zfill_offset(
+                    sa_base1, i * 2048,
+                    x_cur, 128 + i * 32 * self.k, rem_rows, i * 16)
+            _cp_async_mbar_arrive_noinc(bar_full + slot1 * Int32(8))
+            x_cur = x_cur + Int64(256)
+            if kb + Int32(1) < num_kb:
+                p0_cur = p0_cur + kb_w_stride
+                p1_cur = p1_cur + kb_w_stride
+                p2_cur = p2_cur + kb_w_stride
+            for k16_in_64 in cutlass.range_constexpr(4):
+                off0 = k16_in_64 * 256 * self.bits
+                w_s0[k16_in_64, 0] = _ld_global_nc_u32_offset(p0_cur, off0)
+                if cutlass.const_expr(self.bits != 4):
+                    w_s0[k16_in_64, 1] = _ld_global_nc_u32_offset(p1_cur, off0)
+                    w_s0[k16_in_64, 2] = _ld_global_nc_u32_offset(p2_cur, off0)
+            sw_base1 = base + slot1 * Int32(stage_bytes) + sw_pw_off
+            for k16_in_64 in cutlass.range_constexpr(4):
+                if cutlass.const_expr(self.bits == 4):
+                    b = w_s1[k16_in_64, 0]
+                    a = cute.arch.shuffle_sync(b, prev_lane)
+                    wa, wb = b, (a << Uint32(16)) | (b >> Uint32(16))
+                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
+                else:
+                    wa, wb = trellis_align_stream_u32x2(
+                        w_s1[k16_in_64, 0], w_s1[k16_in_64, 1], w_s1[k16_in_64, 2], shift, delta)
+                    if cutlass.const_expr(self.mul1):
+                        b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, self.bits)
+                    else:
+                        b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, self.bits)
+                if cutlass.const_expr(self.e4m3):
+                    e01 = _f16x2x2_to_e4m3x4(b0, b1)
+                    e23 = _f16x2x2_to_e4m3x4(b2, b3)
+                    _st_shared_v2_u32_offset(sw_base1, k16_in_64 * 4 * w_tile_bytes, e01, e23)
+                else:
+                    _st_shared_v4_u32_offset(sw_base1, k16_in_64 * 4 * w_tile_bytes, b0, b1, b2, b3)
+            _mbar_arrive(bar_full + slot1 * Int32(8))
+            stage_cnt = stage_cnt + Int32(2)
+        return stage_cnt
 
     @cute.jit
     def _prefill_consume_tile(self, tid: Int32, base: Int32,
                               scales_ptr: Int64, output_ptr: Int64,
                               rows: Int32, m0: Int32, nb64: Int32,
-                              phase: Int32) -> Int32:
+                              stage_cnt: Int32) -> Int32:
         w_tile_bytes = 256 if self.e4m3 else 512
         a_stage_bytes = _PREFILL_BM * 64 * 2
         stage_bytes = a_stage_bytes + 16 * w_tile_bytes
-        bar_full = base + Int32(2 * stage_bytes)
-        bar_empty = bar_full + Int32(16)
+        bar_full = base + Int32(_PREFILL_STAGES * stage_bytes)
+        bar_empty = bar_full + Int32(8 * _PREFILL_STAGES)
         lane, cw = tid & Int32(31), tid >> Int32(5)
+        cw_m, cw_n = cw >> Int32(1), cw & Int32(1)
         l7, l15, l_sh4 = lane & Int32(7), lane & Int32(15), lane >> Int32(4)
-        a_lane_off = (cw * Int32(16) + l15) * Int32(128) + ((l_sh4 ^ l7) << Int32(4))
-        w_lane_off = Int32(a_stage_bytes) + lane * Int32(8 if self.e4m3 else 16)
+        a_lane_off = (cw_m * Int32(32) + l15) * Int32(128) + ((l_sh4 ^ l7) << Int32(4))
+        w_lane_off = Int32(a_stage_bytes) + cw_n * Int32(2 * w_tile_bytes) + lane * Int32(8 if self.e4m3 else 16)
         grand_total = cute.make_rmem_tensor((8, 4), Float32)
         grand_total.fill(Float32(0.0))
         for split in cutlass.range(self.splits, unroll=1):
@@ -609,16 +696,21 @@ class NativeTrellisLinear:
             for block in cutlass.range(8, unroll=1):
                 kb = split * Int32(8) + block
                 if kb < Int32(self.k // 128):
+                    scale = _side_value(scales_ptr, kb)
                     acc = cute.make_rmem_tensor((8, 4), Float32)
                     acc.fill(Float32(0.0))
+                    slot0 = stage_cnt & Int32(2)
+                    phase = (stage_cnt >> Int32(2)) & Int32(1)
                     for s in cutlass.range_constexpr(2):
-                        _mbar_wait(bar_full + Int32(8 * s), phase)
-                        sa = base + Int32(s * stage_bytes)
+                        slot = slot0 + Int32(s)
+                        _mbar_wait(bar_full + slot * Int32(8), phase)
+                        sa = base + slot * Int32(stage_bytes)
                         sw = sa + w_lane_off
                         for k16_in_64 in cutlass.range_constexpr(4):
                             a_addr = sa + (a_lane_off ^ Int32(k16_in_64 * 32))
-                            a0, a1, a2, a3 = _ldmatrix_m8n8x4_b16_offset(a_addr, 0)
-                            for n_local in cutlass.range_constexpr(4):
+                            a0_0, a1_0, a2_0, a3_0 = _ldmatrix_m8n8x4_b16_offset(a_addr, 0)
+                            a0_1, a1_1, a2_1, a3_1 = _ldmatrix_m8n8x4_b16_offset(a_addr, 2048)
+                            for n_local in cutlass.range_constexpr(2):
                                 w_off = (k16_in_64 * 4 + n_local) * w_tile_bytes
                                 if cutlass.const_expr(self.e4m3):
                                     e01, e23 = _ld_ring_v2_u32_offset(sw, w_off)
@@ -626,35 +718,49 @@ class NativeTrellisLinear:
                                     b2, b3 = _e4m3x4_to_f16x2x2(e23)
                                 else:
                                     b0, b1, b2, b3 = _ld_ring_v4_u32_offset(sw, w_off)
+                                i0 = 2 * n_local
+                                i1 = 2 * n_local + 1
                                 d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                    acc[2 * n_local, 0], acc[2 * n_local, 1], acc[2 * n_local, 2], acc[2 * n_local, 3],
-                                    a0, a1, a2, a3, b0, b1)
-                                acc[2 * n_local, 0], acc[2 * n_local, 1], acc[2 * n_local, 2], acc[2 * n_local, 3] = d0, d1, d2, d3
+                                    acc[i0, 0], acc[i0, 1], acc[i0, 2], acc[i0, 3],
+                                    a0_0, a1_0, a2_0, a3_0, b0, b1)
+                                acc[i0, 0], acc[i0, 1], acc[i0, 2], acc[i0, 3] = d0, d1, d2, d3
                                 d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                    acc[2 * n_local + 1, 0], acc[2 * n_local + 1, 1], acc[2 * n_local + 1, 2], acc[2 * n_local + 1, 3],
-                                    a0, a1, a2, a3, b2, b3)
-                                acc[2 * n_local + 1, 0], acc[2 * n_local + 1, 1], acc[2 * n_local + 1, 2], acc[2 * n_local + 1, 3] = d0, d1, d2, d3
-                        _mbar_arrive(bar_empty + Int32(8 * s))
-                    scale = _side_value(scales_ptr, kb)
+                                    acc[i1, 0], acc[i1, 1], acc[i1, 2], acc[i1, 3],
+                                    a0_0, a1_0, a2_0, a3_0, b2, b3)
+                                acc[i1, 0], acc[i1, 1], acc[i1, 2], acc[i1, 3] = d0, d1, d2, d3
+                                j0 = 4 + 2 * n_local
+                                j1 = 4 + 2 * n_local + 1
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[j0, 0], acc[j0, 1], acc[j0, 2], acc[j0, 3],
+                                    a0_1, a1_1, a2_1, a3_1, b0, b1)
+                                acc[j0, 0], acc[j0, 1], acc[j0, 2], acc[j0, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[j1, 0], acc[j1, 1], acc[j1, 2], acc[j1, 3],
+                                    a0_1, a1_1, a2_1, a3_1, b2, b3)
+                                acc[j1, 0], acc[j1, 1], acc[j1, 2], acc[j1, 3] = d0, d1, d2, d3
+                        _mbar_arrive(bar_empty + slot * Int32(8))
                     for n8 in cutlass.range_constexpr(8):
                         for v in cutlass.range_constexpr(4):
                             split_total[n8, v] = split_total[n8, v] + acc[n8, v] * scale
-                    phase = phase ^ Int32(1)
+                    stage_cnt = stage_cnt + Int32(2)
             for n8 in cutlass.range_constexpr(8):
                 for v in cutlass.range_constexpr(4):
                     grand_total[n8, v] = grand_total[n8, v] + split_total[n8, v]
-        row0 = m0 + cw * Int32(16) + (lane >> Int32(2))
-        row1 = row0 + Int32(8)
-        col_base = nb64 * Int32(64) + (lane & Int32(3)) * Int32(2)
-        if row0 < rows:
-            addr0 = output_ptr + (row0.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
-            for n8 in cutlass.range_constexpr(8):
-                st_global_v2_f32(addr0 + Int64(n8 * 32), grand_total[n8, 0], grand_total[n8, 1])
-        if row1 < rows:
-            addr1 = output_ptr + (row1.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
-            for n8 in cutlass.range_constexpr(8):
-                st_global_v2_f32(addr1 + Int64(n8 * 32), grand_total[n8, 2], grand_total[n8, 3])
-        return phase
+        col_base = nb64 * Int32(64) + cw_n * Int32(32) + (lane & Int32(3)) * Int32(2)
+        for m_sub in cutlass.range_constexpr(2):
+            row0 = m0 + cw_m * Int32(32) + Int32(m_sub * 16) + (lane >> Int32(2))
+            row1 = row0 + Int32(8)
+            if row0 < rows:
+                addr0 = output_ptr + (row0.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
+                for n8 in cutlass.range_constexpr(4):
+                    idx = m_sub * 4 + n8
+                    st_global_v2_f32(addr0 + Int64(n8 * 32), grand_total[idx, 0], grand_total[idx, 1])
+            if row1 < rows:
+                addr1 = output_ptr + (row1.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
+                for n8 in cutlass.range_constexpr(4):
+                    idx = m_sub * 4 + n8
+                    st_global_v2_f32(addr1 + Int64(n8 * 32), grand_total[idx, 2], grand_total[idx, 3])
+        return stage_cnt
 
     @cute.kernel
     def multiply_prefill(self, inputs: cute.Tensor, payload: cute.Tensor,
@@ -669,34 +775,44 @@ class NativeTrellisLinear:
         base = shared_ptr_to_u32(storage.buf.data_ptr())
         w_tile_bytes = 256 if self.e4m3 else 512
         stage_bytes = _PREFILL_BM * 64 * 2 + 16 * w_tile_bytes
-        bar_full = base + Int32(2 * stage_bytes)
-        bar_empty = bar_full + Int32(16)
+        bar_full = base + Int32(_PREFILL_STAGES * stage_bytes)
+        bar_empty = bar_full + Int32(8 * _PREFILL_STAGES)
         if tid == Int32(0):
-            for s in cutlass.range_constexpr(2):
+            for s in cutlass.range_constexpr(_PREFILL_STAGES):
                 _mbar_init(bar_full + Int32(8 * s), Int32(2 * _PREFILL_PRODUCER_THREADS))
                 _mbar_init(bar_empty + Int32(8 * s), Int32(_PREFILL_CONSUMER_THREADS))
             _fence_mbar_init()
         cute.arch.sync_threads()
         n_tiles = Int32(self.n // _PREFILL_BN)
-        total_tiles = ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * n_tiles
+        m_tiles = (rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)
+        total_tiles = m_tiles * n_tiles
+        group_tiles = Int32(8) * n_tiles
         x_ptr = inputs[rotation_id]
         payload_ptr = payload.iterator.toint()
         scales_ptr = scales.iterator.toint()
         output_ptr = output.iterator.toint()
         if tid >= Int32(_PREFILL_CONSUMER_THREADS):
             p_tid = tid - Int32(_PREFILL_CONSUMER_THREADS)
-            phase = Int32(0)
+            stage_cnt = Int32(0)
             while task < total_tiles:
-                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = task % n_tiles
-                phase = self._prefill_produce_tile(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, phase)
+                group_id = task // group_tiles
+                first_m = group_id * Int32(8)
+                group_m = min(m_tiles - first_m, Int32(8))
+                in_group = task % group_tiles
+                m0 = (first_m + (in_group % group_m)) * Int32(_PREFILL_BM)
+                nb64 = in_group // group_m
+                stage_cnt = self._prefill_produce_tile(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, stage_cnt)
                 task += step
         else:
-            phase = Int32(0)
+            stage_cnt = Int32(0)
             while task < total_tiles:
-                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = task % n_tiles
-                phase = self._prefill_consume_tile(tid, base, scales_ptr, output_ptr, rows, m0, nb64, phase)
+                group_id = task // group_tiles
+                first_m = group_id * Int32(8)
+                group_m = min(m_tiles - first_m, Int32(8))
+                in_group = task % group_tiles
+                m0 = (first_m + (in_group % group_m)) * Int32(_PREFILL_BM)
+                nb64 = in_group // group_m
+                stage_cnt = self._prefill_consume_tile(tid, base, scales_ptr, output_ptr, rows, m0, nb64, stage_cnt)
                 task += step
 
     @cute.kernel
@@ -714,45 +830,55 @@ class NativeTrellisLinear:
         base = shared_ptr_to_u32(storage.buf.data_ptr())
         w_tile_bytes = 256 if self.e4m3 else 512
         stage_bytes = _PREFILL_BM * 64 * 2 + 16 * w_tile_bytes
-        bar_full = base + Int32(2 * stage_bytes)
-        bar_empty = bar_full + Int32(16)
+        bar_full = base + Int32(_PREFILL_STAGES * stage_bytes)
+        bar_empty = bar_full + Int32(8 * _PREFILL_STAGES)
         if tid == Int32(0):
-            for s in cutlass.range_constexpr(2):
+            for s in cutlass.range_constexpr(_PREFILL_STAGES):
                 _mbar_init(bar_full + Int32(8 * s), Int32(2 * _PREFILL_PRODUCER_THREADS))
                 _mbar_init(bar_empty + Int32(8 * s), Int32(_PREFILL_CONSUMER_THREADS))
             _fence_mbar_init()
         cute.arch.sync_threads()
         n_tiles = Int32(self.n // _PREFILL_BN)
-        proj_tiles = ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * n_tiles
+        m_tiles = (rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)
+        proj_tiles = m_tiles * n_tiles
         total_tiles = Int32(4) * proj_tiles
+        group_tiles = Int32(8) * n_tiles
         if tid >= Int32(_PREFILL_CONSUMER_THREADS):
             p_tid = tid - Int32(_PREFILL_CONSUMER_THREADS)
-            phase = Int32(0)
+            stage_cnt = Int32(0)
             while task < total_tiles:
                 proj = task // proj_tiles
                 rem = task % proj_tiles
-                m0 = (rem // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = rem % n_tiles
+                group_id = rem // group_tiles
+                first_m = group_id * Int32(8)
+                group_m = min(m_tiles - first_m, Int32(8))
+                in_group = rem % group_tiles
+                m0 = (first_m + (in_group % group_m)) * Int32(_PREFILL_BM)
+                nb64 = in_group // group_m
                 x_ptr = inputs[rotation_id + proj]
                 payload_ptr = select4(
                     proj, payloads[0].iterator.toint(), payloads[1].iterator.toint(),
                     payloads[2].iterator.toint(), payloads[3].iterator.toint())
-                phase = self._prefill_produce_tile(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, phase)
+                stage_cnt = self._prefill_produce_tile(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, stage_cnt)
                 task += step
         else:
-            phase = Int32(0)
+            stage_cnt = Int32(0)
             while task < total_tiles:
                 proj = task // proj_tiles
                 rem = task % proj_tiles
-                m0 = (rem // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = rem % n_tiles
+                group_id = rem // group_tiles
+                first_m = group_id * Int32(8)
+                group_m = min(m_tiles - first_m, Int32(8))
+                in_group = rem % group_tiles
+                m0 = (first_m + (in_group % group_m)) * Int32(_PREFILL_BM)
+                nb64 = in_group // group_m
                 scales_ptr = select4(
                     proj, scales[0].iterator.toint(), scales[1].iterator.toint(),
                     scales[2].iterator.toint(), scales[3].iterator.toint())
                 output_ptr = select4(
                     proj, outputs[0].iterator.toint(), outputs[1].iterator.toint(),
                     outputs[2].iterator.toint(), outputs[3].iterator.toint())
-                phase = self._prefill_consume_tile(tid, base, scales_ptr, output_ptr, rows, m0, nb64, phase)
+                stage_cnt = self._prefill_consume_tile(tid, base, scales_ptr, output_ptr, rows, m0, nb64, stage_cnt)
                 task += step
 
     @cute.jit
