@@ -504,7 +504,7 @@ def test_prefill_vs_base_bitwise_and_row_invariance(side, bits, codebook, monkey
     prefill = Case(k=1152, n=256, side=side, bits=bits, rows=max_rows, codebook=codebook)
     base.launch(max_rows)
     full_expected = base.output.clone()
-    for rows in (1, 16, 64, 129, 130, 192, 255, 256, 257, 512):
+    for rows in (1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 127, 128, 129, 130, 192, 255, 256, 257, 512):
         for limit in (4, 188 * 4):
             prefill.partial.fill_(float("nan"))
             prefill.output.fill_(float("nan"))

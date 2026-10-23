@@ -281,25 +281,41 @@ class NativeTrellisLinear:
                  rows: Int32, rotation_id: Int32, cta_limit: Int32,
                  stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations) and cta_limit > Int32(0):
-            if cutlass.const_expr(self.bits == 4 and self.e4m3 and self.splits <= 16):
-                if rows <= Int32(16):
-                    if cutlass.const_expr(self.splits <= 2):
-                        self.multiply_folded(inputs, payload, scales, output, rows, rotation_id).launch(
-                            grid=(min(Int32(self.n // 32), cta_limit), 1, 1),
-                            block=(32 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
-                    else:
-                        self._legacy(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
-                elif rows > Int32(48) and rows <= Int32(64):
-                    self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 4, 4).launch(
-                        grid=(min(Int32(self.n // 128 * self.splits), cta_limit), 1, 1),
-                        block=(128, 1, 1), min_blocks_per_mp=1, stream=stream)
-                    self.reduce(partial, output, rows).launch(
-                        grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
-                        block=(128, 1, 1), stream=stream)
+            if cutlass.const_expr(self.max_rows >= _PREFILL_MIN_ROWS):
+                if rows >= Int32(_PREFILL_MIN_ROWS):
+                    prefill_tiles = ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * Int32(self.n // _PREFILL_BN)
+                    self.multiply_prefill(inputs, payload, scales, output, rows, rotation_id).launch(
+                        grid=(min(prefill_tiles, max(Int32(1), cta_limit // Int32(4))), 1, 1),
+                        block=(_PREFILL_CONSUMER_THREADS + _PREFILL_PRODUCER_THREADS, 1, 1),
+                        min_blocks_per_mp=1, stream=stream)
+                else:
+                    self._decode(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            else:
+                self._decode(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+
+    @cute.jit
+    def _decode(self, inputs: cute.Tensor, payload: cute.Tensor,
+                scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        if cutlass.const_expr(self.bits == 4 and self.e4m3 and self.splits <= 16):
+            if rows <= Int32(16):
+                if cutlass.const_expr(self.splits <= 2):
+                    self.multiply_folded(inputs, payload, scales, output, rows, rotation_id).launch(
+                        grid=(min(Int32(self.n // 32), cta_limit), 1, 1),
+                        block=(32 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
                 else:
                     self._legacy(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            elif rows > Int32(48) and rows <= Int32(64):
+                self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 4, 4).launch(
+                    grid=(min(Int32(self.n // 128 * self.splits), cta_limit), 1, 1),
+                    block=(128, 1, 1), min_blocks_per_mp=1, stream=stream)
+                self.reduce(partial, output, rows).launch(
+                    grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
             else:
                 self._legacy(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+        else:
+            self._legacy(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
 
     @cute.jit
     def _legacy(self, inputs: cute.Tensor, payload: cute.Tensor,
