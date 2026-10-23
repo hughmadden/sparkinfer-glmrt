@@ -64,9 +64,26 @@ class _Pointers:
                   cute.make_tensor(output,cute.make_layout(1,stride=1)),rows,cta_limit,stream)
 
 
-def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp8", sharded_side=1, max_rows=4096):
+def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp8", sharded_side=1,
+                              max_rows=4096, activation_encoding=None):
     g = geometry(input_features,output_features,encoding=encoding,sharded_side=sharded_side,max_rows=max_rows)
     k,n = input_features,output_features
+    if activation_encoding is not None:
+        if activation_encoding != "mxfp8" or encoding != "mxfp8" or sharded_side != 1 or n % 128:
+            raise ValueError("native W8A8 requires MXFP8, output-major weights and N multiple128")
+        from ._mxfp8_linear import Mxfp8Linear
+        launch = Mxfp8Linear(k, n)
+        g.update(abi_version=2, activation_encoding="mxfp8", core="mxfp8_mma",
+                 scale_layout="mma", output_dtype="bfloat16")
+        return compile_program(launch, name="scaled_linear_mxfp8", operands=(
+            Operand("x", torch.bfloat16, f"[rows,{k}]"),
+            Operand("payload", torch.uint8, f"[{n},{k}] (native E4M3)"),
+            Operand("scales", torch.uint8, f"[{n*k//32}] (MMA-packed UE8M0)"),
+            Operand("partial", torch.uint8, "[scratch_bytes(rows)]", "scratch"),
+            Operand("output", torch.bfloat16, f"[rows,{n}]", "out")),
+            scalars=(Scalar("rows"), Scalar("cta_limit", note="unused; runtime SM count sets the grid")),
+            key=(k, n, "mxfp8"), geometry=g,
+            scratch={"partial": launch.stage.scratch_bytes}, version=2)
     scale_dtype = {"mxfp8":torch.uint8,"int4_g32":torch.float16,"fp8_row":torch.float32}[encoding]
     payload_size = k*n//(2 if encoding == "int4_g32" else 1)
     scale_size = n if encoding == "fp8_row" else n*k//32
