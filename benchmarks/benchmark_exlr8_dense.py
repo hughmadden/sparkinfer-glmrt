@@ -109,10 +109,10 @@ def baseline(k, n, rows, a16=False, cold_l2=False, graph_repeats=1):
     return graph, (tensors, extra), len(launches)
 
 
-def compile_native(fmt, k, n, side):
+def compile_native(fmt, k, n, side, input_dtype="f16"):
     if fmt == "trellis":
         return trellis_linear.compile_trellis_linear_aot(input_features=k, output_features=n,
-                                                       sharded_side=side)
+                                                       sharded_side=side, input_dtype=input_dtype)
     if fmt == "embedding":
         return fp8_row_embedding.compile_fp8_row_embedding_aot(hidden=k, vocabulary=n)
     return scaled_linear.compile_scaled_linear_aot(input_features=k, output_features=n,
@@ -289,16 +289,22 @@ def benchmark_unpacked(args):
         storage, read_bytes = native_tensors("trellis", k, n, capacity)
         inputs, payload, scales, partial, native, x16 = storage
         x = x16.bfloat16()
-        x16.copy_(x)
+        if args.trellis_input_dtype == "bf16":
+            inputs = torch.tensor([x.data_ptr()]*4, dtype=torch.int64, device="cuda")
+        else:
+            x16.copy_(x)
         weight = torch.empty((n, k), dtype=torch.uint8, device="cuda")
         unit_grid = torch.ones((n//128, k//128), device="cuda")
         output = torch.empty_like(native)
         unpack = compile_trellis_unpack_e4m3_aot(input_features=k, output_features=n, sharded_side=side)
         gemm = compile_trellis_fp8_prefill_aot(input_features=k, output_features=n)
-        core = compile_native("trellis", k, n, side)
+        core = compile_native("trellis", k, n, side, input_dtype=args.trellis_input_dtype)
         unpack_graph = capture(lambda: unpack.launch(payload, weight, scalars=()))
         finite_nonzero(weight.view(torch.float8_e4m3fn).float(), "unpacked E4M3")
         unpack_us = timing(unpack_graph, args.replays)
+        native_resources = spill_check(core, args.output.parent / "resources" / op)
+        spill_free = all(not any(r["local_bytes"]) and not any(r["stack_bytes"])
+                         and r["local_load_store_instructions"] == 0 for r in native_resources)
         for rows in rows_list:
             scalars = (rows, 0, props.multi_processor_count*4)
             native_graph = capture(lambda: core.launch(inputs, payload, scales, partial, native, scalars=scalars))
@@ -313,8 +319,8 @@ def benchmark_unpacked(args):
             bound = 1.01*torch.linalg.vector_norm(bf16-target)
             native_error = torch.linalg.vector_norm(native[:rows, :columns].double()-target)
             gemm_error = torch.linalg.vector_norm(output[:rows, :columns].double()-target)
-            passed = bool(native_error <= bound and gemm_error <= bound)
-            native_us, gemm_us = timing(native_graph, 1), timing(gemm_graph, args.replays)
+            passed = bool(native_error <= bound and gemm_error <= bound and spill_free)
+            native_us, gemm_us = timing(native_graph, args.replays), timing(gemm_graph, args.replays)
             base_graph, keep, count = baseline(k, n, rows, a16=True)
             base_us = timing(base_graph, args.replays)/count
             total = unpack_us + gemm_us
@@ -323,6 +329,8 @@ def benchmark_unpacked(args):
             record = dict(projection=op, k=k, n=n, side=side, rows=rows,
                 unpack_us=unpack_us, gemm_us=gemm_us, unpack_plus_gemm_us=total,
                 native_us=native_us, w8a16_us=base_us, fp64_pass=passed,
+                input_dtype=args.trellis_input_dtype, spill_free=spill_free, native_resources=native_resources,
+                native_speedup_vs_w8a16=base_us/native_us,
                 native_fp64_error=native_error.item(), gemm_fp64_error=gemm_error.item(),
                 fp64_bound=bound.item(), relative_l2=relative_l2,
                 speedup_vs_native=native_us/total, speedup_vs_w8a16=base_us/total,
@@ -478,6 +486,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--mxfp8-prefill", action="store_true", help="shared MXFP8 records at whole and TP2 native dense shapes")
+    parser.add_argument("--trellis-input-dtype", choices=("f16", "bf16"), default="f16")
     parser.add_argument("--unpacked-trellis", action="store_true", help="measure exact E4M3 unpack plus F32 W8A16 at full/TP2 trellis shapes")
     parser.add_argument("--arm", action="append", help="NAME=git-rev; repeatable")
     parser.add_argument("--arm-bundle", type=Path)

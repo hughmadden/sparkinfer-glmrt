@@ -10,7 +10,7 @@ def reference(codebook="e4m3"):
 
 
 class Case:
-    def __init__(self, k=1152, n=256, side=1, bits=4, rows=4096, codebook="e4m3"):
+    def __init__(self, k=1152, n=256, side=1, bits=4, rows=4096, codebook="e4m3", input_dtype="f16"):
         from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
         rng = np.random.default_rng(408)
         raw = rng.integers(0, 256, k*n*bits//8, dtype=np.uint8)
@@ -21,8 +21,9 @@ class Case:
         else:
             weight = np.concatenate([ref.decode_unit(chunk.tobytes(), bits, "down", n)
                                      for chunk in raw.reshape(k//128, -1)], axis=0)
-        self.x = torch.tensor(rng.normal(0, .1, (rows, k)), device="cuda", dtype=torch.float16)
-        self.other_x = torch.tensor(rng.normal(0, .1, (rows, k)), device="cuda", dtype=torch.float16)
+        dtype = torch.bfloat16 if input_dtype == "bf16" else torch.float16
+        self.x = torch.tensor(rng.normal(0, .1, (rows, k)), device="cuda", dtype=dtype)
+        self.other_x = torch.tensor(rng.normal(0, .1, (rows, k)), device="cuda", dtype=dtype)
         self.inputs = torch.tensor([self.other_x.data_ptr(), self.x.data_ptr()], dtype=torch.int64, device="cuda")
         self.payload = torch.tensor(raw, dtype=torch.uint8, device="cuda")
         self.scales = torch.tensor(rng.uniform(.5, 2, k//128), dtype=torch.float16, device="cuda")
@@ -30,7 +31,7 @@ class Case:
         self.partial = torch.empty((rows, (k+1023)//1024, n), dtype=torch.float32, device="cuda")
         self.output = torch.empty((rows, n), dtype=torch.float32, device="cuda")
         self.program = compile_trellis_linear_aot(input_features=k, output_features=n,
-                           sharded_side=side, bits=bits, codebook=codebook, rotation_count=2, max_rows=rows)
+                           sharded_side=side, bits=bits, codebook=codebook, rotation_count=2, max_rows=rows, input_dtype=input_dtype)
 
     def launch(self, rows, limit=188*4, rotation=1):
         self.program.launch(self.inputs, self.payload, self.scales,
@@ -518,9 +519,10 @@ def test_prefill_vs_base_bitwise_and_row_invariance(side, bits, codebook, monkey
 
 @pytest.mark.parametrize("side", [1, 2])
 @pytest.mark.parametrize("bits,codebook", [(4, "e4m3")])
-def test_prefill_ws_bitwise_and_row_invariance(side, bits, codebook):
+@pytest.mark.parametrize("input_dtype", ["f16", "bf16"])
+def test_prefill_ws_bitwise_and_row_invariance(side, bits, codebook, input_dtype):
     from b12x._lib.runtime_control import kernel_resolution_guard
-    c = Case(k=1152, n=256, side=side, bits=bits, rows=512, codebook=codebook)
+    c = Case(k=1152, n=256, side=side, bits=bits, rows=512, codebook=codebook, input_dtype=input_dtype)
     c.output.fill_(float("nan"))
     c.launch(64)
     expected_64 = c.output[:64].clone()
@@ -544,3 +546,26 @@ def test_prefill_ws_bitwise_and_row_invariance(side, bits, codebook):
                 graph.replay()
                 assert torch.equal(c.output[:rows].view(torch.int32), expected_512[:rows].view(torch.int32))
                 assert torch.isnan(c.output[rows:]).all()
+
+
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("codebook,bits", [("e4m3", 4), ("mcg", 6), ("mul1", 6)])
+def test_bf16_input_fp64_oracle_and_range(side, codebook, bits):
+    c = Case(k=1152, n=128, side=side, bits=bits, rows=256,
+             codebook=codebook, input_dtype="bf16")
+    # Include BF16 mantissas not representable in E4M3 and rows outside F16 range.
+    c.x[1::2].mul_(2**22)
+    c.launch(256)
+    expected = c.output.clone()
+    weight = c.weight.double()
+    ref = c.x.double() @ weight
+    baseline = (c.x @ c.weight.bfloat16()).double()
+    error = torch.linalg.vector_norm(expected.double() - ref)
+    bound = torch.linalg.vector_norm(baseline - ref)
+    assert torch.isfinite(expected).all() and torch.count_nonzero(expected) > 0
+    assert error <= 1.01 * bound, (error.item(), bound.item())
+    for rows in (1, 16, 64, 65, 80, 127, 128, 129, 130, 256):
+        c.output.fill_(float("nan"))
+        c.launch(rows)
+        assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
+        assert torch.isnan(c.output[rows:]).all()
