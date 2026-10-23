@@ -12,6 +12,7 @@ import argparse
 import ctypes as C
 import json
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import sys
@@ -87,6 +88,27 @@ def benchmark_prefill_route(args):
                     grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
                     block=(128, 1, 1), stream=stream)
 
+    def prefill_resources(program, directory):
+        records = spill_check(program, directory)
+        selected = []
+        # One export also contains the unchanged narrow-row decode entry points.
+        # Gate the candidate prefill entry, retaining the full census as evidence.
+        for index, record in enumerate(records):
+            sass = subprocess.check_output(["/usr/local/cuda/bin/cuobjdump", "--dump-sass",
+                str(directory / f"native-{index}.cubin")], text=True)
+            for section in re.split(r"(?=\s*Function :)", sass):
+                if "multiply_prefill" in section and re.search(r"\b(?:LDL|STL)(?:\.|\s)", section):
+                    raise RuntimeError("T2 prefill has local load/store instructions")
+            for name, fields in re.findall(r"Function\s+([^:]+):\s*([^\n]+)", record["resources"]):
+                if "multiply_prefill" in name:
+                    usage = {key: int(value) for key, value in re.findall(r"(REG|STACK|LOCAL):(\d+)", fields)}
+                    if usage.get("STACK", -1) != 0 or usage.get("LOCAL", -1) != 0:
+                        raise RuntimeError(f"T2 prefill spills: {name}: {fields}")
+                    selected.append(dict(name=name, **usage))
+        if not selected:
+            raise RuntimeError("missing prefill resource census")
+        return dict(prefill=selected, full_census=records)
+
     rows_list = [int(r) for r in args.rows.split(",")]
     if args.samples < 1 or not rows_list or min(rows_list) < 1:
         raise ValueError("positive rows and sample count required")
@@ -119,10 +141,7 @@ def benchmark_prefill_route(args):
         t2 = exported(t2_program, directory, "t2")
         dequant = exported(dequant, directory, "dequant")
         gemm = exported(gemm, directory, "gemm_f32")
-        resources = spill_check(t2_program, directory / "resources")
-        for resource in resources:
-            if any(resource["local_bytes"] + resource["stack_bytes"]) or resource["local_load_store_instructions"]:
-                raise RuntimeError("T2 has stack/local storage or local load/store instructions")
+        resources = [prefill_resources(t2_program, directory / "resources")]
         original = _native.NativeTrellisLinear
         _native.NativeTrellisLinear = BaseOracle
         try:
@@ -163,10 +182,7 @@ def benchmark_prefill_route(args):
                 grouped_program = compile_trellis_linear_aot(input_features=k, output_features=n,
                     bits=6, codebook="mcg", sharded_side=side, rotation_count=4, max_rows=capacity, groups=4)
             grouped_t2 = exported(grouped_program, directory, "t2_qkvg")
-            resources += spill_check(grouped_program, directory / "resources_grouped")
-            for resource in resources:
-                if any(resource["local_bytes"] + resource["stack_bytes"]) or resource["local_load_store_instructions"]:
-                    raise RuntimeError("grouped T2 has spills")
+            resources.append(prefill_resources(grouped_program, directory / "resources_grouped"))
             grouped_table = torch.tensor([x.data_ptr() for x in xs], device="cuda", dtype=torch.int64)
             if args.transforms:
                 with exportable_compilation():
