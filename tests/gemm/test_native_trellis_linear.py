@@ -384,7 +384,7 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
 
     rng = np.random.default_rng(273)
-    k, n, max_rows = 1152, 256, 129
+    k, n, max_rows = 1152, 256, 512
     splits = (k + 1023) // 1024
     rotations = [torch.tensor(rng.normal(0, 0.1, (max_rows, k)), device="cuda", dtype=torch.float16) for _ in range(4)]
     inputs = torch.tensor([t.data_ptr() for t in rotations], device="cuda", dtype=torch.int64)
@@ -420,7 +420,7 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
         )
 
     with kernel_resolution_guard("grouped trellis linear uses precompiled kernels"):
-        for rows in (1, 8, 16, 17, 32, 33, 36, 48, 49, 63, 64, 129):
+        for rows in (1, 8, 16, 17, 32, 33, 36, 48, 49, 63, 64, 129, 130, 255, 256, 257, 512):
             for limit in (48, 170 * 4, 188 * 4):
                 for out in standalone_outputs + grouped_outputs:
                     out.fill_(float("nan"))
@@ -434,7 +434,7 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
                         standalone_outputs[i][:rows].view(torch.int32),
                     )
                     assert torch.isnan(grouped_outputs[i][rows:]).all()
-        for graph_rows in (8, 36):
+        for graph_rows in (8, 36, 130, 257):
             run_standalone(graph_rows, 188 * 4)
             expected = [out[:graph_rows].clone() for out in standalone_outputs]
             run_grouped(graph_rows, 188 * 4)
