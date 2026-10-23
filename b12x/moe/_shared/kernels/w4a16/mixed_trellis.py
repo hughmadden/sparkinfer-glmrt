@@ -2497,7 +2497,7 @@ def compile_mixed_trellis(
         if warp_specialized:
             from .mixed_trellis_ws import W4A16MixedTrellisWSKernel
 
-            if paired_boundary is not None or compact_weights or token_major_rotation:
+            if paired_boundary is not None or token_major_rotation:
                 raise ValueError(
                     "warp-specialized mixed Trellis has its own input rotation "
                     "and no paired boundary"
@@ -2513,6 +2513,7 @@ def compile_mixed_trellis(
                 input_stages=ws_input_stages,
                 dynamic_tiles=ws_dynamic_tiles,
                 activations=activations,
+                compact_weights=compact_weights,
             )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
