@@ -429,7 +429,7 @@ class TrellisPrefillMxfp8:
 
     @cute.jit
     def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
-                 input_block_scales: cute.Pointer, partial: cute.Pointer,
+                 scales: cute.Pointer, records: cute.Pointer,
                  output: cute.Pointer, rows: Int32, rotation_id: Int32,
                  cta_limit: Int32, stream: cuda.CUstream):
         if (rows > Int32(0) and rows <= Int32(self.max_rows)
@@ -439,8 +439,8 @@ class TrellisPrefillMxfp8:
             tasks = ((rows + Int32(self.m_cta - 1)) // Int32(self.m_cta)) * Int32((self.n + self.n_cta-1) // self.n_cta)
             self.prefill(cute.make_tensor(rotated_inputs, layout),
                          cute.make_tensor(payload, layout),
-                         cute.make_tensor(input_block_scales, layout),
-                         cute.make_tensor(partial, layout),
+                         cute.make_tensor(scales, layout),
+                         cute.make_tensor(records, layout),
                          cute.make_tensor(output, layout),
                          rows, rotation_id).launch(
                 grid=(min(tasks, cta_limit), 1, 1), block=(32 * NWARP, 1, 1),
