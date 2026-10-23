@@ -23,8 +23,8 @@ def test_prefill_and_glue_abi(monkeypatch):
         input_features=2048, output_features=8192)
     assert (launch.num_compute_warps, launch.num_stages, launch.scales) == (8, 3, "block")
     assert [(p.name, p.dtype, p.shape) for p in info["operands"]] == [
-        ("x", torch.bfloat16, "[rows,2048]"), ("weight", torch.uint8, "[8192,2048]"),
-        ("scales", torch.float32, "[64,16]"), ("output", torch.float32, "[rows,8192]")]
+        ("x", torch.bfloat16, "[rows,2048]"), ("w", torch.uint8, "[8192,2048]"),
+        ("scale", torch.float32, "[64,16]"), ("out", torch.float32, "[rows,8192]")]
     assert [(s.name, s.ctype) for s in info["scalars"]] == [("rows", "int32")]
     _, info = native_dense.compile_swiglu_split_aot(inter=6144)
     assert [p.name for p in info["operands"]] == ["gate", "up", "hidden"]

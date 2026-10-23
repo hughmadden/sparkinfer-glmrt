@@ -87,7 +87,7 @@ def compile_trellis_fp8_prefill_aot(*, input_features, output_features, max_rows
              scales="block", output_dtype="f32", compute_warps=8, num_stages=3)
     return compile_program(launch, name="trellis_fp8_prefill", operands=(
         Operand("x", torch.bfloat16, f"[rows,{k}]"),
-        Operand("weight", torch.uint8, f"[{n},{k}]"),
-        Operand("scales", torch.float32, f"[{n//128},{k//128}]"),
-        Operand("output", torch.float32, f"[rows,{n}]", "out")),
+        Operand("w", torch.uint8, f"[{n},{k}]"),
+        Operand("scale", torch.float32, f"[{n//128},{k//128}]"),
+        Operand("out", torch.float32, f"[rows,{n}]", "out")),
         scalars=(Scalar("rows"),), key=(max_rows, launch.key()), geometry=g)
