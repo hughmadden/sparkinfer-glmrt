@@ -19,6 +19,8 @@ GROUPS = {
     "second_page": [65, 72, 80, 96, 97, 113, 128],
     "later_pages": [129, 140, 160, 192, 204, 255, 256, 257],
     "long": [700, 2048],
+    # A long last row reads its page table after every other row's LSE store.
+    "mixed": [128, 129, 140, 160, 192, 204, 1900],
 }
 
 
@@ -76,6 +78,9 @@ def test_decode_rows_match_dense_attention_across_page_fills(program, group):
         kv_head = torch.arange(64, device="cuda") // 16
         scores = torch.einsum("hd,thd->ht", q, k[:, kv_head]) * 128 ** -0.5
         expected = torch.einsum("ht,thd->hd", scores.softmax(-1), v[:, kv_head])
+        expected_lse = torch.logsumexp(scores, -1) / torch.log(torch.tensor(2.0))
+        if (lse[row] - expected_lse).abs().max().item() > .02:
+            failures.append((length, "lse"))
         actual = output[row].float()
         relative = ((actual - expected).norm() / expected.norm()).item()
         if not torch.isfinite(actual).all() or relative > .03:

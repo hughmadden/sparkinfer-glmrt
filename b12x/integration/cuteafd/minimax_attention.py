@@ -110,7 +110,8 @@ class _Attention:
             self._tensor(q2k_indices, (4, self.rows, 16), (self.rows * 16, 16, 1)),
             union_blocks, union_masks, union_counts, dummy_float, None,
             self._tensor(output, (rows, 64, 128), (8192, 128, 1)),
-            self._tensor(lse, (rows, 64), (64, 1)),
+            # The kernel indexes LSE as [head, row]; the ABI stores [rows,64].
+            self._tensor(lse, (64, rows), (1, 64)),
             self._tensor(k_descale, (batch, 4), (4, 1)),
             self._tensor(v_descale, (batch, 4), (4, 1)), dummy_desc, dummy_desc, stream)
 
