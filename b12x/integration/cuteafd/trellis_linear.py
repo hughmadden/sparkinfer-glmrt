@@ -1,7 +1,8 @@
 """Shared native trellis ABI v1, independent of model family and checkpoint.
 
 All views are contiguous. ``rotated_inputs`` is an I64 device pointer table;
-entry ``rotation_id`` addresses an F16 [rows,K] matrix with K-element row stride.
+entry ``rotation_id`` addresses an F16 or BF16 [rows,K] matrix, selected by the
+static ``input_dtype``, with K-element row stride.
 The caller owns H128/sign rotations, including private id 0, and output H128
 and channel scales. ``input_block_scales`` multiplies each K128 FP32 accumulator.
 Output and partials stay F32. No allocation, atomics or live-row specialization.
@@ -22,7 +23,7 @@ SCALARS = ("rows", "rotation_id", "cta_limit")
 
 
 def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
-             sharded_side=1, rotation_count=4, max_rows=4096, groups=1):
+             sharded_side=1, rotation_count=4, max_rows=4096, groups=1, input_dtype="f16"):
     values = (input_features, output_features, rotation_count, max_rows)
     if any(type(v) is not int or not 0 < v <= 2**31-1 for v in values):
         raise ValueError("trellis geometry must contain positive int32 dimensions")
@@ -30,6 +31,8 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
         raise ValueError("trellis input/output dimensions must be multiples of 128")
     if type(bits) is not int or bits not in (2, 3, 4, 5, 6) or codebook not in ("e4m3", "f16", "mcg", "mul1") or sharded_side not in (1, 2) or type(groups) is not int or groups not in (1, 4) or rotation_count < groups:
         raise ValueError("trellis requires K2--K6, mcg/mul1/e4m3/f16, side 1/2 and groups 1/4")
+    if input_dtype not in ("f16", "bf16"):
+        raise ValueError("trellis input dtype must be f16 or bf16")
     splits = (input_features + 1023) // 1024
     tasks = (max_rows + 15) // 16 * (output_features // 128) * splits * groups
     if max(tasks, max_rows * (output_features // 128) * groups, input_features * output_features // 256) > (2**31-1)//2:
@@ -40,7 +43,7 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
     return dict(abi_version=ABI_VERSION, input_features=input_features,
                 output_features=output_features, bits=bits, codebook=codebook,
                 sharded_side=sharded_side, rotation_count=rotation_count,
-                max_rows=max_rows, split_k_blocks=8, splits=splits,
+                max_rows=max_rows, split_k_blocks=8, splits=splits, input_dtype=input_dtype,
                 ctas_per_sm=CTAS_PER_SM, **({"groups": groups} if groups != 1 else {}))
 
 
@@ -97,10 +100,10 @@ class _GroupedPointers:
 
 def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
                                codebook="e4m3", sharded_side=1,
-                               rotation_count=4, max_rows=4096, groups=1):
+                               rotation_count=4, max_rows=4096, groups=1, input_dtype="f16"):
     g = geometry(input_features, output_features, bits=bits, codebook=codebook,
                  sharded_side=sharded_side, rotation_count=rotation_count,
-                 max_rows=max_rows, groups=groups)
+                 max_rows=max_rows, groups=groups, input_dtype=input_dtype)
     k, n, s = g["input_features"], g["output_features"], g["splits"]
     if groups == 1:
         operands = (
@@ -122,5 +125,5 @@ def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
         pointers = _GroupedPointers(g)
     return compile_program(pointers, name="trellis_linear", operands=operands,
                            scalars=tuple(Scalar(name) for name in SCALARS),
-                           key=tuple(g.values()), version=2, geometry=g,
+                           key=tuple(g.values()), version=3, geometry=g,
                            scratch={"partial": lambda rows: groups*rows*s*n*4}, doc=__doc__)

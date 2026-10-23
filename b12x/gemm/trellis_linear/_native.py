@@ -16,6 +16,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.intrinsics import (
+    bf16_mma_m16n8k16_f32, _f16x2_to_bf16x2,
     f16_mma_m16n8k16_f32, ld_global_nc_u32, ld_global_nc_u32_l2hint, ld_global_nc_v4_u32,
     weight_stream_policy,
     ld_shared_u32, ld_shared_f32, st_shared_f32, packed_dequant_trellis_to_half2x4,
@@ -35,7 +36,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis_ws import (
 )
 
 
-# Gemini's exact FP16 consumer; decoded E4M3 weights round-trip losslessly.
+# Gemini's consumer; E4M3 weights are exact in both F16 and BF16.
 _WS_CONSUMER_THREADS = 256
 _WS_PRODUCER_THREADS = 128
 _WS_CONSUMER_REGS = 192
@@ -525,6 +526,7 @@ class NativeTrellisLinear:
         self.k, self.n = g["input_features"], g["output_features"]
         self.bits, self.e4m3 = g["bits"], g["codebook"] == "e4m3"
         self.mul1 = g["codebook"] == "mul1"
+        self.input_bf16 = g.get("input_dtype", "f16") == "bf16"
         # High-rate windows need more live registers than the frozen K2--K4 path.
         self.min_blocks_per_mp = 2 if self.bits >= 5 else self.CTAS_PER_SM
         self.input_units = g["sharded_side"] == 2
@@ -541,6 +543,18 @@ class NativeTrellisLinear:
             else self.ws_sc_off + (4 - self.ws_sc_m_start) * 16384
         )
 
+
+    @cute.jit
+    def mma(self, d0: Float32, d1: Float32, d2: Float32, d3: Float32,
+            a0: Uint32, a1: Uint32, a2: Uint32, a3: Uint32,
+            b0: Uint32, b1: Uint32):
+        # Decoders retain their native half2 contract. E4M3 is exact in BF16;
+        # other codebooks round once here, before the BF16 MMA.
+        if cutlass.const_expr(self.input_bf16):
+            b0, b1 = _f16x2_to_bf16x2(b0), _f16x2_to_bf16x2(b1)
+            return bf16_mma_m16n8k16_f32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1)
+        else:
+            return f16_mma_m16n8k16_f32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1)
 
     def _storage(self, active: int):
         class Storage:
@@ -709,11 +723,11 @@ class NativeTrellisLinear:
                             if cutlass.const_expr(self.input_units):
                                 tile = kb * Int32(self.n // 16 * 8) + (nb // Int32(4)) * Int32(64) + Int32(k16 * 8) + (nb % Int32(4)) * Int32(2) + Int32(n16)
                             b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            d0, d1, d2, d3 = self.mma(
                                 acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                                 a0, a1, a2, a3, b0, b1)
                             acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            d0, d1, d2, d3 = self.mma(
                                 acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
                                 a0, a1, a2, a3, b2, b3)
                             acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
@@ -780,11 +794,11 @@ class NativeTrellisLinear:
                             if cutlass.const_expr(self.input_units):
                                 tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
                             b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            d0, d1, d2, d3 = self.mma(
                                 acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                                 a0, a1, a2, a3, b0, b1)
                             acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            d0, d1, d2, d3 = self.mma(
                                 acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
                                 a0, a1, a2, a3, b2, b3)
                             acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
@@ -867,11 +881,11 @@ class NativeTrellisLinear:
                                     tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
                                 b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
                                 for mb in cutlass.range_constexpr(active):
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    d0, d1, d2, d3 = self.mma(
                                         acc[mb, 2 * n16, 0], acc[mb, 2 * n16, 1], acc[mb, 2 * n16, 2], acc[mb, 2 * n16, 3],
                                         a[mb, 0], a[mb, 1], a[mb, 2], a[mb, 3], b0, b1)
                                     acc[mb, 2 * n16, 0], acc[mb, 2 * n16, 1], acc[mb, 2 * n16, 2], acc[mb, 2 * n16, 3] = d0, d1, d2, d3
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    d0, d1, d2, d3 = self.mma(
                                         acc[mb, 2 * n16 + 1, 0], acc[mb, 2 * n16 + 1, 1], acc[mb, 2 * n16 + 1, 2], acc[mb, 2 * n16 + 1, 3],
                                         a[mb, 0], a[mb, 1], a[mb, 2], a[mb, 3], b2, b3)
                                     acc[mb, 2 * n16 + 1, 0], acc[mb, 2 * n16 + 1, 1], acc[mb, 2 * n16 + 1, 2], acc[mb, 2 * n16 + 1, 3] = d0, d1, d2, d3
@@ -895,11 +909,11 @@ class NativeTrellisLinear:
                                     a1 = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16 + 8) * 16))
                                     a2 = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16) * 16))
                                     a3 = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16 + 8) * 16))
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    d0, d1, d2, d3 = self.mma(
                                         acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3],
                                         a0, a1, a2, a3, b0, b1)
                                     acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3] = d0, d1, d2, d3
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    d0, d1, d2, d3 = self.mma(
                                         acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3],
                                         a0, a1, a2, a3, b2, b3)
                                     acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3] = d0, d1, d2, d3
@@ -925,11 +939,11 @@ class NativeTrellisLinear:
                                         a1 = ld_shared_u32(sx_k + Int32(((2 * ki) * M_PAD + mb * 16 + 8) * 16))
                                         a2 = ld_shared_u32(sx_k + Int32(((2 * ki + 1) * M_PAD + mb * 16) * 16))
                                         a3 = ld_shared_u32(sx_k + Int32(((2 * ki + 1) * M_PAD + mb * 16 + 8) * 16))
-                                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        d0, d1, d2, d3 = self.mma(
                                             acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3],
                                             a0, a1, a2, a3, b0, b1)
                                         acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3] = d0, d1, d2, d3
-                                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        d0, d1, d2, d3 = self.mma(
                                             acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3],
                                             a0, a1, a2, a3, b2, b3)
                                         acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3] = d0, d1, d2, d3
@@ -1148,21 +1162,21 @@ class NativeTrellisLinear:
                                     b0, b1, b2, b3 = _ld_ring_v4_u32_offset(sw0, w_off)
                                 i0 = 2 * n_local
                                 i1 = 2 * n_local + 1
-                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                d0, d1, d2, d3 = self.mma(
                                     acc[i0, 0], acc[i0, 1], acc[i0, 2], acc[i0, 3],
                                     a0_0, a1_0, a2_0, a3_0, b0, b1)
                                 acc[i0, 0], acc[i0, 1], acc[i0, 2], acc[i0, 3] = d0, d1, d2, d3
-                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                d0, d1, d2, d3 = self.mma(
                                     acc[i1, 0], acc[i1, 1], acc[i1, 2], acc[i1, 3],
                                     a0_0, a1_0, a2_0, a3_0, b2, b3)
                                 acc[i1, 0], acc[i1, 1], acc[i1, 2], acc[i1, 3] = d0, d1, d2, d3
                                 j0 = 4 + 2 * n_local
                                 j1 = 4 + 2 * n_local + 1
-                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                d0, d1, d2, d3 = self.mma(
                                     acc[j0, 0], acc[j0, 1], acc[j0, 2], acc[j0, 3],
                                     a0_1, a1_1, a2_1, a3_1, b0, b1)
                                 acc[j0, 0], acc[j0, 1], acc[j0, 2], acc[j0, 3] = d0, d1, d2, d3
-                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                d0, d1, d2, d3 = self.mma(
                                     acc[j1, 0], acc[j1, 1], acc[j1, 2], acc[j1, 3],
                                     a0_1, a1_1, a2_1, a3_1, b2, b3)
                                 acc[j1, 0], acc[j1, 1], acc[j1, 2], acc[j1, 3] = d0, d1, d2, d3
@@ -1596,7 +1610,7 @@ class NativeTrellisLinear:
                                 a1 = a0_frag[m_local, 1]
                                 a2 = a0_frag[m_local, 2]
                                 a3 = a0_frag[m_local, 3]
-                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                d0, d1, d2, d3 = self.mma(
                                     acc[m_local, 2 * j, 0],
                                     acc[m_local, 2 * j, 1],
                                     acc[m_local, 2 * j, 2],
@@ -1604,7 +1618,7 @@ class NativeTrellisLinear:
                                     a0, a1, a2, a3, b0, b1,
                                 )
                                 acc[m_local, 2 * j, 0], acc[m_local, 2 * j, 1], acc[m_local, 2 * j, 2], acc[m_local, 2 * j, 3] = d0, d1, d2, d3
-                                d4, d5, d6, d7 = f16_mma_m16n8k16_f32(
+                                d4, d5, d6, d7 = self.mma(
                                     acc[m_local, 2 * j + 1, 0],
                                     acc[m_local, 2 * j + 1, 1],
                                     acc[m_local, 2 * j + 1, 2],
@@ -1653,7 +1667,7 @@ class NativeTrellisLinear:
                                 a1 = a1_frag[m_local, 1]
                                 a2 = a1_frag[m_local, 2]
                                 a3 = a1_frag[m_local, 3]
-                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                d0, d1, d2, d3 = self.mma(
                                     acc[m_local, 2 * j, 0],
                                     acc[m_local, 2 * j, 1],
                                     acc[m_local, 2 * j, 2],
@@ -1661,7 +1675,7 @@ class NativeTrellisLinear:
                                     a0, a1, a2, a3, b0, b1,
                                 )
                                 acc[m_local, 2 * j, 0], acc[m_local, 2 * j, 1], acc[m_local, 2 * j, 2], acc[m_local, 2 * j, 3] = d0, d1, d2, d3
-                                d4, d5, d6, d7 = f16_mma_m16n8k16_f32(
+                                d4, d5, d6, d7 = self.mma(
                                     acc[m_local, 2 * j + 1, 0],
                                     acc[m_local, 2 * j + 1, 1],
                                     acc[m_local, 2 * j + 1, 2],
@@ -2188,11 +2202,11 @@ class NativeTrellisLinear:
                             if cutlass.const_expr(self.input_units):
                                 tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
                             b0, b1, b2, b3 = decode_tile(payload_ptr, tile, lane, self.bits, self.e4m3, self.mul1, policy)
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            d0, d1, d2, d3 = self.mma(
                                 acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                                 a0, a1, a2, a3, b0, b1)
                             acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            d0, d1, d2, d3 = self.mma(
                                 acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
                                 a0, a1, a2, a3, b2, b3)
                             acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
@@ -2284,11 +2298,11 @@ class NativeTrellisLinear:
                                     a1 = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16 + 8) * 16))
                                     a2 = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16) * 16))
                                     a3 = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16 + 8) * 16))
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    d0, d1, d2, d3 = self.mma(
                                         acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3],
                                         a0, a1, a2, a3, b0, b1)
                                     acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3] = d0, d1, d2, d3
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    d0, d1, d2, d3 = self.mma(
                                         acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3],
                                         a0, a1, a2, a3, b2, b3)
                                     acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3] = d0, d1, d2, d3
@@ -2306,11 +2320,11 @@ class NativeTrellisLinear:
                                         a1 = ld_shared_u32(sx_k + Int32(((2 * ki) * M_PAD + mb * 16 + 8) * 16))
                                         a2 = ld_shared_u32(sx_k + Int32(((2 * ki + 1) * M_PAD + mb * 16) * 16))
                                         a3 = ld_shared_u32(sx_k + Int32(((2 * ki + 1) * M_PAD + mb * 16 + 8) * 16))
-                                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        d0, d1, d2, d3 = self.mma(
                                             acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3],
                                             a0, a1, a2, a3, b0, b1)
                                         acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3] = d0, d1, d2, d3
-                                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        d0, d1, d2, d3 = self.mma(
                                             acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3],
                                             a0, a1, a2, a3, b2, b3)
                                         acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3] = d0, d1, d2, d3
