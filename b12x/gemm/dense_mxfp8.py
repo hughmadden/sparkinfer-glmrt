@@ -10,11 +10,10 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T
 
 from b12x._lib.intrinsics import (
-    broadcast_f32_to_half2,
     bfloat2_habs2, bfloat2_hmax2, bfloat2_hmax_to_f32,
     bfloat2_to_float2_scaled, cvt_f32x4_to_e4m3x4,
     habs2,
-    half2_mul,
+    half2_to_float2_scaled,
     hmax2,
     hmax_to_f32,
     ld_global_nc_u32,
@@ -154,29 +153,27 @@ class TrellisMxfp8Quant:
             m1 = cute.arch.fmax(m1, cute.arch.shuffle_sync_bfly(m1, offset=2))
             _, code0 = pow2_ceil_ue8m0(m0 * Float32(1.0 / E4M3_MAX))
             _, code1 = pow2_ceil_ue8m0(m1 * Float32(1.0 / E4M3_MAX))
-            if cutlass.const_expr(self.bf16):
-                v = cute.make_rmem_tensor((4,), Uint32)
-                for i in cutlass.range_constexpr(4):
-                    lo, hi = f00, f01
-                    code = code0
-                    if cutlass.const_expr(i == 1):
-                        lo, hi, code = f10, f11, code1
-                    if cutlass.const_expr(i == 2):
-                        lo, hi = f20, f21
-                    if cutlass.const_expr(i == 3):
-                        lo, hi, code = f30, f31, code1
-                    inv = ue8m0_to_output_scale(code)
+            # Inverse scales for tiny F16 blocks exceed the F16 range. Keep
+            # scaling in FP32 for both input dtypes before the E4M3 conversion.
+            v = cute.make_rmem_tensor((4,), Uint32)
+            for i in cutlass.range_constexpr(4):
+                lo, hi = f00, f01
+                code = code0
+                if cutlass.const_expr(i == 1):
+                    lo, hi, code = f10, f11, code1
+                if cutlass.const_expr(i == 2):
+                    lo, hi = f20, f21
+                if cutlass.const_expr(i == 3):
+                    lo, hi, code = f30, f31, code1
+                inv = ue8m0_to_output_scale(code)
+                if cutlass.const_expr(self.bf16):
                     a, b = bfloat2_to_float2_scaled(lo, inv)
                     c0, d = bfloat2_to_float2_scaled(hi, inv)
-                    v[i] = cvt_f32x4_to_e4m3x4(a, b, c0, d)
-                w0, w1, w2, w3 = v[0], v[1], v[2], v[3]
-            else:
-                h0 = broadcast_f32_to_half2(ue8m0_to_output_scale(code0))
-                h1 = broadcast_f32_to_half2(ue8m0_to_output_scale(code1))
-                w0 = _e4m3x4_from_half2x2(half2_mul(f00, h0), half2_mul(f01, h0))
-                w1 = _e4m3x4_from_half2x2(half2_mul(f10, h1), half2_mul(f11, h1))
-                w2 = _e4m3x4_from_half2x2(half2_mul(f20, h0), half2_mul(f21, h0))
-                w3 = _e4m3x4_from_half2x2(half2_mul(f30, h1), half2_mul(f31, h1))
+                else:
+                    a, b = half2_to_float2_scaled(lo, inv)
+                    c0, d = half2_to_float2_scaled(hi, inv)
+                v[i] = cvt_f32x4_to_e4m3x4(a, b, c0, d)
+            w0, w1, w2, w3 = v[0], v[1], v[2], v[3]
             rec = rbase + (rb * Int32(self.nk32) + s).to(Int64) * Int64(MX8_REC)
             st_global_v4_u32(rec + lane.to(Int64) * Int64(16), w0, w1, w2, w3)
             row_lo = (lane >> Int32(2)).to(Int64)

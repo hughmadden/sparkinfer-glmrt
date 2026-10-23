@@ -317,6 +317,12 @@ def benchmark_mx8(args):
     for fmt, op, k, n, side in shapes:
         storage, _ = native_tensors(fmt, k, n, capacity)
         inputs, payload, scales, partial, output, x = storage
+        # Quantization range regressions: zero, inverse scales beyond F16,
+        # and finite near-maximum F16 inputs. Keep these in the FP64 checks.
+        pattern = torch.linspace(-1, 1, k, device="cuda")
+        for row, amplitude in enumerate((0.0, 1e-3, 1e-5, 60000.0)):
+            if row < capacity:
+                x[row].copy_(pattern * amplitude)
         if fmt == "mxfp8":
             scales.random_(118,124)
         else:
@@ -365,8 +371,9 @@ def benchmark_mx8(args):
         amax = x.float().reshape(capacity,k//32,32).abs().amax(-1)
         exponent = torch.ceil(torch.log2(amax/448)).clamp(-127,127)
         sf = torch.exp2(exponent)
-        expected_a = ((x.float().reshape(capacity,k//32,32)/sf[:,:,None])
-                      .to(torch.float8_e4m3fn).float()*sf[:,:,None]).reshape(capacity,k)
+        scaled_a = torch.where(amax[:,:,None] == 0, 0,
+                               x.float().reshape(capacity,k//32,32)/sf[:,:,None])
+        expected_a = (scaled_a.to(torch.float8_e4m3fn).float()*sf[:,:,None]).reshape(capacity,k)
         quant_equal = torch.equal(aq[:capacity],expected_a)
         columns, checks = min(n,64), min(capacity,32)
         target = aq[:checks].double() @ weight[:columns].double().T
@@ -410,7 +417,8 @@ def benchmark_mx8(args):
                 mx8_us=total_us,quant_us=quant_us,gemm_us=gemm_us,native_us=native_us,
                 unpack_us=unpack_total,quant_equal=quant_equal,row_invariant=True,
                 fp64_pass=fp64_pass,fp64_max_error=error.max().item(),
-                a8_vs_exact_relative_l2=(torch.linalg.vector_norm(target-exact)/torch.linalg.vector_norm(exact)).item(),
+                a8_vs_exact_relative_l2=(torch.linalg.vector_norm(target[4:]-exact[4:])/torch.linalg.vector_norm(exact[4:])).item(),
+                quant_range_rows=[0.0,1e-3,1e-5,60000.0],
                 spill_free=spill_free,cubin_spill_check=spills,**bars)
             report["measurements"].append(record)
             args.output.write_text(json.dumps(report,indent=2)+"\n")
