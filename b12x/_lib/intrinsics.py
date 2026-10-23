@@ -509,6 +509,30 @@ def ld_global_nc_u32(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def ld_global_nc_u32_l2hint(
+    base_ptr: Int64, cache_policy: Uint64, offset: int = 0, *, loc=None, ip=None
+) -> Uint32:
+    """Load 32 bits through the non-coherent cache with an L2 cache policy
+    (for example `create_l2_evict_first_policy` for one-pass weights)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(base_ptr).ir_value(loc=loc, ip=ip),
+                Uint64(cache_policy).ir_value(loc=loc, ip=ip),
+            ],
+            f"ld.global.nc.L2::cache_hint.u32 $0, [$1 + {int(offset)}], $2;",
+            "=r,l,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ld_global_nc_f32(base_ptr: Int64, *, loc=None, ip=None) -> Float32:
     """Load an fp32 from global memory via non-coherent cache (.nc)."""
     return Float32(
