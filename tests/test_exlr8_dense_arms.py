@@ -59,3 +59,34 @@ def test_bundle_pins_and_verifies(tmp_path):
     (bundle / records["base"]["path"]).write_text("changed\n")
     with pytest.raises(ValueError, match="digest mismatch"):
         arms.verify(bundle, {"base": revision})
+
+
+def test_trellis_references():
+    assert arms.parse_references("base", ["trellis/q_b=base"], {"base": "HEAD"}) == {"trellis/q_b": "base"}
+
+
+@pytest.mark.parametrize("formats", [("trellis",), ("trellis", "mxfp8"), ("int4_g32",)])
+def test_per_format_modules(tmp_path, formats):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for module in (arms.MODULE, arms.TRELLIS + "/__init__.py", arms.TRELLIS + "/_native.py", arms.TRELLIS + "/_helper.py"):
+        path = repo / module
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("VALUE = 1\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"], check=True)
+    bundle = tmp_path / "bundle"
+    records = arms.materialize(repo, bundle, {"base": "HEAD"}, formats)
+    pinned = {"base": records["base"]["revision"]}
+    assert arms.verify(bundle, pinned, formats) == records
+    files = records["base"]["files"]
+    assert (arms.MODULE in files) == (set(formats) != {"trellis"})
+    assert (arms.TRELLIS + "/_helper.py" in files) == ("trellis" in formats)
+    if "trellis" not in formats:
+        with pytest.raises(ValueError, match="missing requested formats"):
+            arms.verify(bundle, pinned, ["trellis"])
+    target = next(iter(files.values()))
+    (bundle / target["path"]).write_text("VALUE = 2\n")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        arms.verify(bundle, pinned, formats)
