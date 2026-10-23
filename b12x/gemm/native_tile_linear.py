@@ -74,19 +74,18 @@ def _int4x8_bf16(word, *, loc=None, ip=None):
 
 @dsl_user_op
 def _quad_transpose_u8x4(raw, prmt_sel, *, loc=None, ip=None):
-    """Two butterfly exchanges transpose packed int4 pairs across a quad."""
+    """4x4 u8 transpose across the 4 lanes j = 0..3 of each quad."""
     return Uint32(llvm.inline_asm(
         T.i32(),
         [Uint32(raw).ir_value(loc=loc, ip=ip), Uint32(prmt_sel).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b32 s, t, v, sel, bit; .reg .pred p; "
-        "shfl.sync.bfly.b32 s, $1, 1, 0x1f, 0xffffffff; "
-        "and.b32 bit, $2, 1; setp.ne.u32 p, bit, 0; "
-        "selp.b32 sel, 0x3715, 0x6240, p; "
-        "prmt.b32 v, $1, s, sel; "
-        "shfl.sync.bfly.b32 t, v, 2, 0x1f, 0xffffffff; "
-        "and.b32 bit, $2, 2; setp.ne.u32 p, bit, 0; "
-        "selp.b32 sel, 0x3276, 0x5410, p; "
-        "prmt.b32 $0, v, t, sel; }",
+        "{ .reg .b32 s0, s1, s2, s3, lo, hi; "
+        "shfl.sync.idx.b32 s0, $1, 0, 0x1c1f, 0xffffffff; "
+        "shfl.sync.idx.b32 s1, $1, 1, 0x1c1f, 0xffffffff; "
+        "shfl.sync.idx.b32 s2, $1, 2, 0x1c1f, 0xffffffff; "
+        "shfl.sync.idx.b32 s3, $1, 3, 0x1c1f, 0xffffffff; "
+        "prmt.b32 lo, s0, s1, $2; "
+        "prmt.b32 hi, s2, s3, $2; "
+        "prmt.b32 $0, lo, hi, 0x6420; }",
         "=r,r,r",
         has_side_effects=False, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
@@ -218,21 +217,6 @@ def _mma_k32_scaled(acc0, acc1, acc2, acc3, a0, a1, a2, a3, a4, a5, a6, a7,
             Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
             Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)),
             Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)))
-
-
-@cute.jit
-def _decode_mma_k32_scaled(acc0: Float32, acc1: Float32, acc2: Float32, acc3: Float32,
-                           a0: Uint32, a1: Uint32, a2: Uint32, a3: Uint32,
-                           a4: Uint32, a5: Uint32, a6: Uint32, a7: Uint32,
-                           b0: Uint32, b1: Uint32, b2: Uint32, b3: Uint32,
-                           s0: Float32, s1: Float32):
-    # Match the unchanged prefill MMA ordering, not just its real-valued product.
-    lane = Int32(cute.arch.thread_idx()[0]) & Int32(3)
-    a0, a2, a4, a6 = _quad_transpose_x4(a0, a2, a4, a6, lane)
-    a1, a3, a5, a7 = _quad_transpose_x4(a1, a3, a5, a7, lane)
-    return _mma_k32_scaled(acc0, acc1, acc2, acc3,
-                           a0, a1, a2, a3, a4, a5, a6, a7,
-                           b0, b1, b2, b3, s0, s1)
 
 
 @dsl_user_op
@@ -388,7 +372,7 @@ class NativeTileLinear:
     def _scale(self, raw: Uint32, h):
         sh = (Int32(16 if self.int4 else 8) * Int32(h)).to(Uint32)
         if cutlass.const_expr(self.int4):
-            value = _f16_to_f32((raw >> sh) & Uint32(0xFFFF))
+            value = _f16_to_f32(raw >> sh)
         else:
             value = _e8m0((raw >> sh) & Uint32(0xFF))
         return value
@@ -592,19 +576,17 @@ class NativeTileLinear:
                                     hi0, hi1, hi2, hi3 = _ld_cached(x_hi + k32_off)
                                 for gi in cutlass.range_constexpr(G):
                                     if cutlass.const_expr(self.int4):
-                                        b0, b1, b2, b3 = _int4x8_bf16(_quad_transpose_u8x4(
-                                            cur[(c * G + gi) * 2 + h], j.to(Uint32) * Uint32(0x0101) + Uint32(0x0400)))
+                                        b0, b1, b2, b3 = _int4x8_bf16(cur[(c * G + gi) * 2 + h])
                                         r_s0, r_s1 = scur[gi * 4 + c], scur[gi * 4 + 2 + c]
                                     else:
                                         b0, b1 = _e4m3x4_bf16(cur[(c * G + gi) * 4 + 2 * h])
                                         b2, b3 = _e4m3x4_bf16(cur[(c * G + gi) * 4 + 2 * h + 1])
-                                        b0, b1, b2, b3 = _quad_transpose_x4(b0, b1, b2, b3, j)
                                         r_s0 = scur[gi * 2] >> Uint32(16 * c)
                                         r_s1 = scur[gi * 2 + 1] >> Uint32(16 * c)
                                     s0 = self._scale(r_s0, h)
                                     s1 = self._scale(r_s1, h)
                                     f = 4 * gi
-                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _decode_mma_k32_scaled(
+                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
                                         acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
                                         lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3,
                                         b0, b1, b2, b3, s0, s1)
@@ -758,13 +740,11 @@ class NativeTileLinear:
                                 s_h = cute.make_rmem_tensor((2 * G,), Float32)
                                 for gi in cutlass.range_constexpr(G):
                                     if cutlass.const_expr(self.int4):
-                                        b0, b1, b2, b3 = _int4x8_bf16(_quad_transpose_u8x4(
-                                            cur[(c * G + gi) * 2 + h], j.to(Uint32) * Uint32(0x0101) + Uint32(0x0400)))
+                                        b0, b1, b2, b3 = _int4x8_bf16(cur[(c * G + gi) * 2 + h])
                                         r_s0, r_s1 = scur[gi * 4 + c], scur[gi * 4 + 2 + c]
                                     else:
                                         b0, b1 = _e4m3x4_bf16(cur[(c * G + gi) * 4 + 2 * h])
                                         b2, b3 = _e4m3x4_bf16(cur[(c * G + gi) * 4 + 2 * h + 1])
-                                        b0, b1, b2, b3 = _quad_transpose_x4(b0, b1, b2, b3, j)
                                         r_s0 = scur[gi * 2] >> Uint32(16 * c)
                                         r_s1 = scur[gi * 2 + 1] >> Uint32(16 * c)
                                     b_h[4 * gi], b_h[4 * gi + 1], b_h[4 * gi + 2], b_h[4 * gi + 3] = b0, b1, b2, b3
@@ -779,7 +759,7 @@ class NativeTileLinear:
                                             hi0, hi1, hi2, hi3 = ld_shared_v4_u32(sx_r + Int32(q_off + 512))
                                             for gi in cutlass.range_constexpr(G):
                                                 f = 4 * (mt * G + gi)
-                                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _decode_mma_k32_scaled(
+                                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
                                                     acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
                                                     lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3,
                                                     b_h[4 * gi], b_h[4 * gi + 1], b_h[4 * gi + 2], b_h[4 * gi + 3],
@@ -811,13 +791,11 @@ class NativeTileLinear:
                                 s_h = cute.make_rmem_tensor((2 * G,), Float32)
                                 for gi in cutlass.range_constexpr(G):
                                     if cutlass.const_expr(self.int4):
-                                        b0, b1, b2, b3 = _int4x8_bf16(_quad_transpose_u8x4(
-                                            cur[(c * G + gi) * 2 + h], j.to(Uint32) * Uint32(0x0101) + Uint32(0x0400)))
+                                        b0, b1, b2, b3 = _int4x8_bf16(cur[(c * G + gi) * 2 + h])
                                         r_s0, r_s1 = scur[gi * 4 + c], scur[gi * 4 + 2 + c]
                                     else:
                                         b0, b1 = _e4m3x4_bf16(cur[(c * G + gi) * 4 + 2 * h])
                                         b2, b3 = _e4m3x4_bf16(cur[(c * G + gi) * 4 + 2 * h + 1])
-                                        b0, b1, b2, b3 = _quad_transpose_x4(b0, b1, b2, b3, j)
                                         r_s0 = scur[gi * 2] >> Uint32(16 * c)
                                         r_s1 = scur[gi * 2 + 1] >> Uint32(16 * c)
                                     b_h[4 * gi], b_h[4 * gi + 1], b_h[4 * gi + 2], b_h[4 * gi + 3] = b0, b1, b2, b3
@@ -834,7 +812,7 @@ class NativeTileLinear:
                                                 x_col + Int64((16 * mt + 8) * self.k * 2 + k32_off), r0 + Int32(8), rows)
                                             for gi in cutlass.range_constexpr(G):
                                                 f = 4 * (mt * G + gi)
-                                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _decode_mma_k32_scaled(
+                                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
                                                     acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
                                                     lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3,
                                                     b_h[4 * gi], b_h[4 * gi + 1], b_h[4 * gi + 2], b_h[4 * gi + 3],
@@ -1049,8 +1027,8 @@ class NativeTileLinear:
                             b_off = wide + (b_lane_off ^ h_xor)
                             for gi in cutlass.range_constexpr(NG):
                                 b = ldmatrix_m8n8x4_b16(b_off + Int32(gi * 1024))
-                                for i in cutlass.range_constexpr(4):
-                                    bw_h[4 * gi + i] = b[i]
+                                bw_h[4 * gi], bw_h[4 * gi + 1], bw_h[4 * gi + 2], bw_h[4 * gi + 3] = _quad_transpose_x4(
+                                    b[0], b[1], b[2], b[3], j)
                                 sc_h[2 * gi] = self._scale(s_raw[2 * gi], h)
                                 sc_h[2 * gi + 1] = self._scale(s_raw[2 * gi + 1], h)
                             a_off0 = sa + (a_lane_off ^ h_xor)
@@ -1059,9 +1037,8 @@ class NativeTileLinear:
                                 xa_h = cute.make_rmem_tensor((8,), Uint32)
                                 a0 = ldmatrix_m8n8x4_b16(a_off0 + Int32(mt * 2048))
                                 a1 = ldmatrix_m8n8x4_b16(a_off1 + Int32(mt * 2048))
-                                for i in cutlass.range_constexpr(4):
-                                    xa_h[i] = a0[i]
-                                    xa_h[4 + i] = a1[i]
+                                xa_h[0], xa_h[2], xa_h[4], xa_h[6] = _quad_transpose_x4(a0[0], a0[2], a1[0], a1[2], j)
+                                xa_h[1], xa_h[3], xa_h[5], xa_h[7] = _quad_transpose_x4(a0[1], a0[3], a1[1], a1[3], j)
                                 for gi in cutlass.range_constexpr(NG):
                                     f = 4 * (mt * NG + gi)
                                     acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
