@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import statistics
 
 MODULE = "b12x/gemm/native_tile_linear.py"
 TRELLIS = "b12x/gemm/trellis_linear"
@@ -45,6 +46,23 @@ def cold_copies(weight_bytes, l2_bytes):
     if weight_bytes <= 0 or l2_bytes <= 0:
         raise ValueError("weight and L2 sizes must be positive")
     return max(1, (2*l2_bytes + weight_bytes - 1)//weight_bytes)
+
+
+def validate_timing(rounds, replays):
+    if type(rounds) is not int or rounds < 0 or type(replays) is not int or replays < 1:
+        raise ValueError("interleave rounds must be nonnegative and replays positive")
+
+
+def timing_order(names, iteration):
+    names = list(names)
+    return names if iteration % 2 == 0 else names[::-1]
+
+
+def timing_summary(samples, reference):
+    medians = {name: statistics.median(values) for name, values in samples.items()}
+    control, baseline = medians.get("reference_control"), medians.get(reference)
+    spread = abs(control / baseline - 1) if control and baseline else None
+    return medians, spread, spread is not None and spread < .02
 
 
 def materialize(repo, bundle, arms, formats=None):

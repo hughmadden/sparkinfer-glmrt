@@ -17,7 +17,6 @@ from pathlib import Path
 import re
 import sys
 import contextlib
-import statistics
 
 import torch
 import cutlass
@@ -29,7 +28,7 @@ from benchmarks.benchmark_exlr8_a16 import capture, timing, read_roofline, finit
 from b12x.integration.cuteafd._common import Operand, Scalar, compile_program, exportable_compilation
 from b12x.integration.cuteafd import trellis_linear, scaled_linear, fp8_row_embedding
 from b12x.integration.cuteafd._fp8_weights import Fp8Projection
-from benchmarks._exlr8_dense_arms import parse_arms, parse_references, materialize, verify, program_key, cold_copies
+from benchmarks._exlr8_dense_arms import parse_arms, parse_references, materialize, verify, program_key, cold_copies, validate_timing, timing_order, timing_summary
 
 # Unique native formats/shapes from the GLM 5.3 bit325 load plan.
 SHAPES = (
@@ -497,8 +496,10 @@ def main():
     parser.add_argument("--profile-op", help="FORMAT/OP")
     parser.add_argument("--profile-rows", type=int)
     args = parser.parse_args()
-    if args.interleave_rounds < 0:
-        parser.error("interleave rounds must be nonnegative")
+    try:
+        validate_timing(args.interleave_rounds, args.replays)
+    except ValueError as error:
+        parser.error(str(error))
     if args.mxfp8_prefill:
         return benchmark_mx8(args)
     if args.unpacked_trellis:
@@ -675,7 +676,7 @@ def main():
                 torch.cuda.synchronize()
                 order = list(timed)
                 for iteration in range(args.interleave_rounds):
-                    for name in (order if iteration % 2 == 0 else order[::-1]):
+                    for name in timing_order(order, iteration):
                         graph, count = timed[name]
                         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                         start.record()
@@ -683,10 +684,8 @@ def main():
                         end.record()
                         end.synchronize()
                         samples[name].append(start.elapsed_time(end) * 1000 / count)
-                medians = {name: statistics.median(values) for name, values in samples.items()}
-                control = medians.get("reference_control")
+                medians, spread, noise_pass = timing_summary(samples, selected_reference)
                 reference_us = medians.get(selected_reference)
-                spread = abs(control / reference_us - 1) if control and reference_us else None
                 for record in records:
                     name = record["arm"]
                     if name in medians:
@@ -696,7 +695,7 @@ def main():
                                       speedup_vs_w8a16=medians.get("block_fp8", 0)/us or None,
                                       speedup_vs_reference=reference_us/us if reference_us else None,
                                       identical_control_spread=spread,
-                                      timing_noise_pass=spread is not None and spread < .02,
+                                      timing_noise_pass=noise_pass,
                                       interleaved_samples_us=samples, graph_repeats=repeats)
                         print(json.dumps(record), flush=True)
                 args.output.write_text(json.dumps(report, indent=2)+"\n")
