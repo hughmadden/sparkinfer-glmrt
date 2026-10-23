@@ -118,6 +118,45 @@ def test_native_dense_fp8_gdn_preserves_bf16_gates(rows):
 
 
 @pytest.mark.parametrize("rows", [3, 65])
+@pytest.mark.parametrize("kv_format", ["bf16", "fp8"])
+def test_native_dense_fp8_producer_matches_bf16_projection_kv_bytes(rows, kv_format):
+    require_b12x()
+    from b12x.integration.cuteafd._common import QwenDenseGeometry
+    from b12x.integration.cuteafd.qwen_dense import compile_qwen_dense_producer_aot
+    from b12x.integration.cuteafd.qwen_dense_fp8 import compile_qwen_dense_producer_fp8_aot
+
+    g = QwenDenseGeometry(hidden=512, heads=4, kv_heads=1)
+    capacity = 64 if rows <= 64 else 128
+    native = compile_qwen_dense_producer_fp8_aot(g, max_rows=capacity, kv_format=kv_format)
+    reference = compile_qwen_dense_producer_aot(g, max_rows=capacity, kv_format=kv_format)
+    # Exact projections isolate KV packing from FP8-vs-BF16 GEMM rounding.
+    x = torch.zeros(rows, g.hidden, device="cuda", dtype=torch.bfloat16)
+    x[torch.arange(rows, device="cuda"), torch.arange(rows, device="cuda")] = 1
+    weight = torch.randint(-2, 3, (g.attn_in_width, g.hidden), device="cuda").bfloat16()
+    fp8 = weight.to(torch.float8_e4m3fn)
+    scales = torch.ones(g.attn_in_width // 128, g.hidden // 128, device="cuda")
+    q_norm = torch.zeros(g.head_dim, device="cuda", dtype=torch.bfloat16)
+    k_norm = torch.zeros_like(q_norm)
+    positions = torch.arange(rows, device="cuda", dtype=torch.int32)[:, None].expand(-1, 3).contiguous()
+    slots = torch.arange(rows, device="cuda", dtype=torch.int64) * 2
+    slots[-1] = -1
+    outputs = []
+    for program, weights in ((native, (fp8, scales)), (reference, (weight,))):
+        cache = torch.full((2 * rows, g.kv_record_bytes(kv_format)), 0xA5, device="cuda", dtype=torch.uint8)
+        query = torch.empty(rows, g.heads, g.head_dim, device="cuda", dtype=torch.bfloat16)
+        gate = torch.empty(rows, g.heads * g.head_dim, device="cuda", dtype=torch.bfloat16)
+        scratch = torch.empty(program.scratch_bytes(capacity)["scratch"], device="cuda", dtype=torch.uint8)
+        program.launch(x, *weights, q_norm, k_norm, positions, slots, cache, query, gate, scratch, scalars=[rows])
+        outputs.append((cache, query, gate))
+    for actual, expected in zip(outputs[0], outputs[1]):
+        assert torch.equal(actual, expected)
+    assert torch.all(outputs[0][0][1::2] == 0xA5)
+    assert torch.all(outputs[0][0][-2:] == 0xA5)
+    assert native.geometry["kv_format"] == kv_format
+    assert native.geometry["record_bytes"] == g.kv_record_bytes(kv_format)
+
+
+@pytest.mark.parametrize("rows", [3, 65])
 def test_native_dense_fp8_ffn(rows):
     require_b12x()
     from b12x.integration.cuteafd._common import QwenDenseGeometry
