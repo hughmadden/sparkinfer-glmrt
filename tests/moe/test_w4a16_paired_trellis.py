@@ -123,6 +123,12 @@ def test_compact_true_width_weights_match_padded_control(intermediate, tile_k, a
         buffers = make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
         binding = bind_mixed_trellis(*payload, mapping, desc, rot, launch)
         plans.append((binding, buffers))
+    if tile_k == 64 and tile_n == 128:
+        ws_launch = compile_mixed_trellis(**args, compact_weights=True,
+            warp_specialized=True, moe_block_size=32)
+        ws_buffers = make_mixed_trellis_buffers(ws_launch, device=device, sms=props.multi_processor_count)
+        ws_binding = bind_mixed_trellis(*compact_tiers, mapping, compact_descriptor, rotations, ws_launch)
+        plans.append((ws_binding, ws_buffers))
     # Fail before launch for an offset table that would address outside its bank.
     broken = compact_descriptor.clone()
     broken[4 * 4] += 4
@@ -145,12 +151,15 @@ def test_compact_true_width_weights_match_padded_control(intermediate, tile_k, a
             graphs.append(graph)
             outputs.append(out)
         for _ in range(3):
-            plans[1][1].fc1.fill_(float("nan"))
+            for _, buffers in plans[1:]:
+                buffers.fc1.fill_(float("nan"))
             x.mul_(-.75)
             for graph in graphs:
                 graph.replay()
             torch.cuda.synchronize()
-            ref, got = outputs
+            ref, got = outputs[:2]
+            if len(outputs) == 3:
+                assert torch.equal(got[:rows], outputs[2][:rows])
             assert torch.isfinite(ref[:rows]).all() and ref[:rows].abs().max() > 0
             assert torch.isfinite(got[:rows]).all()
             error = float((got[:rows].float() - ref[:rows].float()).abs().max() / ref[:rows].float().abs().max())

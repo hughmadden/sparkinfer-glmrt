@@ -141,3 +141,26 @@ def test_prefill_kimi_routes_preserve_high_expert_ids(tmp_path):
     path = tmp_path / "routes.json"
     path.write_text(bench.json.dumps(dict(schema=1, family="kimik3", experts=896, top_k=16, waves=[wave])))
     assert bench.prefill_route_waves(path, "kimik3", 23) == [wave]
+
+
+def test_compact_prefill_fixture_requires_complete_ownership(tmp_path):
+    bench = _load_benchmark_module()
+    entries = [dict(global_expert=e, combined_local=e, width=128,
+                    projections=[dict(projection=p, tier=0, bits=4,
+                                      tier_local=e, payload_word_offset=0)
+                                 for p in ("gate", "up", "down")]) for e in range(512)]
+    rank = dict(rank=0, compiled_max_intermediate=256, experts=entries,
+                projection_counts=[[512, 512, 512], [0, 0, 0]], unit_map_fingerprint="test")
+    path = tmp_path / "ownership.json"
+    path.write_text(bench.json.dumps(dict(ranks=[rank])))
+    assert len(bench.compact_prefill_fixture(path, 0, "qwen4", 256)["entries"]) == 512
+    with pytest.raises(ValueError, match="requested rank"):
+        bench.compact_prefill_fixture(path, 1, "qwen4", 256)
+    with pytest.raises(ValueError, match="requires Qwen"):
+        bench.compact_prefill_fixture(path, 0, "kimik3", 256)
+    with pytest.raises(ValueError, match="geometry"):
+        bench.compact_prefill_fixture(path, 0, "qwen4", 128)
+    entries[0]["width"] = 129
+    path.write_text(bench.json.dumps(dict(ranks=[rank])))
+    with pytest.raises(ValueError, match="live width"):
+        bench.compact_prefill_fixture(path, 0, "qwen4", 256)

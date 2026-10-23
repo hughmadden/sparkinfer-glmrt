@@ -778,6 +778,78 @@ def _make_prefill_layer(family, width, seed, device):
     return *tiers, mapping, descriptor, combine_trellis_rotations(*tiers)
 
 
+def compact_prefill_fixture(path, rank, family, width):
+    """Validate a planner-replayed ownership fixture, not a synthetic partition."""
+    if family != "qwen4":
+        raise ValueError("compact prefill fixture currently requires Qwen")
+    data = json.loads(Path(path).read_text())
+    matches = [item for item in data["ranks"] if item["rank"] == rank]
+    if len(matches) != 1:
+        raise ValueError("compact fixture must contain the requested rank exactly once")
+    selected = matches[0]
+    entries = sorted(selected["experts"], key=lambda e: e["combined_local"])
+    if (selected["compiled_max_intermediate"] != width or len(entries) != 512
+            or [e["combined_local"] for e in entries] != list(range(512))
+            or sorted(e["global_expert"] for e in entries) != list(range(512))):
+        raise ValueError("compact fixture geometry or expert namespace mismatch")
+    for e in entries:
+        if e["width"] not in range(128, width + 1, 128):
+            raise ValueError("compact fixture has invalid live width")
+        if [p["projection"] for p in e["projections"]] != ["gate", "up", "down"]:
+            raise ValueError("compact fixture requires ordered gate/up/down projections")
+        for projection in e["projections"]:
+            if projection["tier"] not in (0, 1) or projection["bits"] != 4 + projection["tier"]:
+                raise ValueError("compact fixture tier/bit mismatch")
+    return dict(rank=rank, entries=entries, counts=selected["projection_counts"],
+                fingerprint=selected["unit_map_fingerprint"])
+
+
+def _make_compact_prefill_layer(fixture, width, seed, device, mix):
+    hidden, experts, _, bits, _ = PREFILL_FAMILIES["qwen4"]
+    # Serving exports reserve E slots per tier, independently of projection counts.
+    total = 2 * experts
+    rows = [[-1] * total for _ in range(3)]
+    widths = [-1] * total
+    mapping = [-1] * experts
+    for e in fixture["entries"]:
+        local = e["combined_local"]
+        widths[local] = e["width"]
+        mapping[e["global_expert"]] = local
+        for p, projection in enumerate(e["projections"]):
+            rows[p][local] = (projection["tier"] << 9) | projection["tier_local"]
+    canonical, payloads, counts = mix._compact_trellis_layout(
+        [*rows, widths], hidden_size=hidden, intermediate_size=width, bits=bits)
+    if [list(c) for c in counts] != fixture["counts"]:
+        raise ValueError("compact fixture projection counts disagree")
+    for e in fixture["entries"]:
+        for p, projection in enumerate(e["projections"]):
+            if canonical[4 + p][e["combined_local"]] != projection["payload_word_offset"]:
+                raise ValueError("compact fixture payload offset is not canonical")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    tiers = []
+    for tier, bit in enumerate(bits):
+        template = prepare_trellis256_moe_weights(
+            hidden_size=hidden, intermediate_size=width, num_experts=1,
+            activation="silu", fc1_tile_n=128, fc2_tile_n=128, device=device,
+            seed=seed + tier, params_dtype=torch.float16, w13_layout="trellis_t256_proj",
+            trellis_bits=bit, codebook="mcg", tile_config=(64, 128, 64, 128))
+        def packed(size):
+            return torch.randint(-(1 << 31), 1 << 31, (max(size, 4),),
+                                 generator=generator, device=device, dtype=torch.int32)
+        tiers.append(replace(template, num_experts=experts,
+            w13=packed(payloads[tier][0]), w2=packed(payloads[tier][1]),
+            w13_global_scale=template.w13_global_scale.repeat(experts),
+            w2_global_scale=template.w2_global_scale.repeat(counts[tier][2])))
+    def scales(size):
+        return (0.875 + 0.25 * torch.rand(size, generator=generator, device=device)).half()
+    rotations = mix.MixedTrellisRotations(
+        scales(total * 3 * width), scales(total * hidden),
+        scales(total * hidden), scales(total * hidden))
+    descriptor = torch.tensor(canonical, dtype=torch.int32, device=device).flatten()
+    descriptor._mt_projection_counts = (tuple(c[0] for c in counts), tuple(c[1] for c in counts))
+    return (*tiers, torch.tensor(mapping, dtype=torch.int32, device=device), descriptor, rotations)
+
+
 def prefill_compile_options(family, width, block, mode, props):
     hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
     if width <= 0 or width % 128 or (family == "kimik3" and width != 512):
@@ -826,13 +898,23 @@ def _run_prefill_benchmark(args, device, props):
         bundle = materialize_k4_arm(args.prefill_revision,
                                    Path(tempfile.mkdtemp(prefix="family-prefill-")))
     mix, provenance = load_k4_arm(bundle)
-    layers = [_make_prefill_layer(family, width, args.seed + 2*i, device)
+    compact = (compact_prefill_fixture(args.compact_fixture, args.compact_rank, family, width)
+               if args.compact_fixture else None)
+    layers = [(_make_compact_prefill_layer(compact, width, args.seed + 2*i, device, mix)
+               if compact else _make_prefill_layer(family, width, args.seed + 2*i, device))
               for i in range(args.layers)]
     states = {}
     for name, block, mode in specs:
-        launch = mix.compile_mixed_trellis(**prefill_compile_options(family, width, block, mode, props))
+        options = prefill_compile_options(family, width, block, mode, props)
+        if compact:
+            options.update(tier0_num_experts=experts, tier1_num_experts=experts,
+                           force_tile_config=(64, 128, 64, 128), compact_weights=True)
+        launch = mix.compile_mixed_trellis(**options)
         workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
         bounds = dict(gate_experts=(896, 0), up_experts=(896, 0)) if family == "kimik3" else {}
+        if compact:
+            bounds = dict(gate_experts=tuple(c[0] for c in compact["counts"]),
+                          up_experts=tuple(c[1] for c in compact["counts"]))
         bindings = [mix.bind_mixed_trellis(*layer, launch, **bounds) for layer in layers]
         mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
         states[name] = workspace, bindings
@@ -854,16 +936,43 @@ def _run_prefill_benchmark(args, device, props):
     checked = list(range(1, 4097)) if args.prefill_exhaustive else sorted({1, 17, 63, 64, 65, 4096, *rows_list})
     records = []
     with kernel_resolution_guard("family prefill bitwise and frozen timing"):
-        full = run(names[0], 4096).clone()
-        if not bool(torch.isfinite(full).all()) or not bool(full.any()):
-            raise RuntimeError("reference output is not finite and nonzero")
-        for rows in checked:
-            expected = run(names[0], rows).clone()
-            if not torch.equal(expected.view(torch.int16), full[:rows].view(torch.int16)):
-                raise RuntimeError(f"reference prefix invariance failed at {rows}")
-            for name in names[1:]:
-                if not torch.equal(run(name, rows).view(torch.int16), expected.view(torch.int16)):
-                    raise RuntimeError(f"prefill arm {name} differs at {rows}")
+        if compact:
+            for workspace, _ in states.values():
+                workspace.fc1.fill_(float("nan"))
+                workspace.activated.fill_(float("nan"))
+        for layer in range(args.layers if compact else 1):
+            full = run(names[0], 4096, layer).clone()
+            if not bool(torch.isfinite(full).all()) or not bool(full.any()):
+                raise RuntimeError("reference output is not finite and nonzero")
+            for rows in checked:
+                expected = run(names[0], rows, layer).clone()
+                if not torch.equal(expected.view(torch.int16), full[:rows].view(torch.int16)):
+                    raise RuntimeError(f"reference prefix invariance failed at {rows}, layer {layer}")
+                for name in names[1:]:
+                    if not torch.equal(run(name, rows, layer).view(torch.int16), expected.view(torch.int16)):
+                        raise RuntimeError(f"prefill arm {name} differs at {rows}, layer {layer}")
+        if compact:
+            original_x = x.clone()
+            for rows in rows_list:
+                for layer in range(args.layers):
+                    outputs = {}
+                    def replay_call(name):
+                        outputs[name] = run(name, rows, layer)
+                    graphs = {name: _capture(lambda name=name: replay_call(name), 3) for name in names}
+                    for _ in range(3):
+                        x.mul_(-0.75)
+                        for workspace, _bindings in states.values():
+                            workspace.fc1.fill_(float("nan"))
+                            workspace.activated.fill_(float("nan"))
+                        for graph in graphs.values():
+                            graph.replay()
+                        reference = outputs[names[0]].clone()
+                        if not bool(torch.isfinite(reference).all()):
+                            raise RuntimeError("compact poisoned reference is nonfinite")
+                        for name in names[1:]:
+                            if not torch.equal(reference.view(torch.int16), outputs[name].view(torch.int16)):
+                                raise RuntimeError(f"compact poisoned graph differs: {name}, rows {rows}, layer {layer}")
+            x.copy_(original_x)
         for rows in rows_list:
             for layer in range(args.layers):
                 expected = run(names[0], rows, layer).clone()
@@ -889,7 +998,11 @@ def _run_prefill_benchmark(args, device, props):
             records.append(record)
             print(json.dumps(record), flush=True)
     result = dict(schema=1, family=family, intermediate=width, arms=specs, source=provenance,
-        fixture="synthetic weights; K4/K5 expert split 384/128" if family == "qwen4" else "synthetic uniform K2 with dormant K3",
+        fixture=("synthetic weights; actual compact ownership" if compact else
+                 "synthetic weights; K4/K5 expert split 384/128" if family == "qwen4"
+                 else "synthetic uniform K2 with dormant K3"),
+        compact_rank=compact["rank"] if compact else None,
+        compact_sha256=hashlib.sha256(args.compact_fixture.read_bytes()).hexdigest() if compact else None,
         routes="recorded histograms" if waves else "uniform random; correctness only",
         route_sha256=hashlib.sha256(args.routes.read_bytes()).hexdigest() if waves else None,
         route_layer=args.route_layer, checked_rows=len(checked), exact=True, rows=records)
@@ -937,6 +1050,8 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--prefill-family", choices=tuple(PREFILL_FAMILIES))
+    parser.add_argument("--compact-fixture", type=Path, help="planner-replayed compact ownership JSON")
+    parser.add_argument("--compact-rank", type=int, default=0)
     parser.add_argument("--prefill-arm", action="append", type=parse_prefill_arm, default=[])
     parser.add_argument("--intermediate", type=int, help="per-rank H128 width, default Qwen256/Kimi512")
     parser.add_argument("--routes", type=Path, help="family-labelled recorded histogram JSON; absent means correctness only")

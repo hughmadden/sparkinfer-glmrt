@@ -359,7 +359,7 @@ def _e4m3x4_scaled_to_f16x4(packed: Uint32, scale_bits: Uint32, *, loc=None, ip=
 class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     """Warp-specialized two-tier mixed Trellis for packed-route prefill."""
 
-    WS_ABI_VERSION = 3
+    WS_ABI_VERSION = 4
 
     def __init__(
         self,
@@ -374,8 +374,10 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         input_stages: int | None = None,
         dynamic_tiles: bool = False,
         activations: str = "a16",
+        compact_weights: bool = False,
     ):
-        super().__init__(driver=driver, tier0=tier0, tier1=tier1, descriptor_bits=descriptor_bits)
+        super().__init__(driver=driver, tier0=tier0, tier1=tier1,
+                         descriptor_bits=descriptor_bits, compact_weights=compact_weights)
         d = driver
         if activations not in ("a16", "a8"):
             raise ValueError(f"unsupported EXL3 activations {activations!r}")
@@ -416,6 +418,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         if ws_tile_n is None:
             ws_tile_n = (int(d.fc1.tile_n), int(d.fc1.tile_n))
         tile_fc1, tile_fc2 = (int(v) for v in ws_tile_n)
+        if compact_weights and (tile_fc1 != 128 or activations != "a16"):
+            raise ValueError("compact WS requires H128 N tiles and A16 activations")
         if tile_fc1 not in (128, 192, 256) or tile_fc2 not in (128, 192, 256):
             raise ValueError("warp-specialized mixed Trellis needs 128/192/256-wide N tiles")
         if int(d.fc1.tile_k) != 64 or int(d.fc2.tile_k) != 64:
@@ -608,11 +612,20 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         t1_w13 = flat(t1_w13_ptr, tier1_gate * h16 * fc1_n16 * b1)
         t0_w2 = flat(t0_w2_ptr, tier0_fc2 * i16 * h16 * b0)
         t1_w2 = flat(t1_w2_ptr, tier1_fc2 * i16 * h16 * b1)
+        if cutlass.const_expr(self.compact_weights):
+            # Only the base pointer is used; binding validates exact compact payload lengths.
+            t0_w13 = flat(t0_w13_ptr, cutlass.Int64(1))
+            t1_w13 = flat(t1_w13_ptr, cutlass.Int64(1))
+            t0_w2 = flat(t0_w2_ptr, cutlass.Int64(1))
+            t1_w2 = flat(t1_w2_ptr, cutlass.Int64(1))
         t0_w13_global = flat(t0_w13_global_ptr, tier0_experts)
         t1_w13_global = flat(t1_w13_global_ptr, tier1_experts)
         t0_w2_global = flat(t0_w2_global_ptr, tier0_fc2)
         t1_w2_global = flat(t1_w2_global_ptr, tier1_fc2)
-        descriptor_map = flat(descriptor_map_ptr, cutlass.Int64(3) * total_experts)
+        descriptor_map = flat(
+            descriptor_map_ptr,
+            cutlass.Int64(self.COMPACT_DESCRIPTOR_ROWS if self.compact_weights else 3) * total_experts,
+        )
         intermediate_rotations = flat(
             intermediate_rotations_ptr,
             total_experts * cutlass.Int64(3 * self.intermediate_size),
@@ -994,7 +1007,20 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 if d_tier == Int32(1) and d_local < bound1:
                     tier = Int32(1)
                     local = d_local
+                if cutlass.const_expr(self.compact_weights and is_fc1):
+                    width = descriptor_map[Int64(3) * Int64(total) + Int64(combined)].to(Int32)
+                    if nt % (n_tiles // Int32(2)) >= width // Int32(self.ws_n):
+                        tier = Int32(-1)
         return rb, nt, combined, tier, local
+
+    @cute.jit
+    def _ws_live_k(self, is_fc1: cutlass.Constexpr, combined: Int32,
+                   descriptor_map: cute.Tensor, total: Int32):
+        size = Int32(self.hidden_size if is_fc1 else self.intermediate_size)
+        if cutlass.const_expr(self.compact_weights and not is_fc1):
+            if combined >= Int32(0) and combined < total:
+                size = descriptor_map[Int64(3) * Int64(total) + Int64(combined)].to(Int32)
+        return size
 
     @cute.jit
     def _ws_next_claim(
@@ -1110,6 +1136,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         t1_w: cute.Tensor,
         tier0_lo_experts: Int32,
         tier1_lo_experts: Int32,
+        combined: Int32,
+        descriptor_map: cute.Tensor,
+        total_experts: Int32,
     ):
         """(byte address of the tile's first K16 weight row, K16 row stride in
         bytes, bytes of one tile row). The tile's N16 records of one K16 row
@@ -1123,6 +1152,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             gate_count = tier1_lo_experts
         tile_u32 = Int64(8) * bits.to(Int64)
         row_bytes = Int32(self.ws_n16 * 32) * bits
+        local_n16 = Int64(0)
         if cutlass.const_expr(is_fc1):
             # Projection-major W13: [gate plane | up plane], each [E, K16, N16/2].
             half_n16 = Int64(n_total // 32)
@@ -1145,6 +1175,20 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 + Int64(nt) * Int64(self.ws_n16) * tile_u32
             )
             stride_u32 = n16_total * tile_u32
+        if cutlass.const_expr(self.compact_weights):
+            # Payload offsets are projection-local; activation rows retain max-I strides.
+            if combined >= Int32(0) and combined < total_experts:
+                projection = Int64(2)
+                local_n16 = Int64(nt) * Int64(self.ws_n16)
+                if cutlass.const_expr(is_fc1):
+                    projection = Int64(0)
+                    if nt >= n_tiles // Int32(2):
+                        projection = Int64(1)
+                        local_n16 -= Int64(n_total // 32)
+                    width = descriptor_map[Int64(3) * Int64(total_experts) + Int64(combined)].to(Int64)
+                    stride_u32 = (width // Int64(16)) * tile_u32
+                offset = descriptor_map[(projection + Int64(4)) * Int64(total_experts) + Int64(combined)].to(Int64)
+                first_u32 = offset + local_n16 * tile_u32
         if cutlass.const_expr("w_l2" in self.ws_exp):
             first_u32 = Int64(0)
         return wbase + first_u32 * Int64(4), stride_u32 * Int64(4), row_bytes
@@ -1592,6 +1636,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         packed_route_indices: cute.Tensor,
         live: Int32,
         ptid: Int32,
+        live_k: Int32,
     ):
         """Write tile ``ti``'s header (valid rows or -1 for the end, route
         block, N tile, tier, global scale) and route ids into the tile ring."""
@@ -1607,6 +1652,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             st_shared_i32(hdr + Int32(8), nt)
             st_shared_i32(hdr + Int32(12), tier)
             st_shared_f32(hdr + Int32(16), scale)
+            if cutlass.const_expr(self.compact_weights):
+                st_shared_i32(hdr + Int32(20), live_k)
         if valid >= Int32(0) and ptid < Int32(self.ws_m):
             idx = packed_route_indices[rb * Int32(self.ws_m) + ptid].to(Int32)
             if idx >= live:
@@ -1658,8 +1705,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(self.ws_m)
         total_tiles = route_blocks * n_tiles
         live = active_m * Int32(self.top_k)
-        units_per_tile = Int32(k_size // 64)
-        blocks_per_tile = Int32(k_size // 128)
+        total_experts = tier0_num_experts + tier1_num_experts
         na = self.ws_a_stages
         nc = self.ws_bc_stages
         meta = (
@@ -1685,10 +1731,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         jc, nclaimed, ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_claim(
             is_fc1, Int32(0), nclaimed, *claim, *meta
         )
+        c_units = self._ws_live_k(is_fc1, _ccomb, descriptor_map, total_experts) // Int32(64)
         cu = Int32(0)
         crow0, cstride, crow_bytes = self._ws_weight_row(
             is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
-            tier0_lo_experts, tier1_lo_experts,
+            tier0_lo_experts, tier1_lo_experts, _ccomb, descriptor_map, total_experts,
         )
         clast = Int32(0)
         if ct < total_tiles:
@@ -1700,7 +1747,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     self._ws_issue_bc(base, Int32(i), cu, crow0, cstride, crow_bytes, clast)
                 bc_issued += Int32(1)
                 cu += Int32(1)
-                if cu == units_per_tile:
+                if cu == c_units:
                     cu = Int32(0)
                     jc, nclaimed, ct, _crb, cnt, _ccomb, ctier, clocal = self._ws_next_claim(
                         is_fc1, jc, nclaimed, *claim, *meta
@@ -1708,8 +1755,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     if ct < total_tiles:
                         crow0, cstride, crow_bytes = self._ws_weight_row(
                             is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
-                            tier0_lo_experts, tier1_lo_experts,
+                            tier0_lo_experts, tier1_lo_experts, _ccomb, descriptor_map, total_experts,
                         )
+                        c_units = self._ws_live_k(is_fc1, _ccomb, descriptor_map, total_experts) // Int32(64)
                         clast = self._ws_last_block(block_expert_ids, _crb, route_blocks)
 
         # Input-row cursor and prologue.
@@ -1717,6 +1765,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         ja, nclaimed, at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_claim(
             is_fc1, Int32(0), nclaimed, *claim, *meta
         )
+        a_blocks = self._ws_live_k(is_fc1, _acomb, descriptor_map, total_experts) // Int32(128)
         ab = Int32(0)
         if at < total_tiles:
             self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
@@ -1729,12 +1778,13 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 )
                 a_issued += Int32(1)
                 ab += Int32(1)
-                if ab == blocks_per_tile:
+                if ab == a_blocks:
                     ab = Int32(0)
                     ja, nclaimed, at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_claim(
                         is_fc1, ja, nclaimed, *claim, *meta
                     )
                     if at < total_tiles:
+                        a_blocks = self._ws_live_k(is_fc1, _acomb, descriptor_map, total_experts) // Int32(128)
                         self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
 
         # Block cursor.
@@ -1745,6 +1795,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         ti = Int32(0)
         suh_next = cute.make_rmem_tensor((4,), Uint32)
         while dt < total_tiles:
+            live_k = self._ws_live_k(is_fc1, dcomb, descriptor_map, total_experts)
+            blocks_per_tile = live_k // Int32(128)
             dvalid = self._ws_valid_rows(packed_route_indices, drb, live, lane)
             scale = cutlass.Float32(0.0)
             if dtier == Int32(1):
@@ -1752,7 +1804,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             else:
                 scale = t0_global[dlocal].to(cutlass.Float32)
             self._ws_publish_tile(
-                base, ti, dvalid, drb, dnt, dtier, scale, packed_route_indices, live, ptid
+                base, ti, dvalid, drb, dnt, dtier, scale, packed_route_indices, live, ptid, live_k
             )
             ti += Int32(1)
             suh_addr = Int64(0)
@@ -1805,12 +1857,13 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         )
                         a_issued += Int32(1)
                         ab += Int32(1)
-                        if ab == blocks_per_tile:
+                        if ab == a_blocks:
                             ab = Int32(0)
                             ja, nclaimed, at, arb, _ant, _acomb, _atier, _alocal = (
                                 self._ws_next_claim(is_fc1, ja, nclaimed, *claim, *meta)
                             )
                             if at < total_tiles:
+                                a_blocks = self._ws_live_k(is_fc1, _acomb, descriptor_map, total_experts) // Int32(128)
                                 self._ws_load_rows(
                                     is_fc1, rows, packed_route_indices, arb, ptid, live
                                 )
@@ -1825,7 +1878,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                 self._ws_issue_bc(base, fill, cu, crow0, cstride, crow_bytes, clast)
                             bc_issued += Int32(1)
                             cu += Int32(1)
-                            if cu == units_per_tile:
+                            if cu == c_units:
                                 cu = Int32(0)
                                 jc, nclaimed, ct, _crb, cnt, _ccomb, ctier, clocal = (
                                     self._ws_next_claim(is_fc1, jc, nclaimed, *claim, *meta)
@@ -1834,7 +1887,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                     crow0, cstride, crow_bytes = self._ws_weight_row(
                                         is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier,
                                         t0_w, t1_w, tier0_lo_experts, tier1_lo_experts,
+                                        _ccomb, descriptor_map, total_experts,
                                     )
+                                    c_units = self._ws_live_k(is_fc1, _ccomb, descriptor_map, total_experts) // Int32(64)
                                     clast = self._ws_last_block(
                                         block_expert_ids, _crb, route_blocks
                                     )
@@ -1846,7 +1901,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         # End of the CTA's tiles.
         self._ws_publish_tile(
             base, ti, Int32(-1), Int32(0), Int32(0), Int32(0), cutlass.Float32(0.0),
-            packed_route_indices, live, ptid,
+            packed_route_indices, live, ptid, Int32(0),
         )
         if cutlass.const_expr(self.ws_dynamic):
             # Every CTA's claims precede its arrival (acq_rel); the last CTA
@@ -1906,7 +1961,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         is_fc1: cutlass.Constexpr,
         tier_idx: cutlass.Constexpr,
         active: cutlass.Constexpr,
-        k_size: cutlass.Constexpr,
+        k_size: Int32,
         acc,
         base: Int32,
         lut_addr: Int64,
@@ -2236,6 +2291,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 nt = ld_shared_i32_relaxed(hdr + Int32(8))
                 tier = ld_shared_i32_relaxed(hdr + Int32(12))
                 scale = ld_shared_f32(hdr + Int32(16))
+                live_k = Int32(k_size)
+                if cutlass.const_expr(self.compact_weights):
+                    live_k = ld_shared_i32_relaxed(hdr + Int32(20))
                 for i in cutlass.range_constexpr(n_acc):
                     acc[i][0] = cutlass.Float32(0.0)
                 occupied = (valid + Int32(15)) // Int32(16)
@@ -2268,11 +2326,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         else:
                             if tier == Int32(0):
                                 step, blk = self._ws_kloop(
-                                    is_fc1, 0, active, k_size, acc, base, lut_addr, tid, step, blk
+                                    is_fc1, 0, active, live_k, acc, base, lut_addr, tid, step, blk
                                 )
                             else:
                                 step, blk = self._ws_kloop(
-                                    is_fc1, 1, active, k_size, acc, base, lut_addr, tid, step, blk
+                                    is_fc1, 1, active, live_k, acc, base, lut_addr, tid, step, blk
                                 )
                             self._ws_store(
                                 active, n_total, acc, tid, hdr, nt, valid, scale, c_out
