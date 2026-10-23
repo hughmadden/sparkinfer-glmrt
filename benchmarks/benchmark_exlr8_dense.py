@@ -216,13 +216,89 @@ def spill_check(program, directory):
     return records
 
 
+def benchmark_unpacked(args):
+    """Sanctioned trellis-only FP8 unpack arm, sharing the existing graph timer."""
+    from b12x.integration.cuteafd.trellis_unpack import compile_trellis_unpack_e4m3_aot
+    from b12x.integration.cuteafd.native_dense import compile_trellis_fp8_prefill_aot
+    rows_list = [int(v) for v in args.rows.split(",")]
+    if any(r < 1 or r > 4096 for r in rows_list) or args.replays < 1 or args.output is None:
+        raise ValueError("unpacked arm requires output, rows in 1..4096 and positive replays")
+    shapes = [s for s in SHAPES if s[0] == "trellis"]
+    shapes += [(fmt, op + "_tp2", k if side == 1 else k//2,
+                n//2 if side == 1 else n, side) for fmt, op, k, n, side in shapes]
+    if args.shapes:
+        names = set(args.shapes.split(","))
+        shapes = [s for s in shapes if s[1] in names]
+    if not shapes:
+        raise ValueError("empty trellis shape selection")
+    torch.manual_seed(408)
+    props = torch.cuda.get_device_properties(0)
+    report = dict(device=props.name, sms=props.multi_processor_count,
+        revision=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        scope="synthetic native K4/e4m3; already-rotated input; one-time unpack reported separately",
+        measurements=[])
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    for _, op, k, n, side in shapes:
+        capacity = max(rows_list)
+        storage, read_bytes = native_tensors("trellis", k, n, capacity)
+        inputs, payload, scales, partial, native, x16 = storage
+        x = x16.bfloat16()
+        x16.copy_(x)
+        weight = torch.empty((n, k), dtype=torch.uint8, device="cuda")
+        unit_grid = torch.ones((n//128, k//128), device="cuda")
+        output = torch.empty_like(native)
+        unpack = compile_trellis_unpack_e4m3_aot(input_features=k, output_features=n, sharded_side=side)
+        gemm = compile_trellis_fp8_prefill_aot(input_features=k, output_features=n)
+        core = compile_native("trellis", k, n, side)
+        unpack_graph = capture(lambda: unpack.launch(payload, weight))
+        finite_nonzero(weight.view(torch.float8_e4m3fn).float(), "unpacked E4M3")
+        unpack_us = timing(unpack_graph, args.replays)
+        for rows in rows_list:
+            scalars = (rows, 0, props.multi_processor_count*4)
+            native_graph = capture(lambda: core.launch(inputs, payload, scales, partial, native, scalars=scalars))
+            gemm_graph = capture(lambda: gemm.launch(x, weight, unit_grid, output, scalars=(rows,)))
+            finite_nonzero(native[:rows], "native trellis")
+            finite_nonzero(output[:rows], "unpacked FP8 GEMM")
+            # The unit and synthetic CPU-oracle tests gate every unpacked byte.
+            # Here check the actual full-shape GEMM against native and an FP64 slice.
+            columns = min(n, 128)
+            target = x[:rows].double() @ weight[:columns].view(torch.float8_e4m3fn).double().T
+            bf16 = (x[:rows] @ weight[:columns].view(torch.float8_e4m3fn).bfloat16().T).double()
+            bound = 1.01*torch.linalg.vector_norm(bf16-target)
+            native_error = torch.linalg.vector_norm(native[:rows, :columns].double()-target)
+            gemm_error = torch.linalg.vector_norm(output[:rows, :columns].double()-target)
+            passed = bool(native_error <= bound and gemm_error <= bound)
+            native_us, gemm_us = timing(native_graph, 1), timing(gemm_graph, args.replays)
+            base_graph, keep, count = baseline(k, n, rows, a16=True)
+            base_us = timing(base_graph, args.replays)/count
+            total = unpack_us + gemm_us
+            delta = output[:rows].double()-native[:rows].double()
+            relative_l2 = (torch.linalg.vector_norm(delta)/torch.linalg.vector_norm(native[:rows].double())).item()
+            record = dict(projection=op, k=k, n=n, side=side, rows=rows,
+                unpack_us=unpack_us, gemm_us=gemm_us, unpack_plus_gemm_us=total,
+                native_us=native_us, w8a16_us=base_us, fp64_pass=passed,
+                native_fp64_error=native_error.item(), gemm_fp64_error=gemm_error.item(),
+                fp64_bound=bound.item(), relative_l2=relative_l2,
+                speedup_vs_native=native_us/total, speedup_vs_w8a16=base_us/total,
+                gemm_speedup_vs_w8a16=base_us/gemm_us, read_bytes=read_bytes)
+            report["measurements"].append(record)
+            args.output.write_text(json.dumps(report, indent=2)+"\n")
+            print(json.dumps(record), flush=True)
+            del native_graph, gemm_graph, base_graph, keep, target, bf16, delta
+            if not passed:
+                raise RuntimeError(f"{op} rows={rows}: FP64 gate failed")
+        del unpack_graph, storage, inputs, payload, scales, partial, native, x16, x, weight, unit_grid, output
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--arm", action="append", required=True, help="NAME=git-rev; repeatable")
-    parser.add_argument("--arm-bundle", type=Path, required=True)
+    parser.add_argument("--unpacked-trellis", action="store_true", help="measure exact E4M3 unpack plus F32 W8A16 at full/TP2 trellis shapes")
+    parser.add_argument("--arm", action="append", help="NAME=git-rev; repeatable")
+    parser.add_argument("--arm-bundle", type=Path)
     parser.add_argument("--materialize-only", action="store_true", help="host-side git show, no CUDA")
-    parser.add_argument("--reference", required=True)
+    parser.add_argument("--reference")
     parser.add_argument("--op-reference", action="append", default=[], help="FORMAT/OP=ARM frozen route")
     parser.add_argument("--accuracy-reference", help="arm whose FP64 error defines the 1.01x ceiling")
     parser.add_argument("--require-reference-arm", action="append", default=[], help="arm required to match the selected frozen op reference")
@@ -235,6 +311,10 @@ def main():
     parser.add_argument("--profile-op", help="FORMAT/OP")
     parser.add_argument("--profile-rows", type=int)
     args = parser.parse_args()
+    if args.unpacked_trellis:
+        return benchmark_unpacked(args)
+    if not args.arm or args.arm_bundle is None or args.reference is None:
+        parser.error("multi-arm scaled dense requires --arm, --arm-bundle and --reference")
     arms = parse_arms(args.arm)
     try:
         op_references = parse_references(args.reference, args.op_reference, arms)
