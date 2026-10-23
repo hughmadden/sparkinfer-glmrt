@@ -166,13 +166,14 @@ def compile_qwen_dense_gdn_fp8_aot(g: QwenDenseGeometry = QWEN38_27B, *, max_row
 
 
 class _Producer:
-    def __init__(self, g: QwenDenseGeometry, rows: int):
-        self.g = g
+    def __init__(self, g: QwenDenseGeometry, rows: int, kv_format: str = "bf16"):
+        g.kv_record_bytes(kv_format)
+        self.g, self.kv_format = g, kv_format
         self.proj = _projection(g.attn_in_width, g.hidden, rows)
-        self.post = Qwen4AttnPost(g, indexed=False)
+        self.post = Qwen4AttnPost(g, kv_format=kv_format, indexed=False)
 
     def key(self):
-        return (self.g, self.proj.key(), "unrestricted")
+        return (self.g, self.kv_format, self.proj.key(), "unrestricted")
 
     def scratch_bytes(self, rows: int):
         return _align(max(rows, 1) * self.g.attn_in_width * 2) + self.proj.prefill_scratch_bytes(rows)
@@ -190,8 +191,10 @@ class _Producer:
                   query, query, gate, query, rows, stream)
 
 
-def compile_qwen_dense_producer_fp8_aot(g: QwenDenseGeometry = QWEN38_27B, *, max_rows: int):
-    launch = _Producer(g, max_rows)
+def compile_qwen_dense_producer_fp8_aot(g: QwenDenseGeometry = QWEN38_27B, *, max_rows: int,
+                                      kv_format: str = "bf16"):
+    record_bytes = g.kv_record_bytes(kv_format)
+    launch = _Producer(g, max_rows, kv_format)
     return compile_program(launch, name="qwen_dense_producer_fp8", operands=(
         Operand("x", torch.bfloat16, f"[rows,{g.hidden}]"),
         *fp8_only_operands("w_in", g.attn_in_width, g.hidden, prefill=_prefill(max_rows)),
@@ -199,14 +202,14 @@ def compile_qwen_dense_producer_fp8_aot(g: QwenDenseGeometry = QWEN38_27B, *, ma
         Operand("k_norm", torch.bfloat16, f"[{g.head_dim}]"),
         Operand("rope_positions", torch.int32, "[rows,3]", align=4),
         Operand("kv_slots", torch.int64, "[rows]", align=8),
-        Operand("kv_cache", torch.uint8, f"[record_slots,{g.record_bytes}]", "inout"),
+        Operand("kv_cache", torch.uint8, f"[record_slots,{record_bytes}]", "inout"),
         Operand("query", torch.bfloat16, f"[rows,{g.heads},{g.head_dim}]", "out"),
         Operand("gate", torch.bfloat16, f"[rows,{g.heads * g.head_dim}]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch")),
         scalars=(Scalar("rows"),), key=(max_rows, launch.key()),
         geometry={**_geometry(g, max_rows), "heads": g.heads, "kv_heads": g.kv_heads,
-                  "head_dim": g.head_dim, "in_width": g.attn_in_width, "record_bytes": g.record_bytes,
-                  "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "indexed": False},
+                  "head_dim": g.head_dim, "in_width": g.attn_in_width, "record_bytes": record_bytes,
+                  "kv_format": kv_format, "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "indexed": False},
         scratch={"scratch": launch.scratch_bytes})
 
 
