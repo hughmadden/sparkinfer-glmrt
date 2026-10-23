@@ -162,3 +162,46 @@ def test_grouped_uniform_uses_serving_policy(monkeypatch, rows, block):
     assert calls["fused"]["full_rotation"]
     assert calls["fused"]["rotation_input_dtype"] == "bf16"
     assert calls["sum"]["full_rotation_output_dtype"] == "bf16"
+
+
+def test_k4_arm_materializes_all_sibling_dependencies(monkeypatch, tmp_path):
+    calls = []
+    def git(args):
+        calls.append(args[3:])
+        return (b'c' * 40 + b'\n') if args[3] == 'rev-parse' else args[-1].encode()
+    monkeypatch.setattr(bench.subprocess, 'check_output', git)
+    directory = bench.materialize_k4_arm('HEAD', tmp_path)
+    assert directory == tmp_path / ('c' * 40) / 'k4'
+    manifest = bench.json.loads((directory / 'manifest.json').read_text())
+    assert set(manifest['sources']) == set(bench.K4_ARM_MODULES)
+    assert all(call[1].startswith('c' * 40 + ':') for call in calls[1:])
+    for name, digest in manifest['sources'].items():
+        assert digest == bench.hashlib.sha256((directory / f'{name}.py').read_bytes()).hexdigest()
+    (directory / 'mixed_trellis_ws.py').write_text('tampered')
+    with pytest.raises(ValueError, match='digest mismatch'):
+        bench.load_k4_arm(directory)
+
+
+def test_k4_arm_isolates_revision_module_names(tmp_path):
+    packages = []
+    for revision in ('a' * 40, 'b' * 40):
+        directory = tmp_path / revision / 'k4'
+        directory.mkdir(parents=True)
+        manifest = dict(revision=revision, sources={})
+        for name in bench.K4_ARM_MODULES:
+            source = f'REVISION = {revision!r}\n'
+            (directory / f'{name}.py').write_text(source)
+            manifest['sources'][name] = bench.hashlib.sha256(source.encode()).hexdigest()
+        (directory / 'manifest.json').write_text(bench.json.dumps(manifest))
+        module, _ = bench.load_k4_arm(directory)
+        assert module.REVISION == revision
+        packages.append(module.__package__)
+    assert packages[0] != packages[1]
+
+
+@pytest.mark.parametrize('control,passes', [(100.5, True), (103.0, False)])
+def test_k4_identical_control_noise_gate(control, passes):
+    result = bench.k4_noise_summary(dict(base=[100, 100, 100],
+        base_control=[control] * 3, candidate=[90, 90, 90]), 'base')
+    assert result['noise_pass'] == passes
+    assert result['speedups']['candidate'] == pytest.approx(100 / 90)
