@@ -120,27 +120,73 @@ def compile_native(fmt, k, n, side):
 
 
 @contextlib.contextmanager
-def arm_source(name, arm, bundle):
-    """Patch only the imported dense class; compiled symbols and keys include its source."""
+def arm_source(name, arm, bundle, fmt="mxfp8"):
+    """Freeze the implementation package and restore every imported sibling."""
     import b12x.gemm.native_tile_linear as current
-    path = bundle / arm["path"]
-    spec = importlib.util.spec_from_file_location("dense_arm_" + name + "_" + arm["sha256"], path)
+    from benchmarks._exlr8_dense_arms import MODULE, TRELLIS
+    suffix = name + "_" + arm["sha256"]
+    integration = trellis_linear if fmt == "trellis" else scaled_linear
+    original_compile = integration.compile_program
+    saved = {}
+    parent = None
+    if fmt == "trellis":
+        import b12x.gemm as parent
+        package = "b12x.gemm.trellis_linear"
+        saved = {k: v for k, v in sys.modules.items() if k == package or k.startswith(package + ".")}
+        old_parent = getattr(parent, "trellis_linear", None)
+        for key in saved:
+            del sys.modules[key]
+        entry = arm["files"][TRELLIS + "/__init__.py"]
+        path = bundle / entry["path"]
+        spec = importlib.util.spec_from_file_location(package, path, submodule_search_locations=[str(path.parent)])
+    else:
+        entry = arm.get("files", {}).get(MODULE, arm)
+        path = bundle / entry["path"]
+        spec = importlib.util.spec_from_file_location("dense_arm_" + suffix, path)
     module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    original_class, original_compile = current.NativeTileLinear, scaled_linear.compile_program
 
     def compile_distinct(*args, **kwargs):
-        kwargs["name"] += "_" + name + "_" + arm["sha256"][:16]
+        kwargs["name"] += "_" + suffix[:len(name)+17]
         kwargs["key"] = program_key(arm, kwargs["key"])
         return original_compile(*args, **kwargs)
 
-    current.NativeTileLinear = module.NativeTileLinear
-    scaled_linear.compile_program = compile_distinct
+    original_class = current.NativeTileLinear
     try:
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        if fmt != "trellis":
+            current.NativeTileLinear = module.NativeTileLinear
+        integration.compile_program = compile_distinct
         yield
     finally:
-        current.NativeTileLinear, scaled_linear.compile_program = original_class, original_compile
+        integration.compile_program = original_compile
+        current.NativeTileLinear = original_class
+        if fmt == "trellis":
+            for key in list(sys.modules):
+                if key == package or key.startswith(package + "."):
+                    del sys.modules[key]
+            sys.modules.update(saved)
+            if old_parent is None:
+                if hasattr(parent, "trellis_linear"):
+                    delattr(parent, "trellis_linear")
+            else:
+                parent.trellis_linear = old_parent
+
+
+def trellis_reference(k, n, columns, side, payload, scales):
+    """Independent MSB-first CPU oracle, restricted to checked output units."""
+    import numpy as np
+    from tests._reference.native_trellis import Reference
+    ref = Reference("e4m3")
+    if side == 1:
+        raw = payload.flatten()[:columns*k//2].cpu().numpy()
+        weight = np.concatenate([ref.decode_unit(u.tobytes(), 4, "gate", k)
+                                 for u in raw.reshape(columns//128, -1)], axis=1)
+    else:
+        raw = payload.reshape(k//128, n//128, 8192)[:, :columns//128].contiguous().cpu().numpy()
+        weight = np.concatenate([ref.decode_unit(u.tobytes(), 4, "down", columns)
+                                 for u in raw], axis=0)
+    return (torch.from_numpy(weight).to(device="cuda") * scales.float().repeat_interleave(128)[:, None]).T.contiguous()
 
 
 def reference_weight(fmt, k, n, side, payload, scales):
@@ -464,17 +510,17 @@ def main():
     if accuracy_reference not in arms or set(args.require_reference_arm) - set(arms):
         parser.error("accuracy and required-reference arms must name an arm")
     if args.materialize_only:
-        materialize(Path(__file__).resolve().parents[1], args.arm_bundle, arms)
+        materialize(Path(__file__).resolve().parents[1], args.arm_bundle, arms, args.formats.split(","))
         return
-    arms = verify(args.arm_bundle, arms)
+    arms = verify(args.arm_bundle, arms, args.formats.split(","))
     if args.output is None:
         parser.error("--output is required for measurement")
     rows_list = [int(v) for v in args.rows.split(",")]
     if any(r < 1 or r > 4096 for r in rows_list) or args.replays < 1:
         parser.error("rows must be in 1..4096 and replays positive")
     formats = set(args.formats.split(","))
-    if formats - {"mxfp8", "int4_g32", "fp8_row"}:
-        parser.error("multi-arm dense core supports mxfp8, int4_g32 and fp8_row")
+    if formats - {"trellis", "mxfp8", "int4_g32", "fp8_row"}:
+        parser.error("multi-arm dense core supports trellis, mxfp8, int4_g32 and fp8_row")
     names = set(args.shapes.split(",")) if args.shapes else {s[1] for s in SHAPES}
     shapes = [s for s in SHAPES if s[0] in formats and s[1] in names]
     profile = any((args.profile_arm, args.profile_op, args.profile_rows))
@@ -496,36 +542,52 @@ def main():
     for fmt, op, k, n, side in shapes:
         programs, spills = {}, {}
         for name, arm in arms.items():
-            with arm_source(name, arm, args.arm_bundle), exportable_compilation():
+            with arm_source(name, arm, args.arm_bundle, fmt), exportable_compilation():
                 programs[name] = compile_native(fmt, k, n, side)
             spills[name] = spill_check(programs[name], args.output.parent / "cubins" / name / f"{fmt}-{op}")
         # All widths use exactly the same input prefix and weights. Each arm's
         # own prefill freezes its K order, independently of other arms' ordering.
-        storage, read_bytes = native_tensors(fmt, k, n, 4096, 0)
+        capacity = 64 if fmt == "trellis" and max(rows_list) <= 64 else 4096
+        storage, read_bytes = native_tensors(fmt, k, n, capacity, None if fmt == "trellis" else 0)
         tensors = storage[:5]
         columns = min(n, 256)
-        if side == 1:
+        if fmt == "trellis":
+            weight = trellis_reference(k, n, columns, side, tensors[1], tensors[2])
+        elif side == 1:
             payload = tensors[1].flatten()[:columns*k//(2 if fmt == "int4_g32" else 1)]
             scales = tensors[2][:columns if fmt == "fp8_row" else columns*k//32]
         else:
             payload = tensors[1].reshape(k//128, n, -1)[:, :columns].contiguous().flatten()
             scales = tensors[2].reshape(k//128, n, 4)[:, :columns].contiguous().flatten()
-        weight = reference_weight(fmt, k, columns, side, payload, scales)
+        if fmt != "trellis":
+            weight = reference_weight(fmt, k, columns, side, payload, scales)
         x = storage[-1]
         oracle = x.double() @ weight.double().T
-        bf16 = (x @ weight.bfloat16().T).double()
+        bf16 = (x.bfloat16() @ weight.bfloat16().T).double()
         prefixes, global_errors = {}, {}
+        def launch_scalars(rows):
+            return (rows, 0, limit) if fmt == "trellis" else (rows, limit)
+
+        invariance_all = {}
         for name, program in programs.items():
-            program.launch(*tensors, scalars=(4096, limit))
+            program.launch(*tensors, scalars=launch_scalars(capacity))
             torch.cuda.synchronize()
             prefixes[name] = tensors[-1][:64].clone()
             global_errors[name] = torch.linalg.vector_norm(tensors[-1][:, :columns].double()-oracle).item()
+            invariant = True
+            for count in range(1, 65):
+                tensors[-1].fill_(float("nan"))
+                program.launch(*tensors, scalars=launch_scalars(count))
+                torch.cuda.synchronize()
+                invariant &= torch.equal(prefixes[name][:count].view(torch.int32), tensors[-1][:count].view(torch.int32))
+                invariant &= bool(torch.isnan(tensors[-1][count:]).all())
+            invariance_all[name] = invariant
         global_bound = torch.linalg.vector_norm(bf16-oracle).item()
         global_pass = {name: error <= 1.01*global_errors[accuracy_reference] and error <= 1.01*global_bound
                        for name, error in global_errors.items()}
         selected_reference = op_references.get(f"{fmt}/{op}", args.reference)
         for rows in rows_list:
-            scalars = (rows, limit)
+            scalars = launch_scalars(rows)
             reference = programs[selected_reference]
             reference.launch(*tensors, scalars=scalars)
             torch.cuda.synchronize()
@@ -558,7 +620,8 @@ def main():
                 tail_untouched = torch.isnan(tensors[-1][rows:]).all().item()
                 error = torch.linalg.vector_norm(tensors[-1][:rows, :columns].double()-oracle[:rows]).item()
                 record = dict(arm=name, revision=arms[name]["revision"], format=fmt, projection=op,
-                              rows=rows, bitwise_equal=equal, row_invariant=invariant,
+                              rows=rows, bitwise_equal=equal, row_invariant=invariant and invariance_all[name],
+                              row_invariance_checked=list(range(1, 65)),
                               output_tail_untouched=tail_untouched, frozen_reference=selected_reference,
                               fp64_error=error, bf16_error=bound, accuracy_reference_error=reference_error,
                               global_fp64_error=global_errors[name],
@@ -568,7 +631,7 @@ def main():
                 # Different K-order groups may be eligible; required arms must
                 # additionally agree with the per-op frozen group reference.
                 record["spill_free"] = all(not any(r["local_bytes"] + r["stack_bytes"]) and not r["local_load_store_instructions"] for r in spills[name])
-                record["eligible"] = invariant and tail_untouched and record["fp64_pass"] and (equal or name not in args.require_reference_arm)
+                record["eligible"] = record["row_invariant"] and tail_untouched and record["spill_free"] and record["fp64_pass"] and (equal or name not in args.require_reference_arm)
                 if record["eligible"]:
                     launches = [lambda p=program: p.launch(*tensors, scalars=scalars)]
                     launches += [lambda w=w, s=s, p=program: p.launch(tensors[0], w, s, *tensors[3:], scalars=scalars) for w, s in extra]
