@@ -262,6 +262,14 @@ def spill_check(program, directory):
     return records
 
 
+def source_revision():
+    source = Path(__file__).resolve().parents[1]
+    if (source / ".git").exists():
+        return subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    # Release compiler sources are verified, metadata-free copies.
+    return json.loads((source.parent / "sparkinfer.lock.json").read_text())["revision"]
+
+
 def benchmark_unpacked(args):
     """Sanctioned trellis-only FP8 unpack arm, sharing the existing graph timer."""
     from b12x.integration.cuteafd.trellis_unpack import compile_trellis_unpack_e4m3_aot
@@ -280,7 +288,7 @@ def benchmark_unpacked(args):
     torch.manual_seed(408)
     props = torch.cuda.get_device_properties(0)
     report = dict(device=props.name, sms=props.multi_processor_count,
-        revision=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        revision=source_revision(),
         scope="synthetic native K4/e4m3; already-rotated input; one-time unpack reported separately",
         measurements=[])
     args.output.parent.mkdir(parents=True, exist_ok=True)
