@@ -1,6 +1,7 @@
 """MSA paged GQA pointer ABI: FP8 planar KV, D128, 64 Q / 4 KV heads.
 
-Selections retain a fixed [4,max_rows,16] allocation. Cache pages contain 64
+Selections retain a fixed [4,max_rows,16] allocation. pool_pages must fit
+signed Int32; physical page offsets use Int64. Cache pages contain 64
 rows; each selected 128-token block addresses two logical pages. Descales are
 per request and KV head. Output LSE is base 2, as in PagedForwardKernel.
 """
@@ -92,8 +93,9 @@ class _Attention:
             union_blocks = self._tensor(blocks, (work, 4, 128), (512, 128, 1))
             union_masks = self._tensor(masks, (work, 4, 128), (512, 128, 1))
             union_counts = self._tensor(counts, (work, 4), (4, 1))
-        k = self._tensor(key_cache, (pool_pages, 64, 4, 128), (Int64(32768), 512, 128, 1))
-        v = self._tensor(value_cache, (pool_pages, 64, 4, 128), (Int64(32768), 512, 128, 1))
+        cache_layout = cute.make_layout((Int32(pool_pages), 64, 4, 128), stride=(32768, 512, 128, 1))
+        k = cute.make_tensor(cute.recast_ptr(key_cache, dtype=cutlass.Uint8), cache_layout)
+        v = cute.make_tensor(cute.recast_ptr(value_cache, dtype=cutlass.Uint8), cache_layout)
         dummy_float = self._tensor(cute.recast_ptr(zeros, dtype=cutlass.Float32), (1,), (1,))
         dummy_desc = self._tensor(cute.recast_ptr(zeros, dtype=Int64), (1,), (1,))
         self.forward(
@@ -190,7 +192,7 @@ def compile_minimax_attention_aot(*, max_rows, max_batch, mode="decode"):
         Operand("lse", torch.float32, "[rows,64] base-2", "out"),
         Operand("scratch", torch.uint8, f"[{launch.nbytes}]", "scratch"))
     return compile_program(launch, name=f"minimax_attention_{mode}", operands=operands,
-        scalars=(Scalar("rows"), Scalar("batch"), Scalar("table_stride"), Scalar("pool_pages", "int64")),
+        scalars=(Scalar("rows"), Scalar("batch"), Scalar("table_stride"), Scalar("pool_pages", "int64", "must fit signed int32 page extent")),
         key=(int(max_rows), int(max_batch), mode), scratch={"scratch": lambda rows: launch.nbytes},
         geometry=dict(max_rows=int(max_rows), max_batch=int(max_batch), page_rows=64,
                       query_heads=64, kv_heads=4, head_dim=128, block_tokens=128,
