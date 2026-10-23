@@ -458,3 +458,47 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
                 assert torch.isnan(out).all()
 
 
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("bits,codebook", [(4, "e4m3"), (6, "mcg"), (6, "mul1")])
+def test_prefill_vs_base_bitwise_and_row_invariance(side, bits, codebook, monkeypatch):
+    import cutlass.cute as cute
+    from cutlass import Int32
+    from cuda.bindings import driver as cuda
+    from b12x.gemm.trellis_linear import _native
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    class Base(_native.NativeTrellisLinear):
+        @cute.jit
+        def __call__(self, inputs: cute.Tensor, payload: cute.Tensor,
+                     scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                     rows: Int32, rotation_id: Int32, cta_limit: Int32,
+                     stream: cuda.CUstream):
+            tiles = Int32(self.n // 128 * self.splits)
+            self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+                grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+            self.reduce(partial, output, rows).launch(
+                grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                block=(128, 1, 1), stream=stream)
+
+    max_rows = 512
+    with exportable_compilation(), monkeypatch.context() as patch:
+        patch.setattr(_native, "NativeTrellisLinear", Base)
+        base = Case(k=1152, n=256, side=side, bits=bits, rows=max_rows, codebook=codebook)
+    prefill = Case(k=1152, n=256, side=side, bits=bits, rows=max_rows, codebook=codebook)
+    base.launch(max_rows)
+    full_expected = base.output.clone()
+    for rows in (1, 16, 64, 129, 130, 192, 255, 256, 257, 512):
+        for limit in (4, 188 * 4):
+            prefill.partial.fill_(float("nan"))
+            prefill.output.fill_(float("nan"))
+            with kernel_resolution_guard("prefill row dispatch uses precompiled kernels"):
+                prefill.launch(rows, cta_limit=limit)
+            assert torch.equal(prefill.output[:rows].view(torch.int32), full_expected[:rows].view(torch.int32))
+            assert torch.isnan(prefill.output[rows:]).all()
+            if rows >= 130:
+                assert torch.isnan(prefill.partial).all()
+
+
+

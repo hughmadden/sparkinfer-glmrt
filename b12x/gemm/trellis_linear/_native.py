@@ -12,6 +12,8 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.intrinsics import (
     f16_mma_m16n8k16_f32, ld_global_nc_u32, ld_global_nc_u32_l2hint, ld_global_nc_v4_u32,
@@ -19,10 +21,135 @@ from b12x._lib.intrinsics import (
     ld_shared_u32, packed_dequant_trellis_to_half2x4,
     packed_dequant_trellis_stream_to_half2x4,
     packed_dequant_trellis_mul1_to_half2x4,
-    shared_ptr_to_u32, st_shared_v4_u32, trellis_align_stream_u32x2,
+    shared_ptr_to_u32, st_global_v2_f32, st_shared_v4_u32,
+    trellis_align_stream_u32x2,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a16.exlr8 import _e4m3_round_half2, _side_value
+from b12x.moe._shared.kernels.w4a16.mixed_trellis_ws import (
+    _cp_async_mbar_arrive_noinc,
+    _fence_mbar_init,
+    _mbar_arrive,
+    _mbar_init,
+    _mbar_wait,
+)
+
+
+_PREFILL_BM = 128
+_PREFILL_BN = 64
+_PREFILL_CONSUMER_THREADS = 256
+_PREFILL_PRODUCER_THREADS = 128
+_PREFILL_PRODUCER_REGS = 104
+_PREFILL_CONSUMER_REGS = 192
+_PREFILL_MIN_ROWS = 130
+
+
+@dsl_user_op
+def _f16x2x2_to_e4m3x4(b0: Uint32, b1: Uint32, *, loc=None, ip=None) -> Uint32:
+    return Uint32(llvm.inline_asm(
+        T.i32(),
+        [Uint32(b0).ir_value(loc=loc, ip=ip), Uint32(b1).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 lo, hi; cvt.rn.satfinite.e4m3x2.f16x2 lo, $1; "
+        "cvt.rn.satfinite.e4m3x2.f16x2 hi, $2; mov.b32 $0, {lo, hi}; }",
+        "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _e4m3x4_to_f16x2x2(word: Uint32, *, loc=None, ip=None) -> tuple[Uint32, Uint32]:
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(word).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $2; "
+        "cvt.rn.f16x2.e4m3x2 $0, lo; cvt.rn.f16x2.e4m3x2 $1, hi; }",
+        "=r,=r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return (Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)))
+
+
+@dsl_user_op
+def _cp_async4_zfill_offset(smem_addr: Int32, offset: int, gmem_addr: Int64, pred: Int32,
+                            *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip),
+         Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+         Int32(pred).ir_value(loc=loc, ip=ip)],
+        f"{{ .reg .pred p; .reg .b32 sz; setp.ne.b32 p, $2, 0; selp.b32 sz, 16, 0, p; "
+        f"cp.async.cg.shared.global [$0 + {int(offset)}], [$1], 16, sz; }}",
+        "r,l,r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _st_shared_v2_u32_offset(smem_addr: Int32, offset: int, v0: Uint32, v1: Uint32,
+                             *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip),
+         Uint32(v0).ir_value(loc=loc, ip=ip),
+         Uint32(v1).ir_value(loc=loc, ip=ip)],
+        f"st.shared.v2.b32 [$0 + {int(offset)}], {{$1, $2}};",
+        "r,r,r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _st_shared_v4_u32_offset(smem_addr: Int32, offset: int, v0: Uint32, v1: Uint32,
+                             v2: Uint32, v3: Uint32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip),
+         Uint32(v0).ir_value(loc=loc, ip=ip),
+         Uint32(v1).ir_value(loc=loc, ip=ip),
+         Uint32(v2).ir_value(loc=loc, ip=ip),
+         Uint32(v3).ir_value(loc=loc, ip=ip)],
+        f"st.shared.v4.b32 [$0 + {int(offset)}], {{$1, $2, $3, $4}};",
+        "r,r,r,r,r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _ld_ring_v2_u32_offset(smem_addr: Int32, offset: int, *, loc=None, ip=None) -> tuple[Uint32, Uint32]:
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        f"ld.shared.v2.b32 {{$0, $1}}, [$2 + {int(offset)}];",
+        "=r,=r,r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return (Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)))
+
+
+@dsl_user_op
+def _ld_ring_v4_u32_offset(smem_addr: Int32, offset: int,
+                           *, loc=None, ip=None) -> tuple[Uint32, Uint32, Uint32, Uint32]:
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        f"ld.shared.v4.b32 {{$0, $1, $2, $3}}, [$4 + {int(offset)}];",
+        "=r,=r,=r,=r,r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return (Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), res, [2], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), res, [3], loc=loc, ip=ip)))
+
+
+@dsl_user_op
+def _ldmatrix_m8n8x4_b16_offset(base_addr: Int32, offset: int,
+                                *, loc=None, ip=None) -> tuple[Uint32, Uint32, Uint32, Uint32]:
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int32(base_addr).ir_value(loc=loc, ip=ip)],
+        f"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{$0, $1, $2, $3}}, [$4 + {int(offset)}];",
+        "=r,=r,=r,=r,r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return (Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), res, [2], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), res, [3], loc=loc, ip=ip)))
 
 
 def _load_word(address, policy):
@@ -33,11 +160,9 @@ def _load_word(address, policy):
 
 
 @cute.jit
-def decode_tile(address: Int64, tile: Int32, lane: Int32,
-                bits: cutlass.Constexpr, e4m3: cutlass.Constexpr,
-                mul1: cutlass.Constexpr = False, policy=None):
-    """One warp's 16x16 trellis tile. ``policy``: an L2 cache policy for the
-    payload words (``weight_stream_policy``), or None for plain loads."""
+def decode_tile_raw(address: Int64, tile: Int32, lane: Int32,
+                    bits: cutlass.Constexpr, mul1: cutlass.Constexpr = False, policy=None):
+    """Decode exact FP16 weights, retaining the caller's L2 payload policy."""
     base = address + tile.to(Int64) * Int64(32 * bits)
 
     if cutlass.const_expr(bits == 4):
@@ -76,6 +201,14 @@ def decode_tile(address: Int64, tile: Int32, lane: Int32,
         b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, bits)
     else:
         b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, bits)
+    return b0, b1, b2, b3
+
+
+@cute.jit
+def decode_tile(address: Int64, tile: Int32, lane: Int32,
+                bits: cutlass.Constexpr, e4m3: cutlass.Constexpr,
+                mul1: cutlass.Constexpr = False, policy=None):
+    b0, b1, b2, b3 = decode_tile_raw(address, tile, lane, bits, mul1, policy)
     if cutlass.const_expr(e4m3):
         b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
         b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
@@ -104,6 +237,17 @@ class NativeTrellisLinear:
         }
         return cute.struct(Storage)
 
+    def _prefill_storage(self):
+        w_tile_bytes = 256 if self.e4m3 else 512
+        stage_bytes = _PREFILL_BM * 64 * 2 + 16 * w_tile_bytes
+        total_bytes = 2 * stage_bytes + 128
+        class Storage:
+            pass
+        Storage.__annotations__ = {
+            "buf": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, total_bytes], 128],
+        }
+        return cute.struct(Storage)
+
     @cute.jit
     def __call__(self, inputs: cute.Tensor, payload: cute.Tensor,
                  scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
@@ -111,29 +255,61 @@ class NativeTrellisLinear:
                  stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations) and cta_limit > Int32(0):
             tiles = Int32(self.n // 128 * self.splits)
-            if cutlass.const_expr(self.bits < 5):
-                self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
-                    grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            elif rows <= Int32(16):
-                self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
-                    grid=(min(tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            elif rows <= Int32(32):
-                self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 2, 8).launch(
-                    grid=(min(tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            elif rows <= Int32(48):
-                self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 3, 8).launch(
-                    grid=(min(tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+            if cutlass.const_expr(self.max_rows >= _PREFILL_MIN_ROWS):
+                if rows >= Int32(_PREFILL_MIN_ROWS):
+                    prefill_tiles = ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * Int32(self.n // _PREFILL_BN)
+                    self.multiply_prefill(inputs, payload, scales, output, rows, rotation_id).launch(
+                        grid=(min(prefill_tiles, max(Int32(1), cta_limit // Int32(4))), 1, 1),
+                        block=(_PREFILL_CONSUMER_THREADS + _PREFILL_PRODUCER_THREADS, 1, 1),
+                        min_blocks_per_mp=1, stream=stream)
+                else:
+                    if cutlass.const_expr(self.bits < 5):
+                        self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+                            grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                    elif rows <= Int32(16):
+                        self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+                            grid=(min(tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                    elif rows <= Int32(32):
+                        self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 2, 8).launch(
+                            grid=(min(tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                    elif rows <= Int32(48):
+                        self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 3, 8).launch(
+                            grid=(min(tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                    else:
+                        self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 4, 4).launch(
+                            grid=(min(((rows + Int32(63)) // Int32(64)) * tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                    self.reduce(partial, output, rows).launch(
+                        grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                        block=(128, 1, 1), stream=stream)
             else:
-                self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 4, 4).launch(
-                    grid=(min(((rows + Int32(63)) // Int32(64)) * tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            self.reduce(partial, output, rows).launch(
-                grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
-                block=(128, 1, 1), stream=stream)
+                if cutlass.const_expr(self.bits < 5):
+                    self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+                        grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                elif rows <= Int32(16):
+                    self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+                        grid=(min(tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                elif rows <= Int32(32):
+                    self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 2, 8).launch(
+                        grid=(min(tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                elif rows <= Int32(48):
+                    self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 3, 8).launch(
+                        grid=(min(tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                else:
+                    self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 4, 4).launch(
+                        grid=(min(((rows + Int32(63)) // Int32(64)) * tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                self.reduce(partial, output, rows).launch(
+                    grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
 
     @cute.kernel
     def multiply(self, inputs: cute.Tensor, payload: cute.Tensor,
@@ -364,6 +540,222 @@ class NativeTrellisLinear:
             task += step
 
     @cute.jit
+    def _prefill_produce_tile(self, p_tid: Int32, base: Int32,
+                              x_ptr: Int64, payload_ptr: Int64,
+                              rows: Int32, m0: Int32, nb64: Int32,
+                              phase: Int32) -> Int32:
+        w_tile_bytes = 256 if self.e4m3 else 512
+        a_stage_bytes = _PREFILL_BM * 64 * 2
+        stage_bytes = a_stage_bytes + 16 * w_tile_bytes
+        bar_full = base + Int32(2 * stage_bytes)
+        bar_empty = bar_full + Int32(16)
+        lane, pw = p_tid & Int32(31), p_tid >> Int32(5)
+        r0, c = p_tid >> Int32(3), p_tid & Int32(7)
+        sa_lane_off = r0 * Int32(128) + ((c ^ (r0 & Int32(7))) << Int32(4))
+        sw_pw_off = Int32(a_stage_bytes) + pw * Int32(w_tile_bytes) + lane * Int32(8 if self.e4m3 else 16)
+        nb128 = nb64 >> Int32(1)
+        n16_in_128 = (nb64 & Int32(1)) * Int32(4) + pw
+        for kb in cutlass.range(self.k // 128, unroll=1):
+            for s in cutlass.range_constexpr(2):
+                _mbar_wait(bar_empty + Int32(8 * s), phase ^ Int32(1))
+                sa_base = base + Int32(s * stage_bytes) + sa_lane_off
+                k_col = kb * Int32(128) + Int32(s * 64) + c * Int32(8)
+                x_col_base = x_ptr + k_col.to(Int64) * Int64(2)
+                for i in cutlass.range_constexpr(8):
+                    row = m0 + r0 + Int32(i * 16)
+                    pred = Int32(0)
+                    if row < rows:
+                        pred = Int32(1)
+                    _cp_async4_zfill_offset(
+                        sa_base, i * 2048,
+                        x_col_base + row.to(Int64) * Int64(self.k * 2), pred)
+                _cp_async_mbar_arrive_noinc(bar_full + Int32(8 * s))
+                sw_base = base + Int32(s * stage_bytes) + sw_pw_off
+                for k16_in_64 in cutlass.range_constexpr(4):
+                    k16 = Int32(s * 4 + k16_in_64)
+                    tile = nb128 * Int32(self.k // 16 * 8) + (kb * Int32(8) + k16) * Int32(8) + n16_in_128
+                    if cutlass.const_expr(self.input_units):
+                        tile = kb * Int32(self.n // 16 * 8) + nb128 * Int32(64) + k16 * Int32(8) + n16_in_128
+                    b0, b1, b2, b3 = decode_tile_raw(payload_ptr, tile, lane, self.bits, self.mul1)
+                    if cutlass.const_expr(self.e4m3):
+                        e01 = _f16x2x2_to_e4m3x4(b0, b1)
+                        e23 = _f16x2x2_to_e4m3x4(b2, b3)
+                        _st_shared_v2_u32_offset(sw_base, k16_in_64 * 4 * w_tile_bytes, e01, e23)
+                    else:
+                        _st_shared_v4_u32_offset(sw_base, k16_in_64 * 4 * w_tile_bytes, b0, b1, b2, b3)
+                _mbar_arrive(bar_full + Int32(8 * s))
+            phase = phase ^ Int32(1)
+        return phase
+
+    @cute.jit
+    def _prefill_consume_tile(self, tid: Int32, base: Int32,
+                              scales_ptr: Int64, output_ptr: Int64,
+                              rows: Int32, m0: Int32, nb64: Int32,
+                              phase: Int32) -> Int32:
+        w_tile_bytes = 256 if self.e4m3 else 512
+        a_stage_bytes = _PREFILL_BM * 64 * 2
+        stage_bytes = a_stage_bytes + 16 * w_tile_bytes
+        bar_full = base + Int32(2 * stage_bytes)
+        bar_empty = bar_full + Int32(16)
+        lane, cw = tid & Int32(31), tid >> Int32(5)
+        l7, l15, l_sh4 = lane & Int32(7), lane & Int32(15), lane >> Int32(4)
+        a_lane_off = (cw * Int32(16) + l15) * Int32(128) + ((l_sh4 ^ l7) << Int32(4))
+        w_lane_off = Int32(a_stage_bytes) + lane * Int32(8 if self.e4m3 else 16)
+        grand_total = cute.make_rmem_tensor((8, 4), Float32)
+        grand_total.fill(Float32(0.0))
+        for split in cutlass.range(self.splits, unroll=1):
+            split_total = cute.make_rmem_tensor((8, 4), Float32)
+            split_total.fill(Float32(0.0))
+            for block in cutlass.range(8, unroll=1):
+                kb = split * Int32(8) + block
+                if kb < Int32(self.k // 128):
+                    acc = cute.make_rmem_tensor((8, 4), Float32)
+                    acc.fill(Float32(0.0))
+                    for s in cutlass.range_constexpr(2):
+                        _mbar_wait(bar_full + Int32(8 * s), phase)
+                        sa = base + Int32(s * stage_bytes)
+                        sw = sa + w_lane_off
+                        for k16_in_64 in cutlass.range_constexpr(4):
+                            a_addr = sa + (a_lane_off ^ Int32(k16_in_64 * 32))
+                            a0, a1, a2, a3 = _ldmatrix_m8n8x4_b16_offset(a_addr, 0)
+                            for n_local in cutlass.range_constexpr(4):
+                                w_off = (k16_in_64 * 4 + n_local) * w_tile_bytes
+                                if cutlass.const_expr(self.e4m3):
+                                    e01, e23 = _ld_ring_v2_u32_offset(sw, w_off)
+                                    b0, b1 = _e4m3x4_to_f16x2x2(e01)
+                                    b2, b3 = _e4m3x4_to_f16x2x2(e23)
+                                else:
+                                    b0, b1, b2, b3 = _ld_ring_v4_u32_offset(sw, w_off)
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[2 * n_local, 0], acc[2 * n_local, 1], acc[2 * n_local, 2], acc[2 * n_local, 3],
+                                    a0, a1, a2, a3, b0, b1)
+                                acc[2 * n_local, 0], acc[2 * n_local, 1], acc[2 * n_local, 2], acc[2 * n_local, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[2 * n_local + 1, 0], acc[2 * n_local + 1, 1], acc[2 * n_local + 1, 2], acc[2 * n_local + 1, 3],
+                                    a0, a1, a2, a3, b2, b3)
+                                acc[2 * n_local + 1, 0], acc[2 * n_local + 1, 1], acc[2 * n_local + 1, 2], acc[2 * n_local + 1, 3] = d0, d1, d2, d3
+                        _mbar_arrive(bar_empty + Int32(8 * s))
+                    scale = _side_value(scales_ptr, kb)
+                    for n8 in cutlass.range_constexpr(8):
+                        for v in cutlass.range_constexpr(4):
+                            split_total[n8, v] = split_total[n8, v] + acc[n8, v] * scale
+                    phase = phase ^ Int32(1)
+            for n8 in cutlass.range_constexpr(8):
+                for v in cutlass.range_constexpr(4):
+                    grand_total[n8, v] = grand_total[n8, v] + split_total[n8, v]
+        row0 = m0 + cw * Int32(16) + (lane >> Int32(2))
+        row1 = row0 + Int32(8)
+        col_base = nb64 * Int32(64) + (lane & Int32(3)) * Int32(2)
+        if row0 < rows:
+            addr0 = output_ptr + (row0.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
+            for n8 in cutlass.range_constexpr(8):
+                st_global_v2_f32(addr0 + Int64(n8 * 32), grand_total[n8, 0], grand_total[n8, 1])
+        if row1 < rows:
+            addr1 = output_ptr + (row1.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
+            for n8 in cutlass.range_constexpr(8):
+                st_global_v2_f32(addr1 + Int64(n8 * 32), grand_total[n8, 2], grand_total[n8, 3])
+        return phase
+
+    @cute.kernel
+    def multiply_prefill(self, inputs: cute.Tensor, payload: cute.Tensor,
+                         scales: cute.Tensor, output: cute.Tensor,
+                         rows: Int32, rotation_id: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        tid = Int32(tid)
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._prefill_storage())
+        base = shared_ptr_to_u32(storage.buf.data_ptr())
+        w_tile_bytes = 256 if self.e4m3 else 512
+        stage_bytes = _PREFILL_BM * 64 * 2 + 16 * w_tile_bytes
+        bar_full = base + Int32(2 * stage_bytes)
+        bar_empty = bar_full + Int32(16)
+        if tid == Int32(0):
+            for s in cutlass.range_constexpr(2):
+                _mbar_init(bar_full + Int32(8 * s), Int32(2 * _PREFILL_PRODUCER_THREADS))
+                _mbar_init(bar_empty + Int32(8 * s), Int32(_PREFILL_CONSUMER_THREADS))
+            _fence_mbar_init()
+        cute.arch.sync_threads()
+        n_tiles = Int32(self.n // _PREFILL_BN)
+        total_tiles = ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * n_tiles
+        x_ptr = inputs[rotation_id]
+        payload_ptr = payload.iterator.toint()
+        scales_ptr = scales.iterator.toint()
+        output_ptr = output.iterator.toint()
+        if tid >= Int32(_PREFILL_CONSUMER_THREADS):
+            p_tid = tid - Int32(_PREFILL_CONSUMER_THREADS)
+            phase = Int32(0)
+            while task < total_tiles:
+                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
+                nb64 = task % n_tiles
+                phase = self._prefill_produce_tile(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, phase)
+                task += step
+        else:
+            phase = Int32(0)
+            while task < total_tiles:
+                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
+                nb64 = task % n_tiles
+                phase = self._prefill_consume_tile(tid, base, scales_ptr, output_ptr, rows, m0, nb64, phase)
+                task += step
+
+    @cute.kernel
+    def multiply_prefill_grouped(self, inputs: cute.Tensor,
+                                 payloads: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+                                 scales: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+                                 outputs: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+                                 rows: Int32, rotation_id: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        tid = Int32(tid)
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._prefill_storage())
+        base = shared_ptr_to_u32(storage.buf.data_ptr())
+        w_tile_bytes = 256 if self.e4m3 else 512
+        stage_bytes = _PREFILL_BM * 64 * 2 + 16 * w_tile_bytes
+        bar_full = base + Int32(2 * stage_bytes)
+        bar_empty = bar_full + Int32(16)
+        if tid == Int32(0):
+            for s in cutlass.range_constexpr(2):
+                _mbar_init(bar_full + Int32(8 * s), Int32(2 * _PREFILL_PRODUCER_THREADS))
+                _mbar_init(bar_empty + Int32(8 * s), Int32(_PREFILL_CONSUMER_THREADS))
+            _fence_mbar_init()
+        cute.arch.sync_threads()
+        n_tiles = Int32(self.n // _PREFILL_BN)
+        proj_tiles = ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * n_tiles
+        total_tiles = Int32(4) * proj_tiles
+        if tid >= Int32(_PREFILL_CONSUMER_THREADS):
+            p_tid = tid - Int32(_PREFILL_CONSUMER_THREADS)
+            phase = Int32(0)
+            while task < total_tiles:
+                proj = task // proj_tiles
+                rem = task % proj_tiles
+                m0 = (rem // n_tiles) * Int32(_PREFILL_BM)
+                nb64 = rem % n_tiles
+                x_ptr = inputs[rotation_id + proj]
+                payload_ptr = select4(
+                    proj, payloads[0].iterator.toint(), payloads[1].iterator.toint(),
+                    payloads[2].iterator.toint(), payloads[3].iterator.toint())
+                phase = self._prefill_produce_tile(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, phase)
+                task += step
+        else:
+            phase = Int32(0)
+            while task < total_tiles:
+                proj = task // proj_tiles
+                rem = task % proj_tiles
+                m0 = (rem // n_tiles) * Int32(_PREFILL_BM)
+                nb64 = rem % n_tiles
+                scales_ptr = select4(
+                    proj, scales[0].iterator.toint(), scales[1].iterator.toint(),
+                    scales[2].iterator.toint(), scales[3].iterator.toint())
+                output_ptr = select4(
+                    proj, outputs[0].iterator.toint(), outputs[1].iterator.toint(),
+                    outputs[2].iterator.toint(), outputs[3].iterator.toint())
+                phase = self._prefill_consume_tile(tid, base, scales_ptr, output_ptr, rows, m0, nb64, phase)
+                task += step
+
+    @cute.jit
     def call_grouped(self, inputs: cute.Tensor,
                      payloads: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
                      scales: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
@@ -373,29 +765,61 @@ class NativeTrellisLinear:
                      stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id + Int32(3) < Int32(self.rotations) and cta_limit > Int32(0):
             group_tiles = Int32(4 * (self.n // 128) * self.splits)
-            if cutlass.const_expr(self.bits < 5):
-                self.multiply_grouped(inputs, payloads, scales, partial, rows, rotation_id).launch(
-                    grid=(min(((rows + Int32(15)) // Int32(16)) * group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            elif rows <= Int32(16):
-                self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 1, 8).launch(
-                    grid=(min(group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
-            elif rows <= Int32(32):
-                self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 2, 4).launch(
-                    grid=(min(group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
-            elif rows <= Int32(48):
-                self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 3, 8 if self.mul1 else 4).launch(
-                    grid=(min(group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=2 if self.mul1 else 3, stream=stream)
+            if cutlass.const_expr(self.max_rows >= _PREFILL_MIN_ROWS):
+                if rows >= Int32(_PREFILL_MIN_ROWS):
+                    prefill_tiles = Int32(4) * ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * Int32(self.n // _PREFILL_BN)
+                    self.multiply_prefill_grouped(inputs, payloads, scales, outputs, rows, rotation_id).launch(
+                        grid=(min(prefill_tiles, max(Int32(1), cta_limit // Int32(4))), 1, 1),
+                        block=(_PREFILL_CONSUMER_THREADS + _PREFILL_PRODUCER_THREADS, 1, 1),
+                        min_blocks_per_mp=1, stream=stream)
+                else:
+                    if cutlass.const_expr(self.bits < 5):
+                        self.multiply_grouped(inputs, payloads, scales, partial, rows, rotation_id).launch(
+                            grid=(min(((rows + Int32(15)) // Int32(16)) * group_tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                    elif rows <= Int32(16):
+                        self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 1, 8).launch(
+                            grid=(min(group_tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
+                    elif rows <= Int32(32):
+                        self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 2, 4).launch(
+                            grid=(min(group_tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
+                    elif rows <= Int32(48):
+                        self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 3, 8 if self.mul1 else 4).launch(
+                            grid=(min(group_tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=2 if self.mul1 else 3, stream=stream)
+                    else:
+                        self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 4, 4).launch(
+                            grid=(min(((rows + Int32(63)) // Int32(64)) * group_tiles, cta_limit), 1, 1),
+                            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                    self.reduce_grouped(partial, outputs, rows).launch(
+                        grid=(min(rows * Int32(4 * (self.n // 128)), cta_limit), 1, 1),
+                        block=(128, 1, 1), stream=stream)
             else:
-                self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 4, 4).launch(
-                    grid=(min(((rows + Int32(63)) // Int32(64)) * group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            self.reduce_grouped(partial, outputs, rows).launch(
-                grid=(min(rows * Int32(4 * (self.n // 128)), cta_limit), 1, 1),
-                block=(128, 1, 1), stream=stream)
+                if cutlass.const_expr(self.bits < 5):
+                    self.multiply_grouped(inputs, payloads, scales, partial, rows, rotation_id).launch(
+                        grid=(min(((rows + Int32(15)) // Int32(16)) * group_tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                elif rows <= Int32(16):
+                    self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 1, 8).launch(
+                        grid=(min(group_tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
+                elif rows <= Int32(32):
+                    self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 2, 4).launch(
+                        grid=(min(group_tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
+                elif rows <= Int32(48):
+                    self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 3, 8 if self.mul1 else 4).launch(
+                        grid=(min(group_tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=2 if self.mul1 else 3, stream=stream)
+                else:
+                    self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 4, 4).launch(
+                        grid=(min(((rows + Int32(63)) // Int32(64)) * group_tiles, cta_limit), 1, 1),
+                        block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                self.reduce_grouped(partial, outputs, rows).launch(
+                    grid=(min(rows * Int32(4 * (self.n // 128)), cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
 
     @cute.kernel
     def multiply_grouped(self, inputs: cute.Tensor,
