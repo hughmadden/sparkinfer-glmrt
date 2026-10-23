@@ -154,3 +154,29 @@ def test_invalid_capacities_fail_before_compilation():
         env, _ = module(name)
         with pytest.raises(ValueError):
             env["_layout"](*args)
+
+
+def test_scalar_index_page_load_widens_recycled_physical_ids():
+    path = ROOT.parents[1] / "attention/dsa_indexer/kernel.py"
+    tree = ast.parse(path.read_text())
+    tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_load_index_k_page_scalar"]
+    tree.body[0].decorator_list = []
+    env = dict(Int32=np.int32, Int64=np.int64, _PAGE_SIZE=64, _INDEX_HEAD_DIM=128,
+               _PAGED_THREADS_PER_CTA=128)
+    exec(compile(tree, str(path), "exec", flags=__future__.annotations.compiler_flag), env)
+    addresses, shared = [], {}
+
+    class Cache:
+        def __getitem__(self, coords):
+            page, row, col = coords
+            address = page * np.int32(8448) + row * np.int32(128) + col
+            addresses.append(int(address))
+            return address & 255
+
+    page = np.int32(2**31 // 8448 + 13)
+    for thread in range(128):
+        env["_load_index_k_page_scalar"](Cache(), page, shared, np.int32(thread))
+    expected = int(page) * 8448
+    assert sorted(addresses) == list(range(expected, expected + 8192))
+    assert min(addresses) > 2**31
+    assert len(shared) == 8192
