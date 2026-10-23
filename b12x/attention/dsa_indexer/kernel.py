@@ -1803,7 +1803,7 @@ class DSAScheduledMultiRowLogitsKernel:
                         head_idx = q_linear // Int32(_INDEX_HEAD_DIM)
                         col_idx = q_linear - head_idx * Int32(_INDEX_HEAD_DIM)
                         s_q[head_idx, col_idx] = (
-                            q_bytes[current_q_idx, head_idx, col_idx]
+                            cutlass.Uint8(q_bytes[current_q_idx, head_idx, col_idx])
                             if head_idx < num_heads
                             else cutlass.Uint8(0)
                         )

@@ -120,13 +120,14 @@ class _Attention:
         if idx < work or idx <= batch:
             zeros[idx] = Int32(0)
         if idx < work:
-            req, base = Int32(0), Int32(0)
-            while req < batch:
+            req, base, searching = Int32(0), Int32(0), Int32(1)
+            while req < batch and searching != 0:
                 n = (cu[req + 1] - cu[req] + self.tokens - 1) // self.tokens
                 if idx < base + n:
-                    break
-                base += n
-                req += 1
+                    searching = Int32(0)
+                else:
+                    base += n
+                    req += 1
             valid[idx] = Int32(req < batch)
             requests[idx] = req if req < batch else Int32(0)
             tiles[idx] = idx - base if req < batch else Int32(0)
@@ -157,13 +158,14 @@ class _Attention:
                                         found = probe
                                     probe += 1
                                 if found < 0:
-                                    insert = count
-                                    while insert > 0:
+                                    insert, moving = count, Int32(1)
+                                    while insert > 0 and moving != 0:
                                         if blocks[base + insert - 1] <= block:
-                                            break
-                                        blocks[base + insert] = blocks[base + insert - 1]
-                                        masks[base + insert] = masks[base + insert - 1]
-                                        insert -= 1
+                                            moving = Int32(0)
+                                        else:
+                                            blocks[base + insert] = blocks[base + insert - 1]
+                                            masks[base + insert] = masks[base + insert - 1]
+                                            insert -= 1
                                     blocks[base + insert] = block
                                     masks[base + insert] = Int32(1 << token)
                                     count += 1
