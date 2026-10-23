@@ -8594,8 +8594,10 @@ def dense_gemm(
         b_launch_torch = rhs_values_tiled
     if is_mxfp8:
         _validate_mxfp8_bk64_plan(tile_k, mma_tiler_mn, swap_ab)
-    # k-reuse relies on SFB being the 128x128-block weight operand; with
-    # swap_ab the smem B slot holds activations, so force it off there.
+    # k-reuse relies on SFB being read once per 128x128 weight block in the
+    # unswapped MMA-B fragment; swap_ab feeds sB/sSFB to MMA-A instead, so
+    # force it off there. The B tensor, its TMA atom and its L2 evict-first
+    # policy stay on the weights (rhs) either way.
     sfb_k_reuse = bool(sfb_k_replicated) and not swap_ab and is_mxfp8
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]
@@ -9468,8 +9470,10 @@ def _lower_dense_gemm(
         b_launch_torch = rhs_values_tiled
     if is_mxfp8:
         _validate_mxfp8_bk64_plan(tile_k, mma_tiler_mn, swap_ab)
-    # k-reuse relies on SFB being the 128x128-block weight operand; with
-    # swap_ab the smem B slot holds activations, so force it off there.
+    # k-reuse relies on SFB being read once per 128x128 weight block in the
+    # unswapped MMA-B fragment; swap_ab feeds sB/sSFB to MMA-A instead, so
+    # force it off there. The B tensor, its TMA atom and its L2 evict-first
+    # policy stay on the weights (rhs) either way.
     sfb_k_reuse = bool(sfb_k_replicated) and not swap_ab and is_mxfp8
     if alpha_dtype is None:
         alpha_dtype = "float32" if alpha is None else str(alpha.dtype).split(".")[-1]
