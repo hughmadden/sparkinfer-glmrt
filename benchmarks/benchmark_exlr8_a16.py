@@ -23,6 +23,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import types
 
 import cutlass
 import cutlass.cute as cute
@@ -281,6 +282,54 @@ def parse_grouped_arm(value):
             or name in {"chunked", "grouped", "exl3", "mixed_unreachable_k5"}):
         raise argparse.ArgumentTypeError("grouped arm must be NAME:REV with a nonreserved name")
     return name, revision
+
+
+K4_ARM_MODULES = ("host", "ws_a8", "kernel", "mixed_trellis", "mixed_trellis_ws")
+
+
+def materialize_k4_arm(revision, directory, repository=None):
+    """Freeze WS and its sibling implementation dependencies at one commit."""
+    repository = repository or Path(__file__).resolve().parents[1]
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repository), *args])
+    sha = git("rev-parse", "--verify", revision + "^{commit}").decode().strip()
+    directory = Path(directory) / sha / "k4"
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = {"revision": sha, "sources": {}}
+    for name in K4_ARM_MODULES:
+        source = git("show", f"{sha}:b12x/moe/_shared/kernels/w4a16/{name}.py")
+        (directory / f"{name}.py").write_bytes(source)
+        manifest["sources"][name] = hashlib.sha256(source).hexdigest()
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    return directory
+
+
+def load_k4_arm(directory):
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if set(manifest["sources"]) != set(K4_ARM_MODULES):
+        raise ValueError("incomplete frozen K4 arm")
+    for name, digest in manifest["sources"].items():
+        if hashlib.sha256((directory / f"{name}.py").read_bytes()).hexdigest() != digest:
+            raise ValueError(f"K4 arm digest mismatch: {name}")
+    identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    package = f"b12x.moe._shared.kernels.k4_arm_{identity}"
+    if package not in sys.modules:
+        module = types.ModuleType(package)
+        module.__path__ = [str(directory)]
+        module.__package__ = package
+        sys.modules[package] = module
+    mixed = __import__(package + ".mixed_trellis", fromlist=["mixed_trellis"])
+    return mixed, manifest
+
+
+def k4_noise_summary(samples, baseline):
+    medians = {name: statistics.median(values) for name, values in samples.items()}
+    control = medians[baseline + "_control"]
+    reference = medians[baseline]
+    spread = abs(control - reference) / min(control, reference)
+    return dict(medians_us=medians, identical_control_spread=spread,
+                noise_pass=spread < 0.02,
+                speedups={name: reference / value for name, value in medians.items()})
 
 
 def materialize_grouped_arm(revision, directory, repository=None):
@@ -614,6 +663,10 @@ def main():
                         help="master's K1 core source (b12x/moe/_shared/kernels/w4a16/exlr8.py)")
     parser.add_argument("--control-glue",type=Path,
                         help="master's grouping source (b12x/integration/cuteafd/exlr8_glue.py)")
+    parser.add_argument("--k4-arm", action="append", type=parse_grouped_arm, default=[],
+                        help="NAME:REV frozen EXL3 WS arm; K4-only comparison, first arm is reference")
+    parser.add_argument("--k4-exhaustive", action="store_true",
+                        help="gate every live row count 1..4096 and exact prefix row invariance before timing")
     parser.add_argument("--grouped-arm", action="append", type=parse_grouped_arm, default=[],
                         help="repeatable NAME:REV frozen grouped core and ingress")
     parser.add_argument("--approximate-arm", action="append", default=[],
@@ -676,10 +729,22 @@ def main():
             parser.error(str(exc))
     elif args.rank != 0 or args.layer != 3:
         parser.error("--rank/--layer require --world")
+    if args.k4_arm:
+        names = [name for name, _ in args.k4_arm]
+        if (not args.grouped or args.world is None or args.grouped_arm or args.profile
+                or len(names) < 2 or len(set(names)) != len(names)
+                or any(name.endswith("_control") for name in names)):
+            parser.error("--k4-arm requires --grouped --world, >=2 unique arms, no *_control names or grouped/profile arms")
+        if args.repeats < 3:
+            parser.error("K4 timing requires at least three interleaved repeats")
+    elif args.k4_exhaustive:
+        parser.error("--k4-exhaustive requires --k4-arm")
     if torch.cuda.get_device_capability() != (12,1):
         parser.error("this performance gate requires SM121")
     torch.cuda.set_per_process_memory_fraction(min(
         0.25, (args.memory_cap_gib << 30) / torch.cuda.get_device_properties(0).total_memory))
+    if args.k4_arm:
+        return k4_main(args)
     if args.grouped:
         return grouped_main(args)
     props = torch.cuda.get_device_properties(0)
@@ -858,8 +923,9 @@ def main():
         json.dump(result,stream,indent=2)
 
 
-def grouped_mixed_state(rows, tiers, props, width=512, serving=False, workspace=None):
-    from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
+def grouped_mixed_state(rows, tiers, props, width=512, serving=False, workspace=None, mix=None):
+    if mix is None:
+        from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     from b12x.moe._shared.kernels.w4a16.host import max_packed_route_slots
     from b12x.moe.fused_moe._impl import _projection_mixed_tile_config
     tile = _projection_mixed_tile_config(None, hidden_size=6144,
@@ -891,6 +957,97 @@ def grouped_mixed_state(rows, tiers, props, width=512, serving=False, workspace=
     binding = mix.bind_mixed_trellis(*tiers, mapping, desc, rotations, launch)
     return binding, bufs
 
+
+
+def k4_main(args):
+    """Same-session frozen WS comparison; synthetic K4, recorded GLM routes."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    props = torch.cuda.get_device_properties(0)
+    _, width = rank_geometry(args.world, args.rank, args.layer)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    layers = prepare_comparison_layers(args.layer_copies, width, True)
+    modules, states, provenance = {}, {}, {}
+    for name, revision in args.k4_arm:
+        directory = (materialize_k4_arm(revision, Path(tempfile.mkdtemp(prefix="k4-arms-")))
+                     if args.grouped_arm_source_dir is None else
+                     grouped_arm_bundle(revision, args.grouped_arm_source_dir) / "k4")
+        modules[name], provenance[name] = load_k4_arm(directory)
+        states[name] = []
+        workspace = None
+        for tiers in layers:
+            state = grouped_mixed_state(4096, tiers, props, width, serving=True,
+                                        workspace=workspace, mix=modules[name])
+            states[name].append(state)
+            workspace = state[1]
+    torch.cuda.empty_cache()
+    waves = load_route_waves(args.routes or "realistic")
+    generator = torch.Generator().manual_seed(408)
+    ids = [real_route_ids(4096, waves[i % len(waves)], generator).cuda().int()
+           for i in range(len(layers))]
+    weights = torch.rand((4096, 8), generator=generator).cuda() / 8
+    wire = make_wire(torch.randn((4096, 6144), generator=generator).cuda() * 0.02)
+    names = list(modules)
+    reference = names[0]
+
+    def run(name, rows, layer=0):
+        binding, workspace = states[name][layer]
+        return modules[name].run_bound_mixed_trellis(
+            wire[:rows], weights[:rows], ids[layer][:rows], binding, workspace)
+
+    # Resolve route packing before the frozen-resolution gate and any capture.
+    for name in names:
+        binding, workspace = states[name][0]
+        modules[name].warmup_mixed_trellis_route_pack(
+            binding.launch, workspace, expert_map=binding.global_to_combined)
+        for rows in (1, 17, 4096):
+            run(name, rows)
+    checked = range(1, 4097) if args.k4_exhaustive else sorted(
+        {1, 17, 63, 64, 65, 4096, *map(int, args.rows.split(","))})
+    with kernel_resolution_guard("EXL3 WS frozen-arm row invariance"):
+        full = run(reference, 4096).clone()
+        finite_nonzero(full, reference)
+        for rows in checked:
+            expected = run(reference, rows).clone()
+            if not torch.equal(expected.view(torch.int16), full[:rows].view(torch.int16)):
+                raise RuntimeError(f"reference row invariance failed at {rows}")
+            for name in names[1:]:
+                actual = run(name, rows)
+                if not torch.equal(actual.view(torch.int16), expected.view(torch.int16)):
+                    raise RuntimeError(f"K4 arm {name} differs at {rows} rows")
+    records = []
+    for rows in map(int, args.rows.split(",")):
+        if not 1 <= rows <= 4096:
+            raise ValueError("K4 rows must be 1..4096")
+        def layer_step(name):
+            for layer in range(len(layers)):
+                run(name, rows, layer)
+        # Check every timed cold copy too, not only the exhaustive fixture.
+        for layer in range(len(layers)):
+            expected = run(reference, rows, layer).clone()
+            for name in names[1:]:
+                if not torch.equal(run(name, rows, layer).view(torch.int16), expected.view(torch.int16)):
+                    raise RuntimeError(f"K4 arm {name} differs on timed layer {layer}, rows {rows}")
+        graphs = {name: capture(functools.partial(layer_step, name)) for name in names}
+        graphs[reference + "_control"] = capture(functools.partial(layer_step, reference))
+        samples = {name: [] for name in graphs}
+        order = list(graphs)
+        for repeat in range(args.repeats):
+            rotated = order[repeat % len(order):] + order[:repeat % len(order)]
+            if repeat % 2:
+                rotated.reverse()
+            for name in rotated:
+                samples[name].append(timing(graphs[name], args.replays) / len(layers))
+        record = dict(rows=rows, samples_us=samples, **k4_noise_summary(samples, reference))
+        records.append(record)
+        print(json.dumps(record), flush=True)
+    result = dict(schema=1, kind="exl3_ws_revision_comparison", arms=provenance,
+                  fixture="synthetic K4 weights, recorded GLM layer routes",
+                  world=args.world, rank=args.rank, layer=args.layer, width=width,
+                  layer_copies=len(layers), device=props.name,
+                  exhaustive=args.k4_exhaustive, checked_rows=len(checked), rows=records)
+    args.output.write_text(json.dumps(result, indent=2))
+    if not all(record["noise_pass"] for record in records):
+        raise RuntimeError("K4 identical-control timing spread exceeds 2%; no performance verdict")
 
 
 def serving_k4_states(rows, layers, props, width):
