@@ -499,6 +499,3 @@ def test_prefill_vs_base_bitwise_and_row_invariance(side, bits, codebook, monkey
             assert torch.isnan(prefill.output[rows:]).all()
             if rows >= 130:
                 assert torch.isnan(prefill.partial).all()
-
-
-
