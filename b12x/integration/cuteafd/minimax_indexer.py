@@ -1,6 +1,7 @@
 """Native MSA index-score and top-16 pointer ABIs.
 
 Decode reads 64-row FP8 index pages (8192 key bytes then 256 scale bytes).
+pool_pages must fit signed Int32; physical page offsets use Int64.
 Prefill reads contiguous FP8 rows and FP32 scales: request starts must be
 128-token aligned, and the K allocation must be padded to 256 rows. k_end
 is the exclusive causal end for each query. max_pages bounds the whole
@@ -171,11 +172,11 @@ class _Decode(_Index):
         self.scorer(
             self._tensor(cute.recast_ptr(q_fp8, dtype=cutlass.Uint8), (rows, 4, 128), (512, 128, 1)),
             self._tensor(weights, (rows, 4), (4, 1)),
-            self._tensor(cache_bytes, (pool_pages, 64, 128), (Int64(8448), 128, 1)),
+            self._tensor(cache_bytes, (Int32(pool_pages), 64, 128), (8448, 128, 1)),
             self._tensor(cute.recast_ptr(controls + 2, dtype=Int64), (1,), (1,)),
             self._tensor(controls + 1, (1,), (1,)),
             self._tensor(cute.recast_ptr(cache_bytes + 8192, dtype=Float32),
-                         (pool_pages, 64), (Int64(2112), 1)),
+                         (Int32(pool_pages), 64), (2112, 1)),
             self._tensor(page_table, (rows, table_width), (Int64(table_stride), 1)),
             self._tensor(cache_lengths, (rows,), (1,)),
             self._tensor(schedule, (rows + 1, 2), (2, 1)),
@@ -234,7 +235,7 @@ def compile_minimax_index_aot(*, max_rows, max_pages, mode="decode"):
         operands += [Operand("index_k_cache", torch.uint8, "[pool_pages,8448]"),
             Operand("page_table", torch.int32, "[rows,table_stride]", align=4),
             Operand("cache_lengths", torch.int32, "[rows]", align=4)]
-        scalars = (Scalar("rows"), Scalar("table_width"), Scalar("table_stride"), Scalar("pool_pages", "int64"))
+        scalars = (Scalar("rows"), Scalar("table_width"), Scalar("table_stride"), Scalar("pool_pages", "int64", "must fit signed int32 page extent"))
     else:
         operands += [Operand("k_fp8", torch.float8_e4m3fn, "[ceil(k_rows/256)*256,128]"),
             Operand("k_scale", torch.float32, "[ceil(k_rows/256)*256]"),

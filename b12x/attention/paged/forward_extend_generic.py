@@ -4190,6 +4190,12 @@ class PagedForwardKernel:
             raise ValueError(
                 "MSA block-sparse extend requires cta_tile_q=16 or union cta_tile_q=128, page_size in (64, 128), cta_tile_kv dividing 64, and head_dim=128"
             )
+        # Raw pointer AOT calls may erase the signedness of byte tensors.
+        if const_expr(self.dtype_kv_storage == cutlass.Uint8):
+            if const_expr(mKCache.element_type == cutlass.Int8):
+                mKCache = cute.recast_tensor(mKCache, cutlass.Uint8)
+            if const_expr(mVCache.element_type == cutlass.Int8):
+                mVCache = cute.recast_tensor(mVCache, cutlass.Uint8)
         if const_expr(mQ.element_type != self.dtype_q):
             raise TypeError("mQ dtype must match dtype_q")
         if const_expr(
