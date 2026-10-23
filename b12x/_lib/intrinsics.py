@@ -491,6 +491,15 @@ def u32_as_f32(value: Uint32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def ld_global_nc_u8(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
+    """Load one global byte through the non-coherent cache, zero-extended."""
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.u8 $0, [$1];", "=r,l", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
 def ld_global_nc_u32(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
     """Load 32 bits from global memory via non-coherent cache (.nc)."""
     return Uint32(
