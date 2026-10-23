@@ -514,3 +514,33 @@ def test_prefill_vs_base_bitwise_and_row_invariance(side, bits, codebook, monkey
             assert torch.isnan(prefill.output[rows:]).all()
             if rows >= 130:
                 assert torch.isnan(prefill.partial).all()
+
+
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("bits,codebook", [(4, "e4m3")])
+def test_prefill_ws_bitwise_and_row_invariance(side, bits, codebook):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    c = Case(k=1152, n=256, side=side, bits=bits, rows=512, codebook=codebook)
+    c.output.fill_(float("nan"))
+    c.launch(64)
+    expected_64 = c.output[:64].clone()
+    c.output.fill_(float("nan"))
+    c.launch(512)
+    expected_512 = c.output[:512].clone()
+    assert torch.equal(expected_512[:64].view(torch.int32), expected_64.view(torch.int32))
+    with kernel_resolution_guard("prefill_ws uses precompiled kernels"):
+        for rows in (65, 80, 127, 128, 129, 130, 191, 192, 193, 255, 256, 257, 384, 512):
+            for limit in (48, 170 * 4, 188 * 4):
+                c.output.fill_(float("nan"))
+                c.launch(rows, limit)
+                assert torch.equal(c.output[:rows].view(torch.int32), expected_512[:rows].view(torch.int32))
+                assert torch.isnan(c.output[rows:]).all()
+        for rows in (65, 129, 256):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                c.launch(rows)
+            for _ in range(3):
+                c.output.fill_(float("nan"))
+                graph.replay()
+                assert torch.equal(c.output[:rows].view(torch.int32), expected_512[:rows].view(torch.int32))
+                assert torch.isnan(c.output[rows:]).all()
