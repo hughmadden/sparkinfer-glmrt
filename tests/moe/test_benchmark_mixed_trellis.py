@@ -79,3 +79,65 @@ def test_benchmark_kimi_variant_parsing_and_geometry() -> None:
         ("old", None, (64, 256, 64, 256), 1),
         ("n128-2cta", None, (64, 128, 64, 128), 2),
     ]
+
+
+@pytest.mark.parametrize("value", ["ws:32:ws", "coop8:8:cooperative", "coop16:16:cooperative"])
+def test_prefill_arm(value):
+    bench = _load_benchmark_module()
+    name, block, mode = value.split(":")
+    assert bench.parse_prefill_arm(value) == (name, int(block), mode)
+
+
+@pytest.mark.parametrize("value", ["bad", "ws:8:ws", "a:17:ws", "a_control:32:ws", ":32:ws", "a:32:other"])
+def test_prefill_arm_rejects_invalid(value):
+    bench = _load_benchmark_module()
+    with pytest.raises(bench.argparse.ArgumentTypeError):
+        bench.parse_prefill_arm(value)
+
+
+def test_prefill_policy_separates_route_block_from_ws():
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    qwen_coop = bench.prefill_compile_options("qwen4", 256, 32, "cooperative", props)
+    qwen_ws = bench.prefill_compile_options("qwen4", 256, 32, "ws", props)
+    assert qwen_coop["moe_block_size"] == qwen_ws["moe_block_size"] == 32
+    assert qwen_coop["token_major_rotation"] and not qwen_ws["token_major_rotation"]
+    assert qwen_ws["warp_specialized"] and not qwen_coop["warp_specialized"]
+    assert qwen_ws["tier0_bits"] == 4 and qwen_ws["tier1_bits"] == 5
+    assert qwen_ws["route_num_experts"] == 512 and qwen_ws["top_k"] == 10
+    coop = bench.prefill_compile_options("kimik3", 512, 16, "cooperative", props)
+    ws = bench.prefill_compile_options("kimik3", 512, 16, "ws", props)
+    assert {k for k in coop if coop[k] != ws[k]} == {"warp_specialized"}
+    assert ws["activation"] == "situ" and ws["tier1_num_experts"] == 1
+    assert bench.prefill_compile_options("kimik3", 512, 8, "cooperative", props)["moe_block_size"] == 8
+    for width in (128, 256, 384, 640):
+        opts = bench.prefill_compile_options("qwen4", width, 32, "ws", props)
+        assert width % opts["force_tile_config"][1] == 0
+    with pytest.raises(ValueError):
+        bench.prefill_compile_options("kimik3", 384, 16, "ws", props)
+
+
+def test_prefill_route_fixture_is_family_specific(tmp_path):
+    bench = _load_benchmark_module()
+    path = tmp_path / "routes.json"
+    wave = dict(layer=23, rows=4096, expert_rows=[[e, 4096] for e in range(10)])
+    data = dict(schema=1, family="qwen4", experts=512, top_k=10, waves=[wave])
+    path.write_text(bench.json.dumps(data))
+    assert bench.prefill_route_waves(path, "qwen4", 23) == [wave]
+    with pytest.raises(ValueError, match="metadata"):
+        bench.prefill_route_waves(path, "kimik3", 23)
+    with pytest.raises(ValueError, match="no waves"):
+        bench.prefill_route_waves(path, "qwen4", 0)
+    data["waves"][0]["expert_rows"][0][0] = 512
+    path.write_text(bench.json.dumps(data))
+    with pytest.raises(ValueError, match="histogram"):
+        bench.prefill_route_waves(path, "qwen4", 23)
+
+
+def test_prefill_kimi_routes_preserve_high_expert_ids(tmp_path):
+    bench = _load_benchmark_module()
+    wave = dict(layer=23, rows=4096, expert_rows=[[e, 4096] for e in range(880, 896)])
+    path = tmp_path / "routes.json"
+    path.write_text(bench.json.dumps(dict(schema=1, family="kimik3", experts=896, top_k=16, waves=[wave])))
+    assert bench.prefill_route_waves(path, "kimik3", 23) == [wave]

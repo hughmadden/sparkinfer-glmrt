@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import re
 import statistics
+import tempfile
+from pathlib import Path
 from dataclasses import replace
 
 import torch
@@ -712,6 +716,190 @@ def _run_kimi_benchmark(args, device: torch.device, props) -> None:
         torch.cuda.empty_cache()
 
 
+PREFILL_FAMILIES = {
+    "qwen4": (2560, 512, 10, (4, 5), "silu"),
+    "kimik3": (3584, 896, 16, (2, 3), "situ"),
+}
+
+
+def parse_prefill_arm(text):
+    parts = text.split(":")
+    if (len(parts) != 3 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", parts[0])
+            or parts[0].endswith("_control") or parts[1] not in ("8", "16", "32", "64")
+            or parts[2] not in ("cooperative", "ws")
+            or parts[1:] == ["8", "ws"]):
+        raise argparse.ArgumentTypeError("prefill arm must be NAME:BLOCK:cooperative|ws (WS block >=16)")
+    return parts[0], int(parts[1]), parts[2]
+
+
+def prefill_route_waves(path, family, layer):
+    """Read a family-labelled histogram fixture; never silently reuse another family."""
+    hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
+    data = json.loads(Path(path).read_text())
+    if (data.get("schema") != 1 or data.get("family") != family
+            or data.get("experts") != experts or data.get("top_k") != topk):
+        raise ValueError("route fixture family/expert/top-k metadata mismatch")
+    waves = [wave for wave in data.get("waves", []) if wave.get("layer") == layer]
+    if not waves:
+        raise ValueError("route fixture has no waves for the requested layer")
+    for wave in waves:
+        rows = wave.get("rows", 0)
+        counts = wave.get("expert_rows", [])
+        if (not isinstance(rows, int) or rows <= 0 or not counts
+                or any(not isinstance(e, int) or not isinstance(n, int)
+                       or not 0 <= e < experts or not 0 < n <= rows for e, n in counts)
+                or len({e for e, _ in counts}) != len(counts)
+                or sum(n for _, n in counts) != rows * topk):
+            raise ValueError("invalid recorded route histogram")
+    return waves
+
+
+def _make_prefill_layer(family, width, seed, device):
+    if family == "kimik3":
+        if width != KIMI_INTERMEDIATE:
+            raise ValueError("Kimi prefill fixture follows the TP6 width512 package")
+        return _make_kimi_layer(seed, device)
+    hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
+    generator = torch.Generator(device=device).manual_seed(seed)
+    tile_n = 256 if width % 256 == 0 else 128
+    tiers = []
+    for i, (bit, count) in enumerate(zip(bits, (3 * experts // 4, experts // 4))):
+        def scales(shape):
+            return (0.875 + 0.25 * torch.rand(shape, generator=generator, device=device)).half()
+        tiers.append(prepare_trellis256_moe_weights(
+            hidden_size=hidden, intermediate_size=width, num_experts=count,
+            activation=activation, fc1_tile_n=tile_n, fc2_tile_n=tile_n,
+            device=device, seed=seed + i, params_dtype=torch.float16,
+            w13_layout="trellis_t256_proj", trellis_bits=bit, codebook="mcg",
+            gate_suh=scales((count, hidden)), up_suh=scales((count, hidden)),
+            intermediate_rotations=scales((count, 3 * width)),
+            down_svh=scales((count, hidden)), tile_config=(64, tile_n, 64, tile_n)))
+    mapping, descriptor = build_ordered_maps(*(t.num_experts for t in tiers), device=device)
+    return *tiers, mapping, descriptor, combine_trellis_rotations(*tiers)
+
+
+def prefill_compile_options(family, width, block, mode, props):
+    hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
+    if width <= 0 or width % 128 or (family == "kimik3" and width != 512):
+        raise ValueError("prefill width must follow an H128-aligned family package")
+    slots = route_pack_capacity(4096 * topk, block, experts, topk=topk)[1]
+    tile_n = 256 if width % 256 == 0 else 128
+    counts = (384, 128) if family == "qwen4" else (896, 1)
+    return dict(size_m=4096, hidden_size=hidden, intermediate_size=width,
+        tier0_num_experts=counts[0], tier1_num_experts=counts[1],
+        top_k=topk, route_num_experts=experts, max_m_blocks=(slots + block - 1) // block,
+        sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
+        force_tile_config=(64, tile_n, 64, tile_n), tier0_bits=bits[0], tier1_bits=bits[1],
+        trellis_codebook="mcg", activation=activation, swiglu_limit=None,
+        moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype="bf16",
+        warp_specialized=mode == "ws",
+        token_major_rotation=family == "qwen4" and mode == "cooperative")
+
+
+def _run_prefill_benchmark(args, device, props):
+    from benchmarks.benchmark_exlr8_a16 import (
+        materialize_k4_arm, load_k4_arm, k4_noise_summary, real_route_ids,
+    )
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    if (props.major, props.minor) != (12, 1):
+        raise ValueError("prefill policy gate requires SM121")
+    if args.rounds < 3 or args.layers < 2 or args.replays < 1:
+        raise ValueError("prefill gate requires >=3 rounds, >=2 cold layers and positive replays")
+    specs = args.prefill_arm or [parse_prefill_arm(v) for v in (
+        ("coop:32:cooperative", "ws:32:ws") if args.prefill_family == "qwen4"
+        else ("coop8:8:cooperative", "coop16:16:cooperative", "ws16:16:ws"))]
+    names = [name for name, _, _ in specs]
+    if len(names) < 2 or len(names) != len(set(names)):
+        raise ValueError("prefill needs at least two uniquely named arms")
+    rows_list = list(map(int, (args.rows or "1408,2688,4096").split(",")))
+    if not rows_list or any(not 1 <= rows <= 4096 for rows in rows_list):
+        raise ValueError("prefill rows must be 1..4096")
+    family = args.prefill_family
+    hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
+    width = args.intermediate or (256 if family == "qwen4" else 512)
+    waves = prefill_route_waves(args.routes, family, args.route_layer) if args.routes else None
+    # No recorded family routes means correctness only, never a timing claim.
+    torch.cuda.set_per_process_memory_fraction(min(
+        0.25, (args.memory_cap_gib << 30) / props.total_memory), device)
+    bundle = args.prefill_source_dir
+    if bundle is None:
+        bundle = materialize_k4_arm(args.prefill_revision,
+                                   Path(tempfile.mkdtemp(prefix="family-prefill-")))
+    mix, provenance = load_k4_arm(bundle)
+    layers = [_make_prefill_layer(family, width, args.seed + 2*i, device)
+              for i in range(args.layers)]
+    states = {}
+    for name, block, mode in specs:
+        launch = mix.compile_mixed_trellis(**prefill_compile_options(family, width, block, mode, props))
+        workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
+        bounds = dict(gate_experts=(896, 0), up_experts=(896, 0)) if family == "kimik3" else {}
+        bindings = [mix.bind_mixed_trellis(*layer, launch, **bounds) for layer in layers]
+        mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
+        states[name] = workspace, bindings
+    generator = torch.Generator().manual_seed(args.seed)
+    ids = [(real_route_ids(4096, waves[i % len(waves)], generator, experts, topk)
+            if waves else torch.rand((4096, experts), generator=generator).topk(topk, dim=1).indices
+            ).to(device=device, dtype=torch.int32) for i in range(args.layers)]
+    weights = torch.rand((4096, topk), generator=generator).to(device)
+    weights /= weights.sum(-1, keepdim=True)
+    x = (torch.randn((4096, hidden), generator=generator) * 0.02).to(device=device, dtype=torch.bfloat16)
+
+    def run(name, rows, layer=0):
+        workspace, bindings = states[name]
+        return mix.run_bound_mixed_trellis(x[:rows], weights[:rows], ids[layer][:rows], bindings[layer], workspace)
+
+    for name in names:
+        for rows in (1, 17, 4096):
+            run(name, rows)
+    checked = list(range(1, 4097)) if args.prefill_exhaustive else sorted({1, 17, 63, 64, 65, 4096, *rows_list})
+    records = []
+    with kernel_resolution_guard("family prefill bitwise and frozen timing"):
+        full = run(names[0], 4096).clone()
+        if not bool(torch.isfinite(full).all()) or not bool(full.any()):
+            raise RuntimeError("reference output is not finite and nonzero")
+        for rows in checked:
+            expected = run(names[0], rows).clone()
+            if not torch.equal(expected.view(torch.int16), full[:rows].view(torch.int16)):
+                raise RuntimeError(f"reference prefix invariance failed at {rows}")
+            for name in names[1:]:
+                if not torch.equal(run(name, rows).view(torch.int16), expected.view(torch.int16)):
+                    raise RuntimeError(f"prefill arm {name} differs at {rows}")
+        for rows in rows_list:
+            for layer in range(args.layers):
+                expected = run(names[0], rows, layer).clone()
+                for name in names[1:]:
+                    if not torch.equal(run(name, rows, layer).view(torch.int16), expected.view(torch.int16)):
+                        raise RuntimeError(f"prefill arm {name} differs on layer {layer}, rows {rows}")
+            if waves is None or args.correctness_only:
+                continue
+            def calls(name):
+                for layer in range(args.layers):
+                    run(name, rows, layer)
+            graphs = {name: _capture(lambda name=name: calls(name), 3) for name in names}
+            graphs[names[0] + "_control"] = _capture(lambda: calls(names[0]), 3)
+            samples = {name: [] for name in graphs}
+            order = list(graphs)
+            for repeat in range(args.rounds):
+                rotated = order[repeat % len(order):] + order[:repeat % len(order)]
+                if repeat % 2:
+                    rotated.reverse()
+                for name in rotated:
+                    samples[name].append(statistics.median(_times(graphs[name], args.replays)) / args.layers)
+            record = dict(rows=rows, samples_us=samples, **k4_noise_summary(samples, names[0]))
+            records.append(record)
+            print(json.dumps(record), flush=True)
+    result = dict(schema=1, family=family, intermediate=width, arms=specs, source=provenance,
+        fixture="synthetic weights; K4/K5 expert split 384/128" if family == "qwen4" else "synthetic uniform K2 with dormant K3",
+        routes="recorded histograms" if waves else "uniform random; correctness only",
+        route_sha256=hashlib.sha256(args.routes.read_bytes()).hexdigest() if waves else None,
+        route_layer=args.route_layer, checked_rows=len(checked), exact=True, rows=records)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(dict(exact=True, checked_rows=len(checked), timed=bool(records))), flush=True)
+    if any(not record["noise_pass"] for record in records):
+        raise RuntimeError("identical-control spread exceeds 2%; no performance verdict")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, nargs="+", default=[1, 2, 4, 8, 32])
@@ -748,9 +936,25 @@ def main() -> None:
     parser.add_argument("--calls-per-graph", type=int, default=8)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261022)
+    parser.add_argument("--prefill-family", choices=tuple(PREFILL_FAMILIES))
+    parser.add_argument("--prefill-arm", action="append", type=parse_prefill_arm, default=[])
+    parser.add_argument("--intermediate", type=int, help="per-rank H128 width, default Qwen256/Kimi512")
+    parser.add_argument("--routes", type=Path, help="family-labelled recorded histogram JSON; absent means correctness only")
+    parser.add_argument("--route-layer", type=int, default=23)
+    parser.add_argument("--prefill-exhaustive", action="store_true", help="check every prefix row count 1..4096")
+    parser.add_argument("--correctness-only", action="store_true")
+    parser.add_argument("--prefill-revision", default="HEAD", help="freeze implementation from this git revision")
+    parser.add_argument("--prefill-source-dir", type=Path, help="pre-materialized K4 sibling-module bundle")
+    parser.add_argument("--memory-cap-gib", type=int, default=24)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.prefill_family and (args.kimi or args.output is None or args.memory_cap_gib <= 0):
+        parser.error("--prefill-family requires --output, positive memory cap, and no --kimi")
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
+    if args.prefill_family:
+        _run_prefill_benchmark(args, device, props)
+        return
     if args.kimi:
         if args.replays == 100:
             args.replays = 20
