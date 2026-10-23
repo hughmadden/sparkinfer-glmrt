@@ -231,8 +231,8 @@ class TrellisPrefillMxfp8:
             raise ValueError("the T1 prefill kernel covers K4 trellis only")
         if g.get("codebook", "e4m3") != "e4m3":
             raise ValueError("the T1 E4M3 tile covers the e4m3 codebook only")
-        if n_cta != 64 or self.n % n_cta:
-            raise ValueError("MX8 prefill requires N divisible by 64 and n_cta=64")
+        if n_cta != 64 or self.n % 32:
+            raise ValueError("MX8 prefill requires N32 alignment and n_cta=64")
         if n_cta % 16 or (n_cta // 8) % 2:
             raise ValueError("n_cta must cover whole pairs of n8 tiles")
         if part not in ("both", "quant", "gemm"):
@@ -301,7 +301,7 @@ class TrellisPrefillMxfp8:
                       warp: Int32, lane: Int32, payload: Int64):
         for j in cutlass.range_constexpr(self.n16):
             n = Int32(16 * j) + (lane >> Int32(1))
-            ng = nb * Int32(self.n_cta) + n
+            ng = min(nb * Int32(self.n_cta) + n, Int32(self.n-1))
             k = warp * Int32(16) + (lane & Int32(1)) * Int32(8)
             offset = ng.to(Int64) * Int64(self.k) + kb.to(Int64) * Int64(128) + k.to(Int64)
             if cutlass.const_expr(self.input_units):
@@ -325,7 +325,7 @@ class TrellisPrefillMxfp8:
 
     @cute.jit
     def _scale_index(self, nb: Int32, kb: Int32, col: Int32, k32: Int32):
-        n = nb * Int32(self.n_cta) + col
+        n = min(nb * Int32(self.n_cta) + col, Int32(self.n-1))
         index = n.to(Int64) * Int64(self.nk32) + kb.to(Int64)*Int64(4) + k32.to(Int64)
         if cutlass.const_expr(self.input_units):
             index = (kb.to(Int64)*Int64(self.n) + n.to(Int64))*Int64(4) + k32.to(Int64)
@@ -346,7 +346,7 @@ class TrellisPrefillMxfp8:
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
         sbase = shared_ptr_to_u32(storage.w.data_ptr())
-        n_tiles = Int32(self.n // self.n_cta)
+        n_tiles = Int32((self.n + self.n_cta-1) // self.n_cta)
         nkb = self.k // 128
         total_tasks = ((rows + Int32(self.m_cta - 1)) // Int32(self.m_cta)) * n_tiles
         row_last = Float32(rows - Int32(1))
@@ -451,10 +451,11 @@ class TrellisPrefillMxfp8:
                 for i in cutlass.range_constexpr(self.n8w):
                     col = nb * Int32(self.n_cta) + i * Int32(8) + (lane & Int32(3)) * Int32(2)
                     addr = obase + (mr.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4)
-                    if mr < rows:
-                        st_global_v2_f32(addr, total[m, i, 0], total[m, i, 1])
-                    if mr + Int32(8) < rows:
-                        st_global_v2_f32(addr + Int64(8 * self.n * 4), total[m, i, 2], total[m, i, 3])
+                    if col < Int32(self.n):
+                        if mr < rows:
+                            st_global_v2_f32(addr, total[m, i, 0], total[m, i, 1])
+                        if mr + Int32(8) < rows:
+                            st_global_v2_f32(addr + Int64(8 * self.n * 4), total[m, i, 2], total[m, i, 3])
             task += step
 
     @cute.jit
@@ -473,7 +474,7 @@ class TrellisPrefillMxfp8:
                            cta_limit, stream)
             if self.part in ("both", "gemm"):
                 layout = cute.make_layout(1, stride=1)
-                tasks = ((rows + Int32(self.m_cta - 1)) // Int32(self.m_cta)) * Int32(self.n // self.n_cta)
+                tasks = ((rows + Int32(self.m_cta - 1)) // Int32(self.m_cta)) * Int32((self.n + self.n_cta-1) // self.n_cta)
                 self.prefill(cute.make_tensor(rotated_inputs, layout),
                              cute.make_tensor(payload, layout),
                              cute.make_tensor(input_block_scales, layout),
