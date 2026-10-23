@@ -69,6 +69,21 @@ def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
     assert torch.equal(c.output[:64].view(torch.int32), expected.view(torch.int32))
 
 
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("k", [128, 1152, 2048, 16384])
+def test_folded_decode_all_widths_and_cta_budgets(side, k):
+    # A partial final K split and a one-CTA grid exercise both loops. Freeze
+    # against the unchanged prefill arithmetic, not the candidate's C64 route.
+    c = Case(k=k, n=128, side=side, rows=80)
+    c.launch(80)
+    expected = c.output[:64].clone()
+    for count in range(1, 65):
+        c.output.fill_(float("nan"))
+        c.launch(count, limit=1 if count % 2 else 7)
+        assert torch.equal(c.output[:count].view(torch.int32), expected[:count].view(torch.int32))
+        assert torch.isnan(c.output[count:]).all()
+
+
 def test_graph_replay_and_invalid_launch():
     c = Case(k=128, n=128, rows=64)
     c.launch(17)
@@ -489,7 +504,7 @@ def test_prefill_vs_base_bitwise_and_row_invariance(side, bits, codebook, monkey
     prefill = Case(k=1152, n=256, side=side, bits=bits, rows=max_rows, codebook=codebook)
     base.launch(max_rows)
     full_expected = base.output.clone()
-    for rows in (1, 16, 64, 129, 130, 192, 255, 256, 257, 512):
+    for rows in (1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 127, 128, 129, 130, 192, 255, 256, 257, 512):
         for limit in (4, 188 * 4):
             prefill.partial.fill_(float("nan"))
             prefill.output.fill_(float("nan"))

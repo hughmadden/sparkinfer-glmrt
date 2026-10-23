@@ -74,18 +74,19 @@ def _int4x8_bf16(word, *, loc=None, ip=None):
 
 @dsl_user_op
 def _quad_transpose_u8x4(raw, prmt_sel, *, loc=None, ip=None):
-    """4x4 u8 transpose across the 4 lanes j = 0..3 of each quad."""
+    """Two butterfly exchanges transpose packed int4 pairs across a quad."""
     return Uint32(llvm.inline_asm(
         T.i32(),
         [Uint32(raw).ir_value(loc=loc, ip=ip), Uint32(prmt_sel).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b32 s0, s1, s2, s3, lo, hi; "
-        "shfl.sync.idx.b32 s0, $1, 0, 0x1c1f, 0xffffffff; "
-        "shfl.sync.idx.b32 s1, $1, 1, 0x1c1f, 0xffffffff; "
-        "shfl.sync.idx.b32 s2, $1, 2, 0x1c1f, 0xffffffff; "
-        "shfl.sync.idx.b32 s3, $1, 3, 0x1c1f, 0xffffffff; "
-        "prmt.b32 lo, s0, s1, $2; "
-        "prmt.b32 hi, s2, s3, $2; "
-        "prmt.b32 $0, lo, hi, 0x6420; }",
+        "{ .reg .b32 s, t, v, sel, bit; .reg .pred p; "
+        "shfl.sync.bfly.b32 s, $1, 1, 0x1f, 0xffffffff; "
+        "and.b32 bit, $2, 1; setp.ne.u32 p, bit, 0; "
+        "selp.b32 sel, 0x3715, 0x6240, p; "
+        "prmt.b32 v, $1, s, sel; "
+        "shfl.sync.bfly.b32 t, v, 2, 0x1f, 0xffffffff; "
+        "and.b32 bit, $2, 2; setp.ne.u32 p, bit, 0; "
+        "selp.b32 sel, 0x3276, 0x5410, p; "
+        "prmt.b32 $0, v, t, sel; }",
         "=r,r,r",
         has_side_effects=False, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
