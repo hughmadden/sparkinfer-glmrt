@@ -10,7 +10,7 @@ import torch
 from ._common import Operand, Scalar, compile_program
 
 
-def geometry(input_features, output_features=64, *, encoding="trellis",
+def geometry(input_features, output_features=128, *, encoding="trellis",
              sharded_side=1, max_rows=4096, rotation_count=4, input_dtype="f16"):
     values = (input_features, output_features, max_rows, rotation_count)
     if any(type(v) is not int or not 0 < v < 2**31 for v in values):
