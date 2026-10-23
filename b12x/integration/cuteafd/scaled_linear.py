@@ -1,11 +1,19 @@
-"""Shared native MXFP8/int4-g32/row-FP8 linear ABI v1.
+"""Shared scaled-linear pointer ABIs.
 
-Pointer order: x BF16[rows,K], payload U8, scales, partial (unused by the tile
-core: zero scratch bytes, any pointer), output F32[rows,N]. Scalars rows and
-cta_limit I32, then stream. Payload is native
-[out,in] (int4 low nibble first, biased by 8), or side2 [in/128,out,128]
-(int4 last dimension 64 bytes). Group scales are [out,in/32], or
-[in/128,out,4]. MXFP8 uses UE8M0 bytes; int4 uses F16. Row-FP8 uses F32[out].
+Both versions take x BF16[rows,K], payload U8, scales, partial, output;
+then rows and cta_limit I32, then stream.
+
+ABI v1 (default): output F32[rows,N]; partial is unused (zero scratch bytes).
+Payload is native [out,in] (int4 low nibble first, biased by8), or side2
+[in/128,out,128] (int4 last dimension64 bytes). Group scales are [out,in/32],
+or [in/128,out,4]. MXFP8 uses UE8M0 bytes; int4 uses F16; row-FP8 uses F32[out].
+
+ABI v2 (activation_encoding="mxfp8"): dynamic K32 MXFP8 activations and native
+hardware MXFP8 MMA, output BF16[rows,N]. Payload stays E4M3 [N,K]; scales are
+UE8M0 in MMA tile order, prepared once from checkpoint [N,K/32] scales.
+partial is U8 scratch sized by stage_scratch_bytes(K,N,rows). The fixed
+(64,128) tile uses K128 stages and one K slice. Launch grids query the runtime
+SM count; cta_limit is unused. No device count enters the compile key.
 """
 from __future__ import annotations
 
@@ -73,8 +81,12 @@ def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp
             raise ValueError("native W8A8 requires MXFP8, output-major weights and N multiple128")
         from ._mxfp8_linear import Mxfp8Linear
         launch = Mxfp8Linear(k, n)
-        g.update(abi_version=2, activation_encoding="mxfp8", core="mxfp8_mma",
-                 scale_layout="mma", output_dtype="bfloat16")
+        g = dict(abi_version=2, input_features=k, output_features=n, max_rows=max_rows,
+                 encoding="mxfp8", activation_encoding="mxfp8", sharded_side=1,
+                 core="mxfp8_mma", scale_layout="mma", scale_block_size=32,
+                 output_dtype="bfloat16", splits=1, split_k=k,
+                 tile_m=64, tile_n=128, tile_k=128, mma_k=32,
+                 load_path="tma", target_occupancy=1, grid="runtime_num_sm")
         return compile_program(launch, name="scaled_linear_mxfp8", operands=(
             Operand("x", torch.bfloat16, f"[rows,{k}]"),
             Operand("payload", torch.uint8, f"[{n},{k}] (native E4M3)"),
@@ -83,7 +95,7 @@ def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp
             Operand("output", torch.bfloat16, f"[rows,{n}]", "out")),
             scalars=(Scalar("rows"), Scalar("cta_limit", note="unused; runtime SM count sets the grid")),
             key=(k, n, "mxfp8"), geometry=g,
-            scratch={"partial": launch.stage.scratch_bytes}, version=2)
+            scratch={"partial": launch.stage.scratch_bytes}, doc=__doc__, version=2)
     scale_dtype = {"mxfp8":torch.uint8,"int4_g32":torch.float16,"fp8_row":torch.float32}[encoding]
     payload_size = k*n//(2 if encoding == "int4_g32" else 1)
     scale_size = n if encoding == "fp8_row" else n*k//32
