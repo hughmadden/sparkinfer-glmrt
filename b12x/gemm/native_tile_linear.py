@@ -92,6 +92,29 @@ def _quad_transpose_u8x4(raw, prmt_sel, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _quad_transpose_u16x4(a, b, j, *, loc=None, ip=None):
+    """Transpose packed E4M3 pairs before widening: three shuffles, not four."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip),
+         Int32(j).ir_value(loc=loc, ip=ip)],
+        "{ .reg .pred hi; .reg .b32 bit, s, t, lo, up, x, y, sel; "
+        "and.b32 bit, $4, 2; setp.ne.u32 hi, bit, 0; "
+        "selp.b32 s, $2, $3, hi; "
+        "shfl.sync.bfly.b32 t, s, 2, 0x1f, 0xffffffff; "
+        "selp.b32 lo, t, $2, hi; selp.b32 up, $3, t, hi; "
+        "shfl.sync.bfly.b32 x, lo, 1, 0x1f, 0xffffffff; "
+        "shfl.sync.bfly.b32 y, up, 1, 0x1f, 0xffffffff; "
+        "and.b32 bit, $4, 1; setp.ne.u32 hi, bit, 0; "
+        "selp.b32 sel, 0x3276, 0x5410, hi; "
+        "prmt.b32 $0, lo, x, sel; prmt.b32 $1, up, y, sel; }",
+        "=r,=r,r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return (Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)))
+
+
+@dsl_user_op
 def _quad_transpose_x4(a0, a1, a2, a3, j, *, loc=None, ip=None):
     """4x4 u32 matrix transpose across the 4 lanes j = 0..3 of each quad."""
     result = llvm.inline_asm(
@@ -487,9 +510,10 @@ class NativeTileLinear:
                                     b0, b1, b2, b3 = _int4x8_bf16(t_w)
                                     r_s0, r_s1 = scur[c], scur[2 + c]
                                 else:
-                                    w0, w1 = _e4m3x4_bf16(cur[c * 4 + 2 * h])
-                                    w2, w3 = _e4m3x4_bf16(cur[c * 4 + 2 * h + 1])
-                                    b0, b1, b2, b3 = _quad_transpose_x4(w0, w1, w2, w3, j)
+                                    packed0, packed1 = _quad_transpose_u16x4(
+                                        cur[c * 4 + 2 * h], cur[c * 4 + 2 * h + 1], j)
+                                    b0, b1 = _e4m3x4_bf16(packed0)
+                                    b2, b3 = _e4m3x4_bf16(packed1)
                                     r_s0 = scur[0] >> Uint32(16 * c)
                                     r_s1 = scur[1] >> Uint32(16 * c)
                                 s0 = self._scale(r_s0, h)
