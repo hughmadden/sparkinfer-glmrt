@@ -300,7 +300,7 @@ def benchmark_mx8(args):
     rows_list = [int(r) for r in args.rows.split(",")]
     if not rows_list or any(not 0 < r <= 4096 for r in rows_list) or args.output is None:
         raise ValueError("MX8 requires output and rows in 1..4096")
-    shapes = [s for s in SHAPES if s[0] in {"trellis", "mxfp8", "int4_g32"}]
+    shapes = [s for s in SHAPES if s[0] in {"trellis", "mxfp8"}]
     shapes += [(f, op+"_tp2", k if side == 1 else k//2,
                 n//2 if side == 1 else n, side) for f, op, k, n, side in shapes]
     names = set(args.shapes.split(",")) if args.shapes else {s[1] for s in shapes}
@@ -317,6 +317,10 @@ def benchmark_mx8(args):
     for fmt, op, k, n, side in shapes:
         storage, _ = native_tensors(fmt, k, n, capacity)
         inputs, payload, scales, partial, output, x = storage
+        if fmt == "mxfp8":
+            scales.random_(118,124)
+        else:
+            scales.copy_(torch.exp2(torch.randint(-2,3,scales.shape,device="cuda").float()))
         table = (inputs if fmt == "trellis" else
                  torch.tensor([x.data_ptr()]*4, dtype=torch.int64, device="cuda"))
         dtype = "f16" if fmt == "trellis" else "bf16"

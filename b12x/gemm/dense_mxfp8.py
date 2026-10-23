@@ -207,26 +207,22 @@ class TrellisMxfp8Quant:
 
 
 class TrellisPrefillMxfp8:
-    """Many-row trellis dense linear on MXFP8 records.
+    """Native trellis/MXFP8 prefill over caller-owned MXFP8 activation records.
 
-    ``TrellisMxfp8Quant`` writes the records into the ABI's ``partial`` scratch
-    (``rows*K`` bytes of the 4-byte-per-element split-K scratch, so no new
-    allocation); this kernel then runs the decode-once E4M3 tile in smem in
-    ``ldmatrix`` order -- ``[n][k128]`` bytes with the k16 group XOR-swizzled by
-    ``n & 7`` -- and feeds ``mma.kind::mxf8f6f4.block_scale.scale_vec::1X``
-    m16n8k32 with the activation's E8M0 scale byte and B at E8M0 127.
-
-    ``part`` selects the pass to launch: ``both`` (the whole route), ``quant``
-    or ``gemm`` (the two halves, for separate timing).
+    The zero-spill N64/M256 consumer is shared; only the B-tile loader and
+    scale operand differ. Activation records are prepared separately and can
+    be reused across projections with the same input and rotation.
     """
 
     ABI_VERSION = 1
 
     def __init__(self, g, *, n_cta: int = 64, stages: int = 2,
-                 part: str = "gemm", dbg: bool = False, mpw: int = 2):
+                 mpw: int = 2):
         self.k, self.n = g["input_features"], g["output_features"]
         self.encoding = g.get("encoding", "trellis")
         self.bits = g.get("bits", 4)
+        if self.encoding not in ("trellis", "mxfp8"):
+            raise ValueError("MX8 prefill supports trellis and MXFP8 weights")
         if self.bits != 4:
             raise ValueError("the T1 prefill kernel covers K4 trellis only")
         if g.get("codebook", "e4m3") != "e4m3":
@@ -235,19 +231,16 @@ class TrellisPrefillMxfp8:
             raise ValueError("MX8 prefill requires N32 alignment and n_cta=64")
         if n_cta % 16 or (n_cta // 8) % 2:
             raise ValueError("n_cta must cover whole pairs of n8 tiles")
-        if part not in ("both", "quant", "gemm"):
-            raise ValueError("part must be both, quant or gemm")
         self.input_units = g["sharded_side"] == 2
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
         if mpw not in (1, 2):
             raise ValueError("mpw must be 1 or 2")
         self.mpw, self.m_cta = mpw, M_CTA * mpw
         self.scratch_bytes = ((self.max_rows + 15) // 16) * (self.k // 32) * MX8_REC
-        self.n_cta, self.stages, self.part = n_cta, stages, part
+        self.n_cta, self.stages = n_cta, stages
         self.nk32 = self.k // 32
         self.n16 = n_cta // 16
         self.n8w = n_cta // 8
-        self.quant = TrellisMxfp8Quant(g, dbg=dbg)
 
     def _storage(self):
         # E4M3 B tile: stages x n_cta rows of 128 k-bytes.
@@ -307,17 +300,7 @@ class TrellisPrefillMxfp8:
             if cutlass.const_expr(self.input_units):
                 offset = ((kb.to(Int64) * Int64(self.n) + ng.to(Int64)) * Int64(128)
                           + k.to(Int64))
-            if cutlass.const_expr(self.encoding == "int4_g32"):
-                q = ld_global_nc_u32(payload + offset // Int64(2))
-                e = cute.make_rmem_tensor((2,), Uint32)
-                for h in cutlass.range_constexpr(2):
-                    v = cute.make_rmem_tensor((4,), Float32)
-                    for t in cutlass.range_constexpr(4):
-                        v[t] = ((q >> Uint32(16*h + 4*t)) & Uint32(15)).to(Float32) - Float32(8)
-                    e[h] = cvt_f32x4_to_e4m3x4(v[0], v[1], v[2], v[3])
-                lo, hi = e[0], e[1]
-            else:
-                lo, hi = ld_global_nc_v2_u32(payload + offset)
+            lo, hi = ld_global_nc_v2_u32(payload + offset)
             at = (sbase + stage * Int32(128*self.n_cta) + n * Int32(128)
                   + ((warp ^ (n & Int32(7))) << 4) + (lane & Int32(1))*Int32(8))
             st_shared_u32(at, lo)
@@ -349,7 +332,6 @@ class TrellisPrefillMxfp8:
         n_tiles = Int32((self.n + self.n_cta-1) // self.n_cta)
         nkb = self.k // 128
         total_tasks = ((rows + Int32(self.m_cta - 1)) // Int32(self.m_cta)) * n_tiles
-        row_last = Float32(rows - Int32(1))
         # B-fragment ldmatrix rows: matrix m = lane>>3 selects (n8 of the pair,
         # k16 half); every lane addresses column n = (m>>1)*8 + (lane&7).
         blk = Int32((lane >> Int32(3)) & Int32(1))
@@ -361,7 +343,6 @@ class TrellisPrefillMxfp8:
             nb = task % n_tiles
             m_base = (task // n_tiles) * Int32(self.m_cta)
             row = m_base + warp * Int32(16 * self.mpw) + (lane >> Int32(2))
-            rc = Int32(cute.arch.fmin(Float32(row), row_last))
             total = cute.make_rmem_tensor((self.mpw, self.n8w, 4), Float32)
             total.fill(Float32(0.0))
             mb = ((task // n_tiles) * Int32(NWARP) + warp) * Int32(self.mpw)
@@ -418,25 +399,13 @@ class TrellisPrefillMxfp8:
                                 acc[m, i, 0], acc[m, i, 1], acc[m, i, 2], acc[m, i, 3],
                                 af[m, 0], af[m, 1], af[m, 2], af[m, 3], b2, b3, af[m, 4], sb1)
                             acc[m, i, 0], acc[m, i, 1], acc[m, i, 2], acc[m, i, 3] = d0, d1, d2, d3
-                    if cutlass.const_expr(self.encoding == "int4_g32"):
-                        for m in cutlass.range_constexpr(self.mpw):
-                            for r in cutlass.range_constexpr(self.n8w):
-                                col = Int32(8*r) + (lane & Int32(3))*Int32(2)
-                                idx = self._scale_index(nb, kb, col, Int32(k32))
-                                s0 = _side_value(scales.iterator.toint(), idx)
-                                s1 = _side_value(scales.iterator.toint(), idx + Int64(4 if self.input_units else self.nk32))
-                                for v in cutlass.range_constexpr(4):
-                                    factor = s0 if v % 2 == 0 else s1
-                                    total[m, r, v] = total[m, r, v] + acc[m, r, v]*factor
-                        acc.fill(Float32(0))
-                if cutlass.const_expr(self.encoding != "int4_g32"):
-                    scale = Float32(1)
-                    if cutlass.const_expr(self.encoding == "trellis"):
-                        scale = _side_value(scales.iterator.toint(), kb)
-                    for m in cutlass.range_constexpr(self.mpw):
-                        for r in cutlass.range_constexpr(self.n8w):
-                            for v in cutlass.range_constexpr(4):
-                                total[m, r, v] = total[m, r, v] + acc[m, r, v]*scale
+                scale = Float32(1)
+                if cutlass.const_expr(self.encoding == "trellis"):
+                    scale = _side_value(scales.iterator.toint(), kb)
+                for m in cutlass.range_constexpr(self.mpw):
+                    for r in cutlass.range_constexpr(self.n8w):
+                        for v in cutlass.range_constexpr(4):
+                            total[m, r, v] = total[m, r, v] + acc[m, r, v]*scale
                 if kb + Int32(1) < Int32(nkb):
                     if cutlass.const_expr(self.encoding == "trellis"):
                         for j in cutlass.range_constexpr(self.n16):
@@ -463,23 +432,16 @@ class TrellisPrefillMxfp8:
                  input_block_scales: cute.Pointer, partial: cute.Pointer,
                  output: cute.Pointer, rows: Int32, rotation_id: Int32,
                  cta_limit: Int32, stream: cuda.CUstream):
-        # ``partial`` (the ABI's split-K scratch, 4 B/element) carries the MXFP8
-        # records (K*rows bytes) for every column CTA: it is at least
-        # ceil(rows/16)*(K/32)*528 B whenever N >= 264.
         if (rows > Int32(0) and rows <= Int32(self.max_rows)
                 and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations)
                 and cta_limit > Int32(0)):
-            if self.part in ("both", "quant"):
-                self.quant(rotated_inputs, partial, rows, rotation_id,
-                           cta_limit, stream)
-            if self.part in ("both", "gemm"):
-                layout = cute.make_layout(1, stride=1)
-                tasks = ((rows + Int32(self.m_cta - 1)) // Int32(self.m_cta)) * Int32((self.n + self.n_cta-1) // self.n_cta)
-                self.prefill(cute.make_tensor(rotated_inputs, layout),
-                             cute.make_tensor(payload, layout),
-                             cute.make_tensor(input_block_scales, layout),
-                             cute.make_tensor(partial, layout),
-                             cute.make_tensor(output, layout),
-                             rows, rotation_id).launch(
-                    grid=(min(tasks, cta_limit), 1, 1), block=(32 * NWARP, 1, 1),
-                    stream=stream)
+            layout = cute.make_layout(1, stride=1)
+            tasks = ((rows + Int32(self.m_cta - 1)) // Int32(self.m_cta)) * Int32((self.n + self.n_cta-1) // self.n_cta)
+            self.prefill(cute.make_tensor(rotated_inputs, layout),
+                         cute.make_tensor(payload, layout),
+                         cute.make_tensor(input_block_scales, layout),
+                         cute.make_tensor(partial, layout),
+                         cute.make_tensor(output, layout),
+                         rows, rotation_id).launch(
+                grid=(min(tasks, cta_limit), 1, 1), block=(32 * NWARP, 1, 1),
+                stream=stream)

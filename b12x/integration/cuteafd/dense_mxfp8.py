@@ -17,7 +17,7 @@ def geometry(input_features, output_features=128, *, encoding="trellis",
         raise ValueError("MX8 dense geometry requires positive int32 dimensions")
     if input_features % 128 or output_features % 32:
         raise ValueError("MX8 dense requires K128 and N32 alignment")
-    if encoding not in ("trellis", "mxfp8", "int4_g32"):
+    if encoding not in ("trellis", "mxfp8"):
         raise ValueError("unsupported MX8 dense encoding")
     if sharded_side not in (1, 2) or input_dtype not in ("f16", "bf16"):
         raise ValueError("unsupported MX8 dense shard side or activation dtype")
