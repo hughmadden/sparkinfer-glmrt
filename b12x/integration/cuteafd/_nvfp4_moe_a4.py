@@ -16,8 +16,10 @@ rounding.
 ``ChunkRowsA4``       chunk-padded packed activations ``[max_tiles * 128, K/2]``
     and E4M3 scales ``[max_tiles * 128, K/16]`` from BF16 or FP8 K32 wire
     rows (each chunk with its expert's gate ``input_scale``).
-``ChunkSwiGLUA4``     ``act = bf16(bf16(silu(g)) * u)`` (clamped as the BF16
-    route) quantized the same way with the expert's down ``input_scale``.
+``ChunkSwiGLUA4``     the selected activation contract (default
+    ``act = bf16(bf16(silu(g)) * u)``), quantized the same way with the
+    expert's down ``input_scale``. SwiGLU-OAI clamps gate above and up on both
+    sides, then rounds ``g * sigmoid(1.702 * g) * (u + 1)`` to BF16 once.
 ``StreamNvfp4LinearA4``  ``y[p] = alpha_e * in_e * (a_p . w_e^T)`` over the
     packed operands: a CTA owns either a sparse 16-row tile with 32/64/128
     output columns, or a wide 128-row tile with 128 columns. Both stream
@@ -158,11 +160,13 @@ class ChunkSwiGLUA4:
                  activation: str = "silu_bf16_product"):
         self.inter, self.experts, self.limit = int(inter), int(experts), float(limit)
         self.post_silu = activation == "silu_post_clamp_fp32_product"
+        self.swigluoai = activation == "swigluoai_uninterleave"
         self.in_offset = nvfp4_input_scale_offset(experts, hidden, inter)
 
     def key(self) -> tuple:
         return ("chunk_swiglu_a4", self.inter, self.experts, self.limit, self.in_offset) + (
-            ("silu_post_clamp_fp32_product",) if self.post_silu else ())
+            ("silu_post_clamp_fp32_product",) if self.post_silu else
+            ("swigluoai_uninterleave",) if self.swigluoai else ())
 
     @cute.jit
     def __call__(self, g: cute.Pointer, u: cute.Pointer, meta: cute.Pointer, scales: cute.Pointer,
@@ -192,19 +196,7 @@ class ChunkSwiGLUA4:
                     u2, u3 = _ld_v2_u32(Int64(u.toint()) + at + Int64(16 * half + 8))
                     gw = (g0, g1, g2, g3)
                     uw = (u0, u1, u2, u3)
-                    for q in cutlass.range_constexpr(4):
-                        for side in cutlass.range_constexpr(2):
-                            gate = _bf16_lo(gw[q]) if side == 0 else _bf16_hi(gw[q])
-                            up = _bf16_lo(uw[q]) if side == 0 else _bf16_hi(uw[q])
-                            if const_expr(self.post_silu):
-                                values[8 * half + 2 * q + side] = _round_bf16(_post_silu_product(gate, up, self.limit))
-                            else:
-                                if const_expr(self.limit > 0.0):
-                                    gate = cutlass.select_(gate > Float32(self.limit), Float32(self.limit), gate)
-                                    up = cutlass.select_(up > Float32(self.limit), Float32(self.limit), up)
-                                    up = cutlass.select_(up < Float32(-self.limit), Float32(-self.limit), up)
-                                silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
-                                values[8 * half + 2 * q + side] = _round_bf16(silu * up)
+                    _swiglu16(gw, uw, values, 8 * half, self.limit, self.post_silu, self.swigluoai)
                 _quantize_row16(values, gs, Int64(aq.toint()) + Int64(i) * Int64(self.inter // 2) + Int64(grp) * Int64(8),
                                 Int64(a_s.toint()) + Int64(i) * Int64(groups) + Int64(grp))
 
@@ -434,8 +426,8 @@ class StreamNvfp4LinearA4:
 
 @cute.jit
 def _swiglu16(gw, uw, values: cute.Tensor, base: cutlass.Constexpr, limit: cutlass.Constexpr,
-              post_silu: cutlass.Constexpr = False):
-    """``values[base + j] = bf16(bf16(silu(g)) * u)`` of eight BF16 gate/up pairs (``ChunkSwiGLUA4``'s math)."""
+              post_silu: cutlass.Constexpr = False, swigluoai: cutlass.Constexpr = False):
+    """Eight BF16 gate/up pairs under the selected activation contract."""
     for q in cutlass.range_constexpr(4):
         for side in cutlass.range_constexpr(2):
             gate = _bf16_lo(gw[q]) if side == 0 else _bf16_hi(gw[q])
@@ -447,8 +439,12 @@ def _swiglu16(gw, uw, values: cute.Tensor, base: cutlass.Constexpr, limit: cutla
                     gate = cutlass.select_(gate > Float32(limit), Float32(limit), gate)
                     up = cutlass.select_(up > Float32(limit), Float32(limit), up)
                     up = cutlass.select_(up < Float32(-limit), Float32(-limit), up)
-                silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
-                values[base + 2 * q + side] = _round_bf16(silu * up)
+                if const_expr(swigluoai):
+                    sigmoid = div_rn_f32(Float32(1.0), Float32(1.0) + cute.math.exp(-Float32(1.702) * gate, fastmath=False))
+                    values[base + 2 * q + side] = _round_bf16(gate * sigmoid * (up + Float32(1.0)))
+                else:
+                    silu = _round_bf16(div_rn_f32(gate, Float32(1.0) + cute.math.exp(-gate, fastmath=False)))
+                    values[base + 2 * q + side] = _round_bf16(silu * up)
 
 
 class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
@@ -460,7 +456,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
     main loop is ``StreamNvfp4LinearA4``'s. Each warp scales its accumulators by
     its projection's ``alpha_e * in_e`` and rounds them to BF16 into shared
     memory (the ring, after the last K block); then each thread takes 16
-    columns of one row, computes ``bf16(bf16(silu(g)) * u)`` and writes them as
+    columns of one row, applies the selected activation contract and writes it as
     NVFP4 with the expert's down ``input_scale`` into ``aq [max_tiles * 128,
     I/2]`` / ``a_s [max_tiles * 128, I/16]``."""
 
@@ -477,6 +473,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.x_stride = 2 * self.tile_n + 16
         self.inter, self.limit = int(inter), float(limit)
         self.post_silu = activation == "silu_post_clamp_fp32_product"
+        self.swigluoai = activation == "swigluoai_uninterleave"
         if k_block is None:
             k_block = self.k_block
         if self.k % k_block or k_block % 64:
@@ -508,7 +505,8 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
     def key(self) -> tuple:
         return ("stream_gate_up_nvfp4_a4", 5, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.live_min, self.live_max) + (
-                    ("silu_post_clamp_fp32_product",) if self.post_silu else ())
+                    ("silu_post_clamp_fp32_product",) if self.post_silu else
+                    ("swigluoai_uninterleave",) if self.swigluoai else ())
 
     def _storage(self):
         class Storage:
@@ -622,7 +620,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                         for half in cutlass.range_constexpr(2):
                             gw = ld_shared_v4_u32(at + Int32(16 * half))
                             uw = ld_shared_v4_u32(at + Int32(self.half_n * 2 + 16 * half))
-                            _swiglu16(gw, uw, values, 8 * half, self.limit, self.post_silu)
+                            _swiglu16(gw, uw, values, 8 * half, self.limit, self.post_silu, self.swigluoai)
                         i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(row)
                         col16 = Int64(n0 // Int32(16) + grp)
                         _quantize_row16(values, gs, Int64(act.toint()) + i * Int64(self.inter // 2) + col16 * Int64(8),
