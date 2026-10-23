@@ -624,11 +624,17 @@ class NativeTrellisLinear:
                     b = w_s0[k16_in_64, 0]
                     a = cute.arch.shuffle_sync(b, prev_lane)
                     wa, wb = b, (a << Uint32(16)) | (b >> Uint32(16))
-                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
+                    if cutlass.const_expr(self.mul1):
+                        b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, 4)
+                    else:
+                        b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
                 else:
                     wa, wb = trellis_align_stream_u32x2(
                         w_s0[k16_in_64, 0], w_s0[k16_in_64, 1], w_s0[k16_in_64, 2], shift, delta)
                     if cutlass.const_expr(self.mul1):
+                        # K2--K5 MUL1 consumes two four-window words, not lo/hi.
+                        if cutlass.const_expr(self.bits < 6):
+                            wb = (wa >> Uint32(4 * self.bits)) | (wb << Uint32(32 - 4 * self.bits))
                         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, self.bits)
                     else:
                         b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, self.bits)
@@ -663,11 +669,17 @@ class NativeTrellisLinear:
                     b = w_s1[k16_in_64, 0]
                     a = cute.arch.shuffle_sync(b, prev_lane)
                     wa, wb = b, (a << Uint32(16)) | (b >> Uint32(16))
-                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
+                    if cutlass.const_expr(self.mul1):
+                        b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, 4)
+                    else:
+                        b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
                 else:
                     wa, wb = trellis_align_stream_u32x2(
                         w_s1[k16_in_64, 0], w_s1[k16_in_64, 1], w_s1[k16_in_64, 2], shift, delta)
                     if cutlass.const_expr(self.mul1):
+                        # K2--K5 MUL1 consumes two four-window words, not lo/hi.
+                        if cutlass.const_expr(self.bits < 6):
+                            wb = (wa >> Uint32(4 * self.bits)) | (wb << Uint32(32 - 4 * self.bits))
                         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, self.bits)
                     else:
                         b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, self.bits)

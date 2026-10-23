@@ -38,7 +38,7 @@ class Case:
                             scalars=(rows, rotation, limit))
 
 
-@pytest.mark.parametrize("side,bits,codebook", [(1, 4, "e4m3"), (2, 4, "e4m3"), (1, 2, "e4m3"), (2, 3, "e4m3"), (1, 4, "f16"), (2, 3, "f16"), *[(side, bits, cb) for side in (1, 2) for bits in (5, 6) for cb in ("mcg", "mul1")]])
+@pytest.mark.parametrize("side,bits,codebook", [(1, 4, "e4m3"), (2, 4, "e4m3"), (1, 2, "e4m3"), (2, 3, "e4m3"), (1, 4, "f16"), (2, 3, "f16"), *[(side, bits, cb) for side in (1, 2) for bits in (2, 3, 4, 5, 6) for cb in ("mcg", "mul1")]])
 def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
     c = Case(side=side, bits=bits, codebook=codebook)
     c.launch(64, rotation=0)
