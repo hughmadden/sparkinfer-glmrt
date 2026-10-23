@@ -90,3 +90,34 @@ def test_per_format_modules(tmp_path, formats):
     (bundle / target["path"]).write_text("VALUE = 2\n")
     with pytest.raises(ValueError, match="digest mismatch"):
         arms.verify(bundle, pinned, formats)
+
+
+@pytest.mark.parametrize("rounds,replays", [(0, 1), (6, 100)])
+def test_valid_timing(rounds, replays):
+    arms.validate_timing(rounds, replays)
+
+
+@pytest.mark.parametrize("rounds,replays", [(-1, 10), (1, 0), (0, -1), (1.5, 10), (2, 1.5)])
+def test_invalid_timing(rounds, replays):
+    with pytest.raises(ValueError):
+        arms.validate_timing(rounds, replays)
+
+
+def test_alternating_timing_order():
+    names = ["base", "candidate", "reference_control"]
+    assert [arms.timing_order(names, i) for i in range(4)] == [names, names[::-1], names, names[::-1]]
+    assert names == ["base", "candidate", "reference_control"]
+
+
+@pytest.mark.parametrize("control,passed", [(10.1, True), (10.5, False)])
+def test_control_noise(control, passed):
+    medians, spread, noise_pass = arms.timing_summary(
+        {"base": [9., 10., 11.], "reference_control": [control]*3, "candidate": [8.]*3}, "base")
+    assert medians["base"] == 10.
+    assert spread == pytest.approx(abs(control/10.-1))
+    assert noise_pass is passed
+
+
+def test_missing_control_is_not_a_noise_pass():
+    _, spread, passed = arms.timing_summary({"base": [10.]}, "base")
+    assert spread is None and passed is False

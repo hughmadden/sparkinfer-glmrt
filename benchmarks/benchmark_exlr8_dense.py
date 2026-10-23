@@ -28,7 +28,7 @@ from benchmarks.benchmark_exlr8_a16 import capture, timing, read_roofline, finit
 from b12x.integration.cuteafd._common import Operand, Scalar, compile_program, exportable_compilation
 from b12x.integration.cuteafd import trellis_linear, scaled_linear, fp8_row_embedding
 from b12x.integration.cuteafd._fp8_weights import Fp8Projection
-from benchmarks._exlr8_dense_arms import parse_arms, parse_references, materialize, verify, program_key, cold_copies
+from benchmarks._exlr8_dense_arms import parse_arms, parse_references, materialize, verify, program_key, cold_copies, validate_timing, timing_order, timing_summary
 
 # Unique native formats/shapes from the GLM 5.3 bit325 load plan.
 SHAPES = (
@@ -84,7 +84,7 @@ def rotated(launches):
     return run
 
 
-def baseline(k, n, rows, a16=False, cold_l2=False):
+def baseline(k, n, rows, a16=False, cold_l2=False, graph_repeats=1):
     # Decode programs keep their GEMV to 64 rows either way; prefill W8A16 on fp8_rows 0.
     core = BlockFp8(k, n, rows > 64, 0 if a16 and rows > 64 else 255)
     ops = (Operand("x", torch.bfloat16, "[rows,K]"),
@@ -104,7 +104,7 @@ def baseline(k, n, rows, a16=False, cold_l2=False):
     tensors = (x, weight, scales, scratch, output)
     launches = [lambda: program.launch(*tensors, scalars=(rows,))]
     launches += [lambda w=w, s=s: program.launch(x, w, s, scratch, output, scalars=(rows,)) for w, s in extra]
-    graph = capture(rotated(launches))
+    graph = capture(rotated(launches * graph_repeats))
     finite_nonzero(output, "block-FP8")
     return graph, (tensors, extra), len(launches)
 
@@ -491,10 +491,15 @@ def main():
     parser.add_argument("--rows", default="1,4,16,64,4096")
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--cold-l2", action="store_true")
+    parser.add_argument("--interleave-rounds", type=int, default=0, help="alternate arms and duplicate reference control; replays are captured inside each graph")
     parser.add_argument("--profile-arm")
     parser.add_argument("--profile-op", help="FORMAT/OP")
     parser.add_argument("--profile-rows", type=int)
     args = parser.parse_args()
+    try:
+        validate_timing(args.interleave_rounds, args.replays)
+    except ValueError as error:
+        parser.error(str(error))
     if args.mxfp8_prefill:
         return benchmark_mx8(args)
     if args.unpacked_trellis:
@@ -599,15 +604,21 @@ def main():
             copies = copies_for(read_bytes, args.cold_l2 and rows <= 64)
             extra = [(tensors[1].clone(), tensors[2].clone()) for _ in range(copies-1)]
             base_us, base_error = None, None
+            timed, keeps, records = {}, [], []
+            repeats = args.replays if args.interleave_rounds and not profile else 1
             if not profile:
                 try:
-                    graph, keep, count = baseline(k, n, rows, a16=True, cold_l2=args.cold_l2)
+                    graph, keep, count = baseline(k, n, rows, a16=True, cold_l2=args.cold_l2, graph_repeats=repeats)
                 except TypeError as error:
                     if "dense_gemm launch is unsupported" not in str(error):
                         raise
                     base_error = str(error)
                 else:
-                    base_us = timing(graph, 1 if rows > 64 else args.replays)/count
+                    if args.interleave_rounds:
+                        timed["block_fp8"] = (graph, count * repeats)
+                        keeps.append(keep)
+                    else:
+                        base_us = timing(graph, 1 if rows > 64 else args.replays)/count
                     del graph, keep
             for name, program in programs.items():
                 tensors[-1].fill_(float("nan"))
@@ -635,22 +646,60 @@ def main():
                 if record["eligible"]:
                     launches = [lambda p=program: p.launch(*tensors, scalars=scalars)]
                     launches += [lambda w=w, s=s, p=program: p.launch(tensors[0], w, s, *tensors[3:], scalars=scalars) for w, s in extra]
-                    graph = capture(rotated(launches))
+                    graph = capture(rotated(launches * repeats))
                     if profile:
                         if name == args.profile_arm:
                             torch.cuda.cudart().cudaProfilerStart()
                             graph.replay()
                             torch.cuda.synchronize()
                             torch.cuda.cudart().cudaProfilerStop()
+                    elif args.interleave_rounds:
+                        timed[name] = (graph, copies * repeats)
+                        if name == selected_reference:
+                            timed["reference_control"] = (capture(rotated(launches * repeats)), copies * repeats)
+                        record.update(weight_copies=copies, read_bytes=read_bytes)
                     else:
                         us = timing(graph, 1 if rows > 64 else args.replays)/copies
                         record.update(native_us=us, speedup_vs_w8a16=base_us/us if base_us else None,
                                       weight_copies=copies, read_bytes=read_bytes)
                     del graph
+                records.append(record)
                 report["measurements"].append(record)
                 args.output.write_text(json.dumps(report, indent=2)+"\n")
                 print(json.dumps(record), flush=True)
-            del expected, extra
+            if args.interleave_rounds and not profile:
+                samples = {name: [] for name in timed}
+                # Warm every graph before alternating. One replay contains all
+                # repetitions, so host/WSL submission gaps are not multiplied.
+                for graph, _ in timed.values():
+                    graph.replay()
+                torch.cuda.synchronize()
+                order = list(timed)
+                for iteration in range(args.interleave_rounds):
+                    for name in timing_order(order, iteration):
+                        graph, count = timed[name]
+                        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                        start.record()
+                        graph.replay()
+                        end.record()
+                        end.synchronize()
+                        samples[name].append(start.elapsed_time(end) * 1000 / count)
+                medians, spread, noise_pass = timing_summary(samples, selected_reference)
+                reference_us = medians.get(selected_reference)
+                for record in records:
+                    name = record["arm"]
+                    if name in medians:
+                        us = medians[name]
+                        record.update(native_us=us, native_samples_us=samples[name],
+                                      w8a16_us=medians.get("block_fp8"),
+                                      speedup_vs_w8a16=medians.get("block_fp8", 0)/us or None,
+                                      speedup_vs_reference=reference_us/us if reference_us else None,
+                                      identical_control_spread=spread,
+                                      timing_noise_pass=noise_pass,
+                                      interleaved_samples_us=samples, graph_repeats=repeats)
+                        print(json.dumps(record), flush=True)
+                args.output.write_text(json.dumps(report, indent=2)+"\n")
+            del expected, extra, timed, keeps
         del storage, tensors, prefixes, weight, x, oracle, bf16
     failed = [m for m in report["measurements"] if not m["eligible"]]
     print(f"Wrote {len(report['measurements'])} measurements; {len(failed)} failed gates", flush=True)
