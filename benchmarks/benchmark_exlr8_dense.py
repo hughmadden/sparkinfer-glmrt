@@ -291,9 +291,135 @@ def benchmark_unpacked(args):
     return False
 
 
+def benchmark_mx8(args):
+    """Shared-record native prefill, quantized-A oracle and frozen row checks."""
+    from b12x.integration.cuteafd.dense_mxfp8 import (
+        compile_dense_mxfp8_aot, compile_dense_mxfp8_quant_aot, record_bytes)
+    from b12x.integration.cuteafd.trellis_unpack import compile_trellis_unpack_e4m3_aot
+    from b12x.integration.cuteafd.native_dense import compile_trellis_fp8_prefill_aot
+    rows_list = [int(r) for r in args.rows.split(",")]
+    if not rows_list or any(not 0 < r <= 4096 for r in rows_list) or args.output is None:
+        raise ValueError("MX8 requires output and rows in 1..4096")
+    shapes = [s for s in SHAPES if s[0] in {"trellis", "mxfp8", "int4_g32"}]
+    shapes += [(f, op+"_tp2", k if side == 1 else k//2,
+                n//2 if side == 1 else n, side) for f, op, k, n, side in shapes]
+    names = set(args.shapes.split(",")) if args.shapes else {s[1] for s in shapes}
+    formats = set(args.formats.split(","))
+    shapes = [s for s in shapes if s[1] in names and s[0] in formats]
+    if not shapes:
+        raise ValueError("empty MX8 shape selection")
+    torch.manual_seed(408)
+    props = torch.cuda.get_device_properties(0)
+    limit, capacity = props.multi_processor_count*4, max(rows_list)
+    report = dict(device=props.name, sms=props.multi_processor_count, measurements=[],
+                  scope="native weights, shared MXFP8 records, synthetic operands; rotation excluded")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    for fmt, op, k, n, side in shapes:
+        storage, _ = native_tensors(fmt, k, n, capacity)
+        inputs, payload, scales, partial, output, x = storage
+        table = (inputs if fmt == "trellis" else
+                 torch.tensor([x.data_ptr()]*4, dtype=torch.int64, device="cuda"))
+        dtype = "f16" if fmt == "trellis" else "bf16"
+        quant = compile_dense_mxfp8_quant_aot(input_features=k, input_dtype=dtype)
+        with exportable_compilation():
+            core = compile_dense_mxfp8_aot(input_features=k, output_features=n,
+                       encoding=fmt, sharded_side=side, input_dtype=dtype)
+        spills = spill_check(core, args.output.parent/"cubins"/f"{fmt}-{op}")
+        spill_free = all(not any(r["local_bytes"]+r["stack_bytes"])
+                         and not r["local_load_store_instructions"] for r in spills)
+        records = torch.empty(record_bytes(capacity, k), dtype=torch.uint8, device="cuda")
+        native = compile_native(fmt, k, n, side)
+        if fmt == "trellis":
+            weight_bytes = torch.empty((n,k), dtype=torch.uint8, device="cuda")
+            unpack = compile_trellis_unpack_e4m3_aot(input_features=k, output_features=n, sharded_side=side)
+            unpack_graph = capture(lambda: unpack.launch(payload, weight_bytes, scalars=()))
+            unpack_us = timing(unpack_graph, args.replays)
+            weight = weight_bytes.view(torch.float8_e4m3fn).float()
+            weight *= scales.float().repeat_interleave(128)[None,:]
+            gemm = compile_trellis_fp8_prefill_aot(input_features=k, output_features=n)
+            unit_grid = scales.float().expand(n//128, -1).contiguous()
+            xb = x.bfloat16()
+        else:
+            weight = reference_weight(fmt,k,n,side,payload,scales)
+        def run(rows):
+            quant.launch(table, records, scalars=(rows,0,limit))
+            core.launch(table,payload,scales,records,output,scalars=(rows,0,limit))
+        run(capacity)
+        torch.cuda.synchronize()
+        frozen = output[:min(capacity,257)].clone()
+        # Decode the actual MMA-order records independently into row-major A.
+        rec = records.view(-1,k//32,528)
+        packed = rec[:,:,:512].contiguous().view(torch.float8_e4m3fn).float().reshape(-1,k//32,32,16)
+        aq = torch.empty((rec.shape[0]*16,k), dtype=torch.float32, device="cuda")
+        for lane in range(32):
+            r, c = lane//4, 4*(lane%4)
+            for row_off, byte_off in ((0,0),(8,4)):
+                scale = torch.exp2(rec[:,:,512+r+row_off].float()-127)
+                for ko, bo in ((0,byte_off),(16,byte_off+8)):
+                    values = packed[:,:,lane,bo:bo+4]*scale[:,:,None]
+                    aq.reshape(-1,16,k)[:,r+row_off,:].reshape(-1,k//32,32)[:,:,c+ko:c+ko+4] = values
+        amax = x.float().reshape(capacity,k//32,32).abs().amax(-1)
+        exponent = torch.ceil(torch.log2(amax/448)).clamp(-127,127)
+        sf = torch.exp2(exponent)
+        expected_a = ((x.float().reshape(capacity,k//32,32)/sf[:,:,None])
+                      .to(torch.float8_e4m3fn).float()*sf[:,:,None]).reshape(capacity,k)
+        quant_equal = torch.equal(aq[:capacity],expected_a)
+        columns, checks = min(n,64), min(capacity,32)
+        target = aq[:checks].double() @ weight[:columns].double().T
+        exact = x[:checks].double() @ weight[:columns].double().T
+        # Standard forward FP32 accumulation bound, applied elementwise.
+        absolute_products = aq[:checks].double().abs() @ weight[:columns].double().abs().T
+        gamma = (k*2**-24)/(1-k*2**-24)
+        error = (output[:checks,:columns].double()-target).abs()
+        fp64_pass = bool((error <= gamma*absolute_products+1e-7).all())
+        for count in sorted({r for r in (1,15,16,17,127,128,129,255,256,257) if r<=capacity}):
+            output.fill_(float("nan"))
+            run(count)
+            torch.cuda.synchronize()
+            if not torch.equal(output[:count].view(torch.int32),frozen[:count].view(torch.int32)):
+                raise RuntimeError(f"{fmt}/{op}: row invariance failed at {count}")
+            if not bool(torch.isnan(output[count:]).all()):
+                raise RuntimeError(f"{fmt}/{op}: output tail overwritten")
+        for rows in rows_list:
+            graph = capture(lambda: run(rows))
+            total_us = timing(graph,args.replays)
+            qgraph = capture(lambda: quant.launch(table,records,scalars=(rows,0,limit)))
+            quant_us = timing(qgraph,args.replays)
+            ggraph = capture(lambda: core.launch(table,payload,scales,records,output,scalars=(rows,0,limit)))
+            gemm_us = timing(ggraph,args.replays)
+            ns = (rows,0,limit) if fmt == "trellis" else (rows,limit)
+            ng = capture(lambda: native.launch(*storage[:5],scalars=ns))
+            native_us = timing(ng,1)
+            bars = {}
+            for label,a16 in (("w8a16",True),("w8a8",False)):
+                try:
+                    bg,keep,count = baseline(k,n,rows,a16=a16)
+                    bars[label+"_us"] = timing(bg,args.replays)/count
+                    del bg,keep
+                except (TypeError,ValueError) as exc:
+                    bars[label+"_unsupported"] = str(exc)
+            unpack_total = None
+            if fmt == "trellis":
+                ug = capture(lambda: gemm.launch(xb,weight_bytes,unit_grid,output,scalars=(rows,)))
+                unpack_total = unpack_us+timing(ug,args.replays)
+            record = dict(format=fmt,projection=op,k=k,n=n,side=side,rows=rows,
+                mx8_us=total_us,quant_us=quant_us,gemm_us=gemm_us,native_us=native_us,
+                unpack_us=unpack_total,quant_equal=quant_equal,row_invariant=True,
+                fp64_pass=fp64_pass,fp64_max_error=error.max().item(),
+                a8_vs_exact_relative_l2=(torch.linalg.vector_norm(target-exact)/torch.linalg.vector_norm(exact)).item(),
+                spill_free=spill_free,cubin_spill_check=spills,**bars)
+            report["measurements"].append(record)
+            args.output.write_text(json.dumps(report,indent=2)+"\n")
+            print(json.dumps(record),flush=True)
+        if not (quant_equal and fp64_pass and spill_free):
+            raise RuntimeError(f"{fmt}/{op}: MX8 correctness/resource gate failed")
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--mxfp8-prefill", action="store_true", help="shared MXFP8 records at whole and TP2 native dense shapes")
     parser.add_argument("--unpacked-trellis", action="store_true", help="measure exact E4M3 unpack plus F32 W8A16 at full/TP2 trellis shapes")
     parser.add_argument("--arm", action="append", help="NAME=git-rev; repeatable")
     parser.add_argument("--arm-bundle", type=Path)
@@ -311,6 +437,8 @@ def main():
     parser.add_argument("--profile-op", help="FORMAT/OP")
     parser.add_argument("--profile-rows", type=int)
     args = parser.parse_args()
+    if args.mxfp8_prefill:
+        return benchmark_mx8(args)
     if args.unpacked_trellis:
         return benchmark_unpacked(args)
     if not args.arm or args.arm_bundle is None or args.reference is None:
