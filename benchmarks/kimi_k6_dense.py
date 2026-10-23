@@ -46,13 +46,14 @@ def exported(program, directory, stem):
     return lib
 
 
-# Unique stored geometries from Core-K6 headers and the engine's TP2 ownership.
+# Unique stored geometries from Core-K6 headers and TP2/owned-MLA exports.
 # MLA kv_a is logically 576 outputs, but both routes must reconstruct all 640.
 PREFILL_TP2_SHAPES = (
     (7168, 6144, 1, 4), (6144, 7168, 2, 1),
     (7168, 1536, 1, 1), (1536, 9216, 1, 1), (7168, 640, 1, 1),
     (7168, 3072, 1, 1), (3072, 7168, 2, 1),
     (7168, 3584, 1, 1), (3584, 7168, 1, 1),
+    (1536, 18432, 1, 1), (7168, 12288, 1, 1), (12288, 7168, 1, 1),
 )
 
 
