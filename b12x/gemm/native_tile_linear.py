@@ -141,6 +141,42 @@ def _ld_cached_pred(address: Int64, r: Int32, rows: Int32, *, loc=None, ip=None)
 
 
 @dsl_user_op
+def _ld_nc_u32_l2hint_noalloc(base_ptr: Int64, cache_policy: Uint64, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip), Uint64(cache_policy).ir_value(loc=loc, ip=ip)],
+            "ld.global.nc.L1::no_allocate.L2::cache_hint.u32 $0, [$1], $2;",
+            "=r,l,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_nc_v2_u32_l2hint_noalloc(base_ptr: Int64, cache_policy: Uint64, *, loc=None, ip=None):
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip), Uint64(cache_policy).ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {$0, $1}, [$2], $3;",
+        "=r,=r,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def _warp_uniform_i32(val: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(llvm.inline_asm(
         T.i32(), [Int32(val).ir_value(loc=loc, ip=ip)],
@@ -217,6 +253,13 @@ def _st_shared_f32(addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _st_shared_v4_f32(addr, a, b, c, d, *, loc=None, ip=None):
+    llvm.inline_asm(None, [Int32(addr).ir_value(loc=loc, ip=ip)] + [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+                    "st.shared.v4.f32 [$0], {$1, $2, $3, $4};", "r,f,f,f,f", has_side_effects=True,
+                    is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def _e8m0(byte, *, loc=None, ip=None):
     return Float32(llvm.inline_asm(
         T.f32(), [Uint32(byte).ir_value(loc=loc, ip=ip)],
@@ -228,9 +271,7 @@ def _e8m0(byte, *, loc=None, ip=None):
 
 
 def decode_groups(n: int, encoding: str) -> int:
-    if encoding == "fp8_row":
-        return 2
-    if encoding == "int4_g32" and n >= 2048:
+    if encoding == "fp8_row" or n >= 2048:
         return 2
     return 1
 
@@ -247,7 +288,7 @@ class NativeTileLinear:
         if self.segments < 1 or self.segments & (self.segments - 1):
             raise ValueError("tile segments must be a power of two")
         self.cols = 8 * self.groups
-        decode_warps = 4 if (self.int4 and self.segments == 1 and self.groups == 2) else DECODE_WARPS
+        decode_warps = 4 if (self.segments == 1 or (not self.int4 and self.segments == 4 and self.groups == 2)) else DECODE_WARPS
         self.slots = max(1, decode_warps // self.segments)
         self.d_threads = 32 * self.slots * self.segments
         self.stages = 2 if self.grouped else int(stages)
@@ -279,7 +320,8 @@ class NativeTileLinear:
     def __call__(self, x: cute.Tensor, payload: cute.Tensor, scales: cute.Tensor,
                  output: cute.Tensor, rows: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
-            if rows <= Int32(DECODE_ROWS):
+            decode_limit = 32 if (self.int4 and self.n >= 16384) else DECODE_ROWS
+            if rows <= Int32(decode_limit):
                 if cutlass.const_expr(self.decode_tiles > 1):
                     row_tiles = max(Int32(1), min(min((rows + Int32(15)) >> Int32(4), Int32(self.decode_tiles)),
                                                   cta_limit // Int32(self.decode_ctas)))
@@ -296,7 +338,7 @@ class NativeTileLinear:
                     self.decode(x, payload, scales, output, rows, rows_per, row_tiles).launch(
                         grid=(min(Int32(self.decode_ctas) * row_tiles, cta_limit), 1, 1),
                         block=(self.d_threads, 1, 1),
-                        stream=stream, min_blocks_per_mp=2 if self.groups == 2 else (3 if self.side2 else 2))
+                        stream=stream, min_blocks_per_mp=1 if self.groups == 2 else (3 if self.side2 else 2))
             else:
                 tiles = ((rows + Int32(self.bm - 1)) // Int32(self.bm)) * Int32(self.n_tiles)
                 if cutlass.const_expr(self.grouped):
@@ -332,7 +374,7 @@ class NativeTileLinear:
     def _scale(self, raw: Uint32, h):
         sh = (Int32(16 if self.int4 else 8) * Int32(h)).to(Uint32)
         if cutlass.const_expr(self.int4):
-            value = _f16_to_f32((raw >> sh) & Uint32(0xFFFF))
+            value = _f16_to_f32(raw >> sh)
         else:
             value = _e8m0((raw >> sh) & Uint32(0xFF))
         return value
@@ -403,11 +445,11 @@ class NativeTileLinear:
                         wdst[(c * self.groups + gi) * 4 + t] = words[t]
                 elif cutlass.const_expr(self.int4):
                     for h in cutlass.range_constexpr(2):
-                        wdst[(c * self.groups + gi) * 2 + h] = ld_global_nc_u32_l2hint(
+                        wdst[(c * self.groups + gi) * 2 + h] = _ld_nc_u32_l2hint_noalloc(
                             w_gi + Int64(32 * c + 16 * h), policy)
                 else:
                     for h in cutlass.range_constexpr(2):
-                        w0, w1 = ld_global_nc_v2_u32_l2hint(
+                        w0, w1 = _ld_nc_v2_u32_l2hint_noalloc(
                             w_gi + Int64(64 * c + 32 * h), policy)
                         wdst[(c * self.groups + gi) * 4 + 2 * h] = w0
                         wdst[(c * self.groups + gi) * 4 + 2 * h + 1] = w1
@@ -417,21 +459,21 @@ class NativeTileLinear:
             for gi in cutlass.range_constexpr(self.groups):
                 if cutlass.const_expr(self.side2 and self.int4):
                     v0, v1, v2, v3 = ld_global_nc_v4_u32_l2hint(
-                        s_ptr + Int64(8 * gi) * s_col_stride, policy)
+                        s_ptr + Int64(8 * gi) * s_col_stride, policy, no_allocate=True)
                     sdst[gi * 4 + 0], sdst[gi * 4 + 1] = v0, v1
                     sdst[gi * 4 + 2], sdst[gi * 4 + 3] = v2, v3
                 elif cutlass.const_expr(self.side2):
-                    v0, v1 = ld_global_nc_v2_u32_l2hint(
+                    v0, v1 = _ld_nc_v2_u32_l2hint_noalloc(
                         s_ptr + Int64(8 * gi) * s_col_stride, policy)
                     sdst[gi * 2 + 0], sdst[gi * 2 + 1] = v0, v1
                 else:
                     for e in cutlass.range_constexpr(2):
                         s_addr = s_ptr + Int64(8 * gi + e) * s_col_stride
                         if cutlass.const_expr(self.int4):
-                            s0, s1 = ld_global_nc_v2_u32_l2hint(s_addr, policy)
+                            s0, s1 = _ld_nc_v2_u32_l2hint_noalloc(s_addr, policy)
                             sdst[(gi * 2 + e) * 2], sdst[(gi * 2 + e) * 2 + 1] = s0, s1
                         else:
-                            sdst[gi * 2 + e] = ld_global_nc_u32_l2hint(s_addr, policy)
+                            sdst[gi * 2 + e] = _ld_nc_u32_l2hint_noalloc(s_addr, policy)
 
     @cute.jit
     def _decode_unpack(self, bw: cute.Tensor, sc: cute.Tensor,
@@ -577,16 +619,23 @@ class NativeTileLinear:
             if cutlass.const_expr(self.segments > 1):
                 if seg > Int32(0):
                     base = fold + (((seg - Int32(1)) * Int32(self.slots) + slot)
-                                   * Int32(4 * G * 32)) * Int32(4)
-                    for i in cutlass.range_constexpr(4 * G):
-                        _st_shared_f32(base + Int32(i * 128) + lane * Int32(4), acc[i])
+                                   * Int32(4 * G * 32) + lane * Int32(4)) * Int32(4)
+                    for gi in cutlass.range_constexpr(G):
+                        _st_shared_v4_f32(
+                            base + Int32(gi * 512),
+                            acc[4 * gi + 0], acc[4 * gi + 1], acc[4 * gi + 2], acc[4 * gi + 3],
+                        )
                 cute.arch.sync_threads()
                 if seg == Int32(0):
                     for s in cutlass.range_constexpr(self.segments - 1):
-                        base = fold + ((Int32(s) * Int32(self.slots) + slot) * Int32(4 * G * 32)) * Int32(4)
-                        for i in cutlass.range_constexpr(4 * G):
-                            acc[i] = _add(acc[i], u32_as_f32(
-                                ld_shared_u32(base + Int32(i * 128) + lane * Int32(4))))
+                        base = fold + ((Int32(s) * Int32(self.slots) + slot)
+                                       * Int32(4 * G * 32) + lane * Int32(4)) * Int32(4)
+                        for gi in cutlass.range_constexpr(G):
+                            u0, u1, u2, u3 = ld_shared_v4_u32(base + Int32(gi * 512))
+                            acc[4 * gi + 0] = _add(acc[4 * gi + 0], u32_as_f32(u0))
+                            acc[4 * gi + 1] = _add(acc[4 * gi + 1], u32_as_f32(u1))
+                            acc[4 * gi + 2] = _add(acc[4 * gi + 2], u32_as_f32(u2))
+                            acc[4 * gi + 3] = _add(acc[4 * gi + 3], u32_as_f32(u3))
                 cute.arch.sync_threads()
             if seg == Int32(0) and active:
                 for gi in cutlass.range_constexpr(G):
@@ -728,16 +777,25 @@ class NativeTileLinear:
                     if Int32(mt) < live:
                         if seg > Int32(0):
                             base = fold + (((seg - Int32(1)) * Int32(self.slots) + slot)
-                                           * Int32(4 * G * 32)) * Int32(4)
-                            for i in cutlass.range_constexpr(4 * G):
-                                _st_shared_f32(base + Int32(i * 128) + lane * Int32(4), acc[4 * G * mt + i])
+                                           * Int32(4 * G * 32) + lane * Int32(4)) * Int32(4)
+                            for gi in cutlass.range_constexpr(G):
+                                f = 4 * (mt * G + gi)
+                                _st_shared_v4_f32(
+                                    base + Int32(gi * 512),
+                                    acc[f + 0], acc[f + 1], acc[f + 2], acc[f + 3],
+                                )
                         cute.arch.sync_threads()
                         if seg == Int32(0):
                             for s in cutlass.range_constexpr(self.segments - 1):
-                                base = fold + ((Int32(s) * Int32(self.slots) + slot) * Int32(4 * G * 32)) * Int32(4)
-                                for i in cutlass.range_constexpr(4 * G):
-                                    acc[4 * G * mt + i] = _add(acc[4 * G * mt + i], u32_as_f32(
-                                        ld_shared_u32(base + Int32(i * 128) + lane * Int32(4))))
+                                base = fold + ((Int32(s) * Int32(self.slots) + slot)
+                                               * Int32(4 * G * 32) + lane * Int32(4)) * Int32(4)
+                                for gi in cutlass.range_constexpr(G):
+                                    f = 4 * (mt * G + gi)
+                                    u0, u1, u2, u3 = ld_shared_v4_u32(base + Int32(gi * 512))
+                                    acc[f + 0] = _add(acc[f + 0], u32_as_f32(u0))
+                                    acc[f + 1] = _add(acc[f + 1], u32_as_f32(u1))
+                                    acc[f + 2] = _add(acc[f + 2], u32_as_f32(u2))
+                                    acc[f + 3] = _add(acc[f + 3], u32_as_f32(u3))
                         cute.arch.sync_threads()
             if seg == Int32(0) and active:
                 for mt in cutlass.range_constexpr(4):
