@@ -22,8 +22,8 @@ from b12x._lib.intrinsics import (
     ld_shared_u32, ld_shared_f32, st_shared_f32, packed_dequant_trellis_to_half2x4,
     packed_dequant_trellis_stream_to_half2x4,
     packed_dequant_trellis_mul1_to_half2x4,
-    shared_ptr_to_u32, st_global_v2_f32, st_shared_v4_u32,
-    trellis_align_stream_u32x2,
+    shared_ptr_to_u32, st_global_v2_f32, st_global_v4_f32, st_shared_v4_u32,
+    trellis_align_stream_u32x2, u32_as_f32,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a16.exlr8 import _e4m3_round_half2, _side_value
@@ -518,6 +518,55 @@ def decode_tile(address: Int64, tile: Int32, lane: Int32,
     return b0, b1, b2, b3
 
 
+@cute.jit
+def decode_tile_from_base(base: Int64, lane: Int32,
+                          bits: cutlass.Constexpr, e4m3: cutlass.Constexpr,
+                          mul1: cutlass.Constexpr = False, policy=None,
+                          lane_preadded: cutlass.Constexpr = False):
+    """One warp's 16x16 trellis tile from a pre-computed 64-bit tile base pointer."""
+    if cutlass.const_expr(bits == 4):
+        addr = base if cutlass.const_expr(lane_preadded) else base + lane.to(Int64) * Int64(4)
+        b = _load_word(addr, policy)
+        a = cute.arch.shuffle_sync(b, (lane + Int32(31)) & Int32(31))
+        wa, wb = b, (a << Uint32(16)) | (b >> Uint32(16))
+    elif cutlass.const_expr(bits <= 4):
+        ia, ib, shift, _ = trellis256_lane_geom_bits(lane, 0, 8, bits)
+        a = _load_word(base + ia.to(Int64) * Int64(4), policy)
+        b = _load_word(base + ib.to(Int64) * Int64(4), policy)
+        window = (a.to(Int64) << Int64(32)) | b.to(Int64)
+        wa = (window >> shift.to(Int64)).to(Uint32)
+        wb = (window >> (shift + Int32(4 * bits)).to(Int64)).to(Uint32)
+    elif cutlass.const_expr(bits == 5):
+        # Four K5 windows span 31 bits; all eight may span three ring words.
+        ib0, ib1, sb, _ = trellis256_lane_geom_bits(lane, 0, 4, bits)
+        ia0, ia1, sa, _ = trellis256_lane_geom_bits(lane, 4, 4, bits)
+        b0 = _load_word(base + ib0.to(Int64) * Int64(4), policy)
+        b1 = _load_word(base + ib1.to(Int64) * Int64(4), policy)
+        a0 = _load_word(base + ia0.to(Int64) * Int64(4), policy)
+        a1 = _load_word(base + ia1.to(Int64) * Int64(4), policy)
+        wa = (((a0.to(Int64) << Int64(32)) | a1.to(Int64)) >> sa.to(Int64)).to(Uint32)
+        wb = (((b0.to(Int64) << Int64(32)) | b1.to(Int64)) >> sb.to(Int64)).to(Uint32)
+    else:
+        # Even four K6 windows need 34 bits. Retain the aligned 64-bit stream.
+        i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, bits)
+        i1 = i0 + Int32(1)
+        i1 -= Int32(8 * bits) * (i1 >= Int32(8 * bits)).to(Int32)
+        z0 = _load_word(base + i0.to(Int64) * Int64(4), policy)
+        z1 = _load_word(base + i1.to(Int64) * Int64(4), policy)
+        z2 = _load_word(base + i2.to(Int64) * Int64(4), policy)
+        wa, wb = trellis_align_stream_u32x2(z0, z1, z2, shift, delta)
+    if cutlass.const_expr(mul1):
+        b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, bits)
+    elif cutlass.const_expr(bits == 6):
+        b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, bits)
+    else:
+        b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, bits)
+    if cutlass.const_expr(e4m3):
+        b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
+        b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
+    return b0, b1, b2, b3
+
+
 class NativeTrellisLinear:
     ABI_VERSION = 1
     CTAS_PER_SM = 4
@@ -627,6 +676,86 @@ class NativeTrellisLinear:
     def _decode(self, inputs: cute.Tensor, payload: cute.Tensor,
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        if cutlass.const_expr(self.bits == 4 and self.e4m3 and not self.input_bf16):
+            # Same-session overlap: folded short-K wins <=16; Gemini wins the rest.
+            if cutlass.const_expr(self.splits <= 2):
+                if rows <= Int32(16):
+                    self.multiply_folded(inputs, payload, scales, output, rows, rotation_id).launch(
+                        grid=(min(Int32(self.n // 32), cta_limit), 1, 1),
+                        block=(32 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
+                else:
+                    self._gemini_decode(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            else:
+                self._gemini_decode(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+        else:
+            self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+
+    @cute.jit
+    def _gemini_decode(self, inputs: cute.Tensor, payload: cute.Tensor,
+                       scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                       rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        tiles = Int32(self.n // 128 * self.splits)
+        if rows <= Int32(8):
+            self.multiply_narrow(inputs, payload, scales, partial, rows, rotation_id).launch(
+                grid=(min(tiles, cta_limit), 1, 1), block=(128, 1, 1),
+                min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        elif rows <= Int32(16):
+            self.multiply_gemini(inputs, payload, scales, partial, rows, rotation_id).launch(
+                grid=(min(tiles, cta_limit), 1, 1), block=(128, 1, 1),
+                min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        elif rows <= Int32(32):
+            self.multiply_wide_gemini(inputs, payload, scales, partial, rows, rotation_id, 2, 8).launch(
+                grid=(min(tiles, cta_limit), 1, 1), block=(128, 1, 1),
+                min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        elif rows <= Int32(48):
+            self.multiply_wide_gemini(inputs, payload, scales, partial, rows, rotation_id, 3, 4).launch(
+                grid=(min(tiles, cta_limit), 1, 1), block=(128, 1, 1),
+                min_blocks_per_mp=2, stream=stream)
+        else:
+            self.multiply_wide_gemini(inputs, payload, scales, partial, rows, rotation_id, 4, 4).launch(
+                grid=(min(((rows + Int32(63)) // Int32(64)) * tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=2, stream=stream)
+        r_blocks = Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else Int32(self.n // 128)
+        self.reduce_gemini(partial, output, rows).launch(
+            grid=(min(rows * r_blocks, cta_limit), 1, 1), block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def reduce_gemini(self, partial: cute.Tensor, output: cute.Tensor, rows: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        if cutlass.const_expr(self.n % 512 == 0):
+            n_blocks = Int32(self.n // 512)
+            p_ptr = partial.iterator.toint()
+            o_ptr = output.iterator.toint()
+            while task < rows * n_blocks:
+                row = task // n_blocks
+                col = (task % n_blocks) * Int32(512) + Int32(tid) * Int32(4)
+                t0, t1, t2, t3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
+                row_base = p_ptr + (row.to(Int64) * Int64(self.splits * self.n) + col.to(Int64)) * Int64(4)
+                for split in cutlass.range_constexpr(self.splits):
+                    v0, v1, v2, v3 = ld_global_nc_v4_u32(row_base + Int64(split * self.n * 4))
+                    t0 = t0 + u32_as_f32(v0)
+                    t1 = t1 + u32_as_f32(v1)
+                    t2 = t2 + u32_as_f32(v2)
+                    t3 = t3 + u32_as_f32(v3)
+                out_addr = o_ptr + (row.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4)
+                st_global_v4_f32(out_addr, t0, t1, t2, t3)
+                task += step
+        else:
+            while task < rows * Int32(self.n // 128):
+                row, col = task // Int32(self.n // 128), (task % Int32(self.n // 128)) * Int32(128) + Int32(tid)
+                total = Float32(0.0)
+                for split in cutlass.range(self.splits):
+                    total += partial[(row.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col.to(Int64)]
+                output[row.to(Int64) * Int64(self.n) + col.to(Int64)] = total
+                task += step
+
+
+    @cute.jit
+    def _decode_existing(self, inputs: cute.Tensor, payload: cute.Tensor,
+                         scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                         rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if cutlass.const_expr(self.bits == 4 and self.e4m3 and self.splits <= 16):
             if rows <= Int32(16):
                 if cutlass.const_expr(self.splits <= 2):
@@ -675,6 +804,273 @@ class NativeTrellisLinear:
         self.reduce(partial, output, rows).launch(
             grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
             block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def multiply_narrow(self, inputs: cute.Tensor, payload: cute.Tensor,
+                        scales: cute.Tensor, partial: cute.Tensor,
+                        rows: Int32, rotation_id: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        x = inputs[rotation_id]
+        row0 = lane >> Int32(2)
+        r0c = min(row0, rows - Int32(1))
+        x_row = x + (r0c.to(Int64) * Int64(self.k) + ((lane & Int32(3)) * Int32(2)).to(Int64)) * Int64(2)
+        w_base_ptr = payload.iterator.toint() + (lane.to(Int64) * Int64(4) if cutlass.const_expr(self.bits == 4) else Int64(0))
+        policy = weight_stream_policy(Int32(1))
+        tiles = Int32(self.n // 128 * self.splits)
+        while task < tiles:
+            split = task % Int32(self.splits)
+            nb = task // Int32(self.splits)
+            total = cute.make_rmem_tensor((4, 2), Float32)
+            total.fill(Float32(0.0))
+            for block in cutlass.range(8, unroll=1):
+                kb = split * Int32(8) + block
+                if kb < Int32(self.k // 128):
+                    acc = cute.make_rmem_tensor((4, 2), Float32)
+                    acc.fill(Float32(0.0))
+                    x0_kb = x_row + kb.to(Int64) * Int64(256)
+                    tile_kb = nb * Int32(self.k // 16 * 8) + kb * Int32(64) + warp * Int32(2)
+                    if cutlass.const_expr(self.input_units):
+                        tile_kb = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + warp * Int32(2)
+                    w_kb = w_base_ptr + tile_kb.to(Int64) * Int64(32 * self.bits)
+                    for k16 in cutlass.range_constexpr(8):
+                        a0 = ld_global_nc_u32(x0_kb + Int64(k16 * 32))
+                        a2 = ld_global_nc_u32(x0_kb + Int64(k16 * 32 + 16))
+                        for n16 in cutlass.range_constexpr(2):
+                            w_addr = w_kb + Int64((k16 * 8 + n16) * (32 * self.bits))
+                            b0, b1, b2, b3 = decode_tile_from_base(
+                                w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
+                            d0, d1, _, _ = f16_mma_m16n8k16_f32(
+                                acc[2*n16, 0], acc[2*n16, 1], Float32(0.0), Float32(0.0),
+                                a0, Uint32(0), a2, Uint32(0), b0, b1)
+                            acc[2*n16, 0], acc[2*n16, 1] = d0, d1
+                            d0, d1, _, _ = f16_mma_m16n8k16_f32(
+                                acc[2*n16+1, 0], acc[2*n16+1, 1], Float32(0.0), Float32(0.0),
+                                a0, Uint32(0), a2, Uint32(0), b2, b3)
+                            acc[2*n16+1, 0], acc[2*n16+1, 1] = d0, d1
+                    scale = _side_value(scales.iterator.toint(), kb)
+                    for n in cutlass.range_constexpr(4):
+                        for v in cutlass.range_constexpr(2):
+                            total[n, v] = total[n, v] + acc[n, v] * scale
+            if row0 < rows:
+                col_base = nb * Int32(128) + warp * Int32(32) + (lane & Int32(3)) * Int32(2)
+                p_row = partial.iterator.toint() + ((row0.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
+                for n in cutlass.range_constexpr(4):
+                    st_global_v2_f32(p_row + Int64(n * 32), total[n, 0], total[n, 1])
+            task += step
+
+    @cute.kernel
+    def multiply_gemini(self, inputs: cute.Tensor, payload: cute.Tensor,
+                 scales: cute.Tensor, partial: cute.Tensor,
+                 rows: Int32, rotation_id: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        x = inputs[rotation_id]
+        w_base_ptr = payload.iterator.toint() + (lane.to(Int64) * Int64(4) if cutlass.const_expr(self.bits == 4) else Int64(0))
+        while task < ((rows + Int32(15)) // Int32(16)) * Int32(self.n // 128 * self.splits):
+            split = task % Int32(self.splits)
+            nb = (task // Int32(self.splits)) % Int32(self.n // 128)
+            group = task // Int32(self.splits * (self.n // 128))
+            # Each 16-row group re-reads the weights; the last one evicts them first.
+            policy = weight_stream_policy((group + Int32(1) == (rows + Int32(15)) // Int32(16)).to(Int32))
+            row0 = group * Int32(16) + lane // Int32(4)
+            row1 = row0 + Int32(8)
+            r0c = min(row0, rows - Int32(1))
+            r1c = min(row1, rows - Int32(1))
+            x0_row = x + (r0c.to(Int64) * Int64(self.k) + ((lane & Int32(3)) * Int32(2)).to(Int64)) * Int64(2)
+            x1_row = x + (r1c.to(Int64) * Int64(self.k) + ((lane & Int32(3)) * Int32(2)).to(Int64)) * Int64(2)
+            has_r1 = row1 < rows
+            total = cute.make_rmem_tensor((4, 4), Float32)
+            total.fill(Float32(0.0))
+            for block in cutlass.range(8, unroll=1):
+                kb = split * Int32(8) + block
+                if kb < Int32(self.k // 128):
+                    acc = cute.make_rmem_tensor((4, 4), Float32)
+                    acc.fill(Float32(0.0))
+                    x0_kb = x0_row + kb.to(Int64) * Int64(256)
+                    x1_kb = x1_row + kb.to(Int64) * Int64(256)
+                    tile_kb = nb * Int32(self.k // 16 * 8) + kb * Int32(64) + warp * Int32(2)
+                    if cutlass.const_expr(self.input_units):
+                        tile_kb = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + warp * Int32(2)
+                    w_kb = w_base_ptr + tile_kb.to(Int64) * Int64(32 * self.bits)
+                    for k16 in cutlass.range_constexpr(8):
+                        a0 = ld_global_nc_u32(x0_kb + Int64(k16 * 32))
+                        a2 = ld_global_nc_u32(x0_kb + Int64(k16 * 32 + 16))
+                        a1, a3 = Uint32(0), Uint32(0)
+                        if has_r1:
+                            a1 = ld_global_nc_u32(x1_kb + Int64(k16 * 32))
+                            a3 = ld_global_nc_u32(x1_kb + Int64(k16 * 32 + 16))
+                        for n16 in cutlass.range_constexpr(2):
+                            w_addr = w_kb + Int64((k16 * 8 + n16) * (32 * self.bits))
+                            b0, b1, b2, b3 = decode_tile_from_base(
+                                w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
+                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
+                                a0, a1, a2, a3, b0, b1)
+                            acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
+                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
+                                a0, a1, a2, a3, b2, b3)
+                            acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
+                    scale = _side_value(scales.iterator.toint(), kb)
+                    for n in cutlass.range_constexpr(4):
+                        for v in cutlass.range_constexpr(4):
+                            total[n, v] = total[n, v] + acc[n, v] * scale
+            for n in cutlass.range_constexpr(4):
+                col = nb * Int32(128) + warp * Int32(32) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
+                base = partial.iterator.toint() + ((row0.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col.to(Int64)) * Int64(4)
+                if row0 < rows:
+                    st_global_v2_f32(base, total[n, 0], total[n, 1])
+                if row1 < rows:
+                    st_global_v2_f32(base + Int64(8 * self.splits * self.n * 4), total[n, 2], total[n, 3])
+            task += step
+
+    @cute.kernel
+    def multiply_wide_gemini(self, inputs: cute.Tensor, payload: cute.Tensor,
+                      scales: cute.Tensor, partial: cute.Tensor,
+                      rows: Int32, rotation_id: Int32,
+                      active: cutlass.Constexpr, unroll_k16: cutlass.Constexpr):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        tid = Int32(tid)
+        lane, warp = tid & Int32(31), tid >> Int32(5)
+        c, r_grp = tid & Int32(15), tid >> Int32(4)
+        x = inputs[rotation_id]
+        M = 16 * active
+        M_PAD = M + 1
+        tiles = Int32(self.n // 128 * self.splits)
+        limit = tiles if cutlass.const_expr(active < 4) else ((rows + Int32(M - 1)) // Int32(M)) * tiles
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage(active))
+        sx = shared_ptr_to_u32(storage.x.data_ptr())
+        sx_store = sx + (c * Int32(M_PAD) + r_grp) * Int32(16)
+        sx_read = sx + lane * Int32(4)
+        w_base_ptr = payload.iterator.toint() + (lane.to(Int64) * Int64(4) if cutlass.const_expr(self.bits == 4) else Int64(0))
+        while task < limit:
+            split = task % Int32(self.splits)
+            nb = (task // Int32(self.splits)) % Int32(self.n // 128)
+            group = Int32(0) if cutlass.const_expr(active < 4) else task // tiles
+            # One pass over the weights below 49 rows; else the last 64-row group evicts.
+            last_reader = Int32(1)
+            if cutlass.const_expr(active == 4):
+                last_reader = (group + Int32(1) == (rows + Int32(M - 1)) // Int32(M)).to(Int32)
+            policy = weight_stream_policy(last_reader)
+            row_base = (lane >> Int32(2)) if cutlass.const_expr(active < 4) else group * Int32(M) + (lane >> Int32(2))
+            total = cute.make_rmem_tensor((active, 4, 4), Float32)
+            total.fill(Float32(0.0))
+            for block in cutlass.range(8, unroll=1):
+                kb = split * Int32(8) + block
+                if kb < Int32(self.k // 128):
+                    k_col = (kb * Int32(128) + c * Int32(8)).to(Int64)
+                    for s in cutlass.range_constexpr(2 * active):
+                        row = r_grp + Int32(s * 8) if cutlass.const_expr(active < 4) else group * Int32(M) + r_grp + Int32(s * 8)
+                        row_c = row if cutlass.const_expr(active in (2, 3) and s < 2 * (active - 1)) else min(row, rows - Int32(1))
+                        v0, v1, v2, v3 = ld_global_nc_v4_u32(
+                            x + (row_c.to(Int64) * Int64(self.k) + k_col) * Int64(2))
+                        st_shared_v4_u32(sx_store + Int32(s * 8 * 16), v0, v1, v2, v3)
+                    cute.arch.sync_threads()
+                    tile_kb = nb * Int32(self.k // 16 * 8) + kb * Int32(64) + warp * Int32(2)
+                    if cutlass.const_expr(self.input_units):
+                        tile_kb = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + warp * Int32(2)
+                    w_kb = w_base_ptr + tile_kb.to(Int64) * Int64(32 * self.bits)
+                    if cutlass.const_expr(active <= 2):
+                        acc = cute.make_rmem_tensor((active, 4, 4), Float32)
+                        acc.fill(Float32(0.0))
+                        for k16 in cutlass.range_constexpr(8):
+                            a = cute.make_rmem_tensor((active, 4), Uint32)
+                            for mb in cutlass.range_constexpr(active):
+                                a[mb, 0] = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16) * 16))
+                                a[mb, 1] = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16 + 8) * 16))
+                                a[mb, 2] = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16) * 16))
+                                a[mb, 3] = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16 + 8) * 16))
+                            for n16 in cutlass.range_constexpr(2):
+                                w_addr = w_kb + Int64((k16 * 8 + n16) * (32 * self.bits))
+                                b0, b1, b2, b3 = decode_tile_from_base(
+                                    w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
+                                for mb in cutlass.range_constexpr(active):
+                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        acc[mb, 2 * n16, 0], acc[mb, 2 * n16, 1], acc[mb, 2 * n16, 2], acc[mb, 2 * n16, 3],
+                                        a[mb, 0], a[mb, 1], a[mb, 2], a[mb, 3], b0, b1)
+                                    acc[mb, 2 * n16, 0], acc[mb, 2 * n16, 1], acc[mb, 2 * n16, 2], acc[mb, 2 * n16, 3] = d0, d1, d2, d3
+                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        acc[mb, 2 * n16 + 1, 0], acc[mb, 2 * n16 + 1, 1], acc[mb, 2 * n16 + 1, 2], acc[mb, 2 * n16 + 1, 3],
+                                        a[mb, 0], a[mb, 1], a[mb, 2], a[mb, 3], b2, b3)
+                                    acc[mb, 2 * n16 + 1, 0], acc[mb, 2 * n16 + 1, 1], acc[mb, 2 * n16 + 1, 2], acc[mb, 2 * n16 + 1, 3] = d0, d1, d2, d3
+                        scale = _side_value(scales.iterator.toint(), kb)
+                        for mb in cutlass.range_constexpr(active):
+                            for n in cutlass.range_constexpr(4):
+                                for v in cutlass.range_constexpr(4):
+                                    total[mb, n, v] = total[mb, n, v] + acc[mb, n, v] * scale
+                    else:
+                        scale = _side_value(scales.iterator.toint(), kb)
+                        for n16 in cutlass.range_constexpr(2):
+                            acc = cute.make_rmem_tensor((active, 2, 4), Float32)
+                            acc.fill(Float32(0.0))
+                            if cutlass.const_expr(unroll_k16 == 8):
+                                for k16 in cutlass.range_constexpr(8):
+                                    w_addr = w_kb + Int64((k16 * 8 + n16) * (32 * self.bits))
+                                    b0, b1, b2, b3 = decode_tile_from_base(
+                                        w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
+                                    for mb in cutlass.range_constexpr(active):
+                                        a0 = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16) * 16))
+                                        a1 = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16 + 8) * 16))
+                                        a2 = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16) * 16))
+                                        a3 = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16 + 8) * 16))
+                                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                            acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3],
+                                            a0, a1, a2, a3, b0, b1)
+                                        acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3] = d0, d1, d2, d3
+                                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                            acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3],
+                                            a0, a1, a2, a3, b2, b3)
+                                        acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3] = d0, d1, d2, d3
+                            else:
+                                for ko in cutlass.range(8 // unroll_k16, unroll=1):
+                                    sx_k = sx_read + ko * Int32(2 * unroll_k16 * M_PAD * 16)
+                                    w_ko = w_kb + ko.to(Int64) * Int64(unroll_k16 * 8 * (32 * self.bits))
+                                    for ki in cutlass.range_constexpr(unroll_k16):
+                                        w_addr = w_ko + Int64((ki * 8 + n16) * (32 * self.bits))
+                                        b0, b1, b2, b3 = decode_tile_from_base(
+                                            w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
+                                        for mb in cutlass.range_constexpr(active):
+                                            a0 = ld_shared_u32(sx_k + Int32(((2 * ki) * M_PAD + mb * 16) * 16))
+                                            a1 = ld_shared_u32(sx_k + Int32(((2 * ki) * M_PAD + mb * 16 + 8) * 16))
+                                            a2 = ld_shared_u32(sx_k + Int32(((2 * ki + 1) * M_PAD + mb * 16) * 16))
+                                            a3 = ld_shared_u32(sx_k + Int32(((2 * ki + 1) * M_PAD + mb * 16 + 8) * 16))
+                                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                                acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3],
+                                                a0, a1, a2, a3, b0, b1)
+                                            acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3] = d0, d1, d2, d3
+                                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                                acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3],
+                                                a0, a1, a2, a3, b2, b3)
+                                            acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3] = d0, d1, d2, d3
+                            for mb in cutlass.range_constexpr(active):
+                                for v in cutlass.range_constexpr(4):
+                                    total[mb, 2 * n16, v] = total[mb, 2 * n16, v] + acc[mb, 0, v] * scale
+                                    total[mb, 2 * n16 + 1, v] = total[mb, 2 * n16 + 1, v] + acc[mb, 1, v] * scale
+                    cute.arch.sync_threads()
+            for mb in cutlass.range_constexpr(active):
+                row0 = row_base + Int32(mb * 16)
+                row1 = row0 + Int32(8)
+                for n in cutlass.range_constexpr(4):
+                    col = nb * Int32(128) + warp * Int32(32) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
+                    base = partial.iterator.toint() + ((row0.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col.to(Int64)) * Int64(4)
+                    t0, t1, t2, t3 = total[mb, n, 0], total[mb, n, 1], total[mb, n, 2], total[mb, n, 3]
+                    if cutlass.const_expr(active < 4 and mb < active - 1):
+                        st_global_v2_f32(base, t0, t1)
+                        st_global_v2_f32(base + Int64(8 * self.splits * self.n * 4), t2, t3)
+                    else:
+                        if row0 < rows:
+                            st_global_v2_f32(base, t0, t1)
+                        if row1 < rows:
+                            st_global_v2_f32(base + Int64(8 * self.splits * self.n * 4), t2, t3)
+            task += step
 
     def _fold_storage(self):
         class Storage:
