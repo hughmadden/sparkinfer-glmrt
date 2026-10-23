@@ -250,7 +250,7 @@ def benchmark_unpacked(args):
         unpack = compile_trellis_unpack_e4m3_aot(input_features=k, output_features=n, sharded_side=side)
         gemm = compile_trellis_fp8_prefill_aot(input_features=k, output_features=n)
         core = compile_native("trellis", k, n, side)
-        unpack_graph = capture(lambda: unpack.launch(payload, weight))
+        unpack_graph = capture(lambda: unpack.launch(payload, weight, scalars=()))
         finite_nonzero(weight.view(torch.float8_e4m3fn).float(), "unpacked E4M3")
         unpack_us = timing(unpack_graph, args.replays)
         for rows in rows_list:

@@ -18,7 +18,7 @@ def qualify(raw, core, side, *, rows=65):
     payload = torch.tensor(np.frombuffer(raw, dtype=np.uint8).copy(), device="cuda")
     unpacked = torch.empty(n, k, device="cuda", dtype=torch.uint8)
     unpack = compile_trellis_unpack_e4m3_aot(input_features=k, output_features=n, sharded_side=side)
-    unpack.launch(payload, unpacked)
+    unpack.launch(payload, unpacked, scalars=())
     expected = torch.tensor(core.T.copy(), device="cuda").to(torch.float8_e4m3fn)
     assert torch.equal(unpacked, expected.view(torch.uint8))
     assert torch.equal(unpacked.view(torch.float8_e4m3fn).half(), expected.half())
@@ -42,7 +42,7 @@ def qualify(raw, core, side, *, rows=65):
     bound = 1.01 * torch.linalg.vector_norm(baseline-target)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        unpack.launch(payload, unpacked)
+        unpack.launch(payload, unpacked, scalars=())
         gemm.launch(x, unpacked, grid, output, scalars=(rows,))
     unpacked.fill_(255)
     output.fill_(float("nan"))
