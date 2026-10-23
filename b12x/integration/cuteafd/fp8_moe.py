@@ -32,6 +32,9 @@ serves (``Fp8MoeGeometry.slice``), ``E`` experts, ``k`` routes per row::
 A TP slice's ``out`` is the rank partial of the Spark response contract
 (BF16 ``[rows, H]``, summed over ranks by the coordinator). ``activation =
 bf16(bf16(silu(g)) * u)`` with the optional clamp ``g.swiglu_limit`` (0 = none).
+MiniMax's ``swigluoai_uninterleave`` uses gate ``w1``, up ``w3`` and
+``bf16(g * sigmoid(1.702 * g) * (u + 1))`` after the same clamp, with one
+BF16 rounding of the activation product.
 
 Routes: ``decode`` groups the (row, route) pairs by expert without padding and
 streams each active expert's weights through the grouped FP8 GEMV (64-row
@@ -257,7 +260,7 @@ class Fp8MoeGeometry:
     def __post_init__(self) -> None:
         import math
 
-        if self.activation not in ("silu_bf16_product", "silu_post_clamp_fp32_product"):
+        if self.activation not in ("silu_bf16_product", "silu_post_clamp_fp32_product", "swigluoai_uninterleave"):
             raise ValueError("unknown expert activation contract")
         if self.projection != "bf16":
             raise ValueError("expert projections must round to BF16 before activation/route sum")
@@ -265,6 +268,8 @@ class Fp8MoeGeometry:
             raise ValueError("SwiGLU limit must be finite and nonnegative")
         if self.weights == "mxfp4" and self.activation != "silu_bf16_product":
             raise ValueError("MXFP4 supports only the pre-SiLU BF16 product contract")
+        if self.activation == "swigluoai_uninterleave" and self.weights != "nvfp4":
+            raise ValueError("SwiGLU-OAI experts require native NVFP4 A4")
         if self.activations not in ("a16", "a4") or (self.activations == "a4" and self.weights != "nvfp4"):
             raise ValueError("activations is 'a16', or 'a4' with NVFP4 weights")
         if self.weights == "nvfp4" and self.activations != "a4":
@@ -318,6 +323,9 @@ GEOMETRIES = {
     "step5_nvfp4": Fp8MoeGeometry("step5_nvfp4", hidden=4096, experts=352, top_k=8, intermediate=1536,
                                     swiglu_limit=7.0, weights="nvfp4", activations="a4",
                                     activation="silu_post_clamp_fp32_product"),
+    "minimax_nvfp4": Fp8MoeGeometry("minimax_nvfp4", hidden=6144, experts=128, top_k=4, intermediate=3072,
+                                      swiglu_limit=7.0, weights="nvfp4", activations="a4",
+                                      activation="swigluoai_uninterleave"),
     "mimo": Fp8MoeGeometry("mimo", hidden=4096, experts=256, top_k=8, intermediate=2048),
     "glm": Fp8MoeGeometry("glm", hidden=6144, experts=256, top_k=8, intermediate=2048),
     # GLM 5.3 Flash: 288 experts, SwiGLU clamped at 10 as its config says.
