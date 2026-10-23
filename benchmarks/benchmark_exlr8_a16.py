@@ -743,14 +743,25 @@ def main():
         def control_chunk(first, rows, layer):
             ids_slot[:rows].copy_(ids[first:first+rows])
             weights_slot[:rows].copy_(weights[first:first+rows])
-            t["control_x"][:rows].copy_(x[first:first+rows])
             k1c, groupc = control
-            groupc.launch(ids_slot, t["group_expert"], t["route_slots"], t["route_group_lane"],
-                          t["group_count"], scalars=(rows,))
-            k1c.launch(t["control_x"], t["tables"][layer], t["bits"], t["group_expert"],
-                       t["route_slots"], t["route_group_lane"], weights_slot, t["fc1"],
-                       t["intermediate"], t["fc2"], t["control_output"], t["group_count"],
-                       scalars=(rows, cta_limit))
+            if len(k1c.operands) == 13:
+                wire_slot[:rows].copy_(wire[first:first+rows])
+                groupc.launch(ids_slot, wire_slot, t["signs_in"], t["group_expert"], t["route_slots"],
+                              t["route_group_lane"], t["group_count"], t["activation"],
+                              scalars=(rows, cta_limit))
+                k1c.launch(t["activation"], t["tables"][layer], t["bits"], t["group_expert"],
+                           t["route_slots"], t["route_group_lane"], weights_slot, t["fc1"],
+                           t["intermediate"], t["fc2"], t["signs_out"], t["output"],
+                           t["group_count"], scalars=(rows, cta_limit))
+                response[first:first+rows].copy_(t["output"][:rows])
+            else:
+                t["control_x"][:rows].copy_(x[first:first+rows])
+                groupc.launch(ids_slot, t["group_expert"], t["route_slots"], t["route_group_lane"],
+                              t["group_count"], scalars=(rows,))
+                k1c.launch(t["control_x"], t["tables"][layer], t["bits"], t["group_expert"],
+                           t["route_slots"], t["route_group_lane"], weights_slot, t["fc1"],
+                           t["intermediate"], t["fc2"], t["control_output"], t["group_count"],
+                           scalars=(rows, cta_limit))
 
         def control_run():
             for layer in range(layers):

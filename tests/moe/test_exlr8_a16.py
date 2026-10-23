@@ -147,13 +147,15 @@ def test_exact_trellis_decode(case):
     import cutlass.cute as cute
     from cutlass import Int32, Int64, Uint32
     from cutlass.cute.runtime import from_dlpack
+    from b12x._lib.intrinsics import create_l2_evict_first_policy
     from b12x.moe._shared.kernels.w4a16.exlr8 import exlr8_decode_tile
 
     @cute.kernel
     def decode(payload: cute.Tensor, output: cute.Tensor, width: cutlass.Constexpr):
         lane, _, _ = cute.arch.thread_idx()
         tile, _, _ = cute.arch.block_idx()
-        values = exlr8_decode_tile(Int64(payload.iterator.toint()), Int32(tile), Int32(lane), width)
+        policy = create_l2_evict_first_policy()
+        values = exlr8_decode_tile(Int64(payload.iterator.toint()), Int32(tile), Int32(lane), width, policy)
         for j in cutlass.range_constexpr(4):
             output[tile*128+lane*4+j] = values[j]
 

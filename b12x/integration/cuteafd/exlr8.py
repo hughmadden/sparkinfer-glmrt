@@ -202,7 +202,11 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                                             if grouped else
                                                             ("rows", "cta_limit") if device_count
                                                             else ("rows", "groups", "cta_limit"))),
-                           key=((h, u, t, m, g["abi_version"], shared_expert, grouped, r)
+                           key=((h, u, t, m, g["abi_version"], shared_expert, grouped, r,
+                                 # The AOT spec is keyed on this tuple, not on kernel
+                                 # source: bump the tag when decode's weight-load
+                                 # cache policy changes.
+                                 "decode_l2_fc2_prefetch_v9")
                                 + (("grouped_compact_units",) if grouped else ())), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)
