@@ -268,7 +268,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 123
+    CODE_VERSION = 125
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
@@ -346,6 +346,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 block=(256, 1, 1), stream=stream)
             if cutlass.const_expr(self.blocks == 48):
                 if rows <= Int32(1024):
+                    # Keep the wide-row FC2 specialization unchanged.
                     fc2_cta_limit = max(Int32(1), cta_limit >> Int32(1))
                     slice_shift = Int32(1) if rows <= Int32(512) else Int32(0)
                     slice_blocks = Int32(3) << slice_shift
@@ -354,7 +355,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         self.launch_fc2(
                             pointers, bits, unit_count, unit_map,
                             group_expert, route_slots, intermediate, fc2,
-                            rows, group_count, unit_limit, slice_base, slice_blocks, slice_shift, fc2_cta_limit, stream)
+                            rows, group_count, unit_limit, slice_base, slice_blocks, slice_shift, fc2_cta_limit, stream, True)
                         self.reduce_kernel(
                             route_group_lane, route_weights, fc2, signs_out, output,
                             rows, group_count, slice_base, slice_blocks, slice_shift
@@ -1286,12 +1287,13 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                    intermediate: cute.Tensor, fc2: cute.Tensor,
                    rows: Int32, group_count: cute.Tensor, unit_limit: Int32,
                    slice_base: Int32, slice_blocks: Int32, slice_shift: Int32,
-                   grid_limit: Int32, stream: cuda.CUstream):
+                   grid_limit: Int32, stream: cuda.CUstream,
+                   evict_first: cutlass.Constexpr = False):
         if cutlass.const_expr(self.FC2_WS):
             self.grouped_fc2_ws_kernel(
                 pointers, bits, unit_count, unit_map, group_expert, route_slots,
                 intermediate, fc2, rows, group_count, unit_limit,
-                slice_base, slice_blocks, slice_shift).launch(
+                slice_base, slice_blocks, slice_shift, evict_first).launch(
                     grid=(min(Int32(self.max_groups * self.blocks), grid_limit), 1, 1),
                     block=(384, 1, 1), min_blocks_per_mp=1, stream=stream)
         else:
@@ -1308,7 +1310,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                            group_expert: cute.Tensor, route_slots: cute.Tensor,
                            intermediate: cute.Tensor, fc2: cute.Tensor,
                            rows: Int32, group_count: cute.Tensor, unit_limit: Int32,
-                           slice_base: Int32, slice_blocks: Int32, slice_shift: Int32):
+                           slice_base: Int32, slice_blocks: Int32, slice_shift: Int32,
+                           evict_first: cutlass.Constexpr = False):
         groups = group_count[0]
         if groups < Int32(0) or groups > Int32(self.max_groups):
             groups = Int32(0)
@@ -1411,6 +1414,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
 
                 if tid >= Int32(256):
                     producer = tid - Int32(256)
+                    if cutlass.const_expr(evict_first):
+                        # Evict disjoint weight bytes only after the final expert group reads them.
+                        last_reader = Int32(1)
+                        if group + Int32(1) < groups:
+                            if group_expert[group + Int32(1)] == expert:
+                                last_reader = Int32(0)
                     for b_idx in cutlass.range(b_count):
                         for k in cutlass.range(owned):
                             slot = sequence & Int32(self.FC2_STAGES - 1)
@@ -1426,10 +1435,23 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 if width != Int32(0):
                                     nbytes = width * Int32(2048)
                                     _mbar_arrive_expect_tx(bar_full + slot * Int32(8), nbytes)
-                                    cp_async_bulk_g2s_mbar(
-                                        stage + Int32(self.group_rows * 256),
-                                        payload + (block_base + b_idx).to(Int64) * nbytes.to(Int64),
-                                        nbytes, bar_full + slot * Int32(8))
+                                    if cutlass.const_expr(evict_first):
+                                        if last_reader != Int32(0):
+                                            policy = create_l2_evict_first_policy()
+                                            cp_async_bulk_g2s_mbar_l2hint(
+                                                stage + Int32(self.group_rows * 256),
+                                                payload + (block_base + b_idx).to(Int64) * nbytes.to(Int64),
+                                                nbytes, bar_full + slot * Int32(8), policy)
+                                        else:
+                                            cp_async_bulk_g2s_mbar(
+                                                stage + Int32(self.group_rows * 256),
+                                                payload + (block_base + b_idx).to(Int64) * nbytes.to(Int64),
+                                                nbytes, bar_full + slot * Int32(8))
+                                    else:
+                                        cp_async_bulk_g2s_mbar(
+                                            stage + Int32(self.group_rows * 256),
+                                            payload + (block_base + b_idx).to(Int64) * nbytes.to(Int64),
+                                            nbytes, bar_full + slot * Int32(8))
                                 else:
                                     _mbar_arrive(bar_full + slot * Int32(8))
                             for half in cutlass.range_constexpr(2):
