@@ -228,6 +228,19 @@ def test_compact_ownership_cpu():
         build(bits)
 
 
+def test_dense_mx8_geometry_has_distinct_record_abi():
+    source = SOURCE.parents[1] / "b12x/integration/cuteafd/dense_mxfp8.py"
+    tree = ast.parse(source.read_text())
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ("geometry", "record_bytes")]
+    scope = {}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), scope)
+    geometry = scope["geometry"](2048, 16384)
+    assert geometry["abi_version"] == 2
+    assert geometry["input_dtype"] == "f16" and geometry["rotation_count"] == 4
+    assert scope["record_bytes"](4096, 2048) == 256 * 64 * 528
+
+
 def test_dense_bf16_comparison_argument_plumbing():
     import argparse
     from types import SimpleNamespace

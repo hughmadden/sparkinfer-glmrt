@@ -28,7 +28,7 @@ def geometry(input_features, output_features=128, *, encoding="trellis",
     return dict(input_features=input_features, output_features=output_features,
                 encoding=encoding, sharded_side=sharded_side, max_rows=max_rows,
                 rotation_count=rotation_count, input_dtype=input_dtype,
-                bits=4, codebook="e4m3")
+                bits=4, codebook="e4m3", abi_version=2)
 
 
 def record_bytes(rows, input_features):
