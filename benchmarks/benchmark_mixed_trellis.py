@@ -1053,7 +1053,8 @@ def _run_prefill_benchmark(args, device, props):
         compact_rank=compact["rank"] if compact else None,
         compact_sha256=hashlib.sha256(args.compact_fixture.read_bytes()).hexdigest() if compact else None,
         routes=("recorded histograms" if waves else
-                "uniform random; timing labelled uniform" if args.routes_uniform else
+                "uniform random; timing labelled uniform"
+                if args.routes_uniform and not args.correctness_only else
                 "uniform random; correctness only"),
         route_sha256=hashlib.sha256(args.routes.read_bytes()).hexdigest() if waves else None,
         route_layer=args.route_layer, checked_rows=len(checked), exact=True, rows=records)
