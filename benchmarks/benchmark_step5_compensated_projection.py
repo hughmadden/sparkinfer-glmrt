@@ -137,6 +137,20 @@ ARMS = {
                                                tile_m=32, tile_n=128, num_stages=3)),
     "w8m32n64s5": dict(kind="tma", config=dict(compensated=True, warp_layout=(2, 4),
                                               tile_m=32, tile_n=64, num_stages=5)),
+    # Round 3: larger tiles cut the duplicated operand traffic that limits the
+    # wide-row cells (B is re-read once per tile_m rows, A once per tile_n).
+    "w8m128n128s3": dict(kind="tma", config=dict(compensated=True, warp_layout=(4, 2),
+                                               tile_m=128, tile_n=128, num_stages=3)),
+    "w8m128n128s2": dict(kind="tma", config=dict(compensated=True, warp_layout=(4, 2),
+                                               tile_m=128, tile_n=128, num_stages=2)),
+    "w8m128n64s3": dict(kind="tma", config=dict(compensated=True, warp_layout=(4, 2),
+                                              tile_m=128, tile_n=64, num_stages=3)),
+    "w8m64n256s2": dict(kind="tma", config=dict(compensated=True, warp_layout=(2, 4),
+                                              tile_m=64, tile_n=256, num_stages=2)),
+    "w16m128n128s2": dict(kind="tma", config=dict(compensated=True, warp_layout=(8, 2),
+                                                tile_m=128, tile_n=128, num_stages=2)),
+    "w16m128n128s3": dict(kind="tma", config=dict(compensated=True, warp_layout=(8, 2),
+                                                tile_m=128, tile_n=128, num_stages=3)),
     # The row table measured here as a single program: the small-M tiles below
     # the row-bound widths and the eight-warp tiles above them (see ROWTILES).
     "rowtile": dict(kind="rowtile", config={}),
@@ -208,17 +222,18 @@ ROWTILES = {
     "q": [
         (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=128, num_stages=5)),
         (64, dict(compute_warps=4, tile_n=64, num_stages=4)),
-        (256, dict(warp_layout=(2, 4), tile_m=64, tile_n=64, num_stages=3)),
+        (256, dict(warp_layout=(2, 4), tile_m=64, tile_n=64, num_stages=4)),
+        (4096, dict(warp_layout=(2, 4), tile_m=64, tile_n=128, num_stages=2)),
     ],
     "csa_o": [
         (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
-        (64, dict(compute_warps=4, tile_n=64, num_stages=4)),
-        (256, dict(compute_warps=8, tile_n=64, num_stages=3)),
+        (64, dict(warp_layout=(2, 4), tile_m=32, tile_n=64, num_stages=5)),
+        (4096, dict(warp_layout=(2, 4), tile_m=64, tile_n=128, num_stages=2)),
     ],
     "swa_o": [
         (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
-        (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=128, num_stages=5)),
-        (4096, dict(compute_warps=4, tile_n=128, num_stages=3)),
+        (64, dict(warp_layout=(2, 4), tile_m=32, tile_n=64, num_stages=5)),
+        (4096, dict(warp_layout=(2, 4), tile_m=64, tile_n=128, num_stages=2)),
     ],
     "kv": [
         (64, dict(warp_layout=(1, 2), tile_m=16, tile_n=16, num_stages=8)),
@@ -227,13 +242,14 @@ ROWTILES = {
     ],
     "gate_up": [
         (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
-        (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=128, num_stages=5)),
-        (256, dict(compute_warps=8, tile_n=64, num_stages=3)),
-        (4096, dict(compute_warps=4, tile_n=128, num_stages=3)),
+        (64, dict(warp_layout=(2, 4), tile_m=32, tile_n=64, num_stages=5)),
+        (256, dict(warp_layout=(2, 4), tile_m=64, tile_n=128, num_stages=3)),
+        (4096, dict(warp_layout=(2, 4), tile_m=64, tile_n=128, num_stages=2)),
     ],
     "kimi_up": [
         (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
-        (4096, dict(compute_warps=4, tile_n=64, num_stages=4)),
+        (64, dict(compute_warps=4, tile_n=64, num_stages=4)),
+        (4096, dict(warp_layout=(2, 4), tile_m=64, tile_n=128, num_stages=2)),
     ],
 }
 
