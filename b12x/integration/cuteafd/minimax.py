@@ -24,12 +24,19 @@ LINEAR_SHAPES = {
 }
 
 
-def compile_minimax_linear_aot(projection, *, max_rows=4096):
+# Decode split-K for the projections one M tile leaves latency-bound: kv,
+# index_q and index_k stream 0.8-6.3 MB through 1-8 CTAs (~23 us each on an
+# RTX 5090, 5-7 us split). The 37-151 MB projections already stream near HBM
+# bandwidth unsplit, and splitting them measured no gain.
+DECODE_SPLITS = {"q": 4, "kv": 8, "index_q": 8, "index_k": 16}
+
+
+def compile_minimax_linear_aot(projection, *, max_rows=4096, splits=1):
     if projection not in LINEAR_SHAPES:
         raise ValueError(f"unknown MiniMax projection {projection!r}")
     k, n = LINEAR_SHAPES[projection]
     return compile_scaled_linear_aot(input_features=k, output_features=n,
-        encoding="mxfp8", activation_encoding="mxfp8", max_rows=max_rows)
+        encoding="mxfp8", activation_encoding="mxfp8", max_rows=max_rows, splits=splits)
 
 
 def compile_minimax_scale_prep_aot():

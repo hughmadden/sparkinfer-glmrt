@@ -73,18 +73,18 @@ class _Pointers:
 
 
 def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp8", sharded_side=1,
-                              max_rows=4096, activation_encoding=None):
+                              max_rows=4096, activation_encoding=None, splits=1):
     g = geometry(input_features,output_features,encoding=encoding,sharded_side=sharded_side,max_rows=max_rows)
     k,n = input_features,output_features
     if activation_encoding is not None:
         if activation_encoding != "mxfp8" or encoding != "mxfp8" or sharded_side != 1 or n % 128:
             raise ValueError("native W8A8 requires MXFP8, output-major weights and N multiple128")
         from ._mxfp8_linear import Mxfp8Linear
-        launch = Mxfp8Linear(k, n)
+        launch = Mxfp8Linear(k, n, splits)
         g = dict(abi_version=2, input_features=k, output_features=n, max_rows=max_rows,
                  encoding="mxfp8", activation_encoding="mxfp8", sharded_side=1,
                  core="mxfp8_mma", scale_layout="mma", scale_block_size=32,
-                 output_dtype="bfloat16", splits=1, split_k=k,
+                 output_dtype="bfloat16", splits=splits, split_k=k // splits,
                  tile_m=64, tile_n=128, tile_k=128, mma_k=32,
                  load_path="tma", target_occupancy=1, grid="runtime_num_sm")
         return compile_program(launch, name="scaled_linear_mxfp8", operands=(
@@ -94,7 +94,7 @@ def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp
             Operand("partial", torch.uint8, "[scratch_bytes(rows)]", "scratch"),
             Operand("output", torch.bfloat16, f"[rows,{n}]", "out")),
             scalars=(Scalar("rows"), Scalar("cta_limit", note="unused; runtime SM count sets the grid")),
-            key=(k, n, "mxfp8"), geometry=g,
+            key=(k, n, "mxfp8") + ((splits,) if splits > 1 else ()), geometry=g,
             scratch={"partial": launch.stage.scratch_bytes}, doc=__doc__, version=2)
     scale_dtype = {"mxfp8":torch.uint8,"int4_g32":torch.float16,"fp8_row":torch.float32}[encoding]
     payload_size = k*n//(2 if encoding == "int4_g32" else 1)
