@@ -22,6 +22,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 __all__ = [
+    "COMPENSATED_TILES_BY_ROWS",
     "DECODE_TMA_TILES",
     "RoutedBf16Projection",
     "RowTiledBf16Projection",
@@ -308,6 +309,58 @@ DECODE_TMA_TILES = {
 }
 
 
+# Measured SM120 compensated tiles by live rows, per weight shape [N, K]:
+# (rows, warp_m, warp_n, tile_m, tile_n, num_stages) in ascending rows, or
+# (rows, compute_warps, tile_n, num_stages). Each entry retiles the K16
+# compensated accumulation of ``Bf16PrefillKernel``: the ordered K16 segments
+# and the four-FP32-op Kahan update per segment are unchanged, so every entry
+# is expected to give the canonical kernel's bits at every row count (it does,
+# see tests/integration/test_cuteafd_step5_compensated_tiles.py).
+#
+# Where the compensated route spends its time (issue at 8K, #703): small live
+# widths stream weights and want many small CTAs and deep stages; the 64-256
+# row chunks are balanced between the tensor pipe and the compensated FADD
+# stream and want 8 warps; wider rows re-read the weight once per tile_m rows,
+# so they want 128-row or 8-warp tiles. L2-flushed cold medians, SM120 RTX PRO
+# 6000, 12-16 replays x 2-3 interleaved blocks, ratio against
+# ``prefill_config``'s compensated tile (64x128x64, 3 stages, 4 warps):
+#
+#   q     4096x6144   1-16 rows 49.15 -> 34.82 us, 41-64 49.15 -> 36.86,
+#                     256 125.97 -> 104.45, 1024 350.21 -> 330.75
+#   csa_o 4096x12288  1-16 184.32 -> 67.58, 41-64 184.32 -> 72.85,
+#                     256 221.18 -> 165.92, 1024 820.24 -> 741.92,
+#                     2048 1465.87 -> 1278.96
+#   swa_o 4096x6144 FP32 out  1-16 71.68 -> 34.85, 41-64 71.68 -> 38.91,
+#                     256 90.14 -> 86.02, 1024 378.91 -> 362.53,
+#                     2048 778.22 -> 741.90
+#   kv    384x4096    1 26.62 -> 8.19, 16-64 26.62 -> 10.24,
+#                     256 26.62 -> 14.34, 2048 69.63 -> 45.06
+#   gate_up 3072x4096 1-16 49.15 -> 18.43, 41-64 49.15 -> 20.48,
+#                     256 51.20 -> 45.06, 1024 200.72 -> 180.24
+#   kimi  7168x24752  1 319.49 -> 227.33, 16 317.44 -> 229.38,
+#                     41-64 319.49 -> 261.10, 256 702.98 -> 571.41,
+#                     1024 2462.72 -> 2094.11, 2048 4869.12 -> 4134.94
+#
+# Rows a table does not cover keep ``prefill_config``'s compensated tile. That
+# is deliberate at 2048 rows for q and gate_up: the 8-warp tiles there
+# measured 1.14x and 1.08x in one session and 0.94x and 1.06x in the next
+# (two arms with identical tiles also landed 3-6% apart inside one run), so
+# the row band is withheld until the cell stops moving.
+COMPENSATED_TILES_BY_ROWS = {
+    (4096, 6144): ((16, 1, 4, 16, 128, 5), (64, 4, 64, 4), (256, 2, 4, 64, 64, 4),
+                   (1024, 2, 4, 64, 128, 2)),
+    (12288, 4096): ((16, 1, 4, 16, 32, 12), (64, 2, 4, 32, 64, 5),
+                    (4096, 2, 4, 64, 128, 2)),
+    (6144, 4096): ((16, 1, 4, 16, 32, 12), (64, 2, 4, 32, 64, 5),
+                   (4096, 2, 4, 64, 128, 3)),
+    (4096, 384): ((64, 1, 2, 16, 16, 8), (256, 1, 4, 16, 64, 9), (1024, 4, 64, 4),
+                  (4096, 4, 2, 128, 64, 3)),
+    (3072, 4096): ((16, 1, 4, 16, 32, 12), (64, 2, 4, 32, 64, 5),
+                   (4096, 2, 4, 64, 128, 3)),
+    (24752, 7168): ((16, 1, 4, 16, 32, 12), (64, 4, 64, 4), (4096, 2, 4, 64, 128, 2)),
+}
+
+
 def prefill_config(n: int, k: int) -> dict:
     """Measured SM120 choices for the TMA tensor-core route (uncompensated)."""
     if n >= 1024:
@@ -327,7 +380,7 @@ class TmaBf16Projection:
         if tiles_by_rows is None:
             tiles_by_rows = DECODE_TMA_TILES.get((self.n, self.k), ()) if not config else ()
         if tiles_by_rows:
-            self.row_tiled = RowTiledBf16Projection(self.n, self.k, tiles_by_rows, out_dtype=out_dtype)
+            self.row_tiled = RowTiledBf16Projection(self.n, self.k, tiles_by_rows, out_dtype=out_dtype, **config)
             self.tiles_by_rows = self.row_tiled.tiles_by_rows
             self.config = self.row_tiled.config
             self.kernel = self.row_tiled.default.kernel
@@ -356,43 +409,62 @@ class TmaBf16Projection:
 class RowTiledBf16Projection:
     """``TmaBf16Projection`` with its tiles picked by the live rows of a launch.
 
-    ``tiles_by_rows`` entries are ``(rows, compute_warps, tile_n, num_stages)`` or
-    ``(rows, warp_m, warp_n, tile_n, num_stages)`` in
+    ``tiles_by_rows`` entries are ``(rows, compute_warps, tile_n, num_stages)``,
+    ``(rows, warp_m, warp_n, tile_n, num_stages)`` or
+    ``(rows, warp_m, warp_n, tile_m, tile_n, num_stages)`` in
     ascending ``rows``: a launch runs the first entry whose ``rows`` it does
-    not exceed (``16 * compute_warps`` x ``tile_n`` tiles, ``prefill_config``'s
-    other settings; ``ceil(rows / (16 * compute_warps))`` row tiles) and
-    ``prefill_config``'s kernel past the last entry. The entries retile one
-    MMA accumulation: each output keeps its K order, so every entry is
-    expected to give the bits of ``prefill_config``'s kernel
+    not exceed (``16 * compute_warps`` x ``tile_n`` tiles, or ``warp_m`` x
+    ``warp_n`` warps over a ``16 * warp_m`` or the explicit ``tile_m`` row
+    tile, ``prefill_config``'s other settings; ``ceil(rows / tile_m)`` row
+    tiles) and ``prefill_config``'s kernel past the last entry. The entries
+    retile one MMA accumulation: each output keeps its K order, so every
+    entry is expected to give the bits of ``prefill_config``'s kernel
     (tests/integration/test_cuteafd_glmf_kda_decode_tiles.py). The branch is
     on the ``rows`` launch scalar, as ``RoutedBf16Projection``'s.
+
+    Keyword arguments override the ``prefill_config`` settings the entries do
+    not set, for every entry and for the past-the-table default. The
+    compensated route needs that: ``prefill_config`` selects
+    ``compensated=False`` and every entry of ``COMPENSATED_TILES_BY_ROWS`` is
+    a retile of the compensated K16 accumulation, so ``compensated=True``
+    must reach all of them (it enters the key, so the two routes never share
+    a compiled program).
     """
 
-    def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16):
+    def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16, **base):
         self.n, self.k = int(n), int(k)
         self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
-        if not self.tiles_by_rows or any(len(entry) not in (4, 5) for entry in self.tiles_by_rows):
+        if not self.tiles_by_rows or any(len(entry) not in (4, 5, 6) for entry in self.tiles_by_rows):
             raise ValueError(
-                "tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages) "
-                "or (rows, warp_m, warp_n, tile_n, num_stages)")
+                "tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages), "
+                "(rows, warp_m, warp_n, tile_n, num_stages) or "
+                "(rows, warp_m, warp_n, tile_m, tile_n, num_stages)")
         self.limits = tuple(entry[0] for entry in self.tiles_by_rows)
         # Entry i serves floors[i] < rows <= limits[i].
         self.floors = (0,) + self.limits[:-1]
         if any(limit <= floor for floor, limit in zip(self.floors, self.limits)):
             raise ValueError("tiles_by_rows rows must be positive and ascending")
-        self.default = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=())
+        self.base = dict(base)
+        self.default = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(), **self.base)
         self.config = self.default.config
         self.tiled = []
         for entry in self.tiles_by_rows:
             if len(entry) == 4:
                 _, warps, tile_n, stages = entry
                 self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(),
-                                                    compute_warps=warps, tile_n=tile_n, num_stages=stages))
+                                                    compute_warps=warps, tile_n=tile_n, num_stages=stages,
+                                                    **self.base))
             else:
-                _, warp_m, warp_n, tile_n, stages = entry
+                if len(entry) == 5:
+                    _, warp_m, warp_n, tile_n, stages = entry
+                    tile_m = 16 * warp_m
+                else:
+                    _, warp_m, warp_n, tile_m, tile_n, stages = entry
+                if tile_m % (16 * warp_m):
+                    raise ValueError(f"tiles_by_rows entry {entry}: tile_m must be a multiple of 16 * warp_m")
                 self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(),
-                                                    warp_layout=(warp_m, warp_n), tile_m=16 * warp_m,
-                                                    tile_n=tile_n, num_stages=stages))
+                                                    warp_layout=(warp_m, warp_n), tile_m=tile_m,
+                                                    tile_n=tile_n, num_stages=stages, **self.base))
         capacity = cutlass_utils.get_smem_capacity_in_bytes("sm_120")
         for entry, launch in zip(self.tiles_by_rows, self.tiled):
             kernel = launch.kernel
