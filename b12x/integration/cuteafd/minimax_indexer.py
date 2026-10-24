@@ -18,7 +18,8 @@ import torch
 from cutlass import Float32, Int32, Int64, const_expr
 
 from b12x.attention._shared.cute import ops as attention_ops
-from b12x.attention.dsa_indexer.kernel import PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT as _SPLIT
+from b12x.attention.dsa_indexer.kernel import (PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT as _SPLIT,
+    _VECTOR_K_LOAD)
 
 from ._common import Operand, Scalar, compile_program
 
@@ -46,13 +47,16 @@ def minimax_index_scratch_bytes(*, max_rows, max_pages, mode="decode"):
 
 
 class _Index:
-    def __init__(self, max_rows, max_pages, mode):
+    def __init__(self, max_rows, max_pages, mode, reference=False):
         from b12x.attention.dsa_indexer.kernel import (
             DSAScheduledMultiRowLogitsKernel, IndexerOutputMode, IndexerScoreMode)
         from b12x.attention.dsa_indexer.contiguous_kernel import DSAContiguousLogitsPrefillKernelBlockScores
         from b12x.attention.dsa_indexer.tiled_topk import DSATiledTopkKernel
 
         self.rows, self.pages, self.mode = max_rows, max_pages, mode
+        # The former decode scoring (one interval per row, scalar byte page
+        # loads): an exactness reference for tests, never exported.
+        self.reference = bool(reference)
         self.blocks, self.offsets, self.nbytes = _layout(max_rows, max_pages, mode)
         self.scorer = (DSAScheduledMultiRowLogitsKernel(4, 4,
             score_mode=IndexerScoreMode.MSA_BILINEAR, output_mode=IndexerOutputMode.PAGE_HEAD_MAX)
@@ -76,7 +80,7 @@ class _Index:
         idx = bx * 128 + tx
         if idx < rows * 4:
             weights[idx] = scale[idx] * Float32(128 ** -0.5)
-        if const_expr(self.mode == "decode"):
+        if const_expr(self.mode == "decode" and not self.reference):
             # The decode scorer's max_rows intervals split the rows' live pages
             # evenly in 4-page segments (the DSA paged-MQA schedule), instead of
             # one interval per row whose 4 CTAs walk every page of a long row.
@@ -106,7 +110,9 @@ class _Index:
                 schedule[Int64(idx) * 2 + 1] = Int32(0)
         if idx == 0:
             controls[0] = width
-            controls[1] = Int32(1)  # Scalar byte loads preserve the packed page stride.
+            # 16-byte vector page loads at the packed page stride (8448 bytes:
+            # keys, then the page's scales; TMA would assume dense pages).
+            controls[1] = Int32(1) if const_expr(self.reference) else Int32(_VECTOR_K_LOAD)
             controls[2] = Int32(0)
             controls[3] = Int32(0)
 
@@ -206,7 +212,7 @@ class _Decode(_Index):
                          (Int32(pool_pages), 64), (2112, 1)),
             self._tensor(page_table, (rows, table_width), (Int64(table_stride), 1)),
             self._tensor(cache_lengths, (rows,), (1,)),
-            self._tensor(schedule, (self.rows + 1, 2), (2, 1)),
+            self._tensor(schedule, (rows + 1 if const_expr(self.reference) else self.rows + 1, 2), (2, 1)),
             self._tensor(controls, (1,), (1,)),
             self._tensor(pages, (4, rows, self.pages), (Int64(rows) * self.pages, self.pages, 1)), stream)
         self.select(pages, scores, self._ptr(scratch, self.offsets["starts"], Int32),
@@ -253,9 +259,12 @@ class _Prefill(_Index):
             self._ptr(scratch, self.offsets["values"], Float32), q2k_indices, rows, k_rows, stream)
 
 
-def compile_minimax_index_aot(*, max_rows, max_pages, mode="decode"):
+def compile_minimax_index_aot(*, max_rows, max_pages, mode="decode", reference=False):
+    """``reference``: the former decode scoring (tests only; same ABI and results)."""
     _layout(int(max_rows), int(max_pages), mode)
-    launch = (_Decode if mode == "decode" else _Prefill)(int(max_rows), int(max_pages), mode)
+    if reference and mode != "decode":
+        raise ValueError("the reference arm is a decode program")
+    launch = (_Decode if mode == "decode" else _Prefill)(int(max_rows), int(max_pages), mode, reference)
     operands = [Operand("q_fp8", torch.float8_e4m3fn, "[rows,4,128]"),
                 Operand("q_scale", torch.float32, "[rows,4]")]
     if mode == "decode":
@@ -271,8 +280,9 @@ def compile_minimax_index_aot(*, max_rows, max_pages, mode="decode"):
         scalars = (Scalar("rows"), Scalar("k_rows"))
     operands += [Operand("q2k_indices", torch.int32, f"[4,{max_rows},16]", "out", align=4),
                  Operand("scratch", torch.uint8, f"[{launch.nbytes}]", "scratch")]
-    return compile_program(launch, name=f"minimax_index_{mode}", operands=tuple(operands),
-        scalars=scalars, key=(int(max_rows), int(max_pages), mode),
+    return compile_program(launch, name=f"minimax_index_{mode}" + ("_reference" if reference else ""),
+        operands=tuple(operands), scalars=scalars,
+        key=(int(max_rows), int(max_pages), mode) + (("reference",) if reference else ()),
         geometry=dict(max_rows=int(max_rows), max_pages=int(max_pages), heads=4,
                       head_dim=128, block_tokens=128, topk=16, mode=mode),
         scratch={"scratch": lambda rows: launch.nbytes}, doc=__doc__)
