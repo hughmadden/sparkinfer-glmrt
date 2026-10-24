@@ -21,6 +21,11 @@ order, the ascending K1024 split fold or output rounding.
               enumeration: only owned units are enumerated, so a rank that owns
               three of sixteen units fills the grid instead of pinning each CTA
               to one (unit, proj, split) family
+  gemini      the routed serving core ported from the S3 Gemini duel branch
+              (``k1_reg_pair_b2``: shared-memory live-unit compaction, bitmask
+              owned-unit FC2 iteration, B-first register prefetch, row-bounded
+              grid clamps) at the shipped ABI and CTA policy; its output must
+              stay bit-identical to K1
 
 The grouped arms reuse the shipped grouped prefill kernel and grouping
 verbatim; the compact ``unit_count``/``unit_map``/``unit_limit`` tables are
@@ -174,9 +179,11 @@ class Arm:
             launch(rows)
 
 
-def base_arm(cta_limit, rows_max, tables, shared, device="cuda"):
+def base_arm(cta_limit, rows_max, tables, shared, device="cuda",
+             variant="baseline", arm_name="base"):
     k1 = compile_exlr8_a16_aot(hidden=HIDDEN, units=UNITS, top_k=TOP_K,
-                               max_groups=MAX_GROUPS, device_count=True)
+                               max_groups=MAX_GROUPS, device_count=True,
+                               serving_variant=variant)
     group = compile_exlr8_group_aot(experts=EXPERTS, top_k=TOP_K,
                                     max_groups=MAX_GROUPS, hidden=HIDDEN,
                                     max_rows=64, group_rows=16)
@@ -204,7 +211,8 @@ def base_arm(cta_limit, rows_max, tables, shared, device="cuda"):
     def core_launch(rows):
         launch_program(k1, core_values, (rows, cta_limit))
 
-    notes = dict(kind="k1", cta_limit=cta_limit, threads=128,
+    notes = dict(kind="k1" if arm_name == "base" else arm_name,
+                 serving_variant=variant, cta_limit=cta_limit, threads=128,
                  min_blocks_per_mp=k1.geometry["ctas_per_sm"],
                  group_rows=16, max_groups=MAX_GROUPS,
                  split_k_blocks=8, fc1_splits=k1.geometry["fc1_splits"],
@@ -213,7 +221,7 @@ def base_arm(cta_limit, rows_max, tables, shared, device="cuda"):
                             "min(max_groups*units, cta_limit) activation; "
                             "min(max_groups*blocks, cta_limit) fc2; "
                             "min((rows*blocks+3)//4, cta_limit) reduce")
-    return Arm("base", (k1, group), buffers, (group_launch, core_launch), notes)
+    return Arm(arm_name, (k1, group), buffers, (group_launch, core_launch), notes)
 
 
 def grouped_arm(name, group_rows, cta_limit, rows_max, tables, shared, owned,
@@ -495,6 +503,9 @@ def main():
                 arm_set[name] = base_arm(sms * factor, rows_max, tables, shared)
             elif name == "wired":
                 arm_set[name] = wired_arm(name, rows_max, tables, shared, owned)
+            elif name == "gemini":
+                arm_set[name] = base_arm(sms * 4, rows_max, tables, shared,
+                                         variant="k1_reg_pair_b2", arm_name=name)
             elif name == "k1compact":
                 arm_set[name] = k1compact_arm(name, rows_max, tables, shared, owned)
             elif name.startswith("grouped"):

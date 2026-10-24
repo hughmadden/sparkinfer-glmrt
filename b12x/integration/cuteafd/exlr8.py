@@ -76,14 +76,17 @@ class _Exlr8Pointers:
 
 class _Exlr8ServingPointers:
     def __init__(self, g):
-        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
+        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel, Exlr8RoutedServingKernel
         if g.get("max_rows", 64) > 64:
             from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
             self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
                                            g["max_groups"], g["group_rows"])
-        else:
+        elif g.get("serving_variant", "baseline") == "baseline":
             self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"],
                                       g["max_groups"], device_count=True)
+        else:
+            self.core = Exlr8RoutedServingKernel(g["hidden"], g["units"], g["top_k"],
+                                                 g["max_groups"], variant=g["serving_variant"])
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -198,9 +201,21 @@ class _Exlr8CompactServingPointers:
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                          device_count=False, shared_expert=False, grouped=False, group_rows=64,
                          grouped_rows=4096, fc2_partials="f16", compact_units=False,
-                         activations="a16", quantize_pass=True):
+                         activations="a16", quantize_pass=True, serving_variant=None):
     if activations not in ("a16", "a8") or (activations == "a8" and not grouped):
         raise ValueError("EXLR8 A8 activations require grouped prefill")
+    # Routed <=64-row decode defaults to the compact-unit routed serving core;
+    # "baseline" keeps the shipped K1 core as the bitwise reference arm.
+    from b12x.moe._shared.kernels.w4a16.exlr8 import SERVING_VARIANTS
+    variant = serving_variant or "k1_reg_pair_b2"
+    if variant != "baseline" and variant not in SERVING_VARIANTS:
+        raise ValueError(f"unknown EXLR8 serving variant {variant!r}")
+    routed_serving = device_count and not shared_expert and not grouped and not compact_units
+    if routed_serving:
+        if units > 16:
+            raise ValueError("EXLR8 routed serving covers at most 16 units")
+    elif serving_variant is not None:
+        raise ValueError("EXLR8 serving variant applies to the plain routed serving ABI")
     if compact_units:
         if not device_count or grouped or shared_expert or activations != "a16":
             raise ValueError("compact EXLR8 units require the plain device-count serving ABI")
@@ -214,6 +229,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     if fc2_partials not in ("f16", "f32"):
         raise ValueError("EXLR8 FC2 partials must be f16 or f32")
     g = geometry(hidden, units, top_k, max_groups)
+    if routed_serving:
+        g["serving_variant"] = variant
     if grouped:
         if not device_count or shared_expert or group_rows not in (16, 32, 64):
             raise ValueError("EXLR8 grouped prefill requires device count and group rows 16/32/64")
@@ -281,6 +298,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                 + ((activations,) if grouped and activations != "a16" else ())
                                 + (("fused_quantize",) if grouped and activations != "a16" and not quantize_pass else ())
                                 + ((grouped_rows,) if grouped and grouped_rows != 4096 else ())
-                                + ((fc2_partials,) if grouped and fc2_partials != "f16" else ())), geometry=g,
+                                + ((fc2_partials,) if grouped and fc2_partials != "f16" else ())
+                                + ((variant,) if routed_serving else ())), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)

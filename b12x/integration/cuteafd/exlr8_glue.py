@@ -417,9 +417,12 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
     result = [
         ("a16_decode", "exlr8_a16", {"max_rows": 64},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k, max_groups=max_groups)),
-        ("a16_serving", "exlr8_a16", {"max_rows": 64},
+        # Routed <=64-row decode: the compact-unit routed serving core (ported
+        # from the S3 Gemini duel branch) beside the 64-row grouped instance.
+        ("a16_serving", "exlr8_a16", {"max_rows": 64, "serving_variant": "k1_reg_pair_b2"},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
-                                      max_groups=max_groups, device_count=True)),
+                                      max_groups=max_groups, device_count=True,
+                                      serving_variant="k1_reg_pair_b2")),
         ("group", "exlr8_group", {"max_rows": 64},
          lambda: compile_exlr8_group_aot(top_k=top_k, max_groups=max_groups, hidden=hidden)),
         ("shared_a16_serving", "exlr8_a16", {"max_rows": 64},
