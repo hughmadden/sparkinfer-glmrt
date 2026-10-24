@@ -26,10 +26,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmarks.benchmark_weight_l2_hint import _digest  # noqa: E402
 
 QWEN_SHAPES = ("34816x5120", "5120x17408", "16384x5120")
+# GLM 5.3 Flash and MiMo V2 decode projections as the engine ships them: the keys of
+# ``glmf.FP8_GEMV_CONFIG``, whose (warps, groups) is already tuned per shape.
+GLMF_SHAPES = ("24896x4096", "4096x8192", "4096x16384", "16384x1536", "2048x4096",
+               "4096x4096", "4096x2048", "24576x4096", "4096x12288", "154880x4096")
+MIMO_SHAPES = ("13568x4096", "14848x4096", "32768x4096", "152576x4096")
+# K=6144 width family (V4-sized hidden), kept from round 1 for continuity.
 GLM_SHAPES = ("2624x6144", "16384x2048", "6144x16384", "4096x2048", "24576x6144",
               "6144x12288", "4096x6144", "6144x2048")
-MIMO_SHAPES = ("13568x4096", "4096x8192", "32768x4096", "4096x16384")
-SETS = {"qwen": QWEN_SHAPES, "glm": GLM_SHAPES, "mimo": MIMO_SHAPES}
+SETS = {"qwen": QWEN_SHAPES, "glmf": GLMF_SHAPES, "glm": GLM_SHAPES, "mimo": MIMO_SHAPES}
+
+
+def _shipped_config() -> dict:
+    """The engine's per-shape decode GEMV ``(warps, groups)`` (``glmf.FP8_GEMV_CONFIG``)."""
+    try:
+        from b12x.integration.cuteafd.glmf import FP8_GEMV_CONFIG
+        return dict(FP8_GEMV_CONFIG)
+    except Exception:  # keep the benchmark runnable without the engine layer
+        return {(24896, 4096): (8, 2), (4096, 8192): (8, 2), (4096, 16384): (4, 2),
+                (16384, 1536): (2, 2), (2048, 4096): (8, 4), (4096, 4096): (8, 2),
+                (4096, 2048): (2, 2), (24576, 4096): (8, 4), (4096, 12288): (8, 2),
+                (154880, 4096): (8, 2), (13568, 4096): (2, 2), (14848, 4096): (2, 2),
+                (32768, 4096): (8, 2), (152576, 4096): (8, 2)}
 
 
 def _time(run, samples, flush, outputs, flush_mode="zero"):
@@ -67,10 +85,26 @@ def _time(run, samples, flush, outputs, flush_mode="zero"):
 
 
 def variants_for(kind: str, n: int, k: int, rows: int) -> list[dict]:
-    """Baseline first; every variant is (name, kwargs for MmaFp8Gemv)."""
+    """Baseline first; every variant is (name, kwargs for MmaFp8Gemv).
+
+    The baseline is the config the engine ships for this shape, so a ratio is the
+    gain over production. ``prod`` keeps the shipped warp count (same cross-warp
+    fold, hence bit-exact) and only varies the column block size / fetch hint.
+    """
     from b12x.integration.cuteafd._fp8_weights import gemv_warps
     warps = gemv_warps(k)
     out = [dict(name="baseline", warps=warps, groups=4)]
+    if kind == "prod":
+        warps, groups = _shipped_config().get((n, k), (gemv_warps(k), 4))
+        out = [dict(name="baseline", warps=warps, groups=groups)]
+        if groups != 4:
+            out.append(dict(name="default_g4", warps=warps, groups=4))
+        for g in (1, 2):
+            if g < groups and 128 % (8 * g) == 0 and n % (8 * g) == 0 and n // (8 * g) >= 2:
+                out.append(dict(name=f"g{g}", warps=warps, groups=g))
+                out.append(dict(name=f"g{g}+h256", warps=warps, groups=g, load_hint="l2_256b"))
+        out.append(dict(name="h256", warps=warps, groups=groups, load_hint="l2_256b"))
+        return out
     if kind == "groups":
         for groups in (2, 8):
             if 128 % (8 * groups) == 0 and n % (8 * groups) == 0 and n // (8 * groups) >= 2:
@@ -208,7 +242,7 @@ def main():
     parser.add_argument("--shapes", default="qwen", help=f"{','.join(SETS)}, or a semicolon list of NxK")
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--variants", default="groups",
-                        choices=("groups", "groups_wide", "hints", "depth", "combo"))
+                        choices=("groups", "groups_wide", "hints", "depth", "combo", "prod"))
     parser.add_argument("--flush", default="zero", choices=("zero", "read"))
     parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--seed", type=int, default=408)
