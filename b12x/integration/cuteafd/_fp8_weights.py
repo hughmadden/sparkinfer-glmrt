@@ -780,20 +780,41 @@ class MmaFp8Gemv:
                     dest[(chunk * self.groups + gi) * 4 + t] = words[t]
 
     @cute.jit
+    def _prefetch_initial(self, w_row: Int64, j: Int32):
+        """Bulk L2 prefetch of the leading K windows of the CTA's output rows.
+
+        A window is ``prefetch_bytes`` of one row's contiguous K run, issued
+        ``prefetch_blocks`` blocks ahead of its demand loads; the windows that
+        would be issued before the block loop starts (the first
+        ``prefetch_blocks`` blocks) are emitted here at kernel start instead.
+        Lane ``j == 0`` of each row group prefetches its own row; the demand
+        loads then find the run in L2 and DRAM sees one long burst per row
+        instead of 64-byte slices. Sizes are exact for a trailing short row."""
+        stride = self.prefetch_bytes // 128
+        lead = min(self.blocks, -(-self.prefetch_blocks // stride) * stride)
+        if j == Int32(0):
+            for first in range(0, lead, stride):
+                size = min(stride, self.blocks - first) * 128
+                for gi in cutlass.range_constexpr(self.groups):
+                    prefetch_bulk_global_l2(
+                        w_row + Int64(gi * 8 * self.k) + Int64(first * 128), Int32(size))
+
+    @cute.jit
     def _prefetch_window(self, w_row: Int64, block: Int32, j: Int32):
-        """Bulk L2 prefetch, one contiguous ``prefetch_bytes`` run per output row,
-        ``prefetch_blocks`` 128-byte K blocks ahead. Lane ``j == 0`` of each row
-        group issues it for its own row; the demand loads then find the window in
-        L2, and DRAM sees one long run per row instead of 64-byte slices."""
+        """Issue the window whose first block is ``prefetch_blocks`` ahead of
+        ``block`` (see ``_prefetch_initial``): one bulk prefetch per output row,
+        clamped to the row's remaining K blocks so nothing reads past the row."""
         stride = self.prefetch_bytes // 128
         if j == Int32(0):
-            if block % Int32(stride) == Int32(0):
-                # Only whole windows inside the row: no read past the tensor.
-                if block + Int32(self.prefetch_blocks + stride) <= Int32(self.blocks):
+            for w in cutlass.range_constexpr(-(-self.blocks // stride)):
+                first = w * stride
+                size = min(stride, self.blocks - first) * 128
+                if first < self.prefetch_blocks:
+                    continue  # emitted by _prefetch_initial at kernel start
+                if block == Int32(first - self.prefetch_blocks):
                     for gi in cutlass.range_constexpr(self.groups):
                         prefetch_bulk_global_l2(
-                            w_row + Int64(gi * 8 * self.k) + Int64(block + self.prefetch_blocks) * Int64(128),
-                            Int32(self.prefetch_bytes))
+                            w_row + Int64(gi * 8 * self.k) + Int64(first * 128), Int32(size))
 
     @cute.kernel
     def kernel(self, x: cute.Pointer, w: cute.Pointer, scale: cute.Pointer, out: cute.Pointer, rows: Int32):
@@ -830,11 +851,11 @@ class MmaFp8Gemv:
         nxt = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
         s_cur = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
         s_nxt = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
+        if const_expr(self.prefetch_blocks):
+            self._prefetch_initial(w_row, j)
         self._load_block(cur, w_row, Int64(0))
         for si in cutlass.range_constexpr(s_rows):
             s_cur[si] = _ld_f32(s_row + Int64(si) * s_gi)
-        if const_expr(self.prefetch_blocks):
-            self._prefetch_window(w_row, Int32(0), j)
         for block in cutlass.range(self.blocks, unroll=1):
             for si in cutlass.range_constexpr(s_rows):
                 s_nxt[si] = s_cur[si]

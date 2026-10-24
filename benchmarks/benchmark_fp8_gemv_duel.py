@@ -80,10 +80,10 @@ def variants_for(kind: str, n: int, k: int, rows: int) -> list[dict]:
             if 128 % (8 * groups) == 0 and n % (8 * groups) == 0 and n // (8 * groups) >= 2:
                 out.append(dict(name=f"g{groups}", warps=warps, groups=groups))
     if kind == "hints":
-        for hint in ("evict_first", "l2_256b", "l2_128b"):
+        for hint in ("l2_256b", "l2_128b"):
             out.append(dict(name=hint, warps=warps, groups=4, load_hint=hint))
     if kind == "depth":
-        for blocks, nbytes in ((4, 1024), (8, 1024), (16, 1024), (8, 2048), (8, 4096)):
+        for blocks, nbytes in ((4, 512), (8, 1024), (8, 2048)):
             out.append(dict(name=f"pf{blocks}x{nbytes}", warps=warps, groups=4,
                             prefetch_blocks=blocks, prefetch_bytes=nbytes))
     return out
@@ -119,34 +119,47 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
     s = torch.rand((n + 127) // 128, (k + 127) // 128, device="cuda", generator=gen) * 2e-4 + 1e-4
     records = []
     for cfg in variants_for(kind, n, k, rows):
-        op, program = _compile(n, k, rows, cfg)
-        out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
-        out16 = torch.empty(16, n, device="cuda", dtype=torch.bfloat16)
+        try:
+            op, program = _compile(n, k, rows, cfg)
+            out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+            out16 = torch.empty(16, n, device="cuda", dtype=torch.bfloat16)
 
-        def run(program=program, out=out, rows=rows):
-            program.launch(x, w, s, out, scalars=(rows,))
+            def run(program=program, out=out, rows=rows):
+                program.launch(x, w, s, out, scalars=(rows,))
 
-        median, best, digest = _time(run, samples, flush, [out], flush_mode)
-        # Row invariance inside this variant: row 0 at M=1 vs row 0 embedded at M=16.
-        def run16(program=program, out=out16):
-            program.launch(x, w, s, out, scalars=(16,))
+            median, best, digest = _time(run, samples, flush, [out], flush_mode)
+            median_read, best_read, digest_read = _time(run, samples, flush, [out], "read")
+            assert digest_read == digest, "output bits moved with the eviction mode"
+            # Row invariance inside this variant: row 0 at M=1 vs row 0 embedded at M=16.
+            def run16(program=program, out=out16):
+                program.launch(x, w, s, out16, scalars=(16,))
 
-        run16()
-        torch.cuda.synchronize()
-        row0_a = out16.view(torch.int16)[0].clone()
-        run()
-        torch.cuda.synchronize()
-        row0_b = out.view(torch.int16)[0].clone()
-        records.append(dict(case=f"fp8gemv_{spec}", rows=rows, variant=cfg["name"],
-                            warps=cfg["warps"], groups=cfg["groups"],
-                            median_us=round(median, 3), min_us=round(best, 3),
-                            weight_gbps=round(n * k / median / 1e3, 1), digest=digest,
-                            row_invariant=bool(torch.equal(row0_a, row0_b))))
-        del op, program, out, out16
+            run16()
+            torch.cuda.synchronize()
+            row0_a = out16.view(torch.int16)[0].clone()
+            run()
+            torch.cuda.synchronize()
+            row0_b = out.view(torch.int16)[0].clone()
+            records.append(dict(case=f"fp8gemv_{spec}", rows=rows, variant=cfg["name"],
+                                warps=cfg["warps"], groups=cfg["groups"],
+                                median_us=round(median, 3), min_us=round(best, 3),
+                                weight_gbps=round(n * k / median / 1e3, 1),
+                                median_read_us=round(median_read, 3),
+                                weight_gbps_read=round(n * k / median_read / 1e3, 1),
+                                digest=digest,
+                                row_invariant=bool(torch.equal(row0_a, row0_b))))
+            del op, program, out, out16
+        except Exception as exc:  # a failed variant is a null, not a dead sweep
+            records.append(dict(case=f"fp8gemv_{spec}", rows=rows, variant=cfg["name"],
+                                error=repr(exc)[:400]))
         torch.cuda.empty_cache()
-    base = records[0]
+    base = next(rec for rec in records
+                if rec["variant"] == "baseline" and "median_us" in rec)
     for rec in records:
+        if "median_us" not in rec:
+            continue
         rec["ratio"] = round(base["median_us"] / rec["median_us"], 4)
+        rec["ratio_read"] = round(base["median_read_us"] / rec["median_read_us"], 4)
         rec["exact_vs_baseline"] = rec["digest"] == base["digest"]
     return records
 
@@ -158,7 +171,7 @@ def main():
     parser.add_argument("--variants", default="groups",
                         choices=("groups", "groups_wide", "hints", "depth"))
     parser.add_argument("--flush", default="zero", choices=("zero", "read"))
-    parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--seed", type=int, default=408)
     parser.add_argument("--tag", default="")
     args = parser.parse_args()
