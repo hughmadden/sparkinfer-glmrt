@@ -575,7 +575,9 @@ class BatchedBf16Gemm:
     buffer_align_bytes = 1024
 
     def __init__(self, *, n: int, k: int, batch: int, a_row: int, a_batch: int, o_row: int,
-                 o_batch: int, compute_warps: int = 4, tile_n: int = 128, num_stages: int = 3):
+                 o_batch: int, compute_warps: int = 4, tile_n: int = 128, num_stages: int = 3,
+                 weight_evict_first: bool = False):
+        self.weight_evict_first = bool(weight_evict_first)
         self.n, self.k, self.batch = int(n), int(k), int(batch)
         self.a_row, self.a_batch, self.o_row, self.o_batch = int(a_row), int(a_batch), int(o_row), int(o_batch)
         self.num_compute_warps = int(compute_warps)
@@ -592,8 +594,9 @@ class BatchedBf16Gemm:
         self.n_tiles = self.n // self.tile_n
 
     def key(self) -> tuple:
-        return (self.n, self.k, self.batch, self.a_row, self.a_batch, self.o_row, self.o_batch,
-                self.num_compute_warps, self.tile_n, self.num_stages)
+        key = (self.n, self.k, self.batch, self.a_row, self.a_batch, self.o_row, self.o_batch,
+               self.num_compute_warps, self.tile_n, self.num_stages)
+        return key + ("weight_last_m_l2",) if self.weight_evict_first else key
 
     def _tiled_mma(self) -> cute.TiledMma:
         return cute.make_tiled_mma(
@@ -729,8 +732,17 @@ class BatchedBf16Gemm:
                 load_pipeline.producer_acquire(producer_state)
                 cute.copy(tma_atom_a, t_ag[(None, m_tile, k_tile, batch)], t_as[(None, producer_state.index)],
                           tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state))
-                cute.copy(tma_atom_b, t_bg[(None, n_tile, k_tile, batch)], t_bs[(None, producer_state.index)],
-                          tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state))
+                if cutlass.const_expr(self.weight_evict_first):
+                    if m_tile == (num_tokens - Int32(1)) // Int32(self.tile_m):
+                        cute.copy(tma_atom_b, t_bg[(None, n_tile, k_tile, batch)], t_bs[(None, producer_state.index)],
+                                  tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
+                                  cache_policy=Int64(0x12F0000000000000))
+                    else:
+                        cute.copy(tma_atom_b, t_bg[(None, n_tile, k_tile, batch)], t_bs[(None, producer_state.index)],
+                                  tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state))
+                else:
+                    cute.copy(tma_atom_b, t_bg[(None, n_tile, k_tile, batch)], t_bs[(None, producer_state.index)],
+                              tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state))
                 load_pipeline.producer_commit(producer_state)
                 producer_state.advance()
             load_pipeline.producer_tail(producer_state)

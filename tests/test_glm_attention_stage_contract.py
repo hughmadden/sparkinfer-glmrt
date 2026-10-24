@@ -130,3 +130,62 @@ def test_fused_launch_order_is_preserved(name, calls):
                 and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)
                 and n.func.value.id == "self"]
     assert launches == calls
+
+
+def test_batched_weight_policy_is_explicit_and_preserves_default_key():
+    source = SOURCE.with_name("_glm_kernels.py")
+    tree = ast.parse(source.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "BatchedBf16Gemm")
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("__init__", "key")]
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(name="Core", bases=[], keywords=[],
+        body=methods, decorator_list=[])], type_ignores=[])), str(source), "exec"), namespace)
+    namespace["Core"].tile_k = 64
+    kwargs = dict(n=512, k=256, batch=64, a_row=16384, a_batch=256,
+                  o_row=32768, o_batch=512)
+    base = namespace["Core"](**kwargs)
+    hinted = namespace["Core"](**kwargs, weight_evict_first=True)
+    assert base.weight_evict_first is False
+    assert base.key() == (512, 256, 64, 16384, 256, 32768, 512, 4, 128, 3)
+    assert hinted.key() == base.key() + ("weight_last_m_l2",)
+    kernel = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "kernel")
+    gates = [n for n in ast.walk(kernel) if isinstance(n, ast.If)
+             and ast.unparse(n.test) == "cutlass.const_expr(self.weight_evict_first)"]
+    assert len(gates) == 1
+    assert "cache_policy" not in ast.unparse(gates[0].orelse[0])
+
+
+def test_production_batched_callers_do_not_implicitly_enable_weight_policy():
+    root = SOURCE.parent
+    enabled = []
+    for path in root.glob("*.py"):
+        if path.name == "_glm_kernels.py":
+            continue
+        tree = ast.parse(path.read_text())
+        for call in ast.walk(tree):
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "BatchedBf16Gemm":
+                for keyword in call.keywords:
+                    if keyword.arg == "weight_evict_first":
+                        assert path.name == "glmf.py"
+                        assert ast.unparse(keyword.value) == "_mla_decode_weight_evict_first(g, max_rows, prefill)"
+                        enabled.append(call)
+    assert len(enabled) == 2
+
+
+@pytest.mark.parametrize("capacity", [1, 16, 64, 128, 1408, 2048, 4096])
+@pytest.mark.parametrize("prefill", [False, True])
+def test_flash_mla_weight_policy_only_measured_decode(capacity, prefill):
+    source = SOURCE.with_name("glmf.py")
+    tree = ast.parse(source.read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "_mla_decode_weight_evict_first")
+    namespace = dict(GLMFGeometry=SimpleNamespace)
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+    policy = namespace[function.name]
+    geometry = dict(heads=64, kv_lora_rank=512, qk_nope_dim=256, qk_head_dim=256,
+                    latent_dim=512, v_head_dim=256)
+    assert policy(SimpleNamespace(**geometry), capacity, prefill) == (capacity <= 64 and not prefill)
+    for field in geometry:
+        changed = dict(geometry)
+        changed[field] //= 2
+        assert not policy(SimpleNamespace(**changed), capacity, prefill)

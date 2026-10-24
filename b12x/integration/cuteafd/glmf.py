@@ -1011,6 +1011,13 @@ def mla_producer_scratch_bytes(g: GLMFGeometry, rows: int, prefill_fp8: bool = F
     return _align(rows * g.qkv_a_width * 2) + _align(rows * g.heads * g.qk_head_dim * 2) + quant
 
 
+def _mla_decode_weight_evict_first(g: GLMFGeometry, max_rows: int, prefill: bool) -> bool:
+    # Cold-L2 gate covers only these full-head absorb/UV layouts at decode capacity.
+    geometry = (g.heads, g.kv_lora_rank, g.qk_nope_dim, g.qk_head_dim,
+                g.latent_dim, g.v_head_dim)
+    return not prefill and 1 <= int(max_rows) <= 64 and geometry == (64, 512, 256, 256, 512, 256)
+
+
 class _MlaProducer:
     def __init__(self, g: GLMFGeometry, fp8=False, max_rows: int = 64):
         self.g = g
@@ -1023,7 +1030,8 @@ class _MlaProducer:
                                       record_bytes=g.record_bytes, rope=0)
         self.absorb = BatchedBf16Gemm(n=g.kv_lora_rank, k=g.qk_nope_dim, batch=n, a_row=n * g.qk_head_dim,
                                       a_batch=g.qk_head_dim, o_row=n * g.latent_dim, o_batch=g.latent_dim,
-                                      compute_warps=_batched_warps(max_rows))
+                                      compute_warps=_batched_warps(max_rows),
+                                      weight_evict_first=_mla_decode_weight_evict_first(g, max_rows, prefill))
 
     def key(self) -> tuple:
         return (self.qkv_a.key(), self.q_b.key(), self.absorb.key(), self.g)
@@ -1539,7 +1547,8 @@ class _GlmfOutput:
         fp8, prefill = _fp8_mode(fp8)
         self.uv = BatchedBf16Gemm(n=v, k=g.kv_lora_rank, batch=n, a_row=n * g.kv_lora_rank,
                                   a_batch=g.kv_lora_rank, o_row=n * v, o_batch=v,
-                                  compute_warps=_batched_warps(max_rows))
+                                  compute_warps=_batched_warps(max_rows),
+                                  weight_evict_first=_mla_decode_weight_evict_first(g, max_rows, prefill))
         self.o = _Fp8Switch(g.hidden, n * v, fp8=fp8, prefill_rows=int(max_rows) if prefill else None)
 
     def key(self) -> tuple:
