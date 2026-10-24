@@ -205,3 +205,44 @@ def test_k4_identical_control_noise_gate(control, passes):
         base_control=[control] * 3, candidate=[90, 90, 90]), 'base')
     assert result['noise_pass'] == passes
     assert result['speedups']['candidate'] == pytest.approx(100 / 90)
+
+
+def test_serving_tier_bits_and_payload_bytes():
+    owned, _ = bench.rank_geometry(6, 0, 3)
+    bits_mixed = bench.serving_tier_bits(owned=owned, tier_mix="mixed")
+    bits_k4 = bench.serving_tier_bits(owned=owned, tier_mix="k4")
+    assert set(bits_mixed.unique().tolist()) == {0, 2, 3, 4}
+    assert set(bits_k4.unique().tolist()) == {0, 4}
+    for e in range(256):
+        for u in range(16):
+            if u in owned[e]:
+                assert [int(bits_mixed[e, u, p]) for p in range(3)] == [(2, 3, 4)[(u + p) % 3] for p in range(3)]
+            else:
+                assert int(bits_mixed[e, u].abs().sum()) == 0
+    ids = torch.tensor([[0, 1, 2, 0]], dtype=torch.int32)
+    expected_bits = int(bits_mixed[[0, 1, 2]].sum().item())
+    assert bench.serving_route_payload_bytes(ids, bits_mixed) == expected_bits * (6144 // 16) * (128 // 16) * 32
+
+
+def test_routed_serving_variant_keys_keep_unrelated_programs_unchanged(monkeypatch):
+    from b12x.integration.cuteafd import exlr8 as exlr8_mod
+    from b12x.integration.cuteafd.exlr8 import DEFAULT_SERVING_VARIANT, compile_exlr8_a16_aot
+    monkeypatch.setattr(exlr8_mod, "compile_program", lambda wrapper, **kwargs: SimpleNamespace(wrapper=wrapper, **kwargs))
+    decode = compile_exlr8_a16_aot(device_count=False)
+    shared = compile_exlr8_a16_aot(top_k=1, max_groups=4, device_count=True, shared_expert=True)
+    grouped = compile_exlr8_a16_aot(device_count=True, grouped=True, group_rows=64)
+    default_srv = compile_exlr8_a16_aot(device_count=True)
+    base_srv = compile_exlr8_a16_aot(device_count=True, serving_variant="baseline")
+    v1 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_compact_prefetch")
+    v2 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_paired_fc1")
+    v3 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_reg_pair_b2")
+    v4 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_k23_coalesced")
+    assert DEFAULT_SERVING_VARIANT == "k1_k23_coalesced"
+    assert decode.key[-1] == "decode_l2_fc2_prefetch_v9"
+    assert shared.key[-1] == "decode_l2_fc2_prefetch_v9"
+    assert grouped.key[-1] == "grouped_compact_units"
+    assert default_srv.key == v4.key
+    assert default_srv.geometry["serving_variant"] == "k1_k23_coalesced"
+    assert base_srv.key[-1] == "baseline"
+    assert len({base_srv.key, v1.key, v2.key, v3.key, v4.key}) == 5
+

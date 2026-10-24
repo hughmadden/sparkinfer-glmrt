@@ -411,7 +411,7 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
 
 def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_groups=512):
     """Exporter tuples and role ownership; callers must not duplicate this list."""
-    from .exlr8 import compile_exlr8_a16_aot
+    from .exlr8 import DEFAULT_SERVING_VARIANT, compile_exlr8_a16_aot
     if role not in ("all", "coordinator", "spark"):
         raise ValueError(f"unknown EXLR8 export role {role!r}")
     result = [
@@ -419,10 +419,10 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k, max_groups=max_groups)),
         # Routed <=64-row decode: the compact-unit routed serving core (ported
         # from the S3 Gemini duel branch) beside the 64-row grouped instance.
-        ("a16_serving", "exlr8_a16", {"max_rows": 64, "serving_variant": "k1_reg_pair_b2"},
+        ("a16_serving", "exlr8_a16", {"max_rows": 64, "serving_variant": DEFAULT_SERVING_VARIANT},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
                                       max_groups=max_groups, device_count=True,
-                                      serving_variant="k1_reg_pair_b2")),
+                                      serving_variant=DEFAULT_SERVING_VARIANT)),
         ("group", "exlr8_group", {"max_rows": 64},
          lambda: compile_exlr8_group_aot(top_k=top_k, max_groups=max_groups, hidden=hidden)),
         ("shared_a16_serving", "exlr8_a16", {"max_rows": 64},
