@@ -139,14 +139,19 @@ def launch_program(program, values, scalars):
 
 
 class Arm:
-    """A compiled program set, its buffers and its ordered launches."""
+    """A compiled program set, its buffers and its ordered launches.
 
-    def __init__(self, name, programs, buffers, launches, notes):
+    ``lossy`` arms change output rounding/partial precision, so they are
+    measured and reported but never pass the bit-exactness gate.
+    """
+
+    def __init__(self, name, programs, buffers, launches, notes, lossy=False):
         self.name = name
         self.programs = programs
         self.buffers = buffers
         self.launches = launches
         self.notes = notes
+        self.lossy = lossy
 
     def run(self, rows):
         for launch in self.launches:
@@ -168,7 +173,7 @@ def base_arm(cta_limit, rows_max, tables, shared, device="cuda"):
         signs_out=shared["signs_out"],
         signs_in=shared["signs_in"],
         output=torch.empty((rows_max, HIDDEN), dtype=torch.bfloat16, device=device),
-        weights=shared["weights"],
+        route_weights=shared["weights"],
         ids=shared["ids"],
         pointers=tables["tables"],
         bits=tables["bits"],
@@ -196,10 +201,18 @@ def base_arm(cta_limit, rows_max, tables, shared, device="cuda"):
 
 
 def grouped_arm(name, group_rows, cta_limit, rows_max, tables, shared, owned,
-                device="cuda"):
-    core = compile_exlr8_a16_aot(hidden=HIDDEN, units=UNITS, top_k=TOP_K,
-                                 max_groups=GROUPED_MAX_GROUPS, device_count=True,
-                                 grouped=True, group_rows=group_rows)
+                half=False, device="cuda"):
+    # The shipped grouped package stores FC2 partials as F16; the <=64 serving
+    # kernel keeps them F32.  F32 partials are the matching-numerics variant;
+    # the shipped F16 setting is measured only as a separately labelled lossy
+    # arm.
+    Exlr8GroupedKernel.FC2_HALF = bool(half)
+    try:
+        core = compile_exlr8_a16_aot(hidden=HIDDEN, units=UNITS, top_k=TOP_K,
+                                     max_groups=GROUPED_MAX_GROUPS, device_count=True,
+                                     grouped=True, group_rows=group_rows)
+    finally:
+        Exlr8GroupedKernel.FC2_HALF = True
     group = compile_exlr8_group_aot(experts=EXPERTS, top_k=TOP_K,
                                     max_groups=GROUPED_MAX_GROUPS, hidden=HIDDEN,
                                     max_rows=4096, group_rows=group_rows)
@@ -214,7 +227,7 @@ def grouped_arm(name, group_rows, cta_limit, rows_max, tables, shared, owned,
         signs_out=shared["signs_out"],
         signs_in=shared["signs_in"],
         output=torch.empty((rows_max, HIDDEN), dtype=torch.bfloat16, device=device),
-        weights=shared["weights"],
+        route_weights=shared["weights"],
         ids=shared["ids"],
         unit_count=unit_count,
         unit_map=unit_map,
@@ -235,10 +248,12 @@ def grouped_arm(name, group_rows, cta_limit, rows_max, tables, shared, owned,
                  min_blocks_per_mp=Exlr8GroupedKernel.CTAS_PER_SM,
                  group_rows=group_rows, max_groups=GROUPED_MAX_GROUPS,
                  unit_limit=unit_limit, fc1_ws=bool(group_rows == 64),
+                 fc2_partials="f16 (shipped)" if half else "f32 (matches K1)",
                  unit_enumerated="owned only (unit_count/unit_map, unit_limit=%d)"
                                  % unit_limit,
                  program=core.name, group_program=group.name)
-    return Arm(name, (core, group), buffers, (group_launch, core_launch), notes)
+    return Arm(name, (core, group), buffers, (group_launch, core_launch), notes,
+               lossy=bool(half))
 
 
 def route_fixture(rows, distribution, generator, wave):
@@ -249,6 +264,23 @@ def route_fixture(rows, distribution, generator, wave):
         ids = real_route_ids(rows, wave, generator, experts=EXPERTS, top_k=TOP_K)
     weights = torch.rand((rows, TOP_K), generator=generator) / 8
     return ids.cuda().int(), weights.cuda()
+
+
+LOSSY: dict = {}
+
+
+def measure(actual, expected, label):
+    """Record how a lossy arm differs; never used for the exactness gate."""
+    difference = actual.float() - expected.float()
+    reference = expected.float()
+    metrics = dict(label=label,
+                   bitwise_equal=bool(torch.equal(actual.view(torch.int16),
+                                                  expected.view(torch.int16))),
+                   relative_l2=float(torch.linalg.vector_norm(difference)
+                                     / torch.linalg.vector_norm(reference).clamp_min(1e-30)),
+                   max_abs=float(difference.abs().max()))
+    LOSSY[label] = metrics
+    return metrics
 
 
 def compare(actual, expected, label):
@@ -316,9 +348,11 @@ def main():
                 factor = int(name[3:])
                 arm_set[name] = base_arm(sms * factor, rows_max, tables, shared)
             elif name.startswith("grouped"):
-                group_rows = int(name[len("grouped"):])
+                spec = name[len("grouped"):]
+                half = spec.endswith("h")
+                group_rows = int(spec[:-1] if half else spec)
                 arm_set[name] = grouped_arm(name, group_rows, sms * 2, rows_max,
-                                            tables, shared, owned)
+                                            tables, shared, owned, half=half)
             else:
                 raise ValueError(f"unknown arm {name}")
         arms[distribution] = arm_set
@@ -345,8 +379,12 @@ def main():
                     continue
                 arm.run(rows)
                 torch.cuda.synchronize()
-                compare(arm.buffers["output"][:rows], expected,
-                        f"{name} {distribution} {rows}")
+                if arm.lossy:
+                    measure(arm.buffers["output"][:rows], expected,
+                            f"{name} {distribution} {rows}")
+                else:
+                    compare(arm.buffers["output"][:rows], expected,
+                            f"{name} {distribution} {rows}")
             checked += 1
         print(json.dumps({"oracle": distribution, "cells": checked}), flush=True)
 
@@ -366,14 +404,21 @@ def main():
                 graph = capture(step)
                 graph.replay()
                 torch.cuda.synchronize()
-                reference = arm_set["base"].buffers["output"][:rows]
-                compare(arm.buffers["output"][:rows], reference,
-                        f"{name} {distribution} {rows} graph capture")
+                reference = arm_set["base"].buffers["output"][:rows].clone()
+                own = arm.buffers["output"][:rows].clone()
+                if arm.lossy:
+                    measure(own, reference,
+                            f"{name} {distribution} {rows} graph capture")
+                else:
+                    compare(own, reference,
+                            f"{name} {distribution} {rows} graph capture")
                 poisoned = arm.buffers["output"][:rows]
                 poisoned.view(torch.int16).fill_(-1)
                 graph.replay()
                 torch.cuda.synchronize()
-                compare(arm.buffers["output"][:rows], reference,
+                # Every output byte must be rewritten by the replay, whatever
+                # the arm's partial precision is.
+                compare(arm.buffers["output"][:rows], own,
                         f"{name} {distribution} {rows} poisoned replay")
                 graphs[name] = graph
             rounds = {name: [] for name in graphs}
@@ -420,7 +465,7 @@ def main():
                     "synthetic payloads sized per tier, cold L2 (%.2f GiB payload), "
                     "graph replay of grouping + expert step, one untimed warm replay"
                     % (tables["payload_bytes"] / 2**30)),
-        checked_cells=checked, rows=records)
+        checked_cells=checked, lossy_metrics=LOSSY, rows=records)
     args.output.write_text(json.dumps(result, indent=2))
     print(json.dumps({"wrote": str(args.output)}), flush=True)
 
