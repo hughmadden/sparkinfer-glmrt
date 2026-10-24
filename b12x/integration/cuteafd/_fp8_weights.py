@@ -48,13 +48,17 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 
-from b12x._lib.intrinsics import bf16_mma_m16n8k16_f32, ld_shared_v2_u32, shared_ptr_to_u32, st_shared_v4_u32
+from b12x._lib.intrinsics import (bf16_mma_m16n8k16_f32, ld_shared_v2_u32, prefetch_bulk_global_l2,
+                                  shared_ptr_to_u32, st_shared_v4_u32)
 
 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_stream
 
-__all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_ROWS", "Fp8Projection", "decode_tile_n", "MmaFp8Gemv", "RoutedFp8Projection",
-           "TmaFp8Gemm", "check_w8_mode", "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps",
-           "projection", "w8_scalars"]
+__all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_CONFIG", "FP8_GEMV_GROUPS_DEFAULT", "FP8_GEMV_ROWS", "FP8_GEMV_WIDE",
+           "FP8_GEMV_WIDE_KERNEL",
+           "Fp8Projection",
+           "decode_tile_n", "fp8_gemv_tuning", "fp8_gemv_wide", "fp8_gemv_wide_kernel", "MmaFp8Gemv",
+           "RoutedFp8Projection", "TmaFp8Gemm", "check_w8_mode",
+           "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps", "projection", "w8_scalars"]
 
 
 # Most decode rows ``MmaFp8Gemv``'s thin tile computes (its M-tile ceiling): the
@@ -62,8 +66,9 @@ __all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_ROWS", "Fp8Projection", "decode_tile_n",
 FP8_GEMV_ROWS = 16
 # Row capacity every decode program reads the FP8 weights through one canonical
 # GEMV reduction up to, unless the caller declares its own. The multi-tile GEMV
-# tiles carry the thin tile's (warps, groups), so the switch at FP8_GEMV_ROWS is
-# a reduction-order-preserving split of the same K walk.
+# tiles carry the thin tile's warps and only move the column block / tiles per
+# CTA (``FP8_GEMV_WIDE``), so the switch at FP8_GEMV_ROWS is a grid split of the
+# same K walk, bitwise.
 FP8_DECODE_ROWS = 64
 
 
@@ -86,8 +91,9 @@ class RoutedFp8Projection:
     GEMM over ``w_bf16`` (the same weight dequantized) above; the branch is
     on the ``rows`` scalar.
 
-    Both GEMV tiles are built with one ``warps``/``groups``, so a row's bits do
-    not move when the batch crosses the ``FP8_GEMV_ROWS`` tile boundary."""
+    Both GEMV tiles are built with one ``warps``, so a row's bits do not move when
+    the batch crosses the ``FP8_GEMV_ROWS`` tile boundary; the wide tile's column
+    block and tiles per CTA come from ``FP8_GEMV_WIDE`` (a grid split)."""
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, decode_rows: int | None = None):
         self.n, self.k = int(n), int(k)
@@ -95,10 +101,13 @@ class RoutedFp8Projection:
         self.decode_rows = FP8_DECODE_ROWS if decode_rows is None else int(decode_rows)
         if self.decode_rows < FP8_GEMV_ROWS:
             raise ValueError(f"an FP8 projection covers at least {FP8_GEMV_ROWS} rows")
-        warps = gemv_warps(self.k)
-        self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_GEMV_ROWS, warps=warps, out_dtype=out_dtype)
+        warps, groups = fp8_gemv_tuning(self.n, self.k)
+        self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_GEMV_ROWS, warps=warps, groups=groups,
+                              out_dtype=out_dtype)
+        wide_groups, wide_tiles = fp8_gemv_wide(self.n, self.k, groups=groups)
         self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=self.decode_rows, warps=warps,
-                                   out_dtype=out_dtype) if self.decode_rows > FP8_GEMV_ROWS else None
+                                   groups=wide_groups, cta_tiles=wide_tiles, out_dtype=out_dtype) \
+            if self.decode_rows > FP8_GEMV_ROWS else None
         self.max_fp8_rows = self.decode_rows
         self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=())
 
@@ -168,7 +177,7 @@ class Fp8Projection:
 
     def __init__(self, n: int, k: int, *, prefill_rows: int | None = None, row_scales: bool = False,
                  kmajor: bool = False, gemv_rows: int = 16, wide_rows: int = 0, warps: int | None = None,
-                 groups: int = 4, prefill_mask: int = 0xFF, out_dtype=cutlass.BFloat16,
+                 groups: int | None = None, prefill_mask: int = 0xFF, out_dtype=cutlass.BFloat16,
                  wide_warps: int | None = None, wide_groups: int | None = None,
                  decode_rows: int | None = None):
         self.n, self.k = int(n), int(k)
@@ -191,8 +200,9 @@ class Fp8Projection:
                                     compute_warps=8, num_stages=3, out_dtype=out_dtype)
             self.max_gemv_rows = 0
         else:
-            warps = gemv_warps(self.k) if warps is None else int(warps)
-            groups = int(groups)
+            tuning_warps, tuning_groups = fp8_gemv_tuning(self.n, self.k)
+            warps = tuning_warps if warps is None else int(warps)
+            groups = tuning_groups if groups is None else int(groups)
             self.gemv = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows), warps=warps, groups=groups,
                                    row_scales=self.row_scales, kmajor=self.kmajor, out_dtype=out_dtype)
             # The decode capacity: FP8_DECODE_ROWS unless the caller exports its program wider;
@@ -200,13 +210,20 @@ class Fp8Projection:
             # on the TMA route (whose K order differs).
             cap = max(FP8_DECODE_ROWS if decode_rows is None else int(decode_rows), int(wide_rows),
                       int(gemv_rows))
-            if (warps if wide_warps is None else int(wide_warps),
-                    groups if wide_groups is None else int(wide_groups)) != (warps, groups):
-                raise ValueError("the wide GEMV tile must keep the thin tile's warps and groups: "
-                                 "one K order covers the decode range")
-            self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=cap, warps=warps, groups=groups,
-                                        row_scales=self.row_scales, kmajor=self.kmajor,
-                                        out_dtype=out_dtype) if cap > int(gemv_rows) else None
+            if (warps if wide_warps is None else int(wide_warps)) != warps:
+                raise ValueError("the wide GEMV tile must keep the thin tile's warps: they set "
+                                 "the K split, and one order covers the decode range")
+            # Columns per CTA and tiles per CTA only partition the launch grid, so the wide
+            # tile may use the shape's measured wide entry without moving a single bit; so may
+            # its kernel, which is bit-identical on the same tiling (FP8_GEMV_WIDE_KERNEL).
+            wide_g, wide_t = fp8_gemv_wide(self.n, self.k, groups=groups)
+            wide_cls = MmaFp8Gemv if wide_groups is not None else \
+                fp8_gemv_wide_kernel(self.n, self.k, row_scales=self.row_scales, kmajor=self.kmajor)
+            self.gemv_wide = wide_cls(self.n, self.k, max_rows=cap, warps=warps,
+                                      groups=wide_g if wide_groups is None else int(wide_groups),
+                                      cta_tiles=wide_t if wide_groups is None else None,
+                                      row_scales=self.row_scales, kmajor=self.kmajor,
+                                      out_dtype=out_dtype) if cap > int(gemv_rows) else None
             self.gemv_rows = int(gemv_rows)
             self.max_gemv_rows = cap if self.gemv_wide is not None else int(gemv_rows)
             tile_n = decode_tile_n(self.n)
@@ -320,6 +337,119 @@ def gemv_warps(k: int) -> int:
     dense gate/up 98/98/100 vs 104/104/106), longer and shorter K take 4
     (o_proj 68/70/76 vs 76/76/80; dense down 53/57/63 vs 57/59/59)."""
     return 8 if int(k) == 6144 else 4
+
+
+# Most decode columns one ``MmaFp8Gemv`` CTA owns: ``8 * groups``. The GEMV is weight-stream
+# bound at decode rows, so the smallest block (8 columns, 4x the CTAs) measured best on every
+# shape of the shared FP8 decode census (#703: dense Qwen 3.8, GLM 5.3 Flash, MiMo V2) and is
+# the fallback for a shape the table does not name. ``FP8_GEMV_CONFIG`` keeps the per-shape
+# ``warps`` -- it sets the K split and the cross-warp fold, so it is part of the numerics --
+# with the measured ``groups``.
+FP8_GEMV_CONFIG = {
+    # Dense Qwen 3.8 27B: (4, 4) -> (4, 1), one row / 16 rows, us, RTX PRO 6000 at 325 W,
+    # L2-cold read-only eviction: qkv 34816x5120 137.2/133.1 -> 114.7/118.8 (1.20/1.12x),
+    # o 5120x17408 69.6/86.0 -> 61.5/75.8 (1.13/1.13x), gate_up 16384x5120 66.6/65.5 ->
+    # 57.3/61.4 (1.16/1.07x); 1299-1463 -> 1463-1554 GB/s of 1.79 TB/s.
+    (34816, 5120): (4, 1), (5120, 17408): (4, 1), (16384, 5120): (4, 1),
+    # GLM 5.3 Flash, block scales, shipped (warps, groups) -> (warps, 1), one row / 16 rows:
+    # KDA in 24896x4096 69.6/71.7 -> 67.6/69.6, KDA o 4096x8192 26.6/28.7 -> 24.6/28.7, MLA o
+    # 4096x16384 59.4/61.4 -> 49.2/61.4, q_b 16384x1536 20.5/22.5 -> 20.5/22.5, qkv_a
+    # 2048x4096 12.3/12.3 -> 10.2/12.3, shared gate_up 4096x4096 14.3/16.4 -> 14.3/16.4,
+    # shared down 4096x2048 12.3/14.3 -> 12.3/12.3, dense gate_up 24576x4096 69.6/71.7 ->
+    # 67.6/69.6, dense down 4096x12288 36.9/42.0 -> 36.8/39.9, FP32 head 154880x4096
+    # 392.2/393.2 -> 391.2/393.2.
+    (24896, 4096): (8, 1), (4096, 8192): (8, 1), (4096, 16384): (4, 1), (16384, 1536): (2, 1),
+    (2048, 4096): (8, 1), (4096, 4096): (8, 1), (4096, 2048): (2, 1), (24576, 4096): (8, 1),
+    (4096, 12288): (8, 1), (154880, 4096): (8, 1),
+    # MiMo V2 Flash, per-row scales: full qkv 13568x4096 43.0/47.1 -> 38.9/43.0, SWA qkv
+    # 14848x4096 45.1/50.2 -> 43.0/47.1, dense gate_up 32768x4096 88.1/90.1 -> 88.1/90.1,
+    # LM head 152576x4096 386.0/388.1 -> 385.0/387.1.
+    (13568, 4096): (2, 1), (14848, 4096): (2, 1), (32768, 4096): (8, 1), (152576, 4096): (8, 1),
+}
+# The 8-column block a shape outside the table gets. The duel measured 1 on all 18 shapes
+# above; the per-shape entries already ship it, so this only covers shapes nobody has
+# measured yet, and it flips to 1 (a whole-table default) once the duel ends.
+FP8_GEMV_GROUPS_DEFAULT = 4
+# The rows 17..64 tile (``max_rows=64``) is a different regime: it re-reads the activation
+# rows once per column block and covers 2-4 row tiles per CTA, so the 8-column block that
+# wins at decode rows loses here. ``FP8_GEMV_WIDE`` is shape -> (groups, cta_tiles); a shape
+# it does not name keeps the thin tile's groups and the ``gemv_cta_tiles`` rule, which is
+# never slower than anything measured. Ratio to that shipped wide tile, RTX PRO 6000 at
+# 325 W, L2-cold read-only eviction, one session, at 32/48/64 rows (row-scale cells are the
+# per-row-scale FP32 grid these shapes ship; block-scale cells the 128x128 grid):
+#   qkv 34816x5120 (2,4) 1.045/1.104/1.148 -- the column block that wins at one row loses
+#   here, and four tiles keep the 64-row step to one 178 MiB read;
+#   o 5120x17408 (1,1) 1.195/1.079/1.057 -- few column CTAs, so a CTA band per 16 rows
+#   fills the machine and the doubled weight read is still cheaper than the idle SM time;
+#   gate_up 16384x5120 keeps shipped: every arm measured 0.84-1.00;
+#   KDA in 24896x4096 keeps shipped: 0.976-0.984 at 32/48 rows for the 4-tile arms;
+#   KDA o 4096x8192 keeps shipped: 0.65-1.00, best is the shipped tile at 64 rows;
+#   MLA o 4096x16384 (2,2) block 1.000/1.084/1.455, row-scale 1.023/1.500;
+#   q_b 16384x1536 keeps shipped: 0.87-1.06;
+#   qkv_a 2048x4096 (1,1) 1.307/1.100/1.183 -- one tile per CTA wins while the batch is
+#   narrow; (1,2) trades 32-row time (1.063) for 1.445 at 64 rows and loses the worst cell;
+#   shared gate_up 4096x4096 (2,4) 1.100/1.077/1.000;
+#   shared down 4096x2048 (1,1) 1.429/1.748/1.889;
+#   dense gate_up 24576x4096 (2,4) 1.000/1.062/1.089;
+#   dense down 4096x12288 keeps shipped: 0.63-1.00;
+#   FP32 head 154880x4096 (2,4) block 0.995/1.083/1.151, row-scale 0.990/1.127 (32 rows is
+#   2 us on 410, inside the +-0.5% session spread the same cell shows);
+#   MiMo qkv 13568x4096 (2,2) block 1.000/1.051/1.400, row-scale 1.032/1.043;
+#   SWA qkv 14848x4096 (2,2) block 1.000/1.049/1.378, row-scale 1.062/1.020 -- the (1,2) arm
+#   that leads at 32 rows falls to 0.826 on the 64-row row-scale cell;
+#   dense gate_up 32768x4096 keeps shipped: 0.981 at 32 rows for every 4-tile arm;
+#   LM head 152576x4096 (2,4) block 0.995/1.092/1.160, row-scale 0.995/1.108.
+# The two 0.99 cells are 2 us on ~410 us, inside the +-0.5% spread the same cell shows across
+# sessions; no other arm reaches 1.00 there while keeping the 64-row win.
+# Every entry keeps the thin tile's ``warps``: ``groups`` and ``cta_tiles`` only partition
+# the launch grid, so the rows 16 -> 17 program switch is still one bitwise K order.
+FP8_GEMV_WIDE = {
+    (34816, 5120): (2, 4), (5120, 17408): (1, 1),
+    (4096, 16384): (2, 2), (2048, 4096): (1, 1), (4096, 4096): (2, 4), (4096, 2048): (1, 1),
+    (24576, 4096): (2, 4), (154880, 4096): (2, 4),
+    (13568, 4096): (2, 2), (14848, 4096): (2, 2), (152576, 4096): (2, 4),
+}
+
+
+def fp8_gemv_wide(n: int, k: int, *, groups: int) -> tuple[int, int | None]:
+    """``MmaFp8Gemv`` ``(groups, cta_tiles)`` for the rows 17..64 tile of an ``N x K``
+    projection: the measured per-shape entry, else the thin tile's ``groups`` and the shape
+    rule's tile count. ``warps`` stays the thin tile's -- it is the K split, and one order
+    has to cover the whole decode range."""
+    entry = FP8_GEMV_WIDE.get((int(n), int(k)))
+    return entry if entry is not None else (int(groups), None)
+
+
+# The one shape whose rows 17..64 tile measured faster on the non-coherent 16-byte load
+# path (``_fp8_gemv_nc``) than on this file's kernel, same (groups, cta_tiles) = (1,1),
+# RTX PRO 6000 at 325 W, L2-cold read-only eviction, one session, ratio to the shipped
+# wide tile at 32/48/64 rows:
+#   q o 5120x17408   1.341/1.007/1.248 nc, 1.195/1.079/1.057 MmaFp8Gemv
+# -- 12-18% off at 32 and 64 rows of a projection every layer runs, never slower than the
+# shipped tile.  The nc path needs few column blocks (n=5120) to pay: on the wide-n shapes
+# it loses badly (34816x5120 0.62/0.51/0.46, 16384x5120 0.59/0.51/0.45), and on every
+# other measured shape the base kernel at least ties it, so everything else stays put.
+FP8_GEMV_WIDE_KERNEL = {(5120, 17408): "nc"}
+
+
+def fp8_gemv_wide_kernel(n: int, k: int, *, row_scales: bool = False, kmajor: bool = False):
+    """``MmaFp8Gemv`` subclass for the rows 17..64 tile of an ``N x K`` projection: the
+    measured nc entry, else the base kernel.  The nc kernel was measured on block-scale
+    weights only, so a per-row-scale or K-block-major shape never leaves the base kernel."""
+    if FP8_GEMV_WIDE_KERNEL.get((int(n), int(k))) != "nc" or row_scales or kmajor:
+        return MmaFp8Gemv
+    from ._fp8_gemv_nc import NcMmaFp8Gemv
+
+    return NcMmaFp8Gemv
+
+
+def fp8_gemv_tuning(n: int, k: int, *, warps: int | None = None) -> tuple[int, int]:
+    """``MmaFp8Gemv`` ``(warps, groups)`` for an ``N x K`` decode projection: the measured
+    per-shape entry, else ``warps`` (default ``gemv_warps(k)``) with the default column block."""
+    entry = FP8_GEMV_CONFIG.get((int(n), int(k)))
+    if entry is not None:
+        return entry
+    return (gemv_warps(k) if warps is None else int(warps)), FP8_GEMV_GROUPS_DEFAULT
 
 
 def gemv_cta_tiles(n: int, k: int, *, groups: int, warps: int) -> int:
@@ -646,6 +776,32 @@ def _e4m3x4_scaled_bf16x2x2(word, s, *, loc=None, ip=None):
             Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)))
 
 
+@dsl_user_op
+def _ld_stream_l2_128(address, *, loc=None, ip=None):
+    """``ld.global.nc`` 16-byte weight run with an ``.L2::128B`` fetch-size hint:
+    the miss fills the row's whole 128-byte K block, which the other lane group
+    and the sibling chunk read next."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(address).ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L1::no_allocate.L2::128B.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _ld_stream_l2_256(address, *, loc=None, ip=None):
+    """As ``_ld_stream_l2_128`` with an ``.L2::256B`` fetch (the next K block)."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(address).ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
 class MmaFp8Gemv:
     """Decode-row GEMM on tensor cores straight from global memory.
 
@@ -677,7 +833,16 @@ class MmaFp8Gemv:
     """
 
     def __init__(self, n: int, k: int, *, max_rows: int = 64, warps: int = 4, groups: int = 4,
-                 out_dtype=cutlass.BFloat16, row_scales: bool = False, kmajor: bool = False):
+                 out_dtype=cutlass.BFloat16, row_scales: bool = False, kmajor: bool = False,
+                 load_hint: str = "stream", prefetch_blocks: int = 0, prefetch_bytes: int = 1024,
+                 cta_tiles: int | None = None):
+        if load_hint not in ("stream", "l2_128b", "l2_256b"):
+            raise ValueError("load_hint is stream, l2_128b or l2_256b")
+        if prefetch_blocks and (prefetch_bytes % 128 or prefetch_bytes > 4096):
+            raise ValueError("prefetch_bytes must be a 128 multiple up to 4096")
+        self.load_hint = str(load_hint)
+        self.prefetch_blocks = int(prefetch_blocks)
+        self.prefetch_bytes = int(prefetch_bytes)
         self.row_scales = bool(row_scales)
         self.kmajor = bool(kmajor)
         if self.kmajor and not self.row_scales:
@@ -686,8 +851,12 @@ class MmaFp8Gemv:
         self.warps, self.groups = int(warps), int(groups)
         self.cols = 8 * self.groups
         self.total_m_tiles = (int(max_rows) + 15) // 16
-        self.m_tiles = min(self.total_m_tiles, gemv_cta_tiles(self.n, self.k, groups=self.groups,
-                                                             warps=self.warps))
+        # ``cta_tiles`` pins the 16-row tiles one CTA holds; unset, the shape rule
+        # decides. A CTA with fewer tiles covers fewer rows, so a wide batch splits
+        # across more CTAs (and re-reads the weights per band).
+        self.m_tiles = min(self.total_m_tiles,
+                           gemv_cta_tiles(self.n, self.k, groups=self.groups, warps=self.warps)
+                           if cta_tiles is None else max(1, int(cta_tiles)))
         self.multi_m_grid = self.total_m_tiles > self.m_tiles
         self.out_dtype = out_dtype
         if self.n % self.cols or 128 % self.cols or self.k % (128 * self.warps):
@@ -703,8 +872,11 @@ class MmaFp8Gemv:
         self.smem_frags = self.frags if self.m_tiles <= 2 else self.tile_frags
 
     def key(self) -> tuple:
-        return (self.n, self.k, self.warps, self.groups, self.total_m_tiles, self.m_tiles,
-                str(self.out_dtype), self.row_scales, self.kmajor)
+        key = (self.n, self.k, self.warps, self.groups, self.total_m_tiles, self.m_tiles,
+               str(self.out_dtype), self.row_scales, self.kmajor)
+        if self.load_hint != "stream" or self.prefetch_blocks:
+            key += (self.load_hint, self.prefetch_blocks, self.prefetch_bytes)
+        return key
 
     def _storage(self):
         class Storage:
@@ -731,9 +903,64 @@ class MmaFp8Gemv:
     def _load_block(self, dest: cute.Tensor, w_row: Int64, k_off: Int64):
         for chunk in cutlass.range_constexpr(2):
             for gi in cutlass.range_constexpr(self.groups):
-                words = _ld_stream(w_row + Int64(gi * 8 * self.k) + k_off + Int64(chunk * 64))
+                address = w_row + Int64(gi * 8 * self.k) + k_off + Int64(chunk * 64)
+                if const_expr(self.load_hint == "l2_128b"):
+                    words = _ld_stream_l2_128(address)
+                elif const_expr(self.load_hint == "l2_256b"):
+                    words = _ld_stream_l2_256(address)
+                else:
+                    words = _ld_stream(address)
                 for t in cutlass.range_constexpr(4):
                     dest[(chunk * self.groups + gi) * 4 + t] = words[t]
+
+    def _prefetch_lead(self):
+        """Windows issued at kernel start: ``[(first block, bytes)]``.
+
+        A window is ``prefetch_bytes`` of one output row's contiguous K run,
+        issued ``prefetch_blocks`` 128-byte blocks ahead of its demand loads.
+        The windows whose issue block would fall before the block loop starts
+        are emitted once up front; sizes are exact for a trailing short row."""
+        stride = self.prefetch_bytes // 128
+        lead = min(self.blocks, -(-self.prefetch_blocks // stride) * stride)
+        return [(first, min(stride, self.blocks - first) * 128)
+                for first in range(0, lead, stride)]
+
+    def _prefetch_plan(self):
+        """Per-iteration windows: ``[(issue block, first block, bytes)]``."""
+        stride = self.prefetch_bytes // 128
+        plan = []
+        for first in range(0, self.blocks, stride):
+            if first >= self.prefetch_blocks:
+                plan.append((first - self.prefetch_blocks, first,
+                             min(stride, self.blocks - first) * 128))
+        return plan
+
+    @cute.jit
+    def _prefetch_initial(self, w_row: Int64, j: Int32):
+        """Bulk L2 prefetch of the leading windows (``_prefetch_lead``): lane
+        ``j == 0`` of each row group issues one long run for its own row, so the
+        demand loads find it in L2 and DRAM sees one burst per row instead of
+        64-byte slices."""
+        lead = self._prefetch_lead()
+        if j == Int32(0):
+            for i in cutlass.range_constexpr(len(lead)):
+                first, size = lead[i]
+                for gi in cutlass.range_constexpr(self.groups):
+                    prefetch_bulk_global_l2(
+                        w_row + Int64(gi * 8 * self.k) + Int64(first * 128), Int32(size))
+
+    @cute.jit
+    def _prefetch_window(self, w_row: Int64, block: Int32, j: Int32):
+        """Issue the window that ``_prefetch_plan`` schedules at ``block`` (see
+        ``_prefetch_initial``), clamped so nothing reads past the row's K run."""
+        plan = self._prefetch_plan()
+        if j == Int32(0):
+            for i in cutlass.range_constexpr(len(plan)):
+                at, first, size = plan[i]
+                if block == Int32(at):
+                    for gi in cutlass.range_constexpr(self.groups):
+                        prefetch_bulk_global_l2(
+                            w_row + Int64(gi * 8 * self.k) + Int64(first * 128), Int32(size))
 
     @cute.kernel
     def kernel(self, x: cute.Pointer, w: cute.Pointer, scale: cute.Pointer, out: cute.Pointer, rows: Int32):
@@ -770,6 +997,8 @@ class MmaFp8Gemv:
         nxt = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
         s_cur = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
         s_nxt = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
+        if const_expr(self.prefetch_blocks):
+            self._prefetch_initial(w_row, j)
         self._load_block(cur, w_row, Int64(0))
         for si in cutlass.range_constexpr(s_rows):
             s_cur[si] = _ld_f32(s_row + Int64(si) * s_gi)
@@ -780,6 +1009,8 @@ class MmaFp8Gemv:
                 self._load_block(nxt, w_row, Int64(block + 1) * Int64(128))
                 for si in cutlass.range_constexpr(s_rows):
                     s_nxt[si] = _ld_f32(s_row + Int64(si) * s_gi + Int64(block + 1) * s_kb)
+            if const_expr(self.prefetch_blocks):
+                self._prefetch_window(w_row, block, j)
             for chunk in cutlass.range_constexpr(2):
                 k_off = Int64(block) * Int64(128) + Int64(chunk * 64)
                 bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
