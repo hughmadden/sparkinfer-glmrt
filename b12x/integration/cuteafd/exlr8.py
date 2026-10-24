@@ -123,7 +123,7 @@ class _Exlr8GroupedServingPointers:
                                        g["max_groups"], g["group_rows"],
                                        activations=g.get("activations", "a16"),
                                        quantize_pass=g.get("quantize_pass", True),
-                                       fc2_half=g.get("fc2_partials", "f16") == "f32")
+                                       fc2_f32=g.get("fc2_partials", "f16") == "f32")
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,

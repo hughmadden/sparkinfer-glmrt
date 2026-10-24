@@ -218,13 +218,10 @@ def grouped_arm(name, group_rows, cta_limit, rows_max, tables, shared, owned,
     # kernel keeps them F32.  F32 partials are the matching-numerics variant;
     # the shipped F16 setting is measured only as a separately labelled lossy
     # arm.
-    Exlr8GroupedKernel.FC2_HALF = bool(half)
-    try:
-        core = compile_exlr8_a16_aot(hidden=HIDDEN, units=UNITS, top_k=TOP_K,
-                                     max_groups=GROUPED_MAX_GROUPS, device_count=True,
-                                     grouped=True, group_rows=group_rows)
-    finally:
-        Exlr8GroupedKernel.FC2_HALF = True
+    core = compile_exlr8_a16_aot(hidden=HIDDEN, units=UNITS, top_k=TOP_K,
+                                 max_groups=GROUPED_MAX_GROUPS, device_count=True,
+                                 grouped=True, group_rows=group_rows,
+                                 fc2_partials="f16" if half else "f32")
     group = compile_exlr8_group_aot(experts=EXPERTS, top_k=TOP_K,
                                     max_groups=GROUPED_MAX_GROUPS, hidden=HIDDEN,
                                     max_rows=4096, group_rows=group_rows)
