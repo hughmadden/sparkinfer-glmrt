@@ -719,24 +719,50 @@ def _run_kimi_benchmark(args, device: torch.device, props) -> None:
 
 
 PREFILL_FAMILIES = {
-    "qwen4": (2560, 512, 10, (4, 5), "silu"),
-    "kimik3": (3584, 896, 16, (2, 3), "situ"),
+    # hidden, experts, top_k, (tier0 bits, tier1 bits), activation, swiglu_limit
+    "qwen4": (2560, 512, 10, (4, 5), "silu", None),
+    "kimik3": (3584, 896, 16, (2, 3), "situ", None),
+    "glm": (6144, 256, 8, (4, 5), "silu", None),
+    "glmf": (4096, 288, 8, (3, 4), "silu", 10.0),
+    "v41": (5120, 384, 6, (3, 4), "silu", 10.0),
+    "dsv4f": (4096, 256, 6, (3, 4), "silu", 10.0),
 }
+# Compact H128 ownership cells: every family whose Spark world does not divide
+# the checkpoint's intermediate-unit count into equal widths.
+COMPACT_PREFILL_FAMILIES = ("qwen4", "glm", "glmf", "v41", "dsv4f")
+# Per-rank H128 widths of the packaged compact profiles, when the family has a
+# single served Spark width.
+PREFILL_WIDTHS = {"qwen4": 256, "kimik3": 512}
+
+# Compact warp-specialized arm options. The shipped compact export claims tiles
+# dynamically and keeps FC1 at N128 (the kernel requires it) with an FC2 N256
+# cycle; `static` and `n128` measure those choices off, `s2..s4` pin the input
+# ring depth (the default stays the kernel's own).
+PREFILL_ARM_OPTIONS = ("dynamic", "static", "s2", "s3", "s4", "n128", "n256")
 
 
 def parse_prefill_arm(text):
     parts = text.split(":")
-    if (len(parts) != 3 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", parts[0])
+    options = parts[3].split(",") if len(parts) == 4 else []
+    if (len(parts) not in (3, 4) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", parts[0])
             or parts[0].endswith("_control") or parts[1] not in ("8", "16", "32", "64")
             or parts[2] not in ("cooperative", "ws")
-            or parts[1:] == ["8", "ws"]):
-        raise argparse.ArgumentTypeError("prefill arm must be NAME:BLOCK:cooperative|ws (WS block >=16)")
-    return parts[0], int(parts[1]), parts[2]
+            or (parts[1] == "8" and parts[2] == "ws")
+            or len(set(options)) != len(options)
+            or any(option not in PREFILL_ARM_OPTIONS for option in options)
+            or (parts[2] != "ws" and options)
+            or {"dynamic", "static"} <= set(options)
+            or {"n128", "n256"} <= set(options)
+            or len({"s2", "s3", "s4"} & set(options)) > 1):
+        raise argparse.ArgumentTypeError(
+            "prefill arm must be NAME:BLOCK:cooperative|ws[:dynamic|static,s2|s3|s4,n128|n256] "
+            "(WS block >=16)")
+    return parts[0], int(parts[1]), parts[2], tuple(sorted(options))
 
 
 def prefill_route_waves(path, family, layer):
     """Read a family-labelled histogram fixture; never silently reuse another family."""
-    hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
+    hidden, experts, topk, bits, activation, swiglu_limit = PREFILL_FAMILIES[family]
     data = json.loads(Path(path).read_text())
     if (data.get("schema") != 1 or data.get("family") != family
             or data.get("experts") != experts or data.get("top_k") != topk):
@@ -761,7 +787,7 @@ def _make_prefill_layer(family, width, seed, device):
         if width != KIMI_INTERMEDIATE:
             raise ValueError("Kimi prefill fixture follows the TP6 width512 package")
         return _make_kimi_layer(seed, device)
-    hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
+    hidden, experts, topk, bits, activation, swiglu_limit = PREFILL_FAMILIES[family]
     generator = torch.Generator(device=device).manual_seed(seed)
     tile_n = 256 if width % 256 == 0 else 128
     tiers = []
@@ -782,8 +808,8 @@ def _make_prefill_layer(family, width, seed, device):
 
 def compact_prefill_fixture(path, rank, family, width, experts):
     """Validate a planner-replayed ownership fixture, not a synthetic partition."""
-    if family not in ("qwen4", "glm"):
-        raise ValueError("compact prefill fixture currently requires Qwen or GLM")
+    if family not in COMPACT_PREFILL_FAMILIES:
+        raise ValueError("compact prefill fixture requires an uneven-world compact family")
     data = json.loads(Path(path).read_text())
     matches = [item for item in data["ranks"] if item["rank"] == rank]
     if len(matches) != 1:
@@ -853,7 +879,7 @@ def _make_compact_prefill_layer(fixture, width, seed, device, mix, *,
 
 
 def prefill_compile_options(family, width, block, mode, props):
-    hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
+    hidden, experts, topk, bits, activation, swiglu_limit = PREFILL_FAMILIES[family]
     if width <= 0 or width % 128 or (family == "kimik3" and width != 512):
         raise ValueError("prefill width must follow an H128-aligned family package")
     slots = route_pack_capacity(4096 * topk, block, experts, topk=topk)[1]
@@ -864,7 +890,7 @@ def prefill_compile_options(family, width, block, mode, props):
         top_k=topk, route_num_experts=experts, max_m_blocks=(slots + block - 1) // block,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=(64, tile_n, 64, tile_n), tier0_bits=bits[0], tier1_bits=bits[1],
-        trellis_codebook="mcg", activation=activation, swiglu_limit=None,
+        trellis_codebook="mcg", activation=activation, swiglu_limit=swiglu_limit,
         moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype="bf16",
         warp_specialized=mode == "ws",
         token_major_rotation=family == "qwen4" and mode == "cooperative")
@@ -882,17 +908,21 @@ def _run_prefill_benchmark(args, device, props):
     specs = args.prefill_arm or [parse_prefill_arm(v) for v in (
         ("coop:32:cooperative", "ws:32:ws") if args.prefill_family == "qwen4"
         else ("coop8:8:cooperative", "coop16:16:cooperative", "ws16:16:ws"))]
-    names = [name for name, _, _ in specs]
+    names = [name for name, _, _, _ in specs]
     if len(names) < 2 or len(names) != len(set(names)):
         raise ValueError("prefill needs at least two uniquely named arms")
     rows_list = list(map(int, (args.rows or "1408,2688,4096").split(",")))
     if not rows_list or any(not 1 <= rows <= 4096 for rows in rows_list):
         raise ValueError("prefill rows must be 1..4096")
     family = args.prefill_family
-    hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
-    width = args.intermediate or (256 if family == "qwen4" else 512)
+    hidden, experts, topk, bits, activation, swiglu_limit = PREFILL_FAMILIES[family]
+    width = args.intermediate or PREFILL_WIDTHS.get(family)
+    if width is None:
+        raise ValueError(f"{family} needs an explicit --intermediate compact width")
     waves = prefill_route_waves(args.routes, family, args.route_layer) if args.routes else None
-    # No recorded family routes means correctness only, never a timing claim.
+    if waves is None and not args.routes_uniform:
+        # No recorded family routes means correctness only, never a timing claim.
+        print("prefill: no family routes; correctness-only run", flush=True)
     torch.cuda.set_per_process_memory_fraction(min(
         0.25, (args.memory_cap_gib << 30) / props.total_memory), device)
     bundle = args.prefill_source_dir
@@ -908,11 +938,25 @@ def _run_prefill_benchmark(args, device, props):
                if compact else _make_prefill_layer(family, width, args.seed + 2*i, device))
               for i in range(args.layers)]
     states = {}
-    for name, block, mode in specs:
+    for name, block, mode, arm_options in specs:
+        if arm_options and not compact:
+            raise ValueError(f"arm {name}: dynamic/static/stages/tile options need a compact fixture")
         options = prefill_compile_options(family, width, block, mode, props)
         if compact:
+            if mode == "ws":
+                # Compact WS requires FC1 N128; FC2 may widen over the hidden
+                # size (the shipped GLM TP6 arm uses N256) and tiles are
+                # claimed dynamically unless an arm asks for static claims.
+                tile = (64, 128, 64, 128) if "n128" in arm_options else (64, 128, 64, 256)
+                stages = next((int(o[1]) for o in ("s2", "s3", "s4") if o in arm_options), None)
+                options.update(force_tile_config=tile, ws_dynamic_tiles="static" not in arm_options,
+                               ws_input_stages=stages)
+            else:
+                # The cooperative compact export keeps the B12x default tile.
+                tile_n = 256 if width % 256 == 0 else 128
+                options.update(force_tile_config=(64, tile_n, 64, tile_n))
             options.update(tier0_num_experts=experts, tier1_num_experts=experts,
-                           force_tile_config=(64, 128, 64, 128), compact_weights=True)
+                           compact_weights=True)
         launch = mix.compile_mixed_trellis(**options)
         workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
         bounds = dict(gate_experts=(896, 0), up_experts=(896, 0)) if family == "kimik3" else {}
@@ -983,7 +1027,7 @@ def _run_prefill_benchmark(args, device, props):
                 for name in names[1:]:
                     if not torch.equal(run(name, rows, layer).view(torch.int16), expected.view(torch.int16)):
                         raise RuntimeError(f"prefill arm {name} differs on layer {layer}, rows {rows}")
-            if waves is None or args.correctness_only:
+            if (waves is None and not args.routes_uniform) or args.correctness_only:
                 continue
             def calls(name):
                 for layer in range(args.layers):
@@ -1007,7 +1051,9 @@ def _run_prefill_benchmark(args, device, props):
                  else "synthetic uniform K2 with dormant K3"),
         compact_rank=compact["rank"] if compact else None,
         compact_sha256=hashlib.sha256(args.compact_fixture.read_bytes()).hexdigest() if compact else None,
-        routes="recorded histograms" if waves else "uniform random; correctness only",
+        routes=("recorded histograms" if waves else
+                "uniform random; timing labelled uniform" if args.routes_uniform else
+                "uniform random; correctness only"),
         route_sha256=hashlib.sha256(args.routes.read_bytes()).hexdigest() if waves else None,
         route_layer=args.route_layer, checked_rows=len(checked), exact=True, rows=records)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1381,7 +1427,8 @@ def benchmark_parser():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--prefill-family", choices=(*PREFILL_FAMILIES, *COORDINATOR_FAMILIES))
-    parser.add_argument("--role", choices=("spark", "coordinator"), default="spark")
+    parser.add_argument("--role", choices=("spark", "coordinator"), default="spark",
+                        help="spark: served GB10 compact/width arms; coordinator: per-capacity width sweep")
     parser.add_argument("--profile", choices=tuple(GLM_PROFILES), default="rtx-tp2")
     parser.add_argument("--capacities", default="256,1024,2752,4096", help="GLM coordinator compile capacities")
     parser.add_argument("--coordinator-arm", action="append", type=parse_coordinator_arm, default=[],
@@ -1396,6 +1443,8 @@ def benchmark_parser():
     parser.add_argument("--prefill-arm", action="append", type=parse_prefill_arm, default=[])
     parser.add_argument("--intermediate", type=int, help="per-rank H128 width, default Qwen256/Kimi512")
     parser.add_argument("--routes", type=Path, help="family-labelled recorded histogram JSON; absent means correctness only")
+    parser.add_argument("--routes-uniform", action="store_true",
+                        help="time with uniform random top-k routes and label the receipt uniform")
     parser.add_argument("--route-layer", type=int, default=23)
     parser.add_argument("--prefill-exhaustive", action="store_true", help="check every prefix row count 1..4096")
     parser.add_argument("--correctness-only", action="store_true")
@@ -1411,7 +1460,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.prefill_family and (args.kimi or args.output is None or args.memory_cap_gib <= 0):
         parser.error("--prefill-family requires --output, positive memory cap, and no --kimi")
-    if args.prefill_family in COORDINATOR_FAMILIES or args.role == "coordinator" or args.preflight_only:
+    if args.role == "coordinator" or args.preflight_only:
         try:
             capacities, specs, distributions, waves, compact = coordinator_preflight(args)
         except ValueError as exc:
@@ -1425,7 +1474,7 @@ def main() -> None:
         parser.error("--coordinator-arm requires GLM coordinator mode")
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
-    if args.prefill_family in COORDINATOR_FAMILIES:
+    if args.role == "coordinator":
         _run_coordinator_benchmark(args, device, props)
         return
     if args.prefill_family:

@@ -85,14 +85,61 @@ def test_benchmark_kimi_variant_parsing_and_geometry() -> None:
 def test_prefill_arm(value):
     bench = _load_benchmark_module()
     name, block, mode = value.split(":")
-    assert bench.parse_prefill_arm(value) == (name, int(block), mode)
+    assert bench.parse_prefill_arm(value) == (name, int(block), mode, ())
 
 
-@pytest.mark.parametrize("value", ["bad", "ws:8:ws", "a:17:ws", "a_control:32:ws", ":32:ws", "a:32:other"])
+@pytest.mark.parametrize("value,options", [
+    ("ws:32:ws:dynamic", ("dynamic",)),
+    ("ws:32:ws:n256,s3,static", ("n256", "s3", "static")),
+])
+def test_prefill_arm_compact_options(value, options):
+    bench = _load_benchmark_module()
+    name, block, mode, parsed = bench.parse_prefill_arm(value)
+    assert (name, block, mode, parsed) == ("ws", 32, "ws", options)
+
+
+@pytest.mark.parametrize("value", [
+    "bad", "ws:8:ws", "a:17:ws", "a_control:32:ws", ":32:ws", "a:32:other",
+    "a:32:cooperative:dynamic", "ws:32:ws:dynamic,static", "ws:32:ws:n128,n256",
+    "ws:32:ws:s2,s3", "ws:32:ws:wire", "ws:32:ws:dynamic,dynamic", "ws:32:ws:",
+])
 def test_prefill_arm_rejects_invalid(value):
     bench = _load_benchmark_module()
     with pytest.raises(bench.argparse.ArgumentTypeError):
         bench.parse_prefill_arm(value)
+
+
+def test_prefill_families_carry_compact_geometry():
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    expected = {
+        "glm": (6144, 256, 8, (4, 5), None),
+        "glmf": (4096, 288, 8, (3, 4), 10.0),
+        "v41": (5120, 384, 6, (3, 4), 10.0),
+        "dsv4f": (4096, 256, 6, (3, 4), 10.0),
+    }
+    for family, (hidden, experts, topk, bits, limit) in expected.items():
+        options = bench.prefill_compile_options(family, 640, 32, "ws", props)
+        assert (options["hidden_size"], options["route_num_experts"], options["top_k"]) == (
+            hidden, experts, topk)
+        assert (options["tier0_bits"], options["tier1_bits"]) == bits
+        assert options["swiglu_limit"] == limit and options["activation"] == "silu"
+    assert set(bench.PREFILL_FAMILIES) == set(bench.COMPACT_PREFILL_FAMILIES) | {"kimik3"}
+
+
+@pytest.mark.parametrize("family", ["qwen4", "glm", "glmf", "v41", "dsv4f"])
+def test_compact_fixture_accepts_every_uneven_family(tmp_path, family):
+    bench = _load_benchmark_module()
+    entries = [dict(global_expert=e, combined_local=e, width=128,
+                    projections=[dict(projection=p, tier=0, bits=4, tier_local=e,
+                                      payload_word_offset=0)
+                                 for p in ("gate", "up", "down")]) for e in range(8)]
+    rank = dict(rank=0, compiled_max_intermediate=256, experts=entries,
+                projection_counts=[[8, 8, 8], [0, 0, 0]], unit_map_fingerprint="test")
+    path = tmp_path / "ownership.json"
+    path.write_text(bench.json.dumps(dict(ranks=[rank])))
+    assert len(bench.compact_prefill_fixture(path, 0, family, 256, 8)["entries"]) == 8
 
 
 def test_prefill_policy_separates_route_block_from_ws():
@@ -156,7 +203,7 @@ def test_compact_prefill_fixture_requires_complete_ownership(tmp_path):
     assert len(bench.compact_prefill_fixture(path, 0, "qwen4", 256, 512)["entries"]) == 512
     with pytest.raises(ValueError, match="requested rank"):
         bench.compact_prefill_fixture(path, 1, "qwen4", 256, 512)
-    with pytest.raises(ValueError, match="requires Qwen"):
+    with pytest.raises(ValueError, match="uneven-world"):
         bench.compact_prefill_fixture(path, 0, "kimik3", 256, 512)
     with pytest.raises(ValueError, match="geometry"):
         bench.compact_prefill_fixture(path, 0, "qwen4", 128, 512)
