@@ -779,39 +779,51 @@ class MmaFp8Gemv:
                 for t in cutlass.range_constexpr(4):
                     dest[(chunk * self.groups + gi) * 4 + t] = words[t]
 
-    @cute.jit
-    def _prefetch_initial(self, w_row: Int64, j: Int32):
-        """Bulk L2 prefetch of the leading K windows of the CTA's output rows.
+    def _prefetch_lead(self):
+        """Windows issued at kernel start: ``[(first block, bytes)]``.
 
-        A window is ``prefetch_bytes`` of one row's contiguous K run, issued
-        ``prefetch_blocks`` blocks ahead of its demand loads; the windows that
-        would be issued before the block loop starts (the first
-        ``prefetch_blocks`` blocks) are emitted here at kernel start instead.
-        Lane ``j == 0`` of each row group prefetches its own row; the demand
-        loads then find the run in L2 and DRAM sees one long burst per row
-        instead of 64-byte slices. Sizes are exact for a trailing short row."""
+        A window is ``prefetch_bytes`` of one output row's contiguous K run,
+        issued ``prefetch_blocks`` 128-byte blocks ahead of its demand loads.
+        The windows whose issue block would fall before the block loop starts
+        are emitted once up front; sizes are exact for a trailing short row."""
         stride = self.prefetch_bytes // 128
         lead = min(self.blocks, -(-self.prefetch_blocks // stride) * stride)
+        return [(first, min(stride, self.blocks - first) * 128)
+                for first in range(0, lead, stride)]
+
+    def _prefetch_plan(self):
+        """Per-iteration windows: ``[(issue block, first block, bytes)]``."""
+        stride = self.prefetch_bytes // 128
+        plan = []
+        for first in range(0, self.blocks, stride):
+            if first >= self.prefetch_blocks:
+                plan.append((first - self.prefetch_blocks, first,
+                             min(stride, self.blocks - first) * 128))
+        return plan
+
+    @cute.jit
+    def _prefetch_initial(self, w_row: Int64, j: Int32):
+        """Bulk L2 prefetch of the leading windows (``_prefetch_lead``): lane
+        ``j == 0`` of each row group issues one long run for its own row, so the
+        demand loads find it in L2 and DRAM sees one burst per row instead of
+        64-byte slices."""
+        lead = self._prefetch_lead()
         if j == Int32(0):
-            for first in range(0, lead, stride):
-                size = min(stride, self.blocks - first) * 128
+            for i in cutlass.range_constexpr(len(lead)):
+                first, size = lead[i]
                 for gi in cutlass.range_constexpr(self.groups):
                     prefetch_bulk_global_l2(
                         w_row + Int64(gi * 8 * self.k) + Int64(first * 128), Int32(size))
 
     @cute.jit
     def _prefetch_window(self, w_row: Int64, block: Int32, j: Int32):
-        """Issue the window whose first block is ``prefetch_blocks`` ahead of
-        ``block`` (see ``_prefetch_initial``): one bulk prefetch per output row,
-        clamped to the row's remaining K blocks so nothing reads past the row."""
-        stride = self.prefetch_bytes // 128
+        """Issue the window that ``_prefetch_plan`` schedules at ``block`` (see
+        ``_prefetch_initial``), clamped so nothing reads past the row's K run."""
+        plan = self._prefetch_plan()
         if j == Int32(0):
-            for w in cutlass.range_constexpr(-(-self.blocks // stride)):
-                first = w * stride
-                size = min(stride, self.blocks - first) * 128
-                if first < self.prefetch_blocks:
-                    continue  # emitted by _prefetch_initial at kernel start
-                if block == Int32(first - self.prefetch_blocks):
+            for i in cutlass.range_constexpr(len(plan)):
+                at, first, size = plan[i]
+                if block == Int32(at):
                     for gi in cutlass.range_constexpr(self.groups):
                         prefetch_bulk_global_l2(
                             w_row + Int64(gi * 8 * self.k) + Int64(first * 128), Int32(size))
