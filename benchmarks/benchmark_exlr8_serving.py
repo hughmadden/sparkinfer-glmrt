@@ -358,8 +358,14 @@ def main():
             elif name.startswith("grouped"):
                 spec = name[len("grouped"):]
                 half = spec.endswith("h")
-                group_rows = int(spec[:-1] if half else spec)
-                arm_set[name] = grouped_arm(name, group_rows, sms * 2, rows_max,
+                if half:
+                    spec = spec[:-1]
+                factor = 2
+                if "x" in spec:
+                    spec, factor = spec.split("x", 1)
+                    factor = int(factor)
+                group_rows = int(spec)
+                arm_set[name] = grouped_arm(name, group_rows, sms * factor, rows_max,
                                             tables, shared, owned, half=half)
             else:
                 raise ValueError(f"unknown arm {name}")
