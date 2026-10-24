@@ -233,12 +233,13 @@ ROWTILES = {
     "swa_o": [
         (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
         (64, dict(warp_layout=(2, 4), tile_m=32, tile_n=64, num_stages=5)),
-        (4096, dict(warp_layout=(2, 4), tile_m=64, tile_n=128, num_stages=2)),
+        (4096, dict(warp_layout=(2, 4), tile_m=64, tile_n=128, num_stages=3)),
     ],
     "kv": [
         (64, dict(warp_layout=(1, 2), tile_m=16, tile_n=16, num_stages=8)),
         (256, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=9)),
-        (4096, dict(compute_warps=4, tile_n=64, num_stages=4)),
+        (1024, dict(compute_warps=4, tile_n=64, num_stages=4)),
+        (4096, dict(warp_layout=(4, 2), tile_m=128, tile_n=64, num_stages=3)),
     ],
     "gate_up": [
         (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
