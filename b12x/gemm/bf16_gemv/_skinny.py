@@ -349,9 +349,18 @@ DECODE_TMA_TILES = {
 # measured 1.14x and 1.08x in one session and 0.94x and 1.06x in the next
 # (two arms with identical tiles also landed 3-6% apart inside one run), so
 # the row band is withheld until the cell stops moving.
+#
+# The (6144, 4096) 16-row band is split at 8 rows. Both Duel B entrants
+# measured the narrower, deeper 16x64x6 tile faster at 16 rows (11.17 vs
+# 15.53 us, 1.39x, and it keeps 1.386x transplanted into
+# ``RowTiledBf16Projection``), and a same-session rows 4-8 check puts the
+# crossing at 8: rows 4-7 tie (L2-flushed cold 34.82 us for both arms, warm
+# 18.08 vs 18.05-18.08) while row 8 warm goes 18.08 -> 13.95 us at an
+# identical 34.82 us cold. The cold medians tie across 4-8, so the split costs
+# nothing in the flushed regime and wins the L2-resident one.
 COMPENSATED_TILES_BY_ROWS = {
-    (6144, 4096): ((16, 1, 4, 16, 128, 5), (64, 4, 64, 4), (256, 2, 4, 64, 64, 4),
-                   (1024, 2, 4, 64, 128, 2)),
+    (6144, 4096): ((7, 1, 4, 16, 128, 5), (16, 1, 4, 16, 64, 6), (64, 4, 64, 4),
+                   (256, 2, 4, 64, 64, 4), (1024, 2, 4, 64, 128, 2)),
     (4096, 12288): ((16, 1, 4, 16, 32, 12), (64, 2, 4, 32, 64, 5),
                     (4096, 2, 4, 64, 128, 2)),
     (4096, 6144): ((16, 1, 4, 16, 32, 12), (64, 2, 4, 32, 64, 5),

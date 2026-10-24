@@ -113,6 +113,10 @@ ARMS = {
     # bound, so these raise the CTA count and the bytes in flight per SM.
     "d16n128s5": dict(kind="tma", config=dict(compensated=True, warp_layout=(1, 4),
                                              tile_m=16, tile_n=128, num_stages=5)),
+    # The same 16-row tile with half the N width and one more stage: the
+    # narrow/deep arm of the two-way 16-row split in COMPENSATED_TILES_BY_ROWS.
+    "d16n64s6": dict(kind="tma", config=dict(compensated=True, warp_layout=(1, 4),
+                                            tile_m=16, tile_n=64, num_stages=6)),
     "w8n64s5": dict(kind="tma", config=dict(compensated=True, warp_layout=(1, 8),
                                            tile_m=16, tile_n=64, num_stages=5)),
     "w8n128s2": dict(kind="tma", config=dict(compensated=True, warp_layout=(1, 8),
