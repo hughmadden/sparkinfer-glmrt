@@ -120,7 +120,9 @@ class _Exlr8GroupedServingPointers:
     def __init__(self, g):
         from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
         self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
-                                       g["max_groups"], g["group_rows"])
+                                       g["max_groups"], g["group_rows"],
+                                       activations=g.get("activations", "a16"),
+                                       quantize_pass=g.get("quantize_pass", True))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -151,7 +153,10 @@ class _Exlr8GroupedServingPointers:
 
 
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
-                         device_count=False, shared_expert=False, grouped=False, group_rows=64):
+                         device_count=False, shared_expert=False, grouped=False, group_rows=64,
+                         activations="a16", quantize_pass=True):
+    if activations not in ("a16", "a8") or (activations == "a8" and not grouped):
+        raise ValueError("EXLR8 A8 activations require grouped prefill")
     if shared_expert:
         if not device_count:
             raise ValueError("shared EXLR8 requires device-count serving ABI")
@@ -164,6 +169,10 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
         from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
         g.update(max_rows=4096, group_rows=group_rows,
                  ctas_per_sm=Exlr8GroupedKernel.CTAS_PER_SM)
+        if activations != "a16":
+            g["activations"] = activations
+            if not quantize_pass:
+                g["quantize_pass"] = False
         tasks = (max_groups * units * 2 * g["fc1_splits"] * 4,
                  max_groups * (hidden // 128) * 4, 4096 * (hidden // 128))
         if max(tasks) > (2**31 - 1) // 2 or max_groups * group_rows > 2**31 - 1:
@@ -195,7 +204,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                      Operand("unit_map", torch.int32, f"[E,{u}]"))
     return compile_program(_Exlr8GroupedServingPointers(g) if grouped else
                            _Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
-                           name=("exlr8_a16_grouped" if grouped else
+                           name=(f"exlr8_{activations}_grouped" if grouped else
                                  "exlr8_shared_a16_serving" if shared_expert else
                                  "exlr8_a16_serving" if device_count else "exlr8_a16_decode"), operands=operands,
                            scalars=tuple(Scalar(n) for n in (("rows", "cta_limit", "unit_limit")
@@ -207,6 +216,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  # source: bump the tag when decode's weight-load
                                  # cache policy changes.
                                  "decode_l2_fc2_prefetch_v9")
-                                + (("grouped_compact_units",) if grouped else ())), geometry=g,
+                                + (("grouped_compact_units",) if grouped else ())
+                                + ((activations,) if grouped and activations != "a16" else ())
+                                + (("fused_quantize",) if grouped and activations != "a16" and not quantize_pass else ())), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)
