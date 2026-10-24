@@ -118,7 +118,25 @@ def parse_variants(texts: list[str]):
     return variants
 
 
+def bitwise_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return (left.dtype == right.dtype and left.shape == right.shape
+            and torch.equal(left.contiguous().view(torch.uint8), right.contiguous().view(torch.uint8)))
+
+
+def require_finite(output: torch.Tensor) -> None:
+    finite = torch.isfinite(output)
+    if not bool(finite.all()):
+        raise RuntimeError(f"nonfinite synthetic output: {int((~finite).sum())}/{output.numel()} values")
+
+
+def fixture_input_scale(geometry: Geometry) -> float:
+    # Unscaled random trellis weights lack checkpoint gains; unclamped SiLU
+    # otherwise overflows F16 scratch even when a row is compared with itself.
+    return 0.25 if geometry.swiglu_limit is not None else 0.25 / geometry.hidden ** 0.5
+
+
 def output_digest(output: torch.Tensor) -> str:
+    require_finite(output)
     return hashlib.sha256(output.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:16]
 
 
@@ -273,9 +291,11 @@ def main() -> None:
     ids = ids.to(torch.int32).to(device)
     weights = torch.rand((80, g.topk), generator=generator).to(device)
     weights = 2.5 * weights / weights.sum(dim=-1, keepdim=True)
-    x = (torch.randn((80, g.hidden), generator=generator) * 0.25).to(torch.bfloat16).to(device)
+    input_scale = fixture_input_scale(g)
+    x = (torch.randn((80, g.hidden), generator=generator) * input_scale).to(torch.bfloat16).to(device)
     print(f"device={props.name} sms={sms} H={g.hidden} I={g.intermediate} experts={g.experts} top{g.topk} "
-          f"layers={args.layers} calls/graph={args.calls_per_graph} replays={args.replays} rounds={args.rounds}", flush=True)
+          f"layers={args.layers} calls/graph={args.calls_per_graph} replays={args.replays} rounds={args.rounds} "
+          f"input_scale={input_scale:.8g}", flush=True)
 
     def build(capacity, schedule, tile, blocks):
         slots = route_pack_capacity(capacity * g.topk, 8, g.experts, topk=g.topk)[1]
@@ -319,6 +339,8 @@ def main() -> None:
             single_outputs[name] = [torch.cat([
                 run_bound_mixed_trellis(x[r:r+1], weights[r:r+1], ids[r:r+1], binding, buffers).clone()
                 for r in range(80)]) for binding in bindings]
+            for output in single_outputs[name]:
+                require_finite(output)
     for rows in rows_list:
         capacity = args.capacity if args.capacity is not None else (1 if rows == 1 else 80)
         xs, ws, ks = x[:rows].contiguous(), weights[:rows].contiguous(), ids[:rows].contiguous()
@@ -334,7 +356,7 @@ def main() -> None:
                      for binding, layer_buffer in zip(bindings, layer_buffers)]
             if args.check_row_invariance:
                 for layer, layer_buffer in enumerate(layer_buffers):
-                    if not torch.equal(layer_buffer.output[:rows], single_outputs[name][layer][:rows]):
+                    if not bitwise_equal(layer_buffer.output[:rows], single_outputs[name][layer][:rows]):
                         raise RuntimeError(f"row-invariance failed: {name} rows={rows} layer={layer}")
 
             def calls(bindings=bindings, layer_buffers=layer_buffers):

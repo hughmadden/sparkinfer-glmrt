@@ -57,6 +57,25 @@ def test_replay_results_certify_every_layer() -> None:
     assert bench.verdict(digests, digests, [digests[0], digests[0]]) == "DIFFERENT"
 
 
+def test_bitwise_comparison_preserves_nan_payloads_and_signed_zero():
+    left = torch.tensor([0x7FC00001, 0], dtype=torch.int32).view(torch.float32)
+    assert bench.bitwise_equal(left, left.clone())
+    assert not bench.bitwise_equal(left, torch.tensor([0x7FC00002, 0], dtype=torch.int32).view(torch.float32))
+    assert not bench.bitwise_equal(torch.tensor([0.0]), torch.tensor([-0.0]))
+    assert not bench.bitwise_equal(torch.zeros(1), torch.zeros(1, dtype=torch.float16))
+    with pytest.raises(RuntimeError, match="nonfinite synthetic output: 1/2"):
+        bench.output_digest(left)
+    with pytest.raises(RuntimeError, match="nonfinite"):
+        bench.require_finite(torch.tensor([float("inf")]))
+
+
+def test_unclamped_synthetic_inputs_are_dimension_normalized():
+    flash = bench.Geometry()
+    glm = dataclasses.replace(flash, hidden=6144, swiglu_limit=None)
+    assert bench.fixture_input_scale(flash) == 0.25
+    assert bench.fixture_input_scale(glm) == pytest.approx(0.25 / 6144 ** 0.5)
+
+
 def test_flash_default_stays_unchanged():
     g = bench.Geometry()
     assert (g.hidden, g.intermediate, g.experts, g.topk, g.bits) == (4096, 512, 288, 8, (3, 4))
