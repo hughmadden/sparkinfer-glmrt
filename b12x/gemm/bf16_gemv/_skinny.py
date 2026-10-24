@@ -311,8 +311,9 @@ DECODE_TMA_TILES = {
 
 # Measured SM120 compensated tiles by live rows, keyed by the weight shape
 # ``(n, k)`` exactly as ``TmaBf16Projection(n, k)`` receives it -- N = output
-# features, K = input width, the same key ``DECODE_TMA_TILES`` uses:
-# (rows, warp_m, warp_n, tile_m, tile_n, num_stages) in ascending rows, or
+# features, K = input width, the same key ``DECODE_TMA_TILES`` uses, in
+# ascending rows: (rows, warp_m, warp_n, tile_m, tile_n, num_stages),
+# (rows, warp_m, warp_n, tile_n, num_stages) or
 # (rows, compute_warps, tile_n, num_stages). Each entry retiles the K16
 # compensated accumulation of ``Bf16PrefillKernel``: the ordered K16 segments
 # and the four-FP32-op Kahan update per segment are unchanged, so every entry
@@ -328,8 +329,8 @@ DECODE_TMA_TILES = {
 # ``prefill_config``'s compensated tile (64x128x64, 3 stages, 4 warps):
 #
 #   q      (6144, 4096)   1-16 rows 49.15 -> 34.82 us, 41-64 49.15 -> 36.86,
-#                     256 125.97 -> 104.45, 1024 350.21 -> 330.75
-#   csa_o  (4096, 12288)  1-16 184.32 -> 67.58, 41-64 184.32 -> 72.85,
+#                     256 124.93 -> 104.45, 1024 381.49 -> 356.35
+#   csa_o  (4096, 12288)  1-16 184.29 -> 67.58, 41-64 184.32 -> 73.73,
 #                     256 221.18 -> 165.92, 1024 820.24 -> 741.92,
 #                     2048 1465.87 -> 1278.96
 #   swa_o  (4096, 6144) FP32 out  1-16 71.68 -> 34.85, 41-64 71.68 -> 38.91,
