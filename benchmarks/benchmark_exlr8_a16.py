@@ -693,7 +693,31 @@ def main():
                         help="recorded serving route histograms: 'realistic' (code, agentic, prose; "
                              "the reference), 'filler' (bench filler prompt) or a JSON path; each "
                              "timed layer copy replays the next wave")
+    parser.add_argument("--serving", action="store_true",
+                        help="<=64-row EXLR8 Spark serving duel benchmark (TP4/TP6 rotated ownership)")
+    parser.add_argument("--tier-mix", choices=("mixed", "k4"), default="mixed",
+                        help="EXLR8 tier distribution for --serving: 'mixed' ((2,3,4)[(u+p)%%3]) or 'k4'")
+    parser.add_argument("--serving-variants", default="k1_compact_prefetch,k1_reg_pair_b2,k1_k23_coalesced",
+                        help="comma-separated <=64 serving variant arms to benchmark against baseline")
     args = parser.parse_args()
+    if args.serving:
+        if args.grouped or args.k4_arm or args.serving_prompt is not None:
+            parser.error("--serving cannot be combined with --grouped, --k4-arm or --serving-prompt")
+        if args.world is None:
+            args.world = 6
+        try:
+            rank_geometry(args.world, args.rank, args.layer)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.rows is None:
+            args.rows = "1,4,8,16,32,64"
+        if not args.profile and args.output is None:
+            parser.error("--output is required unless --profile")
+        if torch.cuda.get_device_capability() != (12, 1):
+            parser.error("this performance gate requires SM121")
+        torch.cuda.set_per_process_memory_fraction(min(
+            0.25, (args.memory_cap_gib << 30) / torch.cuda.get_device_properties(0).total_memory))
+        return serving_main(args)
     if args.serving_prompt is not None:
         if not args.grouped:
             parser.error("--serving-prompt requires --grouped")
@@ -1440,6 +1464,313 @@ def grouped_main(args):
             secondary_baseline="mixed K4/K5; K5 descriptor unreachable",
             frozen_grouped_sources={name: manifest for name, (_, _, manifest) in frozen.items()},
             target_met=all(r["exl3_speedup"]>=1.0 for r in records)),indent=2))
+
+
+def serving_tier_bits(experts=256, units=16, owned=None, tier_mix="mixed"):
+    """Build [E, U, 3] int32 bit-width descriptor table for rotated ownership."""
+    if tier_mix not in ("mixed", "k4"):
+        raise ValueError(f"unsupported tier_mix: {tier_mix!r}")
+    bits = torch.zeros((experts, units, 3), dtype=torch.int32)
+    for e in range(experts):
+        for u in (range(units) if owned is None else owned[e]):
+            for p in range(3):
+                bits[e, u, p] = 4 if tier_mix == "k4" else (2, 3, 4)[(u + p) % 3]
+    return bits
+
+
+def make_serving_candidate(l2_bytes, *, world, rank, layer, tier_mix="mixed",
+                           experts=256, hidden=6144, units=16, topk=8, min_copies=2):
+    """Allocate cold-L2 rotated-ownership EXLR8 tables and 64-row serving scratch."""
+    owned, _ = rank_geometry(world, rank, layer, experts=experts, units=units)
+    bits_cpu = serving_tier_bits(experts=experts, units=units, owned=owned, tier_mix=tier_mix)
+    tiles_per_unit = (hidden // 16) * (128 // 16)  # 3072 tiles of 256 elements per projection
+    layer_bytes = int(bits_cpu.sum().item()) * tiles_per_unit * 32
+    copies = max(min_copies, -(-L2_SPAN * l2_bytes // max(1, layer_bytes)))
+    owners = []
+    tables = []
+    gen = torch.Generator(device="cuda").manual_seed(4080 + world * 100 + rank * 10 + layer)
+    for _ in range(copies):
+        pointers = torch.zeros((experts, units, 3, 3), dtype=torch.int64)
+        for e in range(experts):
+            for u in owned[e]:
+                for p in range(3):
+                    w = int(bits_cpu[e, u, p].item())
+                    payload_bytes = tiles_per_unit * 32 * w
+                    tensors = (
+                        torch.randint(0, 256, (payload_bytes,), generator=gen, dtype=torch.uint8, device="cuda"),
+                        (0.875 + 0.25 * torch.rand((128,), generator=gen, device="cuda")).half(),
+                        torch.full((hidden // 128,), 1.0 / (hidden ** 0.5), dtype=torch.float16, device="cuda"),
+                    )
+                    owners.extend(tensors)
+                    pointers[e, u, p] = torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64)
+        tables.append(pointers.to("cuda"))
+    host_gen = torch.Generator().manual_seed(4080)
+    signs = [(torch.randint(2, (hidden,), generator=host_gen) * 2 - 1).char().cuda() for _ in range(2)]
+    groups = 64 * topk
+    return dict(
+        tables=tables,
+        owners=owners,
+        owned=owned,
+        bits_cpu=bits_cpu,
+        bits=bits_cpu.cuda(),
+        layer_bytes=layer_bytes,
+        signs_in=signs[0],
+        signs_out=signs[1],
+        group_expert=torch.full((groups,), -1, dtype=torch.int32, device="cuda"),
+        route_slots=torch.full((groups, 16), -1, dtype=torch.int32, device="cuda"),
+        route_group_lane=torch.full((64, topk), -1, dtype=torch.int32, device="cuda"),
+        group_count=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        activation=torch.empty((64, hidden), dtype=torch.float16, device="cuda"),
+        **serial_scratch(hidden, units, groups),
+        output=torch.empty((65, hidden), dtype=torch.bfloat16, device="cuda"),
+    )
+
+
+def serving_route_payload_bytes(ids, bits_cpu):
+    """Exact unique weight payload bytes touched by the unique experts in `ids`."""
+    unique_experts = ids.unique().cpu().tolist()
+    if not unique_experts:
+        return 0
+    total_bits = int(bits_cpu[unique_experts].sum().item())
+    return total_bits * (6144 // 16) * (128 // 16) * 32
+
+
+def serving_main(args):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    props = torch.cuda.get_device_properties(0)
+    l2 = int(getattr(props, "L2_cache_size", 0) or (24 << 20))
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+    roof = None if args.profile else read_roofline()
+    t = make_serving_candidate(
+        l2, world=args.world, rank=args.rank, layer=args.layer,
+        tier_mix=args.tier_mix, min_copies=args.layer_copies,
+    )
+    copies = len(t["tables"])
+    variant_names = [v.strip() for v in args.serving_variants.split(",") if v.strip()]
+    if not variant_names or len(variant_names) > 3 or len(set(variant_names)) != len(variant_names):
+        raise ValueError("--serving-variants must specify 1..3 unique variant arms")
+    if "baseline" in variant_names or any(v.endswith("_control") for v in variant_names):
+        raise ValueError("--serving-variants must not include 'baseline' or '*_control'")
+
+    group = compile_exlr8_group_aot(
+        experts=256, top_k=8, max_groups=512, hidden=6144,
+        input_format="fp8_k32", max_rows=64, group_rows=16,
+    )
+    arm_order = ["baseline", *variant_names]
+    programs = {
+        name: compile_exlr8_a16_aot(
+            hidden=6144, units=16, top_k=8, max_groups=512,
+            device_count=True, serving_variant=name,
+        )
+        for name in arm_order
+    }
+    cta_limit = int(props.multi_processor_count) * 4
+    arm_metadata = {
+        name: dict(
+            program_name=prog.name,
+            serving_variant=name,
+            ctas_per_sm=int(prog.geometry["ctas_per_sm"]),
+            cta_limit=cta_limit,
+            max_groups=int(prog.geometry["max_groups"]),
+            group_rows=int(prog.geometry.get("group_rows", 16)),
+        )
+        for name, prog in programs.items()
+    }
+
+    route_waves = load_route_waves(args.routes) if args.routes is not None else None
+    row_list = [int(r) for r in args.rows.split(",")]
+    if any(not 1 <= r <= 64 for r in row_list):
+        raise ValueError("--serving rows must be in 1..64")
+
+    def run_single(arm_name, wire_buf, ids_buf, weights_buf, rows, layer_idx=0):
+        group.launch(
+            ids_buf, wire_buf, t["signs_in"], t["group_expert"], t["route_slots"],
+            t["route_group_lane"], t["group_count"], t["activation"],
+            scalars=(rows, cta_limit),
+        )
+        programs[arm_name].launch(
+            t["activation"], t["tables"][layer_idx], t["bits"], t["group_expert"],
+            t["route_slots"], t["route_group_lane"], weights_buf, t["fc1"],
+            t["intermediate"], t["fc2"], t["signs_out"], t["output"],
+            t["group_count"], scalars=(rows, cta_limit),
+        )
+
+    # Warm up and resolve all arms at boundary row counts before the resolution guard.
+    gen_warm = torch.Generator().manual_seed(4080)
+    warm_ids = comparison_route_ids(64, gen_warm).cuda().int()
+    warm_weights = (torch.rand((64, 8), generator=gen_warm).cuda() + 0.05) / 8
+    warm_wire = make_wire(torch.randn((64, 6144), generator=gen_warm).cuda() * 0.05)
+    for arm_name in arm_order:
+        for r_warm in (1, 17, 63, 64):
+            run_single(arm_name, warm_wire, warm_ids, warm_weights, r_warm, 0)
+    torch.cuda.synchronize()
+
+    invariance_rows = sorted({1, 4, 8, 16, 17, 32, 63, 64, *row_list})
+    with kernel_resolution_guard("EXLR8 <=64 serving row invariance and bitwise oracle"):
+        # Compute solo row-by-row reference with baseline at cta_limit=48.
+        solo = torch.empty((64, 6144), dtype=torch.bfloat16, device="cuda")
+        for r_idx in range(64):
+            t["output"].fill_(float("nan"))
+            run_single(
+                "baseline",
+                warm_wire[r_idx : r_idx + 1],
+                warm_ids[r_idx : r_idx + 1],
+                warm_weights[r_idx : r_idx + 1],
+                1,
+                0,
+            )
+            solo[r_idx : r_idx + 1].copy_(t["output"][:1])
+        finite_nonzero(solo.float(), "baseline_solo")
+        for r_check in invariance_rows:
+            for arm_name in arm_order:
+                t["output"].fill_(float("nan"))
+                run_single(arm_name, warm_wire, warm_ids, warm_weights, r_check, 0)
+                torch.cuda.synchronize()
+                actual = t["output"][:r_check]
+                if not torch.equal(actual.view(torch.int16), solo[:r_check].view(torch.int16)):
+                    raise RuntimeError(f"row invariance / bitwise oracle failed for {arm_name} at rows={r_check}")
+                if not bool(torch.isnan(t["output"][r_check:]).all()):
+                    raise RuntimeError(f"out-of-bounds write past rows={r_check} for {arm_name}")
+
+    records = []
+    for rows in row_list:
+        gen = torch.Generator().manual_seed(408 + rows)
+        if route_waves:
+            picks = [route_waves[(i * len(route_waves)) // copies] for i in range(copies)]
+            ids_list = [real_route_ids(rows, wave, gen).cuda().int() for wave in picks]
+            route_meta = [
+                dict(
+                    layer=w["layer"],
+                    lane=w["lane"],
+                    recorded_rows=w["rows"],
+                    max_expert_share=max(n for _, n in w["expert_rows"]) / w["rows"],
+                )
+                for w in picks
+            ]
+        else:
+            ids_list = [comparison_route_ids(rows, gen).cuda().int() for _ in range(copies)]
+            route_meta = None
+        weights = (torch.rand((rows, 8), generator=gen).cuda() + 0.05) / 8
+        wire = make_wire(torch.randn((rows, 6144), generator=gen).cuda() * 0.05)
+
+        # Pre-capture bitwise verification across all cold layer copies.
+        expected_layers = []
+        for layer_idx in range(copies):
+            t["output"].fill_(float("nan"))
+            run_single("baseline", wire, ids_list[layer_idx], weights, rows, layer_idx)
+            torch.cuda.synchronize()
+            exp = t["output"][:rows].clone()
+            finite_nonzero(exp.float(), f"baseline_rows{rows}_layer{layer_idx}")
+            expected_layers.append(exp)
+            for arm_name in variant_names:
+                t["output"].fill_(float("nan"))
+                run_single(arm_name, wire, ids_list[layer_idx], weights, rows, layer_idx)
+                torch.cuda.synchronize()
+                act = t["output"][:rows]
+                if not torch.equal(act.view(torch.int16), exp.view(torch.int16)):
+                    raise RuntimeError(
+                        f"pre-capture bitwise mismatch for {arm_name} at rows={rows}, layer={layer_idx}"
+                    )
+
+        def make_arm_step(arm_name):
+            def step():
+                for layer_idx in range(copies):
+                    run_single(arm_name, wire, ids_list[layer_idx], weights, rows, layer_idx)
+            return step
+
+        graphs = {arm_name: capture(make_arm_step(arm_name)) for arm_name in arm_order}
+        graphs["baseline_control"] = capture(make_arm_step("baseline"))
+
+        # Post-capture & poisoned-output (-1 int16) double replay check.
+        expected_last = expected_layers[-1]
+        bitwise_checks = {}
+        for arm_name in arm_order:
+            for replay_idx in range(2):
+                t["output"].view(torch.int16).fill_(-1)
+                graphs[arm_name].replay()
+                torch.cuda.synchronize()
+                act = t["output"][:rows]
+                if not torch.equal(act.view(torch.int16), expected_last.view(torch.int16)):
+                    raise RuntimeError(
+                        f"graph replay {replay_idx} bitwise mismatch for {arm_name} at rows={rows}"
+                    )
+                if not bool((t["output"][rows:].view(torch.int16) == -1).all()):
+                    raise RuntimeError(
+                        f"graph replay {replay_idx} wrote past rows={rows} for {arm_name}"
+                    )
+            bitwise_checks[arm_name] = True
+
+        samples = {name: [] for name in graphs}
+        order = list(graphs)
+        repeats = max(3, int(args.repeats))
+        for r in range(repeats):
+            rotated = order[r % len(order) :] + order[: r % len(order)]
+            if r % 2:
+                rotated.reverse()
+            for name in rotated:
+                samples[name].append(timing(graphs[name], args.replays) / copies)
+        noise = k4_noise_summary(samples, "baseline")
+        med = noise["medians_us"]
+
+        arm_stages = {
+            arm_name: {
+                k: (v / copies if k.endswith("_us") else v)
+                for k, v in stage_profile(graphs[arm_name], args.output.parent).items()
+            }
+            for arm_name in arm_order
+        }
+        payload_bytes = sum(serving_route_payload_bytes(ids_l, t["bits_cpu"]) for ids_l in ids_list) / copies
+        arm_gbps = {arm_name: payload_bytes / med[arm_name] / 1000.0 for arm_name in arm_order}
+        arm_roofline_pct = {
+            arm_name: 100.0 * arm_gbps[arm_name] / roof["gbps"] for arm_name in arm_order
+        }
+        rec = dict(
+            rows=rows,
+            routes=route_meta,
+            payload_bytes=payload_bytes,
+            medians_us=med,
+            medians_ms={k: v / 1000.0 for k, v in med.items()},
+            speedups=noise["speedups"],
+            ratios={k: v / med["baseline"] for k, v in med.items()},
+            identical_control_spread=noise["identical_control_spread"],
+            noise_pass=noise["noise_pass"],
+            samples_us=samples,
+            gbps=arm_gbps,
+            read_roofline_percent=arm_roofline_pct,
+            arm_stages=arm_stages,
+            bitwise_exact=bitwise_checks,
+        )
+        records.append(rec)
+        print(json.dumps(rec), flush=True)
+        del graphs
+
+    result = dict(
+        schema=1,
+        kind="exlr8_routed_serving_duel_s3",
+        device=props.name,
+        sm_count=int(props.multi_processor_count),
+        l2_bytes=l2,
+        measured_read_roofline=roof,
+        geometry=dict(
+            world=args.world,
+            rank=args.rank,
+            layer=args.layer,
+            hidden=6144,
+            experts=256,
+            units=16,
+            top_k=8,
+            owned_units_per_expert=[len(u) for u in t["owned"]],
+            tier_mix=args.tier_mix,
+            layer_bytes=t["layer_bytes"],
+            layer_copies=copies,
+        ),
+        routes=str(args.routes) if args.routes else "random",
+        arms=arm_metadata,
+        checked_invariance_rows=invariance_rows,
+        rows=records,
+    )
+    args.output.write_text(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

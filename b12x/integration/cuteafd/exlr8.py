@@ -198,6 +198,9 @@ class _Exlr8CompactServingPointers:
                   cta_limit, unit_limit, stream)
 
 
+DEFAULT_SERVING_VARIANT = "k1_k23_coalesced"
+
+
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                          device_count=False, shared_expert=False, grouped=False, group_rows=64,
                          grouped_rows=4096, fc2_partials="f16", compact_units=False,
@@ -207,7 +210,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     # Routed <=64-row decode defaults to the compact-unit routed serving core;
     # "baseline" keeps the shipped K1 core as the bitwise reference arm.
     from b12x.moe._shared.kernels.w4a16.exlr8 import SERVING_VARIANTS
-    variant = serving_variant or "k1_reg_pair_b2"
+    variant = serving_variant or DEFAULT_SERVING_VARIANT
     if variant != "baseline" and variant not in SERVING_VARIANTS:
         raise ValueError(f"unknown EXLR8 serving variant {variant!r}")
     routed_serving = device_count and not shared_expert and not grouped and not compact_units
