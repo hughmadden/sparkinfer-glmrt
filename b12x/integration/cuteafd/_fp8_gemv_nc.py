@@ -1,11 +1,16 @@
-"""Duel A round 4: the Gemini entrant's FP8 decode GEMV, vendored verbatim.
+"""FP8 decode GEMV with the non-coherent 16-byte load path.
 
-Copied unchanged from fork ``duel/gem-fp8dense`` @ ``635098db`` (kernel commit
-``87f7e91b``) so both entrants' kernels can be timed in one harness (a
-cross-harness ratio is not comparable: the two harnesses evict differently).
-Kept as a benchmark-side module: the production kernel stays
-``_fp8_weights.MmaFp8Gemv``. The class subclasses ``MmaFp8Gemv`` and is
-bit-exact against it.
+Originated with the Gemini entrant in cuteafd RTX kernel Duel A (kernels are
+credited, TJ 2026-10-24) and measured there, shape by shape, against
+``_fp8_weights.MmaFp8Gemv``.  Same tiling, same accumulation order, same bits;
+the difference is the memory path: ``ld.global.nc`` 16-byte weight loads with
+``L1::evict_first``, ``L1::evict_last`` activations, a 4-chunk rotating
+ping-pong pipeline, SM120 ``cvt.rn.bf16x2.e4m3x2`` widening and a vectorized
+shared-memory fold.
+
+``_fp8_weights.fp8_gemv_wide_kernel`` selects it for the rows 17..64 tile of the
+shapes where it measured faster (``FP8_GEMV_WIDE_KERNEL``); everywhere else the
+base kernel runs.  ``benchmarks/benchmark_fp8_gemv_duel.py`` times both.
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ from b12x._lib.intrinsics import (
 
 from ._fp8_weights import MmaFp8Gemv, gemv_warps
 
-__all__ = ["CandidateMmaFp8Gemv", "candidate_gemv_cta_tiles", "candidate_gemv_groups"]
+__all__ = ["NcMmaFp8Gemv", "nc_gemv_cta_tiles", "nc_gemv_groups"]
 
 
 _DEVICE_CAPS_CACHE: dict[int, tuple[int, int]] = {}
@@ -55,7 +60,7 @@ def _query_device_caps() -> tuple[int, int]:
     return sm, l2
 
 
-def candidate_gemv_groups(n: int, k: int, *, warps: int = 4, groups: int = 4, row_scales: bool = False) -> int:
+def nc_gemv_groups(n: int, k: int, *, warps: int = 4, groups: int = 4, row_scales: bool = False) -> int:
     """Select column groups per CTA using runtime SM count while preserving exact K reduction."""
     n = int(n)
     sm_count, _ = _query_device_caps()
@@ -68,7 +73,7 @@ def candidate_gemv_groups(n: int, k: int, *, warps: int = 4, groups: int = 4, ro
     return 1 if n % 8 == 0 else int(groups)
 
 
-def candidate_gemv_cta_tiles(n: int, k: int, *, groups: int, warps: int) -> int:
+def nc_gemv_cta_tiles(n: int, k: int, *, groups: int, warps: int) -> int:
     """Select 16-row M-tiles per CTA for wide decode GEMV using runtime L2 capacity."""
     n, k = int(n), int(k)
     _, l2_bytes = _query_device_caps()
@@ -243,7 +248,7 @@ def _e4m3x4_scaled_bf16x2x2_fast(word, s, *, loc=None, ip=None):
             Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)))
 
 
-class CandidateMmaFp8Gemv(MmaFp8Gemv):
+class NcMmaFp8Gemv(MmaFp8Gemv):
     """Bit-identical ``MmaFp8Gemv`` with 4-chunk rotating ping-pong pipeline (zero MOV copies,
     3 chunks continuously in flight), immediate per-group weight reload, SM120 direct
     ``cvt.rn.bf16x2.e4m3x2`` dequant, clamped/prefetched activation loads, and vectorized
@@ -254,7 +259,7 @@ class CandidateMmaFp8Gemv(MmaFp8Gemv):
                  cta_tiles: int | None = None):
         super().__init__(n, k, max_rows=max_rows, warps=warps, groups=groups, out_dtype=out_dtype,
                          row_scales=row_scales, kmajor=kmajor)
-        target_tiles = (candidate_gemv_cta_tiles(self.n, self.k, groups=self.groups, warps=self.warps)
+        target_tiles = (nc_gemv_cta_tiles(self.n, self.k, groups=self.groups, warps=self.warps)
                         if cta_tiles is None else int(cta_tiles))
         self.m_tiles = min(self.total_m_tiles, target_tiles)
         self.multi_m_grid = self.total_m_tiles > self.m_tiles
@@ -263,7 +268,7 @@ class CandidateMmaFp8Gemv(MmaFp8Gemv):
         self.smem_frags = self.frags if (self.warps * self.frags * 32 * 4 <= 16384) else self.tile_frags
 
     def key(self) -> tuple:
-        return ("candidate_mma_fp8_gemv", super().key(), self.smem_frags)
+        return ("nc_mma_fp8_gemv", super().key(), self.smem_frags)
 
     @cute.jit
     def _load_chunk_v4(self, dest: cute.Tensor, w_row: Int64, k_off: Int64):

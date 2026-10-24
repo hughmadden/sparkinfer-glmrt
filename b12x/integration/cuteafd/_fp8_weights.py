@@ -54,8 +54,10 @@ from b12x._lib.intrinsics import (bf16_mma_m16n8k16_f32, ld_shared_v2_u32, prefe
 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_stream
 
 __all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_CONFIG", "FP8_GEMV_GROUPS_DEFAULT", "FP8_GEMV_ROWS", "FP8_GEMV_WIDE",
+           "FP8_GEMV_WIDE_KERNEL",
            "Fp8Projection",
-           "decode_tile_n", "fp8_gemv_tuning", "fp8_gemv_wide", "MmaFp8Gemv", "RoutedFp8Projection", "TmaFp8Gemm", "check_w8_mode",
+           "decode_tile_n", "fp8_gemv_tuning", "fp8_gemv_wide", "fp8_gemv_wide_kernel", "MmaFp8Gemv",
+           "RoutedFp8Projection", "TmaFp8Gemm", "check_w8_mode",
            "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps", "projection", "w8_scalars"]
 
 
@@ -212,13 +214,16 @@ class Fp8Projection:
                 raise ValueError("the wide GEMV tile must keep the thin tile's warps: they set "
                                  "the K split, and one order covers the decode range")
             # Columns per CTA and tiles per CTA only partition the launch grid, so the wide
-            # tile may use the shape's measured wide entry without moving a single bit.
+            # tile may use the shape's measured wide entry without moving a single bit; so may
+            # its kernel, which is bit-identical on the same tiling (FP8_GEMV_WIDE_KERNEL).
             wide_g, wide_t = fp8_gemv_wide(self.n, self.k, groups=groups)
-            self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=cap, warps=warps,
-                                        groups=wide_g if wide_groups is None else int(wide_groups),
-                                        cta_tiles=wide_t if wide_groups is None else None,
-                                        row_scales=self.row_scales, kmajor=self.kmajor,
-                                        out_dtype=out_dtype) if cap > int(gemv_rows) else None
+            wide_cls = MmaFp8Gemv if wide_groups is not None else \
+                fp8_gemv_wide_kernel(self.n, self.k, row_scales=self.row_scales, kmajor=self.kmajor)
+            self.gemv_wide = wide_cls(self.n, self.k, max_rows=cap, warps=warps,
+                                      groups=wide_g if wide_groups is None else int(wide_groups),
+                                      cta_tiles=wide_t if wide_groups is None else None,
+                                      row_scales=self.row_scales, kmajor=self.kmajor,
+                                      out_dtype=out_dtype) if cap > int(gemv_rows) else None
             self.gemv_rows = int(gemv_rows)
             self.max_gemv_rows = cap if self.gemv_wide is not None else int(gemv_rows)
             tile_n = decode_tile_n(self.n)
@@ -413,6 +418,29 @@ def fp8_gemv_wide(n: int, k: int, *, groups: int) -> tuple[int, int | None]:
     has to cover the whole decode range."""
     entry = FP8_GEMV_WIDE.get((int(n), int(k)))
     return entry if entry is not None else (int(groups), None)
+
+
+# The one shape whose rows 17..64 tile measured faster on the non-coherent 16-byte load
+# path (``_fp8_gemv_nc``) than on this file's kernel, same (groups, cta_tiles) = (1,1),
+# RTX PRO 6000 at 325 W, L2-cold read-only eviction, one session, ratio to the shipped
+# wide tile at 32/48/64 rows:
+#   q o 5120x17408   1.341/1.007/1.248 nc, 1.195/1.079/1.057 MmaFp8Gemv
+# -- 12-18% off at 32 and 64 rows of a projection every layer runs, never slower than the
+# shipped tile.  The nc path needs few column blocks (n=5120) to pay: on the wide-n shapes
+# it loses badly (34816x5120 0.62/0.51/0.46, 16384x5120 0.59/0.51/0.45), and on every
+# other measured shape the base kernel at least ties it, so everything else stays put.
+FP8_GEMV_WIDE_KERNEL = {(5120, 17408): "nc"}
+
+
+def fp8_gemv_wide_kernel(n: int, k: int, *, row_scales: bool = False, kmajor: bool = False):
+    """``MmaFp8Gemv`` subclass for the rows 17..64 tile of an ``N x K`` projection: the
+    measured nc entry, else the base kernel.  The nc kernel was measured on block-scale
+    weights only, so a per-row-scale or K-block-major shape never leaves the base kernel."""
+    if FP8_GEMV_WIDE_KERNEL.get((int(n), int(k))) != "nc" or row_scales or kmajor:
+        return MmaFp8Gemv
+    from ._fp8_gemv_nc import NcMmaFp8Gemv
+
+    return NcMmaFp8Gemv
 
 
 def fp8_gemv_tuning(n: int, k: int, *, warps: int | None = None) -> tuple[int, int]:

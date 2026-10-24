@@ -131,8 +131,8 @@ def variants_for(kind: str, n: int, k: int, rows: int) -> list[dict]:
         # meaningful. Their rule picks groups and cta_tiles from runtime SM/L2;
         # ``gem_g1_*`` pins their load path to my column width so the two
         # improvements are separable.
-        from b12x.integration.cuteafd._fp8_duel_candidate import (
-            candidate_gemv_cta_tiles, candidate_gemv_groups)
+        from b12x.integration.cuteafd._fp8_gemv_nc import (
+            nc_gemv_cta_tiles, nc_gemv_groups)
 
         def legal(g):
             return 128 % (8 * g) == 0 and n % (8 * g) == 0 and n // (8 * g) >= 2
@@ -143,26 +143,26 @@ def variants_for(kind: str, n: int, k: int, rows: int) -> list[dict]:
             out.append(dict(name="mine_g1", warps=warps, groups=1))
         if groups != 4 and legal(4):
             out.append(dict(name="shipped_g4", warps=warps, groups=4))
-        gg = candidate_gemv_groups(n, k, warps=warps, groups=groups)
-        gt = candidate_gemv_cta_tiles(n, k, groups=gg, warps=warps)
+        gg = nc_gemv_groups(n, k, warps=warps, groups=groups)
+        gt = nc_gemv_cta_tiles(n, k, groups=gg, warps=warps)
         out.append(dict(name=f"gem_rule_g{gg}_t{gt}", warps=warps, groups=gg,
-                        cta_tiles=gt, kernel="candidate"))
+                        cta_tiles=gt, kernel="nc"))
         # Their isolation arm (round-4 addendum): their loads/pipeline at my column
         # width and one 16-row tile per CTA.
         if legal(1):
             out.append(dict(name="gem_g1_t1", warps=warps, groups=1,
-                            cta_tiles=1, kernel="candidate"))
+                            cta_tiles=1, kernel="nc"))
         for g in (1, 2):
             if legal(g):
                 out.append(dict(name=f"gem_g{g}_t4", warps=warps, groups=g,
-                                cta_tiles=4, kernel="candidate"))
+                                cta_tiles=4, kernel="nc"))
         return out
     if kind == "wide":
         # The 17-64-row program (``max_rows=64``): production's tile count per CTA is
         # the knob that matters here, so hold the shipped warps and sweep (groups,
         # cta_tiles) on the production kernel; the opponent's kernel stays as the
         # reference for its load path at the same tiling.
-        from b12x.integration.cuteafd._fp8_duel_candidate import candidate_gemv_groups
+        from b12x.integration.cuteafd._fp8_gemv_nc import nc_gemv_groups
 
         def legal(g):
             return 128 % (8 * g) == 0 and n % (8 * g) == 0 and n // (8 * g) >= 2
@@ -172,13 +172,13 @@ def variants_for(kind: str, n: int, k: int, rows: int) -> list[dict]:
         for g, t in ((1, 1), (1, 2), (2, 2), (2, 4), (4, 4), (4, 2)):
             if legal(g):
                 out.append(dict(name=f"prod_g{g}_t{t}", warps=warps, groups=g, cta_tiles=t))
-        gg = candidate_gemv_groups(n, k, warps=warps, groups=groups)
+        gg = nc_gemv_groups(n, k, warps=warps, groups=groups)
         if legal(gg):
             out.append(dict(name=f"gem_rule_g{gg}_t4", warps=warps, groups=gg,
-                            cta_tiles=4, kernel="candidate"))
+                            cta_tiles=4, kernel="nc"))
         if legal(1):
             out.append(dict(name="gem_g1_t1", warps=warps, groups=1, cta_tiles=1,
-                            kernel="candidate"))
+                            kernel="nc"))
         return out
     if kind == "combo":
         # Round-2 grid: the two independent winners (column count per CTA, weight
@@ -211,9 +211,9 @@ def _compile(n: int, k: int, rows: int, cfg: dict, row_scales: bool = False):
         if extra in cfg:
             kwargs[extra] = cfg[extra]
     cls = MmaFp8Gemv
-    if cfg.get("kernel") == "candidate":
-        from b12x.integration.cuteafd._fp8_duel_candidate import CandidateMmaFp8Gemv
-        cls = CandidateMmaFp8Gemv
+    if cfg.get("kernel") == "nc":
+        from b12x.integration.cuteafd._fp8_gemv_nc import NcMmaFp8Gemv
+        cls = NcMmaFp8Gemv
     op = cls(n, k, **kwargs)
     program = compile_program(op, name=f"duel_{cfg['name']}_{n}x{k}", operands=(
         Operand("x", torch.bfloat16, f"[rows,{k}]"), Operand("w", torch.float8_e4m3fn, f"[{n},{k}]"),
