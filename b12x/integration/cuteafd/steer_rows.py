@@ -1,6 +1,7 @@
-"""Per-row low-rank steering ``y -= A (B^T y)`` on BF16 rows, in place (ABI v1).
+"""Per-row low-rank steering ``y -= A (B^T y)`` on BF16 rows, in place (ABI v2).
 
-Weight-variant rows only: ``v = vidx[r]``; a row with ``v <= 0`` or ``k[v] <= 0``
+Weight-variant rows only: ``v = vidx[r]``; a row outside ``0 < v <= variants``
+is rejected before accessing any table. A row with ``k[v] <= 0``
 is never read or written, so base rows stay bit-identical. For a steered row,
 with ``kv = min(k[v], k_max)``:
 
@@ -11,7 +12,7 @@ with ``kv = min(k[v], k_max)``:
 Tables ``a``/``b`` are FP32 ``[V+1][k_max][h]`` (slot 0 unused), ``k`` is
 int32 ``[V+1]``, ``vidx`` int32 ``[rows]``, ``x`` BF16 ``[rows, ld]`` (first
 ``h`` columns). ``h`` is any multiple of 128 up to 8192; ``h``, ``ld``,
-``rows`` and ``k_max`` are launch scalars, so one compiled program serves
+``rows``, ``k_max`` and ``variants`` (the actual V in 1..7) are launch scalars, so one compiled program serves
 every model width and no live count enters a compile key.
 
 Fixed reduction order (``steer_rows_ref`` in cuteafd copies it bit for bit):
@@ -26,7 +27,9 @@ on its own inputs, never on ``rows`` or other rows (batch-invariant).
 Two programs: ``one`` (``k_max == 1``; every load issues before the single
 reduction) and ``general`` (``k_max <= 32``; ``j`` in tiles of four). Both
 give identical bits at ``k == 1``. No allocation and no host sync: graph
-capture records the pointers, and replays read the tables' current contents.
+capture records the pointers and scalars. Keep tables and layout metadata
+immutable until graph retirement; only row assignments change between replays.
+Allocation padding never increases V or the initialized table extent.
 
 ``AddRows`` (``add_rows_f32`` / ``add_rows_bf16``) is the stored-delta site:
 ``y = bf16_rne(y + d)`` on rows whose variant has ``on[v] != 0``.
@@ -53,6 +56,8 @@ WARPS = THREADS // 32
 VECTORS = 2           # 8-element BF16 vectors per thread at h = 8192
 MAX_HIDDEN = THREADS * 8 * VECTORS
 MAX_K = 32
+MAX_VARIANTS = 7
+ABI_VERSION = 2
 J_TILE = 4
 
 
@@ -93,7 +98,7 @@ def _storage(slots: int):
 
 
 class SteerRows:
-    """Launch ``(x, vidx, a, b, k, ld, rows, h, k_max, stream)``; one CTA per row."""
+    """Launch ``(x, vidx, a, b, k, ld, rows, h, k_max, variants, stream)``; one CTA per row."""
 
     def __init__(self, one: bool):
         self.one = bool(one)
@@ -101,10 +106,10 @@ class SteerRows:
 
     @cute.jit
     def __call__(self, x: cute.Pointer, vidx: cute.Pointer, a: cute.Pointer, b: cute.Pointer,
-                 k: cute.Pointer, ld: Int64, rows: Int32, h: Int32, k_max: Int32,
+                 k: cute.Pointer, ld: Int64, rows: Int32, h: Int32, k_max: Int32, variants: Int32,
                  stream: cuda.CUstream):
         if rows > Int32(0):
-            self.kernel(x, vidx, a, b, k, ld, h, k_max).launch(
+            self.kernel(x, vidx, a, b, k, ld, h, k_max, variants).launch(
                 grid=(rows, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
     @cute.jit
@@ -117,7 +122,7 @@ class SteerRows:
 
     @cute.kernel
     def kernel(self, x: cute.Pointer, vidx: cute.Pointer, a: cute.Pointer, b: cute.Pointer,
-               k: cute.Pointer, ld: Int64, h: Int32, k_max: Int32):
+               k: cute.Pointer, ld: Int64, h: Int32, k_max: Int32, variants: Int32):
         tid = Int32(cute.arch.thread_idx()[0])
         lane = tid % Int32(32)
         warp = tid // Int32(32)
@@ -127,8 +132,9 @@ class SteerRows:
         sums = storage.sums.get_tensor(cute.make_layout((self.slots, WARPS), stride=(WARPS, 1)))
         v = cute.make_tensor(vidx, cute.make_layout(1, stride=1))[row]
         kv = Int32(0)
-        if v > Int32(0):
-            kv = cute.make_tensor(k, cute.make_layout(1, stride=1))[v]
+        if (variants > Int32(0)) & (variants <= Int32(MAX_VARIANTS)):
+            if (v > Int32(0)) & (v <= variants):
+                kv = cute.make_tensor(k, cute.make_layout(1, stride=1))[v]
         if cutlass.const_expr(self.one):
             kv = cutlass.min(kv, Int32(1))
         else:
@@ -256,7 +262,7 @@ OPERANDS = (
     Operand("b", torch.float32, "[V+1,k_max,h]"),
     Operand("k", torch.int32, "[V+1]", align=4),
 )
-SCALARS = (Scalar("ld", "int64"), Scalar("rows"), Scalar("h"), Scalar("k_max"))
+SCALARS = (Scalar("ld", "int64"), Scalar("rows"), Scalar("h"), Scalar("k_max"), Scalar("variants"))
 FORMS = {"one": True, "general": False}
 
 
@@ -268,7 +274,7 @@ def compile_steer_rows_aot(form: str = "general"):
     """``form`` ``one`` (k_max == 1) or ``general`` (k_max <= 32); no geometry key."""
     if form not in FORMS:
         raise ValueError("steer_rows form must be 'one' or 'general'")
-    geometry = dict(abi_version=1, form=form, threads=THREADS, max_hidden=MAX_HIDDEN,
+    geometry = dict(abi_version=ABI_VERSION, form=form, threads=THREADS, max_hidden=MAX_HIDDEN,
                     max_k=1 if FORMS[form] else MAX_K, hidden_multiple=128)
     return compile_program(steer_rows_launch(form), name=f"steer_rows_{form}", operands=OPERANDS,
                            scalars=SCALARS, key=tuple(geometry.values()), geometry=geometry,
@@ -287,7 +293,9 @@ class AddRows:
     ``on[v] != 0``; every other row is never read or written. One FP32 add and one
     rounding per element, so the result is exact and batch-invariant.
 
-    Launch ``(y, d, vidx, on, ld_y, ld_d, rows, h, stream)``; ``h`` and both strides
+    Launch ``(y, d, vidx, on, ld_y, ld_d, rows, h, variants, stream)``;
+    reject indices outside ``0 < v <= variants <= 7`` before accessing ``on`` or rows.
+    ``h`` and both strides
     are multiples of 8 elements, ``y`` and ``d`` 16-byte aligned. ``d`` is FP32
     (``delta_bf16=False``) or BF16.
     """
@@ -297,20 +305,21 @@ class AddRows:
 
     @cute.jit
     def __call__(self, y: cute.Pointer, d: cute.Pointer, vidx: cute.Pointer, on: cute.Pointer,
-                 ld_y: Int64, ld_d: Int64, rows: Int32, h: Int32, stream: cuda.CUstream):
+                 ld_y: Int64, ld_d: Int64, rows: Int32, h: Int32, variants: Int32, stream: cuda.CUstream):
         if rows > Int32(0):
-            self.kernel(y, d, vidx, on, ld_y, ld_d, h).launch(
+            self.kernel(y, d, vidx, on, ld_y, ld_d, h, variants).launch(
                 grid=(rows, 1, 1), block=(ADD_THREADS, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, y: cute.Pointer, d: cute.Pointer, vidx: cute.Pointer, on: cute.Pointer,
-               ld_y: Int64, ld_d: Int64, h: Int32):
+               ld_y: Int64, ld_d: Int64, h: Int32, variants: Int32):
         tid = Int32(cute.arch.thread_idx()[0])
         row = Int64(cute.arch.block_idx()[0])
         v = cute.make_tensor(vidx, cute.make_layout(1, stride=1))[row]
         enabled = Int32(0)
-        if v > Int32(0):
-            enabled = cute.make_tensor(on, cute.make_layout(1, stride=1))[v]
+        if (variants > Int32(0)) & (variants <= Int32(MAX_VARIANTS)):
+            if (v > Int32(0)) & (v <= variants):
+                enabled = cute.make_tensor(on, cute.make_layout(1, stride=1))[v]
         if enabled != Int32(0):
             y_row = Int64(y.toint()) + row * ld_y * Int64(2)
             element = 2 if self.delta_bf16 else 4
@@ -348,7 +357,7 @@ def add_rows_operands(form: str):
     )
 
 
-ADD_SCALARS = (Scalar("ld_y", "int64"), Scalar("ld_d", "int64"), Scalar("rows"), Scalar("h"))
+ADD_SCALARS = (Scalar("ld_y", "int64"), Scalar("ld_d", "int64"), Scalar("rows"), Scalar("h"), Scalar("variants"))
 
 
 def add_rows_launch(form: str) -> AddRows:
@@ -359,7 +368,7 @@ def compile_add_rows_aot(form: str = "f32"):
     """``form`` is the delta dtype, ``f32`` or ``bf16``; no geometry key."""
     if form not in ADD_FORMS:
         raise ValueError("add_rows form must be 'f32' or 'bf16'")
-    geometry = dict(abi_version=1, form=form, threads=ADD_THREADS, hidden_multiple=8)
+    geometry = dict(abi_version=ABI_VERSION, form=form, threads=ADD_THREADS, hidden_multiple=8)
     return compile_program(add_rows_launch(form), name=f"add_rows_{form}",
                            operands=add_rows_operands(form), scalars=ADD_SCALARS,
                            key=tuple(geometry.values()), geometry=geometry, doc=AddRows.__doc__)

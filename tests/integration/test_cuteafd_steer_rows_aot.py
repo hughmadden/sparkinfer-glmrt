@@ -42,7 +42,7 @@ def _reference(x, vidx, a, b, k, k_max, h):
     xf = x.float().numpy()
     a, b = a.numpy(), b.numpy()
     for r, v in enumerate(vidx.tolist()):
-        kv = min(int(k[v]), k_max) if v > 0 else 0
+        kv = min(int(k[v]), k_max) if 0 < v < len(k) else 0
         if kv <= 0:
             continue
         row = xf[r, :h]
@@ -77,7 +77,7 @@ def test_steer_rows_bit_exact(form, kk, h, rows):
     want = _reference(x, vidx, a, b, k, kk, h)
     dx = x.cuda()
     program = compile_steer_rows_aot(form)
-    program.launch(dx, vidx.cuda(), a.cuda(), b.cuda(), k.cuda(), scalars=[ld, rows, h, kk])
+    program.launch(dx, vidx.cuda(), a.cuda(), b.cuda(), k.cuda(), scalars=[ld, rows, h, kk, 3])
     torch.cuda.synchronize()
     got = dx.cpu()
     assert torch.equal(got.view(torch.int16), want.view(torch.int16))
@@ -94,9 +94,9 @@ def test_steer_rows_batch_invariant():
     program = compile_steer_rows_aot("general")
     da, db, dk = a.cuda(), b.cuda(), k.cuda()
     full = x.cuda()
-    program.launch(full, vidx.cuda(), da, db, dk, scalars=[h, 300, h, kk])
+    program.launch(full, vidx.cuda(), da, db, dk, scalars=[h, 300, h, kk, 3])
     lone = x[257:258].clone().cuda()
-    program.launch(lone, vidx[:1].cuda(), da, db, dk, scalars=[h, 1, h, kk])
+    program.launch(lone, vidx[:1].cuda(), da, db, dk, scalars=[h, 1, h, kk, 3])
     torch.cuda.synchronize()
     assert torch.equal(full[257].view(torch.int16), lone[0].view(torch.int16))
 
@@ -119,6 +119,88 @@ def test_add_rows_bit_exact(form, h, rows):
         if v > 0 and on[v]:
             want[r, :h] = (y[r, :h].float() + d[r, :h].float()).bfloat16()
     dy = y.cuda()
-    compile_add_rows_aot(form).launch(dy, d.cuda(), vidx.cuda(), on.cuda(), scalars=[ld_y, ld_d, rows, h])
+    compile_add_rows_aot(form).launch(dy, d.cuda(), vidx.cuda(), on.cuda(), scalars=[ld_y, ld_d, rows, h, 3])
     torch.cuda.synchronize()
     assert torch.equal(dy.cpu().view(torch.int16), want.view(torch.int16))
+
+
+@pytest.mark.parametrize("form,kk", [("one", 1), ("general", 1), ("general", 3), ("general", 32)])
+@pytest.mark.parametrize("variants", [1, 3, 7])
+@pytest.mark.parametrize("padded", [False, True])
+def test_steer_rows_bounds_and_replay(form, kk, variants, padded):
+    require_b12x()
+    from b12x.integration.cuteafd.steer_rows import compile_steer_rows_aot
+    h, ld = 128, 136
+    masks = torch.tensor([0, -1, -(2**31), variants + 1, 63, 2**31 - 1, 1, variants], dtype=torch.int32)
+    rows = len(masks)
+    slots = 64 if padded else variants + 1
+    gen = torch.Generator().manual_seed(91)
+    x = torch.rand(rows, ld, generator=gen).bfloat16()
+    # Payload-preserving copies expose accidental reads/rounding on base rows.
+    x.view(torch.int16)[:6, :h] = 0x7f81
+    a = torch.rand(slots, kk, h, generator=gen) * 0.125
+    b = torch.rand(slots, kk, h, generator=gen) * 0.125
+    k = torch.full((slots,), kk, dtype=torch.int32)
+    k[0] = 2**31 - 1
+    k[1] = 2**31 - 1  # clamp rank without changing the table stride
+    dx, dv, da, db, dk = x.cuda(), masks.cuda(), a.cuda(), b.cuda(), k.cuda()
+    program = compile_steer_rows_aot(form)
+    scalars = [ld, rows, h, kk, variants]
+    program.launch(dx, dv, da, db, dk, scalars=scalars)  # compile and warm before capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        program.launch(dx, dv, da, db, dk, scalars=scalars)
+    # Avoid NaN arithmetic in active rows: original invalid rows retain payloads
+    # only on the first replay, then all input rows are finite.
+    for mask in (masks, masks.roll(2), torch.zeros_like(masks)):
+        source = x.clone()
+        if not torch.equal(mask, masks):
+            source[:6] = 1
+        dx.copy_(source)
+        dv.copy_(mask)
+        graph.replay()
+        torch.cuda.synchronize()
+        want = _reference(source, mask, a, b, k[:variants + 1], kk, h)
+        assert torch.equal(dx.cpu().view(torch.int16), want.view(torch.int16))
+    assert torch.equal(da.cpu(), a) and torch.equal(db.cpu(), b) and torch.equal(dk.cpu(), k)
+
+
+@pytest.mark.parametrize("form", ["f32", "bf16"])
+@pytest.mark.parametrize("variants", [1, 3, 7])
+@pytest.mark.parametrize("padded", [False, True])
+def test_add_rows_bounds_and_replay(form, variants, padded):
+    require_b12x()
+    from b12x.integration.cuteafd.steer_rows import compile_add_rows_aot
+    h, ld = 128, 136
+    masks = torch.tensor([0, -1, -(2**31), variants + 1, 63, 2**31 - 1, 1, variants], dtype=torch.int32)
+    rows = len(masks)
+    y = torch.ones(rows, ld, dtype=torch.bfloat16)
+    y.view(torch.int16)[:6, :h] = 0x7f81
+    d = torch.full((rows, ld), 0.25, dtype=torch.float32 if form == "f32" else torch.bfloat16)
+    on = torch.ones(64 if padded else variants + 1, dtype=torch.int32)
+    on[0] = 99
+    if variants > 1:
+        on[variants] = 0
+    dy, dd, dv, do = y.cuda(), d.cuda(), masks.cuda(), on.cuda()
+    program = compile_add_rows_aot(form)
+    scalars = [ld, ld, rows, h, variants]
+    program.launch(dy, dd, dv, do, scalars=scalars)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        program.launch(dy, dd, dv, do, scalars=scalars)
+    for mask in (masks, masks.roll(2), torch.zeros_like(masks)):
+        source = y.clone()
+        if not torch.equal(mask, masks):
+            source[:6] = 1
+        dy.copy_(source)
+        dv.copy_(mask)
+        graph.replay()
+        torch.cuda.synchronize()
+        want = source.clone()
+        for r, v in enumerate(mask.tolist()):
+            if 0 < v <= variants and on[v]:
+                want[r, :h] = (source[r, :h].float() + d[r, :h].float()).bfloat16()
+        assert torch.equal(dy.cpu().view(torch.int16), want.view(torch.int16))
+    assert torch.equal(do.cpu(), on)
