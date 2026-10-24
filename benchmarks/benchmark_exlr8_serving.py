@@ -50,7 +50,10 @@ EXPERTS = 256
 TOP_K = 8
 UNITS = 16
 MAX_GROUPS = 512
-GROUPED_MAX_GROUPS = 256
+# Same capacity as the shipped K1 serving program: at <=64 rows a rank can
+# still pack more than one group per expert, so the grouped arm must not be
+# given a smaller group capacity than production.
+GROUPED_MAX_GROUPS = 512
 SOURCE_PATHS = ("b12x/moe/_shared/kernels/w4a16/exlr8.py",
                 "b12x/moe/_shared/kernels/w4a16/exlr8_grouped.py",
                 "b12x/integration/cuteafd/exlr8.py",
