@@ -3,6 +3,10 @@ variant list and how it certifies the timed replays' outputs."""
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -43,3 +47,53 @@ def test_replay_results_certify_every_layer() -> None:
     # reference variant's, is not certified.
     assert bench.verdict([digests[0], digests[0]], digests, digests) == "REPLAY-DIFFERS"
     assert bench.verdict(digests, digests, [digests[0], digests[0]]) == "DIFFERENT"
+
+
+def test_flash_default_stays_unchanged():
+    g = bench.Geometry()
+    assert (g.hidden, g.intermediate, g.experts, g.topk, g.bits) == (4096, 512, 288, 8, (3, 4))
+    assert g.tier0_ids == tuple(range(284, 288))
+    assert g.tier1_ids == tuple(range(284))
+    assert bench.parse_variant("default") == ("default", None, (64, 256, 64, 256), None)
+
+
+def test_compact_widths_use_balanced_rotated_ownership():
+    g = dataclasses.replace(bench.Geometry(), full_intermediate=2048,
+                            intermediate=384, experts=256, world=6, compact=True)
+    widths = [dataclasses.replace(g, rank=rank).widths(3) for rank in range(6)]
+    assert [w[0] for w in widths] == [384, 256, 256, 384, 384, 384]
+    assert all(sum(w[e] for w in widths) == 2048 for e in range(g.experts))
+    assert set(g.widths(3)) == {256, 384}
+
+
+@pytest.mark.parametrize("geometry,world,compact,expected", [
+    ("glm", 6, True, (6144, 384, 256, 8, "silu", None)),
+    ("glmf", 4, False, (4096, 512, 288, 8, "silu", 10.0)),
+    ("kimik3", 6, False, (3584, 512, 896, 16, "situ", None)),
+    ("qwen4", 4, True, (2560, 256, 512, 10, "silu", None)),
+])
+def test_shipping_geometry_comes_from_engine_policy(geometry, world, compact, expected):
+    root = Path(__file__).resolve().parents[4]
+    policy = root / "python/tools/aot/package_exl3_aot.py"
+    if not policy.is_file():
+        pytest.skip("engine packaging policy is not available in a standalone fork")
+    args = argparse.Namespace(package_policy=policy, geometry=geometry, role="spark",
+                              world=world, rank=0, compact_weights=compact, bits=None, profile=None)
+    g = bench.shipping_geometry(args)
+    assert (g.hidden, g.intermediate, g.experts, g.topk, g.activation, g.swiglu_limit) == expected
+
+
+def test_policy_descriptors_must_be_even_and_written_before_use():
+    good = """Function : test
+/*0000*/ UMOV UR4, URZ;
+/*0010*/ USHF.L.U32 UR5, URZ, 0x14, UR6;
+/*0020*/ LDGSTS.E desc[UR4], [R2], [R4.64];
+"""
+    assert bench.check_policy_descriptors(good) == 1
+    assert bench.check_policy_descriptors("/*0000*/ UTMALDG desc[URZ], [R2];") == 0
+    for bad in (good.replace("desc[UR4]", "desc[UR1]"),
+                good.replace("/*0010*/ USHF.L.U32 UR5, URZ, 0x14, UR6;", ""),
+                good.replace("/*0000*/ UMOV", "/*0000*/ @UP0 UMOV"),
+                good.replace("/*0020*/", "Function : next\n/*0020*/")):
+        with pytest.raises(RuntimeError, match="descriptor"):
+            bench.check_policy_descriptors(bad)
