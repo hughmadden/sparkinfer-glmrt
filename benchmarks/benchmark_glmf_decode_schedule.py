@@ -150,9 +150,23 @@ def check_policy_descriptors(sass: str) -> int:
 def inspect_kernel(launch, directory: Path) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
     launch.compiled.export_to_c(str(directory), "core", "cuteafd_core")
-    info = {}
+    # CuTe embeds cubins as host data; cuobjdump cannot discover them in core.o.
+    path = Path(__file__).resolve().parents[3] / "scripts/qualify/deepseek_v41/inspect-cute-object.py"
+    spec = importlib.util.spec_from_file_location("schedule_cuda_images", path)
+    inspector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(inspector)
+    images = list(inspector.cuda_images((directory / "core.o").read_bytes()))
+    if not images:
+        raise RuntimeError("EXL3 AOT export contains no cubins")
+    cubins = []
+    for index, (_, blob) in enumerate(images):
+        cubin = directory / f"core-{index}.cubin"
+        cubin.write_bytes(blob)
+        cubins.append(cubin)
+    info = {"cubin_sha256": [hashlib.sha256(blob).hexdigest() for _, blob in images]}
     for option, name in (("--dump-sass", "sass"), ("--dump-resource-usage", "resources")):
-        text = subprocess.check_output(["cuobjdump", option, str(directory / "core.o")], text=True)
+        text = "\n".join(subprocess.check_output(["cuobjdump", option, str(cubin)], text=True)
+                         for cubin in cubins)
         (directory / f"core.{name}").write_text(text)
         if name == "sass":
             info["policy_sites"] = check_policy_descriptors(text)
@@ -272,13 +286,22 @@ def main() -> None:
             info = inspect_kernel(launch, args.artifacts / f"m{capacity}-{tag}")
             if schedule and parse_decode_schedule(schedule).l2_evict_first_b and not info["policy_sites"]:
                 raise RuntimeError("hinted core contains no policy-bearing instructions")
+            if schedule is None:
+                resource_baselines[(capacity, tile, blocks)] = info["resources"]
+            elif (capacity, tile, blocks) in resource_baselines:
+                baseline = resource_baselines[(capacity, tile, blocks)]
+                if len(baseline) != len(info["resources"]):
+                    raise RuntimeError("hint changed the exported kernel count")
+                for before, after in zip(baseline, info["resources"]):
+                    if after["registers"] > before["registers"] or after["stack"] or after["local"]:
+                        raise RuntimeError(f"hint resource growth or spill: {before} -> {after}")
             print(f"resource m{capacity} schedule={schedule} tile={tile} {json.dumps(info)}", flush=True)
             inspected.add(key)
         buffers = make_mixed_trellis_buffers(launch, device=device, sms=sms)
         bindings = [bind_mixed_trellis(t0, t1, m, d, r, launch) for t0, t1, m, d, r in layers]
         return launch, buffers, bindings
 
-    inspected, single_outputs = set(), {}
+    inspected, single_outputs, resource_baselines = set(), {}, {}
     if args.check_row_invariance:
         for name, schedule, tile, blocks in variants:
             launch, buffers, bindings = build(1, schedule, tile, blocks)

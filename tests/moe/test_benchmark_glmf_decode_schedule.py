@@ -97,3 +97,30 @@ def test_policy_descriptors_must_be_even_and_written_before_use():
                 good.replace("/*0020*/", "Function : next\n/*0020*/")):
         with pytest.raises(RuntimeError, match="descriptor"):
             bench.check_policy_descriptors(bad)
+
+
+def test_inspection_extracts_embedded_cubins_before_cuobjdump(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    class Program:
+        def export_to_c(self, directory, stem, symbol):
+            (Path(directory) / f"{stem}.o").write_bytes(b"host-object")
+
+    inspector = SimpleNamespace(cuda_images=lambda data: [(12, b"device-elf")])
+    spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda module: None))
+    monkeypatch.setattr(bench.importlib.util, "spec_from_file_location", lambda *args: spec)
+    monkeypatch.setattr(bench.importlib.util, "module_from_spec", lambda spec: inspector)
+    calls = []
+
+    def dump(command, **kwargs):
+        calls.append(command)
+        assert Path(command[-1]).read_bytes() == b"device-elf"
+        if command[1] == "--dump-sass":
+            return "/*0000*/ UMOV UR4, URZ;\n/*0010*/ UMOV UR5, URZ;\n/*0020*/ LDGSTS.E desc[UR4], [R2], [R4.64];"
+        return "REG:128 STACK:0 SHARED:1024 LOCAL:0"
+
+    monkeypatch.setattr(bench.subprocess, "check_output", dump)
+    info = bench.inspect_kernel(SimpleNamespace(compiled=Program()), tmp_path)
+    assert len(calls) == 2 and info["policy_sites"] == 1
+    assert info["resources"] == [dict(registers=128, stack=0, shared=1024, local=0)]
+    assert len(info["cubin_sha256"]) == 1
