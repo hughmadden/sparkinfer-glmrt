@@ -199,3 +199,73 @@ def test_compact_glm_fixture_uses_live_width_ownership(tmp_path):
                                                 {"mode": "ws", "tile": (64, 128, 64, 256)},
                                                 props, "glm", compact=True)
     assert widened["force_tile_config"] == (64, 128, 64, 256)
+    t384 = bench.coordinator_compile_options("spark-tp6-width384", 4096,
+                                             {"mode": "ws", "tile": (64, 192, 64, 256)},
+                                             props, "glm", compact=True)
+    assert t384["force_tile_config"] == (64, 192, 64, 256)
+
+
+def test_compact_prefill_compile_options_match_served_exports(tmp_path):
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+
+    # Qwen4 compact (TP4/TP3 w256, TP2 w384): cooperative must force (64,128,64,128) and no token rotation.
+    for width in (256, 384):
+        qwen_coop = bench.prefill_compile_options("qwen4", width, 32, "cooperative", props, compact=True)
+        assert qwen_coop["compact_weights"] is True
+        assert qwen_coop["warp_specialized"] is False
+        assert qwen_coop["force_tile_config"] == (64, 128, 64, 128)
+        assert qwen_coop["token_major_rotation"] is False
+        assert qwen_coop["ws_dynamic_tiles"] is False
+        assert qwen_coop["swiglu_limit"] is None
+        assert (qwen_coop["tier0_num_experts"], qwen_coop["tier1_num_experts"]) == (512, 512)
+
+        qwen_ws = bench.prefill_compile_options("qwen4", width, 64, "ws", props, compact=True)
+        assert qwen_ws["compact_weights"] is True
+        assert qwen_ws["warp_specialized"] is True
+        assert qwen_ws["force_tile_config"] == (64, 128, 64, 256)
+        assert qwen_ws["token_major_rotation"] is False
+        assert qwen_ws["ws_dynamic_tiles"] is True
+        assert qwen_ws["swiglu_limit"] is None
+
+    qwen_t384 = bench.prefill_compile_options("qwen4", 384, 64, "ws+t384", props, compact=True)
+    assert qwen_t384["force_tile_config"] == (64, 192, 64, 256) and qwen_t384["ws_dynamic_tiles"] is True
+    with pytest.raises(ValueError, match="t384"):
+        bench.prefill_compile_options("qwen4", 256, 64, "ws+t384", props, compact=True)
+
+    # GLM Flash (glmf, bits=(3,4), swiglu_limit=10.0) and V4 Flash (dsv4f, bits=(4,5), swiglu_limit=10.0)
+    for family, experts, topk, bits, block in (
+        ("glmf", 288, 8, (3, 4), 64),
+        ("dsv4f", 256, 6, (4, 5), 8),
+    ):
+        for width in (384, 768):
+            coop = bench.prefill_compile_options(family, width, block, "cooperative", props, compact=True)
+            assert coop["compact_weights"] is True and not coop["warp_specialized"]
+            assert coop["force_tile_config"] == (64, 128, 64, 128)
+            assert not coop["token_major_rotation"] and not coop["ws_dynamic_tiles"]
+            assert coop["swiglu_limit"] == 10.0
+            assert (coop["tier0_bits"], coop["tier1_bits"]) == bits
+            assert (coop["tier0_num_experts"], coop["tier1_num_experts"], coop["route_num_experts"]) == (experts, experts, experts)
+            assert coop["top_k"] == topk and coop["moe_block_size"] == block
+
+            ws = bench.prefill_compile_options(family, width, 64, "ws", props, compact=True)
+            assert ws["compact_weights"] is True and ws["warp_specialized"]
+            assert ws["force_tile_config"] == (64, 128, 64, 256)
+            assert ws["ws_dynamic_tiles"] is True and ws["swiglu_limit"] == 10.0
+
+            ws_t384 = bench.prefill_compile_options(family, width, 64, "ws+t384", props, compact=True)
+            assert ws_t384["force_tile_config"] == (64, 192, 64, 256) and ws_t384["ws_dynamic_tiles"] is True
+
+    # Validate compact_prefill_fixture for glmf (bits 3/4) and dsv4f (bits 4/5)
+    glmf_entries = [dict(global_expert=e, combined_local=e, width=384 if e < 96 else 256,
+                         projections=[dict(projection=p, tier=e & 1, bits=3 + (e & 1),
+                                           tier_local=e // 2, payload_word_offset=0)
+                                      for p in ("gate", "up", "down")]) for e in range(288)]
+    glmf_rank = dict(rank=0, compiled_max_intermediate=384, experts=glmf_entries,
+                     projection_counts=[[144, 144, 144], [144, 144, 144]], unit_map_fingerprint="glmf-test")
+    glmf_path = tmp_path / "glmf-ownership.json"
+    glmf_path.write_text(bench.json.dumps(dict(synthetic=True, source="synthetic", ranks=[glmf_rank])))
+    glmf_fix = bench.compact_prefill_fixture(glmf_path, 0, "glmf", 384)
+    assert glmf_fix["synthetic"] is True and len(glmf_fix["entries"]) == 288
+

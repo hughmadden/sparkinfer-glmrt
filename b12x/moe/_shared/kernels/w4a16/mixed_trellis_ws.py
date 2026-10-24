@@ -418,8 +418,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         if ws_tile_n is None:
             ws_tile_n = (int(d.fc1.tile_n), int(d.fc1.tile_n))
         tile_fc1, tile_fc2 = (int(v) for v in ws_tile_n)
-        if compact_weights and (tile_fc1 != 128 or activations != "a16"):
-            raise ValueError("compact WS requires H128 N tiles and A16 activations")
+        if compact_weights and (tile_fc1 not in (128, 192) or activations != "a16"):
+            raise ValueError("compact WS requires 128/192-wide FC1 N tiles and A16 activations")
         if tile_fc1 not in (128, 192, 256) or tile_fc2 not in (128, 192, 256):
             raise ValueError("warp-specialized mixed Trellis needs 128/192/256-wide N tiles")
         if int(d.fc1.tile_k) != 64 or int(d.fc2.tile_k) != 64:
@@ -1009,8 +1009,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     local = d_local
                 if cutlass.const_expr(self.compact_weights and is_fc1):
                     width = descriptor_map[Int64(3) * Int64(total) + Int64(combined)].to(Int32)
-                    if nt % (n_tiles // Int32(2)) >= width // Int32(self.ws_n):
-                        tier = Int32(-1)
+                    if cutlass.const_expr(self.ws_n == 192):
+                        if (nt % (n_tiles // Int32(2))) * Int32(self.ws_n) >= width:
+                            tier = Int32(-1)
+                    else:
+                        if nt % (n_tiles // Int32(2)) >= width // Int32(self.ws_n):
+                            tier = Int32(-1)
         return rb, nt, combined, tier, local
 
     @cute.jit
@@ -1187,6 +1191,10 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         local_n16 -= Int64(n_total // 32)
                     width = descriptor_map[Int64(3) * Int64(total_experts) + Int64(combined)].to(Int64)
                     stride_u32 = (width // Int64(16)) * tile_u32
+                    if cutlass.const_expr(self.ws_n == 192):
+                        rem_n16 = (width // Int64(16)) - local_n16
+                        if rem_n16 < Int64(self.ws_n16):
+                            row_bytes = rem_n16.to(Int32) * Int32(32) * bits
                 offset = descriptor_map[(projection + Int64(4)) * Int64(total_experts) + Int64(combined)].to(Int64)
                 first_u32 = offset + local_n16 * tile_u32
         if cutlass.const_expr("w_l2" in self.ws_exp):
@@ -1203,19 +1211,26 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         wstride: Int64,
         row_bytes: Int32,
         last_reader: Int32,
+        ctier: Int32 = Int32(0),
     ):
         """One thread: four K16 rows (one 64-wide K unit) of a tile's weights.
         The last route block of an expert streams them L2 evict-first: no
         later block rereads them, and the gathered input rows stay cached."""
         bar = base + Int32(self.ws_bar_bc_full) + slot * Int32(_BARRIER_BYTES)
         dst = base + Int32(self.ws_bc_off) + slot * Int32(self.ws_bc_slot)
+        smem_row_bytes = row_bytes
+        if cutlass.const_expr(self.compact_weights and self.ws_n == 192):
+            bits = Int32(self.ws_bits[0])
+            if ctier == Int32(1):
+                bits = Int32(self.ws_bits[1])
+            smem_row_bytes = Int32(self.ws_n16 * 32) * bits
         _mbar_arrive_expect_tx(bar, row_bytes * Int32(4))
         if last_reader != Int32(0):
             policy = create_l2_evict_first_policy()
             for q in cutlass.range_constexpr(4):
                 k16 = unit * Int32(4) + Int32(q)
                 cp_async_bulk_g2s_mbar_l2hint(
-                    dst + Int32(q) * row_bytes,
+                    dst + Int32(q) * smem_row_bytes,
                     wrow0 + Int64(k16) * wstride,
                     row_bytes,
                     bar,
@@ -1225,7 +1240,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             for q in cutlass.range_constexpr(4):
                 k16 = unit * Int32(4) + Int32(q)
                 cp_async_bulk_g2s_mbar(
-                    dst + Int32(q) * row_bytes,
+                    dst + Int32(q) * smem_row_bytes,
                     wrow0 + Int64(k16) * wstride,
                     row_bytes,
                     bar,
@@ -1637,6 +1652,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         live: Int32,
         ptid: Int32,
         live_k: Int32,
+        live_n: Int32 = Int32(0),
     ):
         """Write tile ``ti``'s header (valid rows or -1 for the end, route
         block, N tile, tier, global scale) and route ids into the tile ring."""
@@ -1654,6 +1670,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             st_shared_f32(hdr + Int32(16), scale)
             if cutlass.const_expr(self.compact_weights):
                 st_shared_i32(hdr + Int32(20), live_k)
+            if cutlass.const_expr(self.compact_weights and self.ws_n == 192):
+                st_shared_i32(hdr + Int32(24), live_n)
         if valid >= Int32(0) and ptid < Int32(self.ws_m):
             idx = packed_route_indices[rb * Int32(self.ws_m) + ptid].to(Int32)
             if idx >= live:
@@ -1744,7 +1762,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         for i in cutlass.range_constexpr(nc):
             if ct < total_tiles:
                 if ptid == Int32(0):
-                    self._ws_issue_bc(base, Int32(i), cu, crow0, cstride, crow_bytes, clast)
+                    self._ws_issue_bc(base, Int32(i), cu, crow0, cstride, crow_bytes, clast, ctier)
                 bc_issued += Int32(1)
                 cu += Int32(1)
                 if cu == c_units:
@@ -1803,8 +1821,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 scale = t1_global[dlocal].to(cutlass.Float32)
             else:
                 scale = t0_global[dlocal].to(cutlass.Float32)
+            live_n = Int32(n_total)
+            if cutlass.const_expr(self.compact_weights and is_fc1 and self.ws_n == 192):
+                if dcomb >= Int32(0) and dcomb < total_experts:
+                    live_n = descriptor_map[Int64(3) * Int64(total_experts) + Int64(dcomb)].to(Int32)
             self._ws_publish_tile(
-                base, ti, dvalid, drb, dnt, dtier, scale, packed_route_indices, live, ptid, live_k
+                base, ti, dvalid, drb, dnt, dtier, scale, packed_route_indices, live, ptid, live_k, live_n
             )
             ti += Int32(1)
             suh_addr = Int64(0)
@@ -1875,7 +1897,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                     base + Int32(self.ws_bar_bc_empty) + fill * Int32(_BARRIER_BYTES),
                                     ((bc_issued // Int32(nc)) & Int32(1)) ^ Int32(1),
                                 )
-                                self._ws_issue_bc(base, fill, cu, crow0, cstride, crow_bytes, clast)
+                                self._ws_issue_bc(base, fill, cu, crow0, cstride, crow_bytes, clast, ctier)
                             bc_issued += Int32(1)
                             cu += Int32(1)
                             if cu == c_units:
@@ -2218,6 +2240,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         b1 = q >> Int32(1)
         mb_count = self.ws_mb
         col = nt * Int32(self.ws_n) + cw * Int32(32) + Int32(8) * q
+        col_valid = Int32(1)
+        if cutlass.const_expr(self.compact_weights and self.ws_n == 192):
+            live_n = ld_shared_i32_relaxed(hdr + Int32(24))
+            local_col = (nt % Int32(n_total // (2 * self.ws_n))) * Int32(self.ws_n) + cw * Int32(32) + Int32(8) * q
+            col_valid = (local_col < live_n).to(Int32)
         for mb in cutlass.range_constexpr(active):
             for rh in cutlass.range_constexpr(2):
                 row = Int32(16 * mb + 8 * rh) + (lane >> Int32(2))
@@ -2243,7 +2270,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 w[3] = cutlass.select_(b0 != Int32(0), w[3], t1)
                 w[0] = cutlass.select_(b0 != Int32(0), t0, w[0])
                 w[2] = cutlass.select_(b0 != Int32(0), t1, w[2])
-                if row < valid:
+                if row < valid and col_valid != Int32(0):
                     route = ld_shared_i32_relaxed(
                         hdr + Int32(4 * _TILE_HEADER_WORDS) + row * Int32(4)
                     )
