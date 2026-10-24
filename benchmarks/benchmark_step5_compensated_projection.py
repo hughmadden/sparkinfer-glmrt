@@ -60,7 +60,8 @@ from benchmarks.common import (  # noqa: E402
     bench_cuda_graph, capture_cuda_graph, make_l2_flush_fn)
 from b12x.integration.cuteafd import _common  # noqa: E402
 from b12x.gemm.bf16_gemv._prefill import Bf16PrefillKernel  # noqa: E402
-from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection  # noqa: E402
+from b12x.gemm.bf16_gemv._skinny import (  # noqa: E402
+    RowTiledBf16Projection, TmaBf16Projection)
 
 ROWS = [int(v) for v in args.rows.split(",") if v]
 
@@ -123,6 +124,22 @@ ARMS = {
     "w8m64n64s3": dict(kind="tma", config=dict(compensated=True, warp_layout=(2, 4),
                                               tile_m=64, tile_n=64, num_stages=3)),
     "unroll": dict(kind="tma", config=dict(compensated=True, unroll_k=True)),
+    # Round 2: the compute-bound width.  Two or four compute warps per SM
+    # partition let the warp MMA issue overlap the compensated ALU of the
+    # other warp instead of serializing inside one in-order warp.
+    "w16n128s2": dict(kind="tma", config=dict(compensated=True, warp_layout=(4, 4),
+                                             tile_m=64, tile_n=128, num_stages=2)),
+    "w16n64s3": dict(kind="tma", config=dict(compensated=True, warp_layout=(4, 4),
+                                            tile_m=64, tile_n=64, num_stages=3)),
+    "w8m64n128s2": dict(kind="tma", config=dict(compensated=True, warp_layout=(2, 4),
+                                               tile_m=64, tile_n=128, num_stages=2)),
+    "w8m32n128s3": dict(kind="tma", config=dict(compensated=True, warp_layout=(2, 4),
+                                               tile_m=32, tile_n=128, num_stages=3)),
+    "w8m32n64s5": dict(kind="tma", config=dict(compensated=True, warp_layout=(2, 4),
+                                              tile_m=32, tile_n=64, num_stages=5)),
+    # The row table measured here as a single program: the small-M tiles below
+    # the row-bound widths and the eight-warp tiles above them (see ROWTILES).
+    "rowtile": dict(kind="rowtile", config={}),
 }
 if args.arms:
     keep = set(args.arms.split(","))
@@ -145,6 +162,82 @@ class DirectProjection(TmaBf16Projection):
         return (self.n, self.k, tuple(sorted(self.config.items())))
 
 
+class CompensatedRowTiled(RowTiledBf16Projection):
+    """``RowTiledBf16Projection`` whose every entry stays compensated.
+
+    The upstream row table carries ``prefill_config``'s ``compensated=False``;
+    this duel may not, so the entries are rebuilt from the same table with the
+    canonical compensated kernel.  The inherited ``__call__`` branches on the
+    ``rows`` launch scalar, so one program covers decode and prefill widths.
+    """
+
+    def __init__(self, n, k, table, *, out_dtype=cutlass.BFloat16):
+        self.n, self.k = int(n), int(k)
+        self.out_dtype = out_dtype
+        self.table = tuple((int(limit), dict(config)) for limit, config in table)
+        self.tiles_by_rows = tuple((int(limit),) for limit, _ in table)
+        self.limits = tuple(int(limit) for limit, _ in table)
+        self.floors = (0,) + self.limits[:-1]
+        self.tiled = [DirectProjection(n, k, out_dtype=out_dtype,
+                                       compensated=True, **config)
+                      for _, config in table]
+        self.default = DirectProjection(n, k, out_dtype=out_dtype,
+                                        compensated=True, compute_warps=4,
+                                        tile_n=64, num_stages=4)
+        self.kernel = self.default.kernel
+        self.row_tiled = None
+        self.config = dict(compensated=True)
+        for launch in [*self.tiled, self.default]:
+            assert launch.kernel.compensated is True
+        capacity = cutlass_utils.get_smem_capacity_in_bytes("sm_120")
+        for entry, launch in zip(self.tiles_by_rows, self.tiled):
+            kernel = launch.kernel
+            smem = kernel.buffer_align_bytes + (
+                kernel.tile_m + kernel.tile_n) * kernel.tile_k * 2 * kernel.num_stages
+            if smem > capacity:
+                raise ValueError(f"rowtile entry {entry} needs {smem} B, "
+                                 f"capacity {capacity}")
+
+    def key(self):
+        return (self.n, self.k, self.table)
+
+
+# Per-shape row tables from the round-1 sweep: the winning tile for each live
+# row band, in the same (rows, config) form RowTiledBf16Projection uses.
+ROWTILES = {
+    "q": [
+        (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=128, num_stages=5)),
+        (64, dict(compute_warps=4, tile_n=64, num_stages=4)),
+        (256, dict(warp_layout=(2, 4), tile_m=64, tile_n=64, num_stages=3)),
+    ],
+    "csa_o": [
+        (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
+        (64, dict(compute_warps=4, tile_n=64, num_stages=4)),
+        (256, dict(compute_warps=8, tile_n=64, num_stages=3)),
+    ],
+    "swa_o": [
+        (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
+        (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=128, num_stages=5)),
+        (4096, dict(compute_warps=4, tile_n=128, num_stages=3)),
+    ],
+    "kv": [
+        (64, dict(warp_layout=(1, 2), tile_m=16, tile_n=16, num_stages=8)),
+        (256, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=9)),
+        (4096, dict(compute_warps=4, tile_n=64, num_stages=4)),
+    ],
+    "gate_up": [
+        (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
+        (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=128, num_stages=5)),
+        (256, dict(compute_warps=8, tile_n=64, num_stages=3)),
+        (4096, dict(compute_warps=4, tile_n=128, num_stages=3)),
+    ],
+    "kimi_up": [
+        (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=12)),
+        (4096, dict(compute_warps=4, tile_n=64, num_stages=4)),
+    ],
+}
+
+
 def torch_dtype(dtype):
     return torch.float32 if dtype == "float32" else torch.bfloat16
 
@@ -164,7 +257,13 @@ def operations(width, outputs, dtype):
 def build(arm, width, outputs, dtype, label, shape_name):
     spec = ARMS[arm]
     out_dtype = torch_dtype(dtype)
-    if spec["kind"] == "direct":
+    if spec["kind"] == "rowtile":
+        table = ROWTILES.get(shape_name)
+        if not table:
+            raise ValueError(f"{shape_name}: no row table")
+        launch = CompensatedRowTiled(outputs, width, table,
+                                     out_dtype=cute_dtype(dtype))
+    elif spec["kind"] == "direct":
         launch = DirectProjection(outputs, width, out_dtype=cute_dtype(dtype),
                                   **spec["config"])
     else:
