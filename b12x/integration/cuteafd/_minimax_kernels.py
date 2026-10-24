@@ -42,7 +42,7 @@ class SwigluOai:
 
 class RouterScores:
     def __init__(self):
-        self.project = SmallNGemvKernel(128, 6144, False, False)
+        self.project = SmallNGemvKernel(128, 6144, False, False, unrolled_scalar=True)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, logits: cute.Pointer,
