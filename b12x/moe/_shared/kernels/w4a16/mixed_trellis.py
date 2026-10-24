@@ -2398,11 +2398,13 @@ def compile_mixed_trellis(
         raise ValueError("EXL3 A8 requires the warp-specialized prefill kernel")
     schedule = parse_decode_schedule(decode_schedule)
     if schedule is not None and (
-        warp_specialized or paired_boundary is not None or compact_weights or direct_topk_routes
+        warp_specialized or paired_boundary is not None
+        or ((compact_weights or direct_topk_routes) and (
+            schedule.fc1_prefetch_k_tiles or schedule.fc2_prefetch_k_tiles or schedule.phase_prefetch))
     ):
         raise ValueError(
-            "the L2 decode schedule applies to the cooperative packed-route "
-            "kernel with disjoint ownership"
+            "the L2 decode schedule requires cooperative disjoint weights; "
+            "compact and direct routes support evict-first only"
         )
     if input_format not in ("bf16", "e4m3_k32"):
         raise ValueError(f"unsupported mixed Trellis input format {input_format!r}")

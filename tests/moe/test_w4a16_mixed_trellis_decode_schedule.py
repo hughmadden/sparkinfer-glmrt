@@ -75,7 +75,8 @@ def test_decode_schedule_rejects_bad_specs(spec: str) -> None:
     "options",
     [
         {"warp_specialized": True, "moe_block_size": 64},
-        {"direct_topk_routes": True},
+        {"direct_topk_routes": True, "decode_schedule": "l2=2,pf1=1"},
+        {"compact_weights": True, "decode_schedule": "l2=2,pf2=1"},
         {"paired_boundary": "first"},
     ],
 )
@@ -125,6 +126,8 @@ def test_memory_schedule_requires_whole_tile_trellis_routes() -> None:
         )
     with pytest.raises(ValueError, match="L2 weight schedule"):
         _fc2_gemm(direct_topk_routes=True, l2_prefetch_k_tiles=2)
+    direct = _fc2_gemm(direct_topk_routes=True, l2_evict_first_b=True)
+    assert direct.l2_evict_first_b and direct.l2_prefetch_k_tiles == 0
 
 
 def _fused(**options) -> W4A16FusedMoeKernel:

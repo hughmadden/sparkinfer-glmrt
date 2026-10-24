@@ -14,6 +14,7 @@ import dataclasses
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import statistics
@@ -236,6 +237,8 @@ def main() -> None:
     rows_list = [int(v) for v in args.rows.split(",")]
     if not rows_list or any(r < 1 or r > 80 for r in rows_list):
         parser.error("decode rows are 1..80")
+    if args.artifacts is not None:
+        os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
     sms = int(props.multi_processor_count)
