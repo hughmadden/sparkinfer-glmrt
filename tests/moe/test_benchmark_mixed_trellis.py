@@ -153,14 +153,49 @@ def test_compact_prefill_fixture_requires_complete_ownership(tmp_path):
                 projection_counts=[[512, 512, 512], [0, 0, 0]], unit_map_fingerprint="test")
     path = tmp_path / "ownership.json"
     path.write_text(bench.json.dumps(dict(ranks=[rank])))
-    assert len(bench.compact_prefill_fixture(path, 0, "qwen4", 256)["entries"]) == 512
+    assert len(bench.compact_prefill_fixture(path, 0, "qwen4", 256, 512)["entries"]) == 512
     with pytest.raises(ValueError, match="requested rank"):
-        bench.compact_prefill_fixture(path, 1, "qwen4", 256)
+        bench.compact_prefill_fixture(path, 1, "qwen4", 256, 512)
     with pytest.raises(ValueError, match="requires Qwen"):
-        bench.compact_prefill_fixture(path, 0, "kimik3", 256)
+        bench.compact_prefill_fixture(path, 0, "kimik3", 256, 512)
     with pytest.raises(ValueError, match="geometry"):
-        bench.compact_prefill_fixture(path, 0, "qwen4", 128)
+        bench.compact_prefill_fixture(path, 0, "qwen4", 128, 512)
     entries[0]["width"] = 129
     path.write_text(bench.json.dumps(dict(ranks=[rank])))
     with pytest.raises(ValueError, match="live width"):
-        bench.compact_prefill_fixture(path, 0, "qwen4", 256)
+        bench.compact_prefill_fixture(path, 0, "qwen4", 256, 512)
+    entries[0]["width"] = 128
+    with pytest.raises(ValueError, match="geometry"):
+        bench.compact_prefill_fixture(path, 0, "qwen4", 256, 256)
+
+
+def test_compact_glm_fixture_uses_live_width_ownership(tmp_path):
+    bench = _load_benchmark_module()
+    entries = [dict(global_expert=e, combined_local=e, width=384 if e < 85 else 256,
+                    projections=[dict(projection=p, tier=e & 1, bits=4 + (e & 1),
+                                      tier_local=e, payload_word_offset=0)
+                                 for p in ("gate", "up", "down")]) for e in range(256)]
+    rank = dict(rank=2, compiled_max_intermediate=384, experts=entries,
+                projection_counts=[[82, 80, 64], [86, 88, 96]], unit_map_fingerprint="test")
+    path = tmp_path / "glm-ownership.json"
+    path.write_text(bench.json.dumps(dict(ranks=[rank])))
+    fixture = bench.compact_prefill_fixture(path, 2, "glm", 384, 256)
+    assert sorted({e["width"] for e in fixture["entries"]}) == [256, 384]
+    with pytest.raises(ValueError, match="geometry"):
+        bench.compact_prefill_fixture(path, 2, "glm", 384, 512)
+    # Only the TP6 Spark profile ships compact live widths.
+    from types import SimpleNamespace
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    with pytest.raises(ValueError, match="spark-tp6"):
+        bench.coordinator_compile_options("spark-tp4-width512", 4096, {}, props, "glm", compact=True)
+    options = bench.coordinator_compile_options("spark-tp6-width384", 4096, {"mode": "ws"}, props, "glm", compact=True)
+    assert options["compact_weights"] and options["warp_specialized"]
+    assert options["force_tile_config"] == (64, 128, 64, 128)
+    assert options["moe_block_size"] == 32 and not options["token_major_rotation"]
+    baseline = bench.coordinator_compile_options("spark-tp6-width384", 4096, {}, props, "glm", compact=True)
+    assert baseline["moe_block_size"] == 64 and baseline["token_major_rotation"]
+    assert not baseline["warp_specialized"] and baseline["compact_weights"]
+    widened = bench.coordinator_compile_options("spark-tp6-width384", 4096,
+                                                {"mode": "ws", "tile": (64, 128, 64, 256)},
+                                                props, "glm", compact=True)
+    assert widened["force_tile_config"] == (64, 128, 64, 256)
