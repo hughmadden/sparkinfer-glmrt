@@ -35,6 +35,12 @@ GLM 5.x (``glm_moe_dsa``, geometry :data:`GLM53`), programs named ``glm_*``:
                        ``compile_glm_ffn_aot`` (SwiGLU), ``compile_glm_router_scores_aot``,
                        ``compile_glm_expert_input_quant_aot``
 
+Shared by every family:
+
+* ``steer_rows``       ``compile_steer_rows_aot`` (weight-variant ``y -= A (B^T y)``
+                       on BF16 rows, forms ``one`` and ``general``) and
+                       ``compile_add_rows_aot`` (stored-delta ``y += d``)
+
 GLM programs take BF16 weights (FP8 blocks x FP32 scales, dequantized at
 load); tests: ``tests/integration/test_cuteafd_glm_*.py`` against the
 transformers ``modeling_glm_moe_dsa`` modules and golden layer outputs.
