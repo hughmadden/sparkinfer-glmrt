@@ -27,6 +27,9 @@ Two programs: ``one`` (``k_max == 1``; every load issues before the single
 reduction) and ``general`` (``k_max <= 32``; ``j`` in tiles of four). Both
 give identical bits at ``k == 1``. No allocation and no host sync: graph
 capture records the pointers, and replays read the tables' current contents.
+
+``AddRows`` (``add_rows_f32`` / ``add_rows_bf16``) is the stored-delta site:
+``y = bf16_rne(y + d)`` on rows whose variant has ``on[v] != 0``.
 """
 from __future__ import annotations
 
@@ -270,3 +273,93 @@ def compile_steer_rows_aot(form: str = "general"):
     return compile_program(steer_rows_launch(form), name=f"steer_rows_{form}", operands=OPERANDS,
                            scalars=SCALARS, key=tuple(geometry.values()), geometry=geometry,
                            doc=__doc__)
+
+
+# ---------------------------------------------------------------------------
+# Delta rows: y += d on variant rows (stored-delta sites)
+# ---------------------------------------------------------------------------
+
+ADD_THREADS = 256
+
+
+class AddRows:
+    """``y[r][i] = bf16_rne(float(y[r][i]) + float(d[r][i]))`` when ``v = vidx[r] > 0`` and
+    ``on[v] != 0``; every other row is never read or written. One FP32 add and one
+    rounding per element, so the result is exact and batch-invariant.
+
+    Launch ``(y, d, vidx, on, ld_y, ld_d, rows, h, stream)``; ``h`` and both strides
+    are multiples of 8 elements, ``y`` and ``d`` 16-byte aligned. ``d`` is FP32
+    (``delta_bf16=False``) or BF16.
+    """
+
+    def __init__(self, delta_bf16: bool):
+        self.delta_bf16 = bool(delta_bf16)
+
+    @cute.jit
+    def __call__(self, y: cute.Pointer, d: cute.Pointer, vidx: cute.Pointer, on: cute.Pointer,
+                 ld_y: Int64, ld_d: Int64, rows: Int32, h: Int32, stream: cuda.CUstream):
+        if rows > Int32(0):
+            self.kernel(y, d, vidx, on, ld_y, ld_d, h).launch(
+                grid=(rows, 1, 1), block=(ADD_THREADS, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, y: cute.Pointer, d: cute.Pointer, vidx: cute.Pointer, on: cute.Pointer,
+               ld_y: Int64, ld_d: Int64, h: Int32):
+        tid = Int32(cute.arch.thread_idx()[0])
+        row = Int64(cute.arch.block_idx()[0])
+        v = cute.make_tensor(vidx, cute.make_layout(1, stride=1))[row]
+        enabled = Int32(0)
+        if v > Int32(0):
+            enabled = cute.make_tensor(on, cute.make_layout(1, stride=1))[v]
+        if enabled != Int32(0):
+            y_row = Int64(y.toint()) + row * ld_y * Int64(2)
+            element = 2 if self.delta_bf16 else 4
+            d_row = Int64(d.toint()) + row * ld_d * Int64(element)
+            for q in cutlass.range(tid, h // Int32(8), ADD_THREADS):
+                words = ld_global_v4_u32(y_row + Int64(q) * Int64(16))
+                delta = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
+                if cutlass.const_expr(self.delta_bf16):
+                    dw = _ld_cached(d_row + Int64(q) * Int64(16))
+                    for w in cutlass.range_constexpr(4):
+                        delta[2 * w] = _bf16_lo(dw[w])
+                        delta[2 * w + 1] = _bf16_hi(dw[w])
+                else:
+                    lo = _ld_cached(d_row + Int64(q) * Int64(32))
+                    hi = _ld_cached(d_row + Int64(q) * Int64(32) + Int64(16))
+                    for w in cutlass.range_constexpr(4):
+                        delta[w] = u32_as_f32(lo[w])
+                        delta[4 + w] = u32_as_f32(hi[w])
+                o = []
+                for w in range(4):
+                    o.append(_pack_bf16x2(_add(_bf16_lo(words[w]), delta[2 * w]),
+                                          _add(_bf16_hi(words[w]), delta[2 * w + 1])))
+                st_global_v4_u32(y_row + Int64(q) * Int64(16), o[0], o[1], o[2], o[3])
+
+
+ADD_FORMS = {"f32": False, "bf16": True}
+
+
+def add_rows_operands(form: str):
+    return (
+        Operand("y", torch.bfloat16, "[rows,ld_y]", "inout", note="first h columns, in place"),
+        Operand("d", torch.bfloat16 if ADD_FORMS[form] else torch.float32, "[rows,ld_d]"),
+        Operand("vidx", torch.int32, "[rows]", align=4),
+        Operand("on", torch.int32, "[V+1]", align=4),
+    )
+
+
+ADD_SCALARS = (Scalar("ld_y", "int64"), Scalar("ld_d", "int64"), Scalar("rows"), Scalar("h"))
+
+
+def add_rows_launch(form: str) -> AddRows:
+    return AddRows(ADD_FORMS[form])
+
+
+def compile_add_rows_aot(form: str = "f32"):
+    """``form`` is the delta dtype, ``f32`` or ``bf16``; no geometry key."""
+    if form not in ADD_FORMS:
+        raise ValueError("add_rows form must be 'f32' or 'bf16'")
+    geometry = dict(abi_version=1, form=form, threads=ADD_THREADS, hidden_multiple=8)
+    return compile_program(add_rows_launch(form), name=f"add_rows_{form}",
+                           operands=add_rows_operands(form), scalars=ADD_SCALARS,
+                           key=tuple(geometry.values()), geometry=geometry, doc=AddRows.__doc__)

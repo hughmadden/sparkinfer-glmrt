@@ -99,3 +99,26 @@ def test_steer_rows_batch_invariant():
     program.launch(lone, vidx[:1].cuda(), da, db, dk, scalars=[h, 1, h, kk])
     torch.cuda.synchronize()
     assert torch.equal(full[257].view(torch.int16), lone[0].view(torch.int16))
+
+
+@pytest.mark.parametrize("form", ["f32", "bf16"])
+@pytest.mark.parametrize("h,rows", [(4096, 5), (6144, 3), (8, 2)])
+def test_add_rows_bit_exact(form, h, rows):
+    require_b12x()
+    from b12x.integration.cuteafd.steer_rows import compile_add_rows_aot
+    gen = torch.Generator().manual_seed(h + rows)
+    ld_y, ld_d = h + 8, h + 8
+    y = (torch.rand(rows, ld_y, generator=gen) * 6 - 3).bfloat16()
+    d = (torch.rand(rows, ld_d, generator=gen) - 0.5) * 0.1
+    if form == "bf16":
+        d = d.bfloat16()
+    vidx = torch.tensor([1, 2, 0, -1, 3][:rows], dtype=torch.int32)
+    on = torch.tensor([0, 1, 0, 1], dtype=torch.int32)
+    want = y.clone()
+    for r, v in enumerate(vidx.tolist()):
+        if v > 0 and on[v]:
+            want[r, :h] = (y[r, :h].float() + d[r, :h].float()).bfloat16()
+    dy = y.cuda()
+    compile_add_rows_aot(form).launch(dy, d.cuda(), vidx.cuda(), on.cuda(), scalars=[ld_y, ld_d, rows, h])
+    torch.cuda.synchronize()
+    assert torch.equal(dy.cpu().view(torch.int16), want.view(torch.int16))
