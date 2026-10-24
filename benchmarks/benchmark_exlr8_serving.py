@@ -274,6 +274,12 @@ def route_fixture(rows, distribution, generator, wave):
     return ids.cuda().int(), weights.cuda()
 
 
+STAGES = {"ingress": ("_Group",), "fc1": ("fc1_kernel", "grouped_fc1_kernel",
+                                          "fc1_ws_kernel"),
+          "activation": ("activation_kernel",),
+          "fc2": ("fc2_kernel", "grouped_fc2_kernel", "fc2_ws_kernel"),
+          "egress": ("reduce_kernel",)}
+
 LOSSY: dict = {}
 
 
@@ -459,11 +465,12 @@ def main():
                                             for name, value in medians.items()})
             records.append(record)
             print(json.dumps(record), flush=True)
-            if args.profile and "base" in graphs:
+            if args.profile:
                 from benchmark_exlr8_a16 import stage_profile
-                stages = stage_profile(graphs["base"], args.output.parent)
-                print(json.dumps({"stages_us": stages, "rows": rows,
-                                  "distribution": distribution}), flush=True)
+                for name, graph in graphs.items():
+                    stages = stage_profile(graph, args.output.parent, STAGES)
+                    print(json.dumps({"stages_us": stages, "arm": name, "rows": rows,
+                                      "distribution": distribution}), flush=True)
             del graphs
 
     result = dict(
