@@ -6,38 +6,48 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
 
-from b12x._lib.dense_gemm import _DenseGemmLaunch, _DenseGemmPolicy
+from b12x._lib.dense_gemm import _DenseGemmLaunch, _DenseGemmPolicy, _DenseSplitKReduce
 from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch
-from ._linear import Fp8LinearStage, stage_scratch_bytes
+from ._linear import Fp8LinearStage, StoreOne, stage_scratch_bytes
 
 
 class Mxfp8LinearStage(Fp8LinearStage):
-    """K32 E4M3/UE8M0 activations and weights, hardware MXFP8 MMA."""
+    """K32 E4M3/UE8M0 activations and weights, hardware MXFP8 MMA.
 
-    def __init__(self, k, n):
-        self.k, self.n, self.slices = int(k), int(n), 1
+    ``slices`` > 1 splits K into FP32 partial planes summed once (one BF16
+    rounding): decode-sized rows fill one M tile, so only K can widen the
+    grid of a weight-streaming projection past its N/128 tiles.
+    """
+
+    def __init__(self, k, n, slices=1):
+        self.k, self.n, self.slices = int(k), int(n), int(slices)
+        if self.slices < 1 or (self.k // 128) % self.slices:
+            raise ValueError("MXFP8 split-K slices must divide the K/128 tiles")
         self.quant = _MXFP8RowsQuantLaunch(
             self.k, cutlass.BFloat16, 4, 256, 32, False, 0.0, False)
         self.quant_warps = 8
         self.quant_tasks_per_row = (self.k // 32 + 7) // 8
+        self.reduce = _DenseSplitKReduce(self.n, self.slices) if self.slices > 1 else None
+        self.store_one = StoreOne()
         self.gemm = _DenseGemmLaunch(
-            n=self.n, k=self.k, l=1, c_l=1, a_major="k", b_major="k", c_major="n",
+            n=self.n, k=self.k, l=1, c_l=self.slices, a_major="k", b_major="k", c_major="n",
             ab_dtype=cutlass.Float8E4M3FN, sf_dtype=cutlass.Float8E8M0FNU,
-            c_dtype=cutlass.BFloat16, alpha_dtype=cutlass.Float32, sf_vec_size=32,
+            c_dtype=cutlass.Float32 if self.slices > 1 else cutlass.BFloat16,
+            alpha_dtype=cutlass.Float32, sf_vec_size=32,
             mma_k=32, tile_k=128, mma_tiler_mn=(64, 128), cluster_shape_mn=(1, 1),
-            policy=_DenseGemmPolicy(False, False, False, 1, False, False),
+            policy=_DenseGemmPolicy(False, False, False, self.slices, False, False),
             # The single-cluster launch queries runtime_num_sm; this constructor
             # field is unused by generated code and cannot specialize by card.
             sm_count=1, sm_version="sm_120", load_path="tma", swap_ab=False,
             sfb_k_reuse=False, alpha_is_one=True)
 
     def scratch_bytes(self, rows):
-        return stage_scratch_bytes(self.k, self.n, rows)
+        return stage_scratch_bytes(self.k, self.n, rows, self.slices)
 
 
 class Mxfp8Linear:
-    def __init__(self, k, n):
-        self.stage = Mxfp8LinearStage(k, n)
+    def __init__(self, k, n, slices=1):
+        self.stage = Mxfp8LinearStage(k, n, slices)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, payload: cute.Pointer, scales: cute.Pointer,
