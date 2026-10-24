@@ -159,7 +159,8 @@ class _Fp8Switch:
     checkpoint's 128x128 block grid.
 
     ``wide_rows`` raises the decode capacity in row steps (``decode_rows``, ``FP8_DECODE_ROWS``
-    by default); the multi-tile GEMV keeps the thin tile's ``(warps, groups)``.
+    by default); the multi-tile GEMV keeps the thin tile's ``warps`` and takes its column
+    block / tiles per CTA from ``FP8_GEMV_WIDE``.
 
     Prefill programs (``prefill_rows``): rows past ``activation_quant_row_threshold`` run
     the block-FP8 GEMM (``BlockFp8Projection``: E4M3 activations per row and
@@ -197,7 +198,11 @@ class _Fp8Switch:
             # default), so the decode route never changes reduction order with the batch width.
             cap = max(FP8_DECODE_ROWS if decode_rows is None else int(decode_rows), int(wide_rows))
             if cap > FP8_ROWS:
-                self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=cap, warps=warps, groups=groups,
+                from ._fp8_weights import fp8_gemv_wide
+
+                wide_groups, wide_tiles = fp8_gemv_wide(self.n, self.k, groups=groups)
+                self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=cap, warps=warps,
+                                           groups=wide_groups, cta_tiles=wide_tiles,
                                            row_scales=row_scales)
         self.max_fp8_rows = FP8_ROWS if self.fp8_wide is None else cap
 
@@ -1644,8 +1649,13 @@ class _HeadFp8:
         warps, groups = fp8_gemv_tuning(vocab, hidden, warps=4)
         self.gemv = MmaFp8Gemv(vocab, hidden, max_rows=FP8_ROWS, warps=warps, groups=groups,
                                out_dtype=cutlass.Float32, row_scales=True)
-        self.gemv_wide = MmaFp8Gemv(vocab, hidden, max_rows=self.max_rows, warps=warps, groups=groups,
-                                    out_dtype=cutlass.Float32, row_scales=True) if self.max_rows > FP8_ROWS else None
+        from ._fp8_weights import fp8_gemv_wide
+
+        wide_groups, wide_tiles = fp8_gemv_wide(vocab, hidden, groups=groups)
+        self.gemv_wide = MmaFp8Gemv(vocab, hidden, max_rows=self.max_rows, warps=warps,
+                                    groups=wide_groups, cta_tiles=wide_tiles,
+                                    out_dtype=cutlass.Float32, row_scales=True) \
+            if self.max_rows > FP8_ROWS else None
 
     def key(self) -> tuple:
         return self.gemv.key() if self.gemv_wide is None else (self.gemv.key(), self.gemv_wide.key())

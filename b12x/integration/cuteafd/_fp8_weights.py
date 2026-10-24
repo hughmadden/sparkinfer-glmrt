@@ -53,8 +53,9 @@ from b12x._lib.intrinsics import (bf16_mma_m16n8k16_f32, ld_shared_v2_u32, prefe
 
 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_stream
 
-__all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_CONFIG", "FP8_GEMV_GROUPS_DEFAULT", "FP8_GEMV_ROWS", "Fp8Projection",
-           "decode_tile_n", "fp8_gemv_tuning", "MmaFp8Gemv", "RoutedFp8Projection", "TmaFp8Gemm", "check_w8_mode",
+__all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_CONFIG", "FP8_GEMV_GROUPS_DEFAULT", "FP8_GEMV_ROWS", "FP8_GEMV_WIDE",
+           "Fp8Projection",
+           "decode_tile_n", "fp8_gemv_tuning", "fp8_gemv_wide", "MmaFp8Gemv", "RoutedFp8Projection", "TmaFp8Gemm", "check_w8_mode",
            "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps", "projection", "w8_scalars"]
 
 
@@ -63,8 +64,9 @@ __all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_CONFIG", "FP8_GEMV_GROUPS_DEFAULT", "FP8
 FP8_GEMV_ROWS = 16
 # Row capacity every decode program reads the FP8 weights through one canonical
 # GEMV reduction up to, unless the caller declares its own. The multi-tile GEMV
-# tiles carry the thin tile's (warps, groups), so the switch at FP8_GEMV_ROWS is
-# a reduction-order-preserving split of the same K walk.
+# tiles carry the thin tile's warps and only move the column block / tiles per
+# CTA (``FP8_GEMV_WIDE``), so the switch at FP8_GEMV_ROWS is a grid split of the
+# same K walk, bitwise.
 FP8_DECODE_ROWS = 64
 
 
@@ -87,8 +89,9 @@ class RoutedFp8Projection:
     GEMM over ``w_bf16`` (the same weight dequantized) above; the branch is
     on the ``rows`` scalar.
 
-    Both GEMV tiles are built with one ``warps``/``groups``, so a row's bits do
-    not move when the batch crosses the ``FP8_GEMV_ROWS`` tile boundary."""
+    Both GEMV tiles are built with one ``warps``, so a row's bits do not move when
+    the batch crosses the ``FP8_GEMV_ROWS`` tile boundary; the wide tile's column
+    block and tiles per CTA come from ``FP8_GEMV_WIDE`` (a grid split)."""
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, decode_rows: int | None = None):
         self.n, self.k = int(n), int(k)
@@ -99,8 +102,9 @@ class RoutedFp8Projection:
         warps, groups = fp8_gemv_tuning(self.n, self.k)
         self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_GEMV_ROWS, warps=warps, groups=groups,
                               out_dtype=out_dtype)
+        wide_groups, wide_tiles = fp8_gemv_wide(self.n, self.k, groups=groups)
         self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=self.decode_rows, warps=warps,
-                                   groups=groups, out_dtype=out_dtype) \
+                                   groups=wide_groups, cta_tiles=wide_tiles, out_dtype=out_dtype) \
             if self.decode_rows > FP8_GEMV_ROWS else None
         self.max_fp8_rows = self.decode_rows
         self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=())
@@ -204,11 +208,15 @@ class Fp8Projection:
             # on the TMA route (whose K order differs).
             cap = max(FP8_DECODE_ROWS if decode_rows is None else int(decode_rows), int(wide_rows),
                       int(gemv_rows))
-            if (warps if wide_warps is None else int(wide_warps),
-                    groups if wide_groups is None else int(wide_groups)) != (warps, groups):
-                raise ValueError("the wide GEMV tile must keep the thin tile's warps and groups: "
-                                 "one K order covers the decode range")
-            self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=cap, warps=warps, groups=groups,
+            if (warps if wide_warps is None else int(wide_warps)) != warps:
+                raise ValueError("the wide GEMV tile must keep the thin tile's warps: they set "
+                                 "the K split, and one order covers the decode range")
+            # Columns per CTA and tiles per CTA only partition the launch grid, so the wide
+            # tile may use the shape's measured wide entry without moving a single bit.
+            wide_g, wide_t = fp8_gemv_wide(self.n, self.k, groups=groups)
+            self.gemv_wide = MmaFp8Gemv(self.n, self.k, max_rows=cap, warps=warps,
+                                        groups=wide_g if wide_groups is None else int(wide_groups),
+                                        cta_tiles=wide_t if wide_groups is None else None,
                                         row_scales=self.row_scales, kmajor=self.kmajor,
                                         out_dtype=out_dtype) if cap > int(gemv_rows) else None
             self.gemv_rows = int(gemv_rows)
@@ -357,6 +365,50 @@ FP8_GEMV_CONFIG = {
 # above; the per-shape entries already ship it, so this only covers shapes nobody has
 # measured yet, and it flips to 1 (a whole-table default) once the duel ends.
 FP8_GEMV_GROUPS_DEFAULT = 4
+# The rows 17..64 tile (``max_rows=64``) is a different regime: it re-reads the activation
+# rows once per column block and covers 2-4 row tiles per CTA, so the 8-column block that
+# wins at decode rows loses here. ``FP8_GEMV_WIDE`` is shape -> (groups, cta_tiles); a shape
+# it does not name keeps the thin tile's groups and the ``gemv_cta_tiles`` rule, which is
+# never slower than anything measured. Ratio to that shipped wide tile, RTX PRO 6000 at
+# 325 W, L2-cold read-only eviction, one session, at 32/48/64 rows (row-scale cells are the
+# per-row-scale FP32 grid these shapes ship; block-scale cells the 128x128 grid):
+#   qkv 34816x5120 (2,4) 1.045/1.104/1.148 -- the column block that wins at one row loses
+#   here, and four tiles keep the 64-row step to one 178 MiB read;
+#   o 5120x17408 (1,1) 1.195/1.079/1.054 -- few column CTAs, so a CTA band per 16 rows
+#   fills the machine and the doubled weight read is still cheaper than the idle SM time;
+#   gate_up 16384x5120 keeps shipped: every arm measured 0.84-1.00;
+#   KDA in 24896x4096 keeps shipped: 0.976-0.984 at 32/48 rows for the 4-tile arms;
+#   KDA o 4096x8192 keeps shipped: 0.65-1.00, best is the shipped tile at 64 rows;
+#   MLA o 4096x16384 (2,2) block 1.000/1.084/1.455, row-scale 1.023/1.500;
+#   q_b 16384x1536 keeps shipped: 0.87-1.06;
+#   qkv_a 2048x4096 (1,2) 1.063/1.223/1.445;
+#   shared gate_up 4096x4096 (2,4) 1.100/1.077/1.031;
+#   shared down 4096x2048 (1,1) 1.429/1.748/1.889;
+#   dense gate_up 24576x4096 (2,4) 1.000/1.062/1.089;
+#   dense down 4096x12288 keeps shipped: 0.63-1.00;
+#   FP32 head 154880x4096 (2,4) block 0.995/1.083/1.155, row-scale 0.990/1.127 (32 rows is
+#   2 us on 410, inside the +-0.5% session spread the same cell shows);
+#   MiMo qkv 13568x4096 (2,2) block 1.000/1.051/1.400, row-scale 1.032/1.043;
+#   SWA qkv 14848x4096 (1,2) block 1.113/1.024/1.062, row-scale 1.150/1.031;
+#   dense gate_up 32768x4096 keeps shipped: 0.981 at 32 rows for every 4-tile arm;
+#   LM head 152576x4096 (2,4) block 0.995/1.092/1.164, row-scale 0.995/1.108.
+# Every entry keeps the thin tile's ``warps``: ``groups`` and ``cta_tiles`` only partition
+# the launch grid, so the rows 16 -> 17 program switch is still one bitwise K order.
+FP8_GEMV_WIDE = {
+    (34816, 5120): (2, 4), (5120, 17408): (1, 1),
+    (4096, 16384): (2, 2), (2048, 4096): (1, 2), (4096, 4096): (2, 4), (4096, 2048): (1, 1),
+    (24576, 4096): (2, 4), (154880, 4096): (2, 4),
+    (13568, 4096): (2, 2), (14848, 4096): (1, 2), (152576, 4096): (2, 4),
+}
+
+
+def fp8_gemv_wide(n: int, k: int, *, groups: int) -> tuple[int, int | None]:
+    """``MmaFp8Gemv`` ``(groups, cta_tiles)`` for the rows 17..64 tile of an ``N x K``
+    projection: the measured per-shape entry, else the thin tile's ``groups`` and the shape
+    rule's tile count. ``warps`` stays the thin tile's -- it is the K split, and one order
+    has to cover the whole decode range."""
+    entry = FP8_GEMV_WIDE.get((int(n), int(k)))
+    return entry if entry is not None else (int(groups), None)
 
 
 def fp8_gemv_tuning(n: int, k: int, *, warps: int | None = None) -> tuple[int, int]:
@@ -750,7 +802,8 @@ class MmaFp8Gemv:
 
     def __init__(self, n: int, k: int, *, max_rows: int = 64, warps: int = 4, groups: int = 4,
                  out_dtype=cutlass.BFloat16, row_scales: bool = False, kmajor: bool = False,
-                 load_hint: str = "stream", prefetch_blocks: int = 0, prefetch_bytes: int = 1024):
+                 load_hint: str = "stream", prefetch_blocks: int = 0, prefetch_bytes: int = 1024,
+                 cta_tiles: int | None = None):
         if load_hint not in ("stream", "l2_128b", "l2_256b"):
             raise ValueError("load_hint is stream, l2_128b or l2_256b")
         if prefetch_blocks and (prefetch_bytes % 128 or prefetch_bytes > 4096):
@@ -766,8 +819,12 @@ class MmaFp8Gemv:
         self.warps, self.groups = int(warps), int(groups)
         self.cols = 8 * self.groups
         self.total_m_tiles = (int(max_rows) + 15) // 16
-        self.m_tiles = min(self.total_m_tiles, gemv_cta_tiles(self.n, self.k, groups=self.groups,
-                                                             warps=self.warps))
+        # ``cta_tiles`` pins the 16-row tiles one CTA holds; unset, the shape rule
+        # decides. A CTA with fewer tiles covers fewer rows, so a wide batch splits
+        # across more CTAs (and re-reads the weights per band).
+        self.m_tiles = min(self.total_m_tiles,
+                           gemv_cta_tiles(self.n, self.k, groups=self.groups, warps=self.warps)
+                           if cta_tiles is None else max(1, int(cta_tiles)))
         self.multi_m_grid = self.total_m_tiles > self.m_tiles
         self.out_dtype = out_dtype
         if self.n % self.cols or 128 % self.cols or self.k % (128 * self.warps):
