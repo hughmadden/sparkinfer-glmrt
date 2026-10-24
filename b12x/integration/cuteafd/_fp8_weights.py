@@ -53,9 +53,9 @@ from b12x._lib.intrinsics import (bf16_mma_m16n8k16_f32, ld_shared_v2_u32, prefe
 
 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_stream
 
-__all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_ROWS", "Fp8Projection", "decode_tile_n", "MmaFp8Gemv", "RoutedFp8Projection",
-           "TmaFp8Gemm", "check_w8_mode", "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps",
-           "projection", "w8_scalars"]
+__all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_CONFIG", "FP8_GEMV_GROUPS_DEFAULT", "FP8_GEMV_ROWS", "Fp8Projection",
+           "decode_tile_n", "fp8_gemv_tuning", "MmaFp8Gemv", "RoutedFp8Projection", "TmaFp8Gemm", "check_w8_mode",
+           "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps", "projection", "w8_scalars"]
 
 
 # Most decode rows ``MmaFp8Gemv``'s thin tile computes (its M-tile ceiling): the
@@ -96,10 +96,12 @@ class RoutedFp8Projection:
         self.decode_rows = FP8_DECODE_ROWS if decode_rows is None else int(decode_rows)
         if self.decode_rows < FP8_GEMV_ROWS:
             raise ValueError(f"an FP8 projection covers at least {FP8_GEMV_ROWS} rows")
-        warps = gemv_warps(self.k)
-        self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_GEMV_ROWS, warps=warps, out_dtype=out_dtype)
+        warps, groups = fp8_gemv_tuning(self.n, self.k)
+        self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_GEMV_ROWS, warps=warps, groups=groups,
+                              out_dtype=out_dtype)
         self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=self.decode_rows, warps=warps,
-                                   out_dtype=out_dtype) if self.decode_rows > FP8_GEMV_ROWS else None
+                                   groups=groups, out_dtype=out_dtype) \
+            if self.decode_rows > FP8_GEMV_ROWS else None
         self.max_fp8_rows = self.decode_rows
         self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=())
 
@@ -169,7 +171,7 @@ class Fp8Projection:
 
     def __init__(self, n: int, k: int, *, prefill_rows: int | None = None, row_scales: bool = False,
                  kmajor: bool = False, gemv_rows: int = 16, wide_rows: int = 0, warps: int | None = None,
-                 groups: int = 4, prefill_mask: int = 0xFF, out_dtype=cutlass.BFloat16,
+                 groups: int | None = None, prefill_mask: int = 0xFF, out_dtype=cutlass.BFloat16,
                  wide_warps: int | None = None, wide_groups: int | None = None,
                  decode_rows: int | None = None):
         self.n, self.k = int(n), int(k)
@@ -192,8 +194,9 @@ class Fp8Projection:
                                     compute_warps=8, num_stages=3, out_dtype=out_dtype)
             self.max_gemv_rows = 0
         else:
-            warps = gemv_warps(self.k) if warps is None else int(warps)
-            groups = int(groups)
+            tuning_warps, tuning_groups = fp8_gemv_tuning(self.n, self.k)
+            warps = tuning_warps if warps is None else int(warps)
+            groups = tuning_groups if groups is None else int(groups)
             self.gemv = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows), warps=warps, groups=groups,
                                    row_scales=self.row_scales, kmajor=self.kmajor, out_dtype=out_dtype)
             # The decode capacity: FP8_DECODE_ROWS unless the caller exports its program wider;
@@ -321,6 +324,48 @@ def gemv_warps(k: int) -> int:
     dense gate/up 98/98/100 vs 104/104/106), longer and shorter K take 4
     (o_proj 68/70/76 vs 76/76/80; dense down 53/57/63 vs 57/59/59)."""
     return 8 if int(k) == 6144 else 4
+
+
+# Most decode columns one ``MmaFp8Gemv`` CTA owns: ``8 * groups``. The GEMV is weight-stream
+# bound at decode rows, so the smallest block (8 columns, 4x the CTAs) measured best on every
+# shape of the shared FP8 decode census (#703: dense Qwen 3.8, GLM 5.3 Flash, MiMo V2) and is
+# the fallback for a shape the table does not name. ``FP8_GEMV_CONFIG`` keeps the per-shape
+# ``warps`` -- it sets the K split and the cross-warp fold, so it is part of the numerics --
+# with the measured ``groups``.
+FP8_GEMV_CONFIG = {
+    # Dense Qwen 3.8 27B: (4, 4) -> (4, 1), one row / 16 rows, us, RTX PRO 6000 at 325 W,
+    # L2-cold read-only eviction: qkv 34816x5120 137.2/133.1 -> 114.7/118.8 (1.20/1.12x),
+    # o 5120x17408 69.6/86.0 -> 61.5/75.8 (1.13/1.13x), gate_up 16384x5120 66.6/65.5 ->
+    # 57.3/61.4 (1.16/1.07x); 1299-1463 -> 1463-1554 GB/s of 1.79 TB/s.
+    (34816, 5120): (4, 1), (5120, 17408): (4, 1), (16384, 5120): (4, 1),
+    # GLM 5.3 Flash, block scales, shipped (warps, groups) -> (warps, 1), one row / 16 rows:
+    # KDA in 24896x4096 69.6/71.7 -> 67.6/69.6, KDA o 4096x8192 26.6/28.7 -> 24.6/28.7, MLA o
+    # 4096x16384 59.4/61.4 -> 49.2/61.4, q_b 16384x1536 20.5/22.5 -> 20.5/22.5, qkv_a
+    # 2048x4096 12.3/12.3 -> 10.2/12.3, shared gate_up 4096x4096 14.3/16.4 -> 14.3/16.4,
+    # shared down 4096x2048 12.3/14.3 -> 12.3/12.3, dense gate_up 24576x4096 69.6/71.7 ->
+    # 67.6/69.6, dense down 4096x12288 36.9/42.0 -> 36.8/39.9, FP32 head 154880x4096
+    # 392.2/393.2 -> 391.2/393.2.
+    (24896, 4096): (8, 1), (4096, 8192): (8, 1), (4096, 16384): (4, 1), (16384, 1536): (2, 1),
+    (2048, 4096): (8, 1), (4096, 4096): (8, 1), (4096, 2048): (2, 1), (24576, 4096): (8, 1),
+    (4096, 12288): (8, 1), (154880, 4096): (8, 1),
+    # MiMo V2 Flash, per-row scales: full qkv 13568x4096 43.0/47.1 -> 38.9/43.0, SWA qkv
+    # 14848x4096 45.1/50.2 -> 43.0/47.1, dense gate_up 32768x4096 88.1/90.1 -> 88.1/90.1,
+    # LM head 152576x4096 386.0/388.1 -> 385.0/387.1.
+    (13568, 4096): (2, 1), (14848, 4096): (2, 1), (32768, 4096): (8, 1), (152576, 4096): (8, 1),
+}
+# The 8-column block a shape outside the table gets. The duel measured 1 on all 18 shapes
+# above; the per-shape entries already ship it, so this only covers shapes nobody has
+# measured yet, and it flips to 1 (a whole-table default) once the duel ends.
+FP8_GEMV_GROUPS_DEFAULT = 4
+
+
+def fp8_gemv_tuning(n: int, k: int, *, warps: int | None = None) -> tuple[int, int]:
+    """``MmaFp8Gemv`` ``(warps, groups)`` for an ``N x K`` decode projection: the measured
+    per-shape entry, else ``warps`` (default ``gemv_warps(k)``) with the default column block."""
+    entry = FP8_GEMV_CONFIG.get((int(n), int(k)))
+    if entry is not None:
+        return entry
+    return (gemv_warps(k) if warps is None else int(warps)), FP8_GEMV_GROUPS_DEFAULT
 
 
 def gemv_cta_tiles(n: int, k: int, *, groups: int, warps: int) -> int:
