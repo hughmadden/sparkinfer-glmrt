@@ -1079,7 +1079,7 @@ class _MlaProducerW8(_MlaProducer):
     """The MLA producer over FP8-only ``q_a|kv_a`` and ``q_b`` (``Fp8Projection``)."""
 
     def __init__(self, g: GLMFGeometry, max_rows: int, prefill: bool):
-        super().__init__(g, False, max_rows)
+        super().__init__(g, "prefill" if prefill else False, max_rows)
         prefill_rows = int(max_rows) if prefill else None
         self.qkv_a = _w8(g.qkv_a_width, g.hidden, prefill_rows)
         self.q_b = _w8(g.heads * g.qk_head_dim, g.q_lora_rank, prefill_rows)
@@ -1579,7 +1579,7 @@ class _GlmfOutputFp8(_GlmfOutput):
 
 class _GlmfOutputW8(_GlmfOutput):
     def __init__(self, g: GLMFGeometry, max_rows: int, prefill: bool):
-        super().__init__(g, False, max_rows)
+        super().__init__(g, "prefill" if prefill else False, max_rows)
         self.o = _w8(g.hidden, self.width, int(max_rows) if prefill else None)
 
     def key(self) -> tuple:

@@ -172,6 +172,30 @@ def test_production_batched_callers_do_not_implicitly_enable_weight_policy():
     assert len(enabled) == 2
 
 
+@pytest.mark.parametrize("name", ["_MlaProducerW8", "_GlmfOutputW8"])
+@pytest.mark.parametrize("prefill", [False, True])
+def test_flash_mla_w8_constructor_preserves_prefill_mode(name, prefill):
+    source = SOURCE.with_name("glmf.py")
+    tree = ast.parse(source.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
+    constructor = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+
+    class Parent:
+        def __init__(self, g, mode, max_rows):
+            self.parent_args = (g, mode, max_rows)
+            self.width = g.heads * g.v_head_dim
+
+    namespace = dict(Parent=Parent, GLMFGeometry=SimpleNamespace, _w8=lambda *args: args)
+    wrapper = ast.ClassDef(name="Core", bases=[ast.Name(id="Parent", ctx=ast.Load())],
+                          keywords=[], body=[constructor], decorator_list=[])
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])),
+                 str(source), "exec"), namespace)
+    geometry = SimpleNamespace(heads=64, v_head_dim=256, hidden=6144,
+                               qkv_a_width=2048, qk_head_dim=256, q_lora_rank=1024)
+    core = namespace["Core"](geometry, 64, prefill)
+    assert core.parent_args == (geometry, "prefill" if prefill else False, 64)
+
+
 @pytest.mark.parametrize("capacity", [1, 16, 64, 128, 1408, 2048, 4096])
 @pytest.mark.parametrize("prefill", [False, True])
 def test_flash_mla_weight_policy_only_measured_decode(capacity, prefill):
