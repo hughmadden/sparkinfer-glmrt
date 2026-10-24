@@ -125,6 +125,61 @@ def variants_for(kind: str, n: int, k: int, rows: int) -> list[dict]:
         for blocks, nbytes in ((4, 512), (8, 1024), (8, 2048)):
             out.append(dict(name=f"pf{blocks}x{nbytes}", warps=warps, groups=4,
                             prefetch_blocks=blocks, prefetch_bytes=nbytes))
+    if kind == "gem":
+        # Round 4: my groups=1 rule against the opponent's vendored kernel (16-byte
+        # nc loads + pipelined widen/MMA), measured in one harness so the ratio is
+        # meaningful. Their rule picks groups and cta_tiles from runtime SM/L2;
+        # ``gem_g1_*`` pins their load path to my column width so the two
+        # improvements are separable.
+        from b12x.integration.cuteafd._fp8_duel_candidate import (
+            candidate_gemv_cta_tiles, candidate_gemv_groups)
+
+        def legal(g):
+            return 128 % (8 * g) == 0 and n % (8 * g) == 0 and n // (8 * g) >= 2
+
+        warps, groups = _shipped_config().get((n, k), (gemv_warps(k), 4))
+        out = [dict(name="baseline", warps=warps, groups=groups)]
+        if groups != 1 and legal(1):
+            out.append(dict(name="mine_g1", warps=warps, groups=1))
+        if groups != 4 and legal(4):
+            out.append(dict(name="shipped_g4", warps=warps, groups=4))
+        gg = candidate_gemv_groups(n, k, warps=warps, groups=groups)
+        gt = candidate_gemv_cta_tiles(n, k, groups=gg, warps=warps)
+        out.append(dict(name=f"gem_rule_g{gg}_t{gt}", warps=warps, groups=gg,
+                        cta_tiles=gt, kernel="candidate"))
+        # Their isolation arm (round-4 addendum): their loads/pipeline at my column
+        # width and one 16-row tile per CTA.
+        if legal(1):
+            out.append(dict(name="gem_g1_t1", warps=warps, groups=1,
+                            cta_tiles=1, kernel="candidate"))
+        for g in (1, 2):
+            if legal(g):
+                out.append(dict(name=f"gem_g{g}_t4", warps=warps, groups=g,
+                                cta_tiles=4, kernel="candidate"))
+        return out
+    if kind == "wide":
+        # The 17-64-row program (``max_rows=64``): production's tile count per CTA is
+        # the knob that matters here, so hold the shipped warps and sweep (groups,
+        # cta_tiles) on the production kernel; the opponent's kernel stays as the
+        # reference for its load path at the same tiling.
+        from b12x.integration.cuteafd._fp8_duel_candidate import candidate_gemv_groups
+
+        def legal(g):
+            return 128 % (8 * g) == 0 and n % (8 * g) == 0 and n // (8 * g) >= 2
+
+        warps, groups = _shipped_config().get((n, k), (gemv_warps(k), 4))
+        out = [dict(name="baseline", warps=warps, groups=groups)]
+        for g, t in ((1, 1), (1, 2), (2, 2), (2, 4), (4, 4), (4, 2)):
+            if legal(g):
+                out.append(dict(name=f"prod_g{g}_t{t}", warps=warps, groups=g, cta_tiles=t))
+        gg = candidate_gemv_groups(n, k, warps=warps, groups=groups)
+        if legal(gg):
+            out.append(dict(name=f"gem_rule_g{gg}_t4", warps=warps, groups=gg,
+                            cta_tiles=4, kernel="candidate"))
+        if legal(1):
+            out.append(dict(name="gem_g1_t1", warps=warps, groups=1, cta_tiles=1,
+                            kernel="candidate"))
+        return out
     if kind == "combo":
         # Round-2 grid: the two independent winners (column count per CTA, weight
         # fetch size) and their product, plus the extreme small-CTA arm.
@@ -145,13 +200,21 @@ def _compile(n: int, k: int, rows: int, cfg: dict, row_scales: bool = False):
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     from b12x.integration.cuteafd._fp8_weights import MmaFp8Gemv
 
-    kwargs = dict(max_rows=max(16, rows), warps=cfg["warps"], groups=cfg["groups"],
+    # Production builds two programs per projection: ``max_rows=16`` for the thin
+    # batch and ``max_rows=decode_rows`` (64) for a wider one. Matching that here
+    # makes the ``rows=32/64`` cells the program the engine actually launches.
+    cap = 16 if rows <= 16 else 64
+    kwargs = dict(max_rows=cap, warps=cfg["warps"], groups=cfg["groups"],
                   out_dtype=cutlass.BFloat16, row_scales=row_scales)
     scale_shape = f"[{n},{k // 128}]" if row_scales else f"[{n // 128},{k // 128}]"
-    for extra in ("load_hint", "prefetch_blocks", "prefetch_bytes"):
+    for extra in ("load_hint", "prefetch_blocks", "prefetch_bytes", "cta_tiles"):
         if extra in cfg:
             kwargs[extra] = cfg[extra]
-    op = MmaFp8Gemv(n, k, **kwargs)
+    cls = MmaFp8Gemv
+    if cfg.get("kernel") == "candidate":
+        from b12x.integration.cuteafd._fp8_duel_candidate import CandidateMmaFp8Gemv
+        cls = CandidateMmaFp8Gemv
+    op = cls(n, k, **kwargs)
     program = compile_program(op, name=f"duel_{cfg['name']}_{n}x{k}", operands=(
         Operand("x", torch.bfloat16, f"[rows,{k}]"), Operand("w", torch.float8_e4m3fn, f"[{n},{k}]"),
         Operand("s", torch.float32, scale_shape, align=4),
@@ -166,7 +229,7 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
     gen = torch.Generator(device="cuda").manual_seed(seed)
     l2 = torch.cuda.get_device_properties(0).L2_cache_size
     flush = torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
-    x = torch.randn(16, k, device="cuda", generator=gen).bfloat16()
+    x = torch.randn(max(16, rows, rows2), k, device="cuda", generator=gen).bfloat16()
     w = (torch.randn(n, k, device="cuda", generator=gen) * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
     if row_scales:
         s = torch.rand(n, k // 128, device="cuda", generator=gen) * 2e-4 + 1e-4
@@ -215,6 +278,8 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
             rec = dict(case=f"fp8gemv_{spec}", rows=rows, variant=cfg["name"],
                        warps=cfg["warps"], groups=cfg["groups"],
                        load_hint=cfg.get("load_hint", "stream"),
+                       kernel=cfg.get("kernel", "production"),
+                       cta_tiles=cfg.get("cta_tiles"),
                        median_us=round(median, 3), min_us=round(best, 3),
                        weight_gbps=round(n * k / median / 1e3, 1),
                        median_read_us=round(median_read, 3),
@@ -230,8 +295,12 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
             records.append(dict(case=f"fp8gemv_{spec}", rows=rows, variant=cfg["name"],
                                 error=repr(exc)[:400]))
         torch.cuda.empty_cache()
-    base = next(rec for rec in records
-                if rec["variant"] == "baseline" and "median_us" in rec)
+    base = next((rec for rec in records
+                 if rec["variant"] == "baseline" and "median_us" in rec), None)
+    if base is None:
+        for rec in records:
+            rec["error"] = rec.get("error", "no baseline") + " | no usable baseline"
+        return records
     for rec in records:
         if "median_us" not in rec:
             continue
@@ -251,7 +320,7 @@ def main():
     parser.add_argument("--shapes", default="qwen", help=f"{','.join(SETS)}, or a semicolon list of NxK")
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--variants", default="groups",
-                        choices=("groups", "groups_wide", "hints", "depth", "combo", "prod"))
+                        choices=("groups", "groups_wide", "hints", "depth", "combo", "prod", "gem", "wide"))
     parser.add_argument("--flush", default="zero", choices=("zero", "read"))
     parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--seed", type=int, default=408)
