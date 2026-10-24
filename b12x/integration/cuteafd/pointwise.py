@@ -72,13 +72,18 @@ def _dtype(value):
     return value
 
 
+# Strided loads a wide norm row issues before accumulating them in order.
+_NORM_GROUP = 32
+
+
 class AffineNorm:
     """One warp per head; native D192 Q/K uses the deployed fixed lane fold.
 
     Inputs/weights are typed by the ABI. D192/R64: 16 logical lanes, each
     three adjacent four-value vectors. D192/R192: 32 lanes, eight contiguous
     values with zero padding. Both use ascending XOR reduction and FMA lanes.
-    Other norms use a fixed striped scalar sum independent of live rows.
+    Other norms use a fixed striped scalar sum independent of live rows; wide
+    unrotated rows (multiples of 1024) load it in groups, with the same order.
     """
     def __init__(self, width, heads, eps, zero_centered, subtract_mean, bias, rotary):
         if width <= 0 or heads <= 0 or rotary < 0 or rotary > width or rotary % 2:
@@ -89,6 +94,10 @@ class AffineNorm:
         self.width, self.heads, self.eps = int(width), int(heads), float(eps)
         self.zero_centered, self.subtract_mean, self.bias = zero_centered, subtract_mean, bias
         self.rotary = int(rotary)
+        # No lane runs past such a row, so the per-chunk guard goes and a
+        # group's loads issue together: a 6144-wide decode row otherwise
+        # waits out one dependent global load per chunk (64 us per row).
+        self.grouped = self.rotary == 0 and self.width % (32 * _NORM_GROUP) == 0
 
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, bias: cute.Pointer,
@@ -132,6 +141,14 @@ class AffineNorm:
                 if dim < Int32(192):
                     v = Float32(x[base + Int64(dim)])
                 squares = _fma(v, v, squares)
+        elif cutlass.const_expr(self.grouped):
+            for group in cutlass.range_constexpr(self.width // (32 * _NORM_GROUP)):
+                held = []
+                for i in cutlass.range_constexpr(_NORM_GROUP):
+                    held.append(Float32(x[base + Int64((group * _NORM_GROUP + i) * 32) + Int64(lane)]))
+                for v in held:
+                    squares = _add(squares, _mul(v, v))
+                    total = _add(total, v)
         else:
             for chunk in cutlass.range_constexpr((self.width + 31) // 32):
                 dim = Int32(chunk * 32) + lane
@@ -146,24 +163,39 @@ class AffineNorm:
             mean = div_rn_f32(_warp_sum(total), Float32(self.width))
             variance = _sub(variance, _mul(mean, mean))
         inv = rsqrt_approx_ftz_f32(_add(variance, Float32(self.eps)))
-        for chunk in cutlass.range_constexpr((self.width + 31) // 32):
-            dim = Int32(chunk * 32) + lane
-            if dim < Int32(self.width):
-                value = self._normalized(x, weight, bias, base, dim, mean, inv)
-                if cutlass.const_expr(self.rotary > 0):
-                    half = Int32(self.rotary // 2)
-                    if dim < Int32(self.rotary):
-                        pair = dim % half
-                        real = self._normalized(x, weight, bias, base, pair, mean, inv)
-                        imag = self._normalized(x, weight, bias, base, pair + half, mean, inv)
-                        position = Int64(positions[row])
-                        cache_at = position * Int64(self.rotary // 2) + Int64(pair)
-                        c, s = Float32(cos[cache_at]), Float32(sin[cache_at])
-                        if dim < half:
-                            value = _sub(_mul(real, c), _mul(imag, s))
-                        else:
-                            value = _fma(real, s, _mul(imag, c))
-                out[base + Int64(dim)] = value.to(BFloat16)
+        if cutlass.const_expr(self.grouped):
+            # _normalized's arithmetic, with the group's loads issued first.
+            for group in cutlass.range_constexpr(self.width // (32 * _NORM_GROUP)):
+                held = []
+                for i in cutlass.range_constexpr(_NORM_GROUP):
+                    dim = Int32((group * _NORM_GROUP + i) * 32) + lane
+                    held.append((dim, Float32(x[base + Int64(dim)]), Float32(weight[dim])))
+                for dim, v, w in held:
+                    if cutlass.const_expr(self.zero_centered):
+                        w = _add(w, Float32(1.0))
+                    value = _mul(_mul(_sub(v, mean), inv), w)
+                    if cutlass.const_expr(self.bias):
+                        value = _add(value, Float32(bias[dim]))
+                    out[base + Int64(dim)] = _bf16(value).to(BFloat16)
+        else:
+            for chunk in cutlass.range_constexpr((self.width + 31) // 32):
+                dim = Int32(chunk * 32) + lane
+                if dim < Int32(self.width):
+                    value = self._normalized(x, weight, bias, base, dim, mean, inv)
+                    if cutlass.const_expr(self.rotary > 0):
+                        half = Int32(self.rotary // 2)
+                        if dim < Int32(self.rotary):
+                            pair = dim % half
+                            real = self._normalized(x, weight, bias, base, pair, mean, inv)
+                            imag = self._normalized(x, weight, bias, base, pair + half, mean, inv)
+                            position = Int64(positions[row])
+                            cache_at = position * Int64(self.rotary // 2) + Int64(pair)
+                            c, s = Float32(cos[cache_at]), Float32(sin[cache_at])
+                            if dim < half:
+                                value = _sub(_mul(real, c), _mul(imag, s))
+                            else:
+                                value = _fma(real, s, _mul(imag, c))
+                    out[base + Int64(dim)] = value.to(BFloat16)
 
 
 class RuntimeAffineNorm(AffineNorm):
