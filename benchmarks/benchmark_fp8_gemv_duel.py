@@ -86,6 +86,17 @@ def variants_for(kind: str, n: int, k: int, rows: int) -> list[dict]:
         for blocks, nbytes in ((4, 512), (8, 1024), (8, 2048)):
             out.append(dict(name=f"pf{blocks}x{nbytes}", warps=warps, groups=4,
                             prefetch_blocks=blocks, prefetch_bytes=nbytes))
+    if kind == "combo":
+        # Round-2 grid: the two independent winners (column count per CTA, weight
+        # fetch size) and their product, plus the extreme small-CTA arm.
+        for groups, hint, tag in ((2, "stream", "g2"), (4, "l2_256b", "h256"),
+                                  (2, "l2_256b", "g2+h256"), (1, "l2_256b", "g1+h256"),
+                                  (1, "stream", "g1")):
+            if 128 % (8 * groups) == 0 and n % (8 * groups) == 0 and n // (8 * groups) >= 2:
+                cfg = dict(name=tag, warps=warps, groups=groups)
+                if hint != "stream":
+                    cfg["load_hint"] = hint
+                out.append(cfg)
     return out
 
 
@@ -108,7 +119,8 @@ def _compile(n: int, k: int, rows: int, cfg: dict):
     return op, program
 
 
-def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mode: str = "zero") -> list[dict]:
+def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mode: str = "zero",
+              rows2: int = 16) -> list[dict]:
     import torch
     n, k = (int(v) for v in spec.split("x"))
     gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -122,7 +134,7 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
         try:
             op, program = _compile(n, k, rows, cfg)
             out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
-            out16 = torch.empty(16, n, device="cuda", dtype=torch.bfloat16)
+            wide = torch.empty(rows2, n, device="cuda", dtype=torch.bfloat16)
 
             def run(program=program, out=out, rows=rows):
                 program.launch(x, w, s, out, scalars=(rows,))
@@ -130,25 +142,47 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
             median, best, digest = _time(run, samples, flush, [out], flush_mode)
             median_read, best_read, digest_read = _time(run, samples, flush, [out], "read")
             assert digest_read == digest, "output bits moved with the eviction mode"
-            # Row invariance inside this variant: row 0 at M=1 vs row 0 embedded at M=16.
-            def run16(program=program, out=out16):
-                program.launch(x, w, s, out16, scalars=(16,))
 
-            run16()
+            # The same program at a wider batch (max_rows covers both): the wide
+            # batch is where ``live_tiles`` and the fragment budget start to bite.
+            wide_rec = {}
+            if rows2 != rows:
+                def run_wide(program=program, dest=wide, rows2=rows2):
+                    program.launch(x, w, s, dest, scalars=(rows2,))
+
+                w_med, w_best, w_digest = _time(run_wide, samples, flush, [wide], flush_mode)
+                w_read, _, w_digest_read = _time(run_wide, samples, flush, [wide], "read")
+                assert w_digest_read == w_digest, "wide output bits moved with the eviction mode"
+                wide_rec = dict(median_us=round(w_med, 3), weight_gbps=round(n * k / w_med / 1e3, 1),
+                                median_read_us=round(w_read, 3),
+                                weight_gbps_read=round(n * k / w_read / 1e3, 1),
+                                digest=w_digest)
+
+            # Row invariance inside this variant: row 0 at the primary width vs
+            # row 0 embedded at the wider batch.
+            def run_wide_out(program=program):
+                program.launch(x, w, s, wide, scalars=(rows2,))
+
+            run_wide_out()
             torch.cuda.synchronize()
-            row0_a = out16.view(torch.int16)[0].clone()
+            row0_a = wide.view(torch.int16)[0].clone()
             run()
             torch.cuda.synchronize()
             row0_b = out.view(torch.int16)[0].clone()
-            records.append(dict(case=f"fp8gemv_{spec}", rows=rows, variant=cfg["name"],
-                                warps=cfg["warps"], groups=cfg["groups"],
-                                median_us=round(median, 3), min_us=round(best, 3),
-                                weight_gbps=round(n * k / median / 1e3, 1),
-                                median_read_us=round(median_read, 3),
-                                weight_gbps_read=round(n * k / median_read / 1e3, 1),
-                                digest=digest,
-                                row_invariant=bool(torch.equal(row0_a, row0_b))))
-            del op, program, out, out16
+            rec = dict(case=f"fp8gemv_{spec}", rows=rows, variant=cfg["name"],
+                       warps=cfg["warps"], groups=cfg["groups"],
+                       load_hint=cfg.get("load_hint", "stream"),
+                       median_us=round(median, 3), min_us=round(best, 3),
+                       weight_gbps=round(n * k / median / 1e3, 1),
+                       median_read_us=round(median_read, 3),
+                       weight_gbps_read=round(n * k / median_read / 1e3, 1),
+                       digest=digest,
+                       row_invariant=bool(torch.equal(row0_a, row0_b)))
+            if wide_rec:
+                rec["wide_rows"] = rows2
+                rec["wide"] = wide_rec
+            records.append(rec)
+            del op, program, out, wide
         except Exception as exc:  # a failed variant is a null, not a dead sweep
             records.append(dict(case=f"fp8gemv_{spec}", rows=rows, variant=cfg["name"],
                                 error=repr(exc)[:400]))
@@ -161,6 +195,11 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
         rec["ratio"] = round(base["median_us"] / rec["median_us"], 4)
         rec["ratio_read"] = round(base["median_read_us"] / rec["median_read_us"], 4)
         rec["exact_vs_baseline"] = rec["digest"] == base["digest"]
+        if "wide" in rec:
+            wide_base = base["wide"]
+            rec["wide"]["ratio"] = round(wide_base["median_us"] / rec["wide"]["median_us"], 4)
+            rec["wide"]["ratio_read"] = round(wide_base["median_read_us"] / rec["wide"]["median_read_us"], 4)
+            rec["wide"]["exact_vs_baseline"] = rec["wide"]["digest"] == wide_base["digest"]
     return records
 
 
@@ -169,10 +208,12 @@ def main():
     parser.add_argument("--shapes", default="qwen", help=f"{','.join(SETS)}, or a semicolon list of NxK")
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--variants", default="groups",
-                        choices=("groups", "groups_wide", "hints", "depth"))
+                        choices=("groups", "groups_wide", "hints", "depth", "combo"))
     parser.add_argument("--flush", default="zero", choices=("zero", "read"))
     parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--seed", type=int, default=408)
+    parser.add_argument("--rows2", type=int, default=16,
+                        help="second batch width timed on the same program (0 disables)")
     parser.add_argument("--tag", default="")
     args = parser.parse_args()
     if args.shapes in SETS:
@@ -184,7 +225,8 @@ def main():
                           l2_bytes=torch.cuda.get_device_properties(0).L2_cache_size,
                           sms=torch.cuda.get_device_properties(0).multi_processor_count)), flush=True)
     for spec in specs:
-        for rec in run_shape(spec, args.rows, args.variants, args.samples, args.seed, args.flush):
+        for rec in run_shape(spec, args.rows, args.variants, args.samples, args.seed, args.flush,
+                             args.rows2 if args.rows2 > 0 else args.rows):
             rec["tag"] = args.tag
             print(json.dumps(rec), flush=True)
 
