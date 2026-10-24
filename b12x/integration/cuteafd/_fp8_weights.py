@@ -48,7 +48,8 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 
-from b12x._lib.intrinsics import bf16_mma_m16n8k16_f32, ld_shared_v2_u32, shared_ptr_to_u32, st_shared_v4_u32
+from b12x._lib.intrinsics import (bf16_mma_m16n8k16_f32, ld_shared_v2_u32, prefetch_bulk_global_l2,
+                                  shared_ptr_to_u32, st_shared_v4_u32)
 
 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_stream
 
@@ -646,6 +647,32 @@ def _e4m3x4_scaled_bf16x2x2(word, s, *, loc=None, ip=None):
             Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)))
 
 
+@dsl_user_op
+def _ld_stream_l2_128(address, *, loc=None, ip=None):
+    """``ld.global.nc`` 16-byte weight run with an ``.L2::128B`` fetch-size hint:
+    the miss fills the row's whole 128-byte K block, which the other lane group
+    and the sibling chunk read next."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(address).ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L1::no_allocate.L2::128B.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _ld_stream_l2_256(address, *, loc=None, ip=None):
+    """As ``_ld_stream_l2_128`` with an ``.L2::256B`` fetch (the next K block)."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(address).ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
 class MmaFp8Gemv:
     """Decode-row GEMM on tensor cores straight from global memory.
 
@@ -677,7 +704,15 @@ class MmaFp8Gemv:
     """
 
     def __init__(self, n: int, k: int, *, max_rows: int = 64, warps: int = 4, groups: int = 4,
-                 out_dtype=cutlass.BFloat16, row_scales: bool = False, kmajor: bool = False):
+                 out_dtype=cutlass.BFloat16, row_scales: bool = False, kmajor: bool = False,
+                 load_hint: str = "stream", prefetch_blocks: int = 0, prefetch_bytes: int = 1024):
+        if load_hint not in ("stream", "l2_128b", "l2_256b"):
+            raise ValueError("load_hint is stream, l2_128b or l2_256b")
+        if prefetch_blocks and (prefetch_bytes % 128 or prefetch_bytes > 4096):
+            raise ValueError("prefetch_bytes must be a 128 multiple up to 4096")
+        self.load_hint = str(load_hint)
+        self.prefetch_blocks = int(prefetch_blocks)
+        self.prefetch_bytes = int(prefetch_bytes)
         self.row_scales = bool(row_scales)
         self.kmajor = bool(kmajor)
         if self.kmajor and not self.row_scales:
@@ -703,8 +738,11 @@ class MmaFp8Gemv:
         self.smem_frags = self.frags if self.m_tiles <= 2 else self.tile_frags
 
     def key(self) -> tuple:
-        return (self.n, self.k, self.warps, self.groups, self.total_m_tiles, self.m_tiles,
-                str(self.out_dtype), self.row_scales, self.kmajor)
+        key = (self.n, self.k, self.warps, self.groups, self.total_m_tiles, self.m_tiles,
+               str(self.out_dtype), self.row_scales, self.kmajor)
+        if self.load_hint != "stream" or self.prefetch_blocks:
+            key += (self.load_hint, self.prefetch_blocks, self.prefetch_bytes)
+        return key
 
     def _storage(self):
         class Storage:
@@ -731,9 +769,31 @@ class MmaFp8Gemv:
     def _load_block(self, dest: cute.Tensor, w_row: Int64, k_off: Int64):
         for chunk in cutlass.range_constexpr(2):
             for gi in cutlass.range_constexpr(self.groups):
-                words = _ld_stream(w_row + Int64(gi * 8 * self.k) + k_off + Int64(chunk * 64))
+                address = w_row + Int64(gi * 8 * self.k) + k_off + Int64(chunk * 64)
+                if const_expr(self.load_hint == "l2_128b"):
+                    words = _ld_stream_l2_128(address)
+                elif const_expr(self.load_hint == "l2_256b"):
+                    words = _ld_stream_l2_256(address)
+                else:
+                    words = _ld_stream(address)
                 for t in cutlass.range_constexpr(4):
                     dest[(chunk * self.groups + gi) * 4 + t] = words[t]
+
+    @cute.jit
+    def _prefetch_window(self, w_row: Int64, block: Int32, j: Int32):
+        """Bulk L2 prefetch, one contiguous ``prefetch_bytes`` run per output row,
+        ``prefetch_blocks`` 128-byte K blocks ahead. Lane ``j == 0`` of each row
+        group issues it for its own row; the demand loads then find the window in
+        L2, and DRAM sees one long run per row instead of 64-byte slices."""
+        stride = self.prefetch_bytes // 128
+        if j == Int32(0):
+            if block % Int32(stride) == Int32(0):
+                # Only whole windows inside the row: no read past the tensor.
+                if block + Int32(self.prefetch_blocks + stride) <= Int32(self.blocks):
+                    for gi in cutlass.range_constexpr(self.groups):
+                        prefetch_bulk_global_l2(
+                            w_row + Int64(gi * 8 * self.k) + Int64(block + self.prefetch_blocks) * Int64(128),
+                            Int32(self.prefetch_bytes))
 
     @cute.kernel
     def kernel(self, x: cute.Pointer, w: cute.Pointer, scale: cute.Pointer, out: cute.Pointer, rows: Int32):
@@ -773,6 +833,8 @@ class MmaFp8Gemv:
         self._load_block(cur, w_row, Int64(0))
         for si in cutlass.range_constexpr(s_rows):
             s_cur[si] = _ld_f32(s_row + Int64(si) * s_gi)
+        if const_expr(self.prefetch_blocks):
+            self._prefetch_window(w_row, Int32(0), j)
         for block in cutlass.range(self.blocks, unroll=1):
             for si in cutlass.range_constexpr(s_rows):
                 s_nxt[si] = s_cur[si]
@@ -780,6 +842,8 @@ class MmaFp8Gemv:
                 self._load_block(nxt, w_row, Int64(block + 1) * Int64(128))
                 for si in cutlass.range_constexpr(s_rows):
                     s_nxt[si] = _ld_f32(s_row + Int64(si) * s_gi + Int64(block + 1) * s_kb)
+            if const_expr(self.prefetch_blocks):
+                self._prefetch_window(w_row, block, j)
             for chunk in cutlass.range_constexpr(2):
                 k_off = Int64(block) * Int64(128) + Int64(chunk * 64)
                 bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
