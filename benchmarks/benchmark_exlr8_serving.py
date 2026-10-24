@@ -82,6 +82,11 @@ def make_tables(owned, device="cuda"):
     keep = []
     unit_bytes = HIDDEN * 16
     slot_bytes = {}
+    # `pointers[..., 1]` is the per-H128 activation scale the activation stage
+    # reads for gate/up/down; one shared unit-scale table serves every slot
+    # (the harness only needs identical inputs across arms).
+    act_scales = torch.ones(128, dtype=torch.float16, device=device)
+    keep.append(act_scales)
     for e in range(EXPERTS):
         for u in owned[e]:
             for p in range(3):
@@ -92,7 +97,7 @@ def make_tables(owned, device="cuda"):
                                     device=device)
                 keep.extend((payload, scales))
                 pointers[e, u, p] = torch.tensor(
-                    [payload.data_ptr(), 0, scales.data_ptr()])
+                    [payload.data_ptr(), act_scales.data_ptr(), scales.data_ptr()])
                 slot_bytes[(e, u, p)] = unit_bytes * width
     bits = torch.zeros((EXPERTS, UNITS, 3), dtype=torch.int32)
     for e in range(EXPERTS):
