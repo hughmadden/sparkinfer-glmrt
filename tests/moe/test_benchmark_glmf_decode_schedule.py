@@ -124,3 +124,12 @@ def test_inspection_extracts_embedded_cubins_before_cuobjdump(monkeypatch, tmp_p
     assert len(calls) == 2 and info["policy_sites"] == 1
     assert info["resources"] == [dict(registers=128, stack=0, shared=1024, local=0)]
     assert len(info["cubin_sha256"]) == 1
+
+
+def test_global_descriptor_and_64_bit_policy_initialization():
+    global_load = "/*0000*/ LDCU.64 UR10, c[0x0][0x358];\n/*0010*/ LDGSTS.E.BYPASS.128 [R2], desc[UR10][R4.64];"
+    assert bench.check_policy_descriptors(global_load) == 0
+    policy = "/*0020*/ UMOV.64 UR4, 0x12;\n/*0030*/ LDGSTS.E.BYPASS.128 [R2], desc[UR4][R4.64];"
+    assert bench.check_policy_descriptors(global_load + '\n' + policy) == 1
+    with pytest.raises(RuntimeError, match="descriptor"):
+        bench.check_policy_descriptors(policy.replace("UMOV.64", "UMOV"))

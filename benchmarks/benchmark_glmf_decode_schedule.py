@@ -130,20 +130,27 @@ def verdict(replay: list[str], eager: list[str], reference: list[str]) -> str:
 
 def check_policy_descriptors(sass: str) -> int:
     """Reject odd or unwritten cache policies; ignore the global tensor descriptor."""
-    written, sites = set(), 0
+    written, globals_, sites = set(), set(), 0
     for line in sass.splitlines():
         if "Function :" in line:
-            written = set()
+            written, globals_ = set(), set()
         if re.search(r"\b(?:LDGSTS|UBLKCP|UTMALDG)\b", line):
             for operand in re.findall(r"desc\[UR(\d+)\]", line):
                 register = int(operand)
                 if register % 2 or not {register, register + 1} <= written:
                     raise RuntimeError(f"invalid or unwritten cache-policy descriptor: {line.strip()}")
-                sites += 1
+                if register not in globals_:
+                    sites += 1
         # Predicated writes do not prove a descriptor initialized on every path.
-        destination = re.search(r"/\*[0-9a-f]+\*/\s+[A-Z][A-Z0-9_.]*\s+UR(\d+)\s*,", line)
+        destination = re.search(r"/\*[0-9a-f]+\*/\s+([A-Z][A-Z0-9_.]*)\s+UR(\d+)\s*,", line)
         if destination:
-            written.add(int(destination.group(1)))
+            opcode, register = destination.group(1), int(destination.group(2))
+            written.add(register)
+            if ".64" in opcode:
+                written.add(register + 1)
+            # The ABI global-memory descriptor is not an eviction policy.
+            if opcode == "LDCU.64" and "c[0x0][0x358]" in line:
+                globals_.add(register)
     return sites
 
 
