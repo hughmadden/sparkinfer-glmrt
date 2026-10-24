@@ -520,6 +520,46 @@ def _repack_k_page_to_permuted(
         linear += Int32(_PAGED_THREADS_PER_CTA)
 
 
+# `use_scalar_k_load` value selecting `_load_index_k_page_vector` (scheduled
+# multi-row scorer): 0 TMA, 1 scalar byte loads, 2 16-byte vector loads.
+_VECTOR_K_LOAD = 2
+
+
+@cute.jit
+def _load_index_k_page_vector(
+    k_quant_bytes: cute.Tensor,
+    page_id: Int32,
+    k_page_perm_base_addr: Int32,
+    lane_linear: Int32,
+):
+    """One page's keys with 16-byte global loads straight into the permuted
+    stage: the bytes `_load_index_k_page_scalar` loads, placed where
+    `_repack_k_page_to_permuted` would move them, without the byte loads, the
+    linear stage or its barrier. Rows sit 128 bytes apart from the page base at
+    the tensor's real page stride (8448 for a packed cache with per-page scales,
+    which keeps every granule 16-byte aligned)."""
+    page_elem_base = Int64(page_id) * Int64(k_quant_bytes.stride[0])
+    linear = lane_linear
+    total = Int32(_PAGE_SIZE * (_INDEX_HEAD_DIM // 16))
+    while linear < total:
+        row = linear // Int32(_INDEX_HEAD_DIM // 16)
+        vec_idx = linear - row * Int32(_INDEX_HEAD_DIM // 16)
+        v0, v1, v2, v3 = ld_global_v4_u32(
+            get_ptr_as_int64(
+                k_quant_bytes,
+                page_elem_base
+                + Int64(row) * Int64(_INDEX_HEAD_DIM)
+                + Int64(vec_idx) * Int64(16),
+            )
+        )
+        dst_addr = _smem_addr_from_b128_offset(
+            k_page_perm_base_addr,
+            _permuted_offset_128b(row, vec_idx, Int32(_INDEX_HEAD_DIM // 16)),
+        )
+        st_shared_v4_u32(dst_addr, v0, v1, v2, v3)
+        linear += Int32(_PAGED_THREADS_PER_CTA)
+
+
 @cute.jit
 def _load_index_k_page_scalar(
     k_quant_bytes: cute.Tensor,
@@ -1831,7 +1871,14 @@ class DSAScheduledMultiRowLogitsKernel:
                         if page_base < seq_len:
                             page_id = Int32(real_page_table[current_q_idx, page_col])
                             if page_id >= Int32(0):
-                                if use_scalar_k_load_flag != Int32(0):
+                                if use_scalar_k_load_flag == Int32(_VECTOR_K_LOAD):
+                                    _load_index_k_page_vector(
+                                        k_quant_bytes,
+                                        page_id,
+                                        k_page_perm_base_addr,
+                                        tx,
+                                    )
+                                elif use_scalar_k_load_flag != Int32(0):
                                     _load_index_k_page_scalar(
                                         k_quant_bytes,
                                         page_id,
@@ -1859,10 +1906,12 @@ class DSAScheduledMultiRowLogitsKernel:
                                         phase=consumer_state.phase,
                                     )
                                 cute.arch.sync_threads()
-                                _repack_k_page_to_permuted(
-                                    k_page_base_addr, k_page_perm_base_addr, tx
-                                )
-                                cute.arch.sync_threads()
+                                # Vector loads already wrote the permuted stage.
+                                if use_scalar_k_load_flag != Int32(_VECTOR_K_LOAD):
+                                    _repack_k_page_to_permuted(
+                                        k_page_base_addr, k_page_perm_base_addr, tx
+                                    )
+                                    cute.arch.sync_threads()
 
                                 valid_slots = seq_len - page_base
                                 if valid_slots > Int32(_PAGE_SIZE):

@@ -23,7 +23,7 @@ def module(name):
     env = dict(Int32=np.int32, Int64=np.int64, Float32=SimpleNamespace(inf=np.inf),
         const_expr=bool, cutlass=SimpleNamespace(range_constexpr=range, range=range, min=min),
         cute=SimpleNamespace(arch=arch), attention_ops=SimpleNamespace(fmax=np.maximum),
-        _SPLIT=4)  # PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT
+        _SPLIT=4, _VECTOR_K_LOAD=2)  # dsa_indexer.kernel constants
     class F32:
         inf = np.inf
 
@@ -59,7 +59,7 @@ def test_index_scratch_regions_are_aligned_and_disjoint(mode, rows, pages):
 def test_decode_schedule_spreads_every_live_page_once_over_balanced_intervals(lengths):
     env, arch = module("minimax_indexer")
     obj = object.__new__(env["_Index"])
-    obj.mode, obj.rows = "decode", 64
+    obj.mode, obj.rows, obj.reference = "decode", 64, False
     rows, width = len(lengths), 1024 * 64
     lengths = np.array(lengths, dtype=np.int32)
     scale, weights = np.ones(rows * 4, np.float32), np.zeros(rows * 4, np.float32)
@@ -86,7 +86,7 @@ def test_decode_schedule_spreads_every_live_page_once_over_balanced_intervals(le
     total = int(splits.sum())
     assert max(work) == -(-total // obj.rows) and sum(work) == total
     assert tuple(schedule[-1]) == (rows, 0)
-    assert controls[0] == width
+    assert controls[0] == width and controls[1] == 2  # vector page loads
 
 
 @pytest.mark.parametrize("mode", ["decode", "extend"])
