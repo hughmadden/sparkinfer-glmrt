@@ -683,6 +683,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         if (rows > Int32(0) and rows <= Int32(4096) and cta_limit > Int32(0)
                 and unit_limit > Int32(0)):
             if cutlass.const_expr(self.quantize_pass):
+                # Borrow fc2 for A8 records until FC1 finishes; same-stream FC2
+                # launches overwrite it only after those readers complete.
+                # cuteafd's safety gate assumes one Spark execution slot and one
+                # coordinator engine stream per GPU. Re-gate for its #708
+                # multi-slot pool or two decode lanes; never share this arena
+                # between concurrently executing streams.
                 self.quantize_x_kernel(x, fc2, rows).launch(
                     grid=(min((rows * Int32(self.blocks) + Int32(15)) // Int32(16), cta_limit), 1, 1),
                     block=(256, 1, 1), stream=stream)
