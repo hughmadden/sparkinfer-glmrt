@@ -32,7 +32,7 @@ SHAPES = {
     "swa_kv": (4096, 384, torch.bfloat16),
     "shared_gate_up": (4096, 3072, torch.bfloat16),
 }
-ROWS = (1, 16, 17, 64, 65, 256, 1024, 2048)
+ROWS = (1, 7, 8, 16, 17, 64, 65, 256, 1024, 2048)
 _PROGRAMS: dict = {}
 _TENSORS: dict = {}
 
