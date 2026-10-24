@@ -18,6 +18,8 @@ def benchmark():
              "coordinator_preflight", "benchmark_parser", "parse_prefill_arm"}
     scope = dict(argparse=argparse, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
                  PREFILL_FAMILIES={"qwen4": (), "kimik3": ()}, GLM_CAPACITIES=(256, 1024, 2752, 4096),
+                 GLM_PROFILES={"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
+                               "spark-tp6-width256": 256, "spark-tp4-width512": 512},
                  GLM_ROUTES=SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json")
     host_names = {"route_pack_capacity", "route_pack_numel_capacity", "route_pack_token_capacity",
                   "max_packed_route_slots"}
@@ -87,6 +89,24 @@ def test_invalid_arguments(extra):
     b = benchmark()
     with pytest.raises(ValueError):
         b.coordinator_preflight(arguments(b, *extra))
+
+
+@pytest.mark.parametrize("profile,width,tile", [("spark-tp6-width384", 384, (64, 192, 64, 256)),
+                                               ("spark-tp6-width256", 256, (64, 256, 64, 256)),
+                                               ("spark-tp4-width512", 512, (64, 256, 64, 256))])
+def test_glm_spark_served_exports(profile, width, tile):
+    b = benchmark()
+    args = arguments(b, "--role", "spark", "--profile", profile, "--capacities", "1024,2752,4096")
+    capacities, specs, _, _ = b.coordinator_preflight(args)
+    assert specs[0] == ("coop", {}) and specs[1][0] == "served"
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    for capacity in capacities:
+        opts = b.coordinator_compile_options(profile, capacity, specs[1][1], props)
+        assert opts["intermediate_size"] == width and opts["force_tile_config"] == tile
+        assert opts["full_rotation_output_dtype"] == "bf16" and opts["sms"] == 48
+        assert opts["moe_block_size"] == 64 and opts["warp_specialized"]
+        assert opts["input_format"] == "e4m3_k32" and opts["ws_input_stages"] == 3
+        assert opts["ws_dynamic_tiles"] and opts["force_blocks_per_sm"] == 1
 
 
 def test_spark_defaults_unchanged():

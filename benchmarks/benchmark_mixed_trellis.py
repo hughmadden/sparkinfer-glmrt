@@ -1016,6 +1016,8 @@ def _run_prefill_benchmark(args, device, props):
 
 
 GLM_CAPACITIES = (256, 1024, 2752, 4096)
+GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024,
+                "spark-tp6-width384": 384, "spark-tp6-width256": 256, "spark-tp4-width512": 512}
 GLM_ROUTES = Path(__file__).resolve().parent / "fixtures/glm53_prefill_routes_realistic.json"
 
 
@@ -1053,9 +1055,10 @@ def parse_coordinator_arm(text):
 
 def coordinator_compile_options(profile, capacity, arm, props):
     """Mirror GLM's cooperative coordinator export, with explicit experimental overrides."""
-    if profile not in ("rtx-tp1", "rtx-tp2") or capacity not in GLM_CAPACITIES:
-        raise ValueError("GLM coordinator requires rtx-tp1/rtx-tp2 and capacity 256/1024/2752/4096")
-    width = 2048 if profile == "rtx-tp1" else 1024
+    if profile not in GLM_PROFILES or capacity not in GLM_CAPACITIES:
+        raise ValueError("GLM requires a supported RTX/Spark profile and capacity 256/1024/2752/4096")
+    width = GLM_PROFILES[profile]
+    spark = profile.startswith("spark-")
     ws = arm.get("mode", "cooperative") == "ws"
     block = arm.get("route_block", 64 if ws or capacity > 256 else 8)
     rotation = arm.get("rotation", "route" if ws else "served")
@@ -1064,7 +1067,7 @@ def coordinator_compile_options(profile, capacity, arm, props):
     if ((ws and (block < 16 or token or fused)) or (fused and block < 16)
             or (not ws and any(arm.get(k) for k in ("wire", "stages", "dynamic")))):
         raise ValueError("WS needs block >=16 and its own rotation; wire/stages/dynamic require WS")
-    tile = arm.get("tile", (64, 256, 64, 256))
+    tile = arm.get("tile", (64, 128 if width == 384 else 256, 64, 128 if width == 384 else 256))
     if width % tile[1] or 6144 % tile[3] or 6144 % tile[0] or width % tile[2]:
         raise ValueError("coordinator tile must divide both projection geometries")
     if not ws and tile[1] != tile[3]:
@@ -1075,7 +1078,7 @@ def coordinator_compile_options(profile, capacity, arm, props):
         route_num_experts=256, top_k=8, max_m_blocks=(slots + block - 1) // block,
         sms=int(props.multi_processor_count), max_shared_mem=int(props.shared_memory_per_block_optin),
         force_tile_config=tile, trellis_codebook="mcg", swiglu_limit=None,
-        moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype="fp32",
+        moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype="bf16" if spark else "fp32",
         direct_topk_routes=False, token_major_rotation=token, fused_input_rotation=fused,
         warp_specialized=ws, input_format="e4m3_k32" if arm.get("wire") else "bf16",
         force_blocks_per_sm=arm.get("ctas"), ws_input_stages=arm.get("stages"),
@@ -1101,15 +1104,21 @@ def coordinator_route_waves(path, layer=None):
 
 
 def coordinator_preflight(args):
-    if args.prefill_family != "glm" or args.role != "coordinator" or args.output is None:
-        raise ValueError("GLM coordinator requires --prefill-family glm --role coordinator --output")
+    if args.prefill_family != "glm" or args.output is None:
+        raise ValueError("GLM requires --prefill-family glm --output")
+    if (args.role == "spark") != args.profile.startswith("spark-"):
+        raise ValueError("GLM --role must match the RTX or Spark --profile")
     if (args.kimi or args.compact_fixture or args.prefill_arm or args.prefill_source_dir
             or args.rows or args.intermediate or args.prefill_exhaustive):
         raise ValueError("coordinator uses --profile/--capacities/--coordinator-arm, not Spark/decode controls")
     capacities = [int(v) for v in args.capacities.split(",")]
     if not capacities or len(capacities) != len(set(capacities)):
         raise ValueError("capacities must be nonempty and unique")
-    specs = [("coop", {}), *args.coordinator_arm]
+    specs = [("coop", {})]
+    if args.role == "spark":
+        specs.append(("served", dict(mode="ws", wire=1, stages=3, dynamic=1, ctas=1,
+                                    tile=(64, 192, 64, 256) if GLM_PROFILES[args.profile] == 384 else (64, 256, 64, 256))))
+    specs.extend(args.coordinator_arm)
     if len({name for name, _ in specs}) != len(specs):
         raise ValueError("coordinator arm names must be unique")
     if min(args.layers, args.rounds, args.replays, args.warmup, args.memory_cap_gib) < 1:
@@ -1134,9 +1143,9 @@ def _make_coordinator_layer(width, k5_experts, seed, device):
     for tier, count in enumerate((256 - k5_experts, k5_experts)):
         prepared = prepare_trellis256_moe_weights(
             hidden_size=6144, intermediate_size=width, num_experts=max(count, 1),
-            activation="silu", fc1_tile_n=256, fc2_tile_n=256, device=device,
+            activation="silu", fc1_tile_n=128, fc2_tile_n=128, device=device,
             seed=seed + tier, params_dtype=torch.float16, w13_layout="trellis_t256_proj",
-            trellis_bits=4 + tier, codebook="mcg", tile_config=(64, 256, 64, 256))
+            trellis_bits=4 + tier, codebook="mcg", tile_config=(64, 128, 64, 128))
         w13 = prepared.w13 if count else prepared.w13[:prepared.w13.numel() // 2]
         scales = torch.ones(256, dtype=torch.float32, device=device)
         scales[:max(count, 1)].copy_(prepared.w13_global_scale)
@@ -1159,10 +1168,13 @@ def _run_coordinator_benchmark(args, device, props):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     capacities, specs, distributions, waves = coordinator_preflight(args)
-    if (props.major, props.minor) != (12, 0):
-        raise ValueError("GLM coordinator benchmark requires SM120")
+    target = (12, 1) if args.role == "spark" else (12, 0)
+    if (props.major, props.minor) != target:
+        raise ValueError(f"GLM {args.role} benchmark requires SM{target[0]}{target[1]}")
     torch.cuda.set_per_process_memory_fraction(min(0.9, (args.memory_cap_gib << 30) / props.total_memory), device)
-    width = 2048 if args.profile == "rtx-tp1" else 1024
+    width = GLM_PROFILES[args.profile]
+    output_dtype = torch.bfloat16 if args.role == "spark" else torch.float32
+    bit_dtype = torch.int16 if args.role == "spark" else torch.int32
     layers = [_make_coordinator_layer(width, args.k5_experts, args.seed + 2*i, device)
               for i in range(args.layers)]
     counts = (256 - args.k5_experts, args.k5_experts)
@@ -1197,12 +1209,12 @@ def _run_coordinator_benchmark(args, device, props):
                         x = wire if bindings[layer].launch.input_format == "e4m3_k32" else decoded
                         return mix.run_bound_mixed_trellis(x, weights, ids, bindings[layer], workspace)
                     expected = run("coop").clone()
-                    if expected.dtype != torch.float32 or not bool(torch.isfinite(expected).all()) or not bool(expected.any()):
-                        raise RuntimeError("cooperative FP32 oracle must be finite and nonzero")
+                    if expected.dtype != output_dtype or not bool(torch.isfinite(expected).all()) or not bool(expected.any()):
+                        raise RuntimeError("cooperative oracle must use the role's sum dtype and be finite and nonzero")
                     graphs, checks = {}, {}
                     for name, _ in specs:
                         actual = run(name)
-                        checks[name] = torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+                        checks[name] = torch.equal(actual.view(bit_dtype), expected.view(bit_dtype))
                         workspace, bindings = states[name]
                         # Freeze routing outside the graph: time the real bound core + top-k sum
                         # without copying its raw ABI or charging precomputed route-pack work.
@@ -1213,7 +1225,7 @@ def _run_coordinator_benchmark(args, device, props):
                             graphs[name] = _capture(lambda name=name: run(name), args.warmup)
                         workspace.output.fill_(float("nan"))
                         graphs[name].replay()
-                        checks[name] &= torch.equal(workspace.output.view(torch.int32), expected.view(torch.int32))
+                        checks[name] &= torch.equal(workspace.output.view(bit_dtype), expected.view(bit_dtype))
                     samples = {name: [] for name, _ in specs}
                     if all(checks.values()) and not args.correctness_only:
                         names = list(graphs)
@@ -1228,7 +1240,7 @@ def _run_coordinator_benchmark(args, device, props):
                         wave_index=wave_index, route_layer=wave.get("layer") if wave else None,
                         content=wave.get("content") if wave else None, bitwise=checks,
                         samples_us=samples, median_us={name: statistics.median(v) for name, v in samples.items() if v},
-                        output_sha256=hashlib.sha256(expected.cpu().numpy().tobytes()).hexdigest())
+                        output_sha256=hashlib.sha256(expected.view(torch.uint8).cpu().numpy().tobytes()).hexdigest())
                     records.append(record)
                     if not all(checks.values()):
                         failures.append({k: record[k] for k in ("capacity", "distribution", "wave_index", "bitwise")})
@@ -1237,14 +1249,15 @@ def _run_coordinator_benchmark(args, device, props):
         del states, workspace, bindings, launch
         torch.cuda.empty_cache()
     source = Path(__file__).resolve().parents[1]
-    result = dict(schema=1, kind="glm_sm120_coordinator_prefill", profile=args.profile,
+    result = dict(schema=1, kind="glm_exl3_prefill", role=args.role, profile=args.profile,
         device=props.name, sm_count=props.multi_processor_count, hidden=6144, intermediate=width,
         experts=256, top_k=8, bits=[4, 5], k5_experts_per_projection=args.k5_experts, arms=specs,
         source_sha256={p: hashlib.sha256((source / p).read_bytes()).hexdigest() for p in (
             "benchmarks/benchmark_mixed_trellis.py", "b12x/moe/_shared/kernels/w4a16/mixed_trellis.py",
             "b12x/moe/_shared/kernels/w4a16/mixed_trellis_ws.py")},
         route_sha256=hashlib.sha256((args.routes or GLM_ROUTES).read_bytes()).hexdigest() if waves else None,
-        conditions="synthetic projection-major weights; FP32 sums; common E4M3/UE8M0 K32-roundtripped BF16 input; "
+        output_dtype=str(output_dtype),
+        conditions="synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); common E4M3/UE8M0 K32-roundtripped BF16 input; "
                    "histogram replay preserves rescaled expert counts, not original token co-occurrence; "
                    "warm CUDA graphs, core+top-k sum only, routing and wire preparation excluded; "
                    "median of interleaved round medians, microseconds per layer",
@@ -1293,7 +1306,7 @@ def benchmark_parser():
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--prefill-family", choices=(*PREFILL_FAMILIES, "glm"))
     parser.add_argument("--role", choices=("spark", "coordinator"), default="spark")
-    parser.add_argument("--profile", choices=("rtx-tp1", "rtx-tp2"), default="rtx-tp2")
+    parser.add_argument("--profile", choices=tuple(GLM_PROFILES), default="rtx-tp2")
     parser.add_argument("--capacities", default="256,1024,2752,4096", help="GLM coordinator compile capacities")
     parser.add_argument("--coordinator-arm", action="append", type=parse_coordinator_arm, default=[],
                         help="NAME:mode=cooperative|ws,rotation=served|route|token|fused,tile=64/256/64/256,"
