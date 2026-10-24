@@ -255,9 +255,9 @@ def mimo_w8(n: int, k: int, prefill_rows: int | None):
     (``fp8_rows`` nonzero) or W8A16. (A K-block-major decode GEMV reads its scales one cache
     line per K block: SM120, 16 rows of 14848x4096 back to back over 40 weights, 40.5 -> 48.7
     us.)"""
-    from ._fp8_weights import Fp8Projection, fp8_gemv_tuning
+    from ._fp8_weights import Fp8Projection, fp8_gemv_shipped_warps, fp8_gemv_tuning
 
-    warps, groups = fp8_gemv_tuning(n, k)
+    warps, groups = fp8_gemv_tuning(n, k, warps=fp8_gemv_shipped_warps(n, k))
     return Fp8Projection(n, k, prefill_rows=prefill_rows, row_scales=True, gemv_rows=FP8_ROWS,
                          warps=warps, groups=groups)
 

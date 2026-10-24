@@ -56,7 +56,8 @@ from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_strea
 __all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_CONFIG", "FP8_GEMV_GROUPS_DEFAULT", "FP8_GEMV_ROWS", "FP8_GEMV_WIDE",
            "FP8_GEMV_WIDE_KERNEL",
            "Fp8Projection",
-           "decode_tile_n", "fp8_gemv_tuning", "fp8_gemv_wide", "fp8_gemv_wide_kernel", "MmaFp8Gemv",
+           "decode_tile_n", "fp8_gemv_shipped_warps", "fp8_gemv_tuning", "fp8_gemv_wide",
+           "fp8_gemv_wide_kernel", "MmaFp8Gemv",
            "RoutedFp8Projection", "TmaFp8Gemm", "check_w8_mode",
            "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps", "projection", "w8_scalars"]
 
@@ -104,7 +105,7 @@ class RoutedFp8Projection:
         warps, groups = fp8_gemv_tuning(self.n, self.k)
         self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_GEMV_ROWS, warps=warps, groups=groups,
                               out_dtype=out_dtype)
-        wide_groups, wide_tiles = fp8_gemv_wide(self.n, self.k, groups=groups)
+        wide_groups, wide_tiles = fp8_gemv_wide(self.n, self.k, warps=warps, groups=groups)
         self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=self.decode_rows, warps=warps,
                                    groups=wide_groups, cta_tiles=wide_tiles, out_dtype=out_dtype) \
             if self.decode_rows > FP8_GEMV_ROWS else None
@@ -200,9 +201,8 @@ class Fp8Projection:
                                     compute_warps=8, num_stages=3, out_dtype=out_dtype)
             self.max_gemv_rows = 0
         else:
-            tuning_warps, tuning_groups = fp8_gemv_tuning(self.n, self.k)
-            warps = tuning_warps if warps is None else int(warps)
-            groups = tuning_groups if groups is None else int(groups)
+            warps = gemv_warps(self.k) if warps is None else int(warps)
+            groups = fp8_gemv_tuning(self.n, self.k, warps=warps)[1] if groups is None else int(groups)
             self.gemv = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows), warps=warps, groups=groups,
                                    row_scales=self.row_scales, kmajor=self.kmajor, out_dtype=out_dtype)
             # The decode capacity: FP8_DECODE_ROWS unless the caller exports its program wider;
@@ -216,9 +216,10 @@ class Fp8Projection:
             # Columns per CTA and tiles per CTA only partition the launch grid, so the wide
             # tile may use the shape's measured wide entry without moving a single bit; so may
             # its kernel, which is bit-identical on the same tiling (FP8_GEMV_WIDE_KERNEL).
-            wide_g, wide_t = fp8_gemv_wide(self.n, self.k, groups=groups)
+            wide_g, wide_t = fp8_gemv_wide(self.n, self.k, warps=warps, groups=groups)
             wide_cls = MmaFp8Gemv if wide_groups is not None else \
-                fp8_gemv_wide_kernel(self.n, self.k, row_scales=self.row_scales, kmajor=self.kmajor)
+                fp8_gemv_wide_kernel(self.n, self.k, warps=warps, row_scales=self.row_scales,
+                                    kmajor=self.kmajor)
             self.gemv_wide = wide_cls(self.n, self.k, max_rows=cap, warps=warps,
                                       groups=wide_g if wide_groups is None else int(wide_groups),
                                       cta_tiles=wide_t if wide_groups is None else None,
@@ -342,9 +343,15 @@ def gemv_warps(k: int) -> int:
 # Most decode columns one ``MmaFp8Gemv`` CTA owns: ``8 * groups``. The GEMV is weight-stream
 # bound at decode rows, so the smallest block (8 columns, 4x the CTAs) measured best on every
 # shape of the shared FP8 decode census (#703: dense Qwen 3.8, GLM 5.3 Flash, MiMo V2) and is
-# the fallback for a shape the table does not name. ``FP8_GEMV_CONFIG`` keeps the per-shape
-# ``warps`` -- it sets the K split and the cross-warp fold, so it is part of the numerics --
-# with the measured ``groups``.
+# the fallback for a shape the table does not name.
+#
+# ``FP8_GEMV_CONFIG`` is shape -> (warps, groups): the ``warps`` its call sites shipped at the
+# base pin (the K split and the cross-warp fold, so it is part of the numerics) and the
+# ``groups`` measured at exactly those warps. A tuning table may move a launch-grid partition,
+# never the warps: the entry applies to a caller only when the caller's own warps equal the
+# entry's, and every other caller of the same shape keeps its shipped warps and block. That
+# matters where one shape has call sites with different K splits -- 4096x2048 is GLM 5.3
+# Flash's 2-warp shared down *and* GLM's 4-warp DSA index producer -- so they tune separately.
 FP8_GEMV_CONFIG = {
     # Dense Qwen 3.8 27B: (4, 4) -> (4, 1), one row / 16 rows, us, RTX PRO 6000 at 325 W,
     # L2-cold read-only eviction: qkv 34816x5120 137.2/133.1 -> 114.7/118.8 (1.20/1.12x),
@@ -372,9 +379,10 @@ FP8_GEMV_CONFIG = {
 FP8_GEMV_GROUPS_DEFAULT = 4
 # The rows 17..64 tile (``max_rows=64``) is a different regime: it re-reads the activation
 # rows once per column block and covers 2-4 row tiles per CTA, so the 8-column block that
-# wins at decode rows loses here. ``FP8_GEMV_WIDE`` is shape -> (groups, cta_tiles); a shape
-# it does not name keeps the thin tile's groups and the ``gemv_cta_tiles`` rule, which is
-# never slower than anything measured. Ratio to that shipped wide tile, RTX PRO 6000 at
+# wins at decode rows loses here. ``FP8_GEMV_WIDE`` is shape -> (warps, groups, cta_tiles); a
+# shape it does not name -- or a caller whose warps differ from the entry's -- keeps the thin
+# tile's groups and the ``gemv_cta_tiles`` rule, which is never slower than anything measured.
+# Ratio to that shipped wide tile, RTX PRO 6000 at
 # 325 W, L2-cold read-only eviction, one session, at 32/48/64 rows (row-scale cells are the
 # per-row-scale FP32 grid these shapes ship; block-scale cells the 128x128 grid):
 #   qkv 34816x5120 (2,4) 1.045/1.104/1.148 -- the column block that wins at one row loses
@@ -401,23 +409,39 @@ FP8_GEMV_GROUPS_DEFAULT = 4
 #   LM head 152576x4096 (2,4) block 0.995/1.092/1.160, row-scale 0.995/1.108.
 # The two 0.99 cells are 2 us on ~410 us, inside the +-0.5% spread the same cell shows across
 # sessions; no other arm reaches 1.00 there while keeping the 64-row win.
-# Every entry keeps the thin tile's ``warps``: ``groups`` and ``cta_tiles`` only partition
-# the launch grid, so the rows 16 -> 17 program switch is still one bitwise K order.
+# Every entry carries the warps it was measured at and applies only to a caller with those
+# warps: ``groups`` and ``cta_tiles`` only partition the launch grid, so the rows 16 -> 17
+# program switch is still one bitwise K order.
 FP8_GEMV_WIDE = {
-    (34816, 5120): (2, 4), (5120, 17408): (1, 1),
-    (4096, 16384): (2, 2), (2048, 4096): (1, 1), (4096, 4096): (2, 4), (4096, 2048): (1, 1),
-    (24576, 4096): (2, 4), (154880, 4096): (2, 4),
-    (13568, 4096): (2, 2), (14848, 4096): (2, 2), (152576, 4096): (2, 4),
+    (34816, 5120): (4, 2, 4), (5120, 17408): (4, 1, 1),
+    (4096, 16384): (4, 2, 2), (2048, 4096): (8, 1, 1), (4096, 4096): (8, 2, 4),
+    (4096, 2048): (2, 1, 1),
+    (24576, 4096): (8, 2, 4), (154880, 4096): (8, 2, 4),
+    (13568, 4096): (2, 2, 2), (14848, 4096): (2, 2, 2), (152576, 4096): (8, 2, 4),
 }
 
 
-def fp8_gemv_wide(n: int, k: int, *, groups: int) -> tuple[int, int | None]:
+def fp8_gemv_shipped_warps(n: int, k: int, *, warps: int | None = None) -> int:
+    """The K-splitting warps a call site shipped at the base pin, for the call sites that had
+    a per-shape rule before the duel (GLM 5.3 Flash's projections, which MiMo V2 shares): the
+    shape's entry, else ``warps`` (default ``gemv_warps(k)``). The tuning tables never choose
+    warps themselves -- a caller keeps whatever this rule gave it."""
+    entry = FP8_GEMV_CONFIG.get((int(n), int(k)))
+    if entry is not None:
+        return entry[0]
+    return gemv_warps(k) if warps is None else int(warps)
+
+
+def fp8_gemv_wide(n: int, k: int, *, warps: int, groups: int) -> tuple[int, int | None]:
     """``MmaFp8Gemv`` ``(groups, cta_tiles)`` for the rows 17..64 tile of an ``N x K``
-    projection: the measured per-shape entry, else the thin tile's ``groups`` and the shape
-    rule's tile count. ``warps`` stays the thin tile's -- it is the K split, and one order
-    has to cover the whole decode range."""
+    projection: the measured per-shape entry when ``warps`` is the warps it was measured at,
+    else the thin tile's ``groups`` and the shape rule's tile count. ``warps`` is the K split
+    and one order has to cover the whole decode range, so it is the caller's, never the
+    table's."""
     entry = FP8_GEMV_WIDE.get((int(n), int(k)))
-    return entry if entry is not None else (int(groups), None)
+    if entry is None or entry[0] != int(warps):
+        return int(groups), None
+    return entry[1], entry[2]
 
 
 # The one shape whose rows 17..64 tile measured faster on the non-coherent 16-byte load
@@ -432,11 +456,16 @@ def fp8_gemv_wide(n: int, k: int, *, groups: int) -> tuple[int, int | None]:
 FP8_GEMV_WIDE_KERNEL = {(5120, 17408): "nc"}
 
 
-def fp8_gemv_wide_kernel(n: int, k: int, *, row_scales: bool = False, kmajor: bool = False):
+def fp8_gemv_wide_kernel(n: int, k: int, *, warps: int, row_scales: bool = False,
+                         kmajor: bool = False):
     """``MmaFp8Gemv`` subclass for the rows 17..64 tile of an ``N x K`` projection: the
-    measured nc entry, else the base kernel.  The nc kernel was measured on block-scale
-    weights only, so a per-row-scale or K-block-major shape never leaves the base kernel."""
+    measured nc entry at the warps it was measured at, else the base kernel.  The nc kernel
+    was measured on block-scale weights only, so a per-row-scale or K-block-major shape never
+    leaves the base kernel."""
     if FP8_GEMV_WIDE_KERNEL.get((int(n), int(k))) != "nc" or row_scales or kmajor:
+        return MmaFp8Gemv
+    entry = FP8_GEMV_WIDE.get((int(n), int(k)))
+    if entry is None or entry[0] != int(warps):
         return MmaFp8Gemv
     from ._fp8_gemv_nc import NcMmaFp8Gemv
 
@@ -444,12 +473,19 @@ def fp8_gemv_wide_kernel(n: int, k: int, *, row_scales: bool = False, kmajor: bo
 
 
 def fp8_gemv_tuning(n: int, k: int, *, warps: int | None = None) -> tuple[int, int]:
-    """``MmaFp8Gemv`` ``(warps, groups)`` for an ``N x K`` decode projection: the measured
-    per-shape entry, else ``warps`` (default ``gemv_warps(k)``) with the default column block."""
+    """``MmaFp8Gemv`` ``(warps, groups)`` for an ``N x K`` decode projection.
+
+    ``warps`` is the caller's own K split and comes back unchanged -- it sets the cross-warp
+    fold, i.e. the numerics, and only the call site's shipped rule may choose it
+    (``fp8_gemv_shipped_warps`` where it had one, ``gemv_warps`` otherwise). The measured
+    ``groups`` apply only when the entry was measured at exactly those warps, so a shape that
+    two call sites split differently gets the 8-column block on the one it was measured on and
+    the shipped block on the other."""
+    warps = gemv_warps(k) if warps is None else int(warps)
     entry = FP8_GEMV_CONFIG.get((int(n), int(k)))
-    if entry is not None:
-        return entry
-    return (gemv_warps(k) if warps is None else int(warps)), FP8_GEMV_GROUPS_DEFAULT
+    if entry is None or entry[0] != warps:
+        return warps, FP8_GEMV_GROUPS_DEFAULT
+    return warps, entry[1]
 
 
 def gemv_cta_tiles(n: int, k: int, *, groups: int, warps: int) -> int:
