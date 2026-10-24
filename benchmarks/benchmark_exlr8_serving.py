@@ -364,7 +364,7 @@ def main():
         ids, weights = fixture[distribution]
         reference = arms[distribution]["base"]
         reference.buffers["ids"].copy_(ids)
-        reference.buffers["weights"].copy_(weights)
+        reference.buffers["route_weights"].copy_(weights)
         reference.run(rows_max)
         torch.cuda.synchronize()
         full = reference.buffers["output"][:rows_max].clone()
@@ -396,7 +396,7 @@ def main():
             arm_set = arms[distribution]
             for arm in arm_set.values():
                 arm.buffers["ids"][:rows].copy_(ids[:rows])
-                arm.buffers["weights"][:rows].copy_(weights[:rows])
+                arm.buffers["route_weights"][:rows].copy_(weights[:rows])
             graphs = {}
             for name, arm in arm_set.items():
                 def step(arm=arm, rows=rows):
