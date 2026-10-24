@@ -1,0 +1,108 @@
+"""CPU-only coordinator argument contracts (no CUDA/DSL imports)."""
+import argparse
+import ast
+import json
+from pathlib import Path
+import re
+from types import SimpleNamespace
+
+import pytest
+
+SOURCE = Path(__file__).resolve().parents[1] / "benchmarks/benchmark_mixed_trellis.py"
+TREE = ast.parse(SOURCE.read_text())
+HOST = SOURCE.parents[1] / "b12x/moe/_shared/kernels/w4a16/host.py"
+
+
+def benchmark():
+    names = {"parse_coordinator_arm", "coordinator_compile_options", "coordinator_route_waves",
+             "coordinator_preflight", "benchmark_parser", "parse_prefill_arm"}
+    scope = dict(argparse=argparse, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
+                 PREFILL_FAMILIES={"qwen4": (), "kimik3": ()}, GLM_CAPACITIES=(256, 1024, 2752, 4096),
+                 GLM_ROUTES=SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json")
+    host_names = {"route_pack_capacity", "route_pack_numel_capacity", "route_pack_token_capacity",
+                  "max_packed_route_slots"}
+    for tree, selected in ((ast.parse(HOST.read_text()), host_names), (TREE, names)):
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in selected]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
+    return SimpleNamespace(**scope)
+
+
+def arguments(b, *extra):
+    return b.benchmark_parser().parse_args([
+        "--prefill-family", "glm", "--role", "coordinator", "--output", "result.json", *extra])
+
+
+@pytest.mark.parametrize("profile,width", [("rtx-tp1", 2048), ("rtx-tp2", 1024)])
+@pytest.mark.parametrize("capacity", [256, 1024, 2752, 4096])
+def test_cooperative_matches_export_contract(profile, width, capacity):
+    b = benchmark()
+    for sms in (170, 188):
+        props = SimpleNamespace(multi_processor_count=sms, shared_memory_per_block_optin=101376)
+        opts = b.coordinator_compile_options(profile, capacity, {}, props)
+        assert (opts["hidden_size"], opts["intermediate_size"], opts["top_k"], opts["route_num_experts"]) == (6144, width, 8, 256)
+        assert opts["tier0_num_experts"] == opts["tier1_num_experts"] == 256
+        assert (opts["tier0_bits"], opts["tier1_bits"]) == (4, 5)
+        assert opts["sms"] == sms
+        assert opts["full_rotation_output_dtype"] == "fp32"
+        assert opts["moe_block_size"] == (8 if capacity == 256 else 64)
+        assert opts["token_major_rotation"] == (capacity > 256)
+        assert not opts["warp_specialized"] and not opts["fused_input_rotation"]
+        assert opts["max_m_blocks"] >= (capacity * 8 + 256 * (opts["moe_block_size"] - 1) + opts["moe_block_size"] - 1) // opts["moe_block_size"]
+
+
+def test_variant_plumbing_and_preflight():
+    b = benchmark()
+    args = arguments(b, "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128")
+    capacities, specs, routes, waves = b.coordinator_preflight(args)
+    assert capacities == [256, 1024, 2752, 4096] and routes == ["random", "realistic"]
+    assert len(waves) == 72 and specs[0] == ("coop", {})
+    opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1], SimpleNamespace(multi_processor_count=170, shared_memory_per_block_optin=101376))
+    assert opts["warp_specialized"] and opts["input_format"] == "e4m3_k32"
+    assert opts["force_tile_config"] == (64, 128, 64, 128)
+    assert opts["moe_block_size"] == 32 and opts["force_blocks_per_sm"] == 1
+    assert opts["ws_input_stages"] == 3 and opts["ws_dynamic_tiles"]
+    assert not opts["token_major_rotation"] and not opts["fused_input_rotation"]
+
+
+@pytest.mark.parametrize("text", ["bad", "coop:mode=ws", "a:wire=2", "a:stages=1", "a:route_block=17",
+                                 "a:mode=other", "a:tile=64/256", "a:unknown=1", "a:wire=1,wire=0"])
+def test_bad_arm(text):
+    with pytest.raises(argparse.ArgumentTypeError):
+        benchmark().parse_coordinator_arm(text)
+
+
+@pytest.mark.parametrize("text", ["a:mode=ws,rotation=token", "a:mode=ws,route_block=8", "a:wire=1",
+                                 "a:stages=3", "a:dynamic=1", "a:rotation=fused,route_block=8",
+                                 "a:tile=64/128/64/256", "a:tile=64/192/64/256"])
+def test_invalid_combinations_fail_before_hardware(text):
+    b = benchmark()
+    with pytest.raises(ValueError):
+        b.coordinator_preflight(arguments(b, "--coordinator-arm", text))
+
+
+@pytest.mark.parametrize("extra", [("--capacities", "256,80"), ("--capacities", "256,256"),
+                                   ("--route-distributions", "random,bad"), ("--rounds", "0"),
+                                   ("--k5-experts", "257"), ("--intermediate", "1024")])
+def test_invalid_arguments(extra):
+    b = benchmark()
+    with pytest.raises(ValueError):
+        b.coordinator_preflight(arguments(b, *extra))
+
+
+def test_spark_defaults_unchanged():
+    args = benchmark().benchmark_parser().parse_args(["--prefill-family", "qwen4", "--output", "result.json"])
+    assert args.role == "spark" and args.route_layer == 23
+    assert args.prefill_arm == [] and args.rounds == 5 and args.replays == 100
+
+
+def test_routes_filter_and_reject_malformed(tmp_path):
+    b = benchmark()
+    assert len(b.coordinator_route_waves(b.GLM_ROUTES, 7)) == 9
+    path = tmp_path / "routes.json"
+    data = dict(schema=1, model="zai-org/GLM-5.3", waves=[dict(layer=7, rows=256, expert_rows=[[e, 256] for e in range(8)])])
+    path.write_text(json.dumps(data))
+    assert len(b.coordinator_route_waves(path)) == 1
+    data["waves"][0]["expert_rows"][0][0] = 256
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="histogram"):
+        b.coordinator_route_waves(path)
