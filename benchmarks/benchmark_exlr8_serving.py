@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import json
 import statistics
+import time
 from pathlib import Path
 
 import torch
@@ -279,6 +280,7 @@ def wired_arm(name, rows_max, tables, shared, owned, device="cuda"):
     """
     if rows_max > 64:
         raise ValueError("the wired decode instance serves at most 64 rows")
+    built = time.monotonic()
     core = compile_exlr8_a16_aot(hidden=HIDDEN, units=UNITS, top_k=TOP_K,
                                  max_groups=MAX_GROUPS, device_count=True,
                                  grouped=True, group_rows=16, grouped_rows=64,
@@ -286,6 +288,7 @@ def wired_arm(name, rows_max, tables, shared, owned, device="cuda"):
     group = compile_exlr8_group_aot(experts=EXPERTS, top_k=TOP_K,
                                     max_groups=MAX_GROUPS, hidden=HIDDEN,
                                     max_rows=64, group_rows=16)
+    build_seconds = time.monotonic() - built
     if core.name != "exlr8_a16_grouped64" or group.name != "exlr8_group":
         raise RuntimeError(f"wired pairing built {core.name} + {group.name}")
     sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -324,6 +327,7 @@ def wired_arm(name, rows_max, tables, shared, owned, device="cuda"):
                  fc1_ws=False, fc2_partials="f32 (bit-identical to K1)",
                  unit_enumerated="owned only (unit_count/unit_map, unit_limit=%d)"
                                  % unit_limit,
+                 build_seconds=round(build_seconds, 3),
                  program=core.name, group_program=group.name)
     return Arm(name, (core, group), buffers, (group_launch, core_launch), notes)
 
