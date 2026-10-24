@@ -21,8 +21,9 @@ def module(name):
             node.decorator_list = []
     arch = SimpleNamespace(thread_idx=lambda: (0, 0, 0), block_idx=lambda: (0, 0, 0))
     env = dict(Int32=np.int32, Int64=np.int64, Float32=SimpleNamespace(inf=np.inf),
-        const_expr=bool, cutlass=SimpleNamespace(range_constexpr=range),
-        cute=SimpleNamespace(arch=arch), attention_ops=SimpleNamespace(fmax=np.maximum))
+        const_expr=bool, cutlass=SimpleNamespace(range_constexpr=range, range=range, min=min),
+        cute=SimpleNamespace(arch=arch), attention_ops=SimpleNamespace(fmax=np.maximum),
+        _SPLIT=4)  # PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT
     class F32:
         inf = np.inf
 
@@ -52,6 +53,40 @@ def test_index_scratch_regions_are_aligned_and_disjoint(mode, rows, pages):
     assert list(offsets.values()) == sorted(offsets.values())
     assert size >= offsets["controls"] + 256
     assert env["minimax_index_scratch_bytes"](max_rows=rows, max_pages=pages, mode=mode) == size
+
+
+@pytest.mark.parametrize("lengths", [[1], [65], [16000], [700] * 16, [5, 70000, 300, 64, 129], [4096] * 64])
+def test_decode_schedule_spreads_every_live_page_once_over_balanced_intervals(lengths):
+    env, arch = module("minimax_indexer")
+    obj = object.__new__(env["_Index"])
+    obj.mode, obj.rows = "decode", 64
+    rows, width = len(lengths), 1024 * 64
+    lengths = np.array(lengths, dtype=np.int32)
+    scale, weights = np.ones(rows * 4, np.float32), np.zeros(rows * 4, np.float32)
+    schedule, controls = np.full((obj.rows + 1) * 2, -7, np.int32), np.zeros(4, np.int32)
+    grid = (rows * 4 + 127) // 128 + (obj.rows + 128) // 128
+    execute(arch, obj.init, (grid, 1), 128, scale, weights, schedule, controls, lengths, rows, width)
+    schedule = schedule.reshape(-1, 2)
+    live = np.minimum(lengths, width)
+    pages = (live + 63) // 64
+    splits = (pages + 3) // 4
+    visited, work = {}, []
+    # The scorer's walk (DSAScheduledMultiRowLogitsKernel): interval i covers
+    # schedule[i] up to schedule[i + 1], 4 pages per split.
+    for (q, s), (end_q, end_s) in zip(schedule[:-1], schedule[1:]):
+        done = 0
+        while q < rows and (q < end_q or (q == end_q and end_s > 0)):
+            first, last = s, splits[q] if q != end_q else min(end_s, splits[q])
+            for page in range(first * 4, min(last * 4, pages[q])):
+                visited[(q, page)] = visited.get((q, page), 0) + 1
+            done += max(last - first, 0)
+            q, s = q + 1, 0
+        work.append(done)
+    assert visited == {(r, p): 1 for r in range(rows) for p in range(pages[r])}
+    total = int(splits.sum())
+    assert max(work) == -(-total // obj.rows) and sum(work) == total
+    assert tuple(schedule[-1]) == (rows, 0)
+    assert controls[0] == width
 
 
 @pytest.mark.parametrize("mode", ["decode", "extend"])
