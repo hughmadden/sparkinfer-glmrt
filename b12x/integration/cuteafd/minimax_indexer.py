@@ -18,6 +18,7 @@ import torch
 from cutlass import Float32, Int32, Int64, const_expr
 
 from b12x.attention._shared.cute import ops as attention_ops
+from b12x.attention.dsa_indexer.kernel import PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT as _SPLIT
 
 from ._common import Operand, Scalar, compile_program
 
@@ -69,15 +70,40 @@ class _Index:
         return cute.make_tensor(ptr, cute.make_layout(shape, stride=strides))
 
     @cute.kernel
-    def init(self, scale, weights, schedule, controls, rows: Int32, width: Int32):
+    def init(self, scale, weights, schedule, controls, lengths, rows: Int32, width: Int32):
         tx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         idx = bx * 128 + tx
         if idx < rows * 4:
             weights[idx] = scale[idx] * Float32(128 ** -0.5)
-        if idx <= rows:
-            schedule[Int64(idx) * 2] = idx
-            schedule[Int64(idx) * 2 + 1] = Int32(0)
+        if const_expr(self.mode == "decode"):
+            # The decode scorer's max_rows intervals split the rows' live pages
+            # evenly in 4-page segments (the DSA paged-MQA schedule), instead of
+            # one interval per row whose 4 CTAs walk every page of a long row.
+            # Each page's score is computed whole by one CTA either way.
+            if idx <= self.rows:
+                total = Int32(0)
+                for r in cutlass.range(rows):
+                    live = cutlass.min(lengths[r], width)
+                    total += ((live + Int32(63)) // Int32(64) + Int32(_SPLIT - 1)) // Int32(_SPLIT)
+                share = total // Int32(self.rows)
+                start = idx * share + cutlass.min(idx, total - share * Int32(self.rows))
+                row, before = Int32(0), Int32(0)
+                searching = Int32(1)
+                while row < rows and searching != 0:
+                    live = cutlass.min(lengths[row], width)
+                    segments = ((live + Int32(63)) // Int32(64) + Int32(_SPLIT - 1)) // Int32(_SPLIT)
+                    if before + segments <= start:
+                        before += segments
+                        row += 1
+                    else:
+                        searching = Int32(0)
+                schedule[Int64(idx) * 2] = row
+                schedule[Int64(idx) * 2 + 1] = start - before
+        else:
+            if idx <= rows:
+                schedule[Int64(idx) * 2] = idx
+                schedule[Int64(idx) * 2 + 1] = Int32(0)
         if idx == 0:
             controls[0] = width
             controls[1] = Int32(1)  # Scalar byte loads preserve the packed page stride.
@@ -163,8 +189,9 @@ class _Decode(_Index):
         controls = self._ptr(scratch, self.offsets["controls"], Int32)
         scores = self._ptr(scratch, self.offsets["scores"], Float32)
         pages = self._ptr(scratch, self.offsets["pages"], Float32)
-        self.init(q_scale, weights, schedule, controls, rows, table_width * 64).launch(
-            grid=((rows * 4 + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream)
+        # Threads for every row's head weights and every schedule boundary.
+        self.init(q_scale, weights, schedule, controls, cache_lengths, rows, table_width * 64).launch(
+            grid=((rows * 4 + 127) // 128 + (self.rows + 128) // 128, 1, 1), block=(128, 1, 1), stream=stream)
         # The scoring kernel visits only live pages; initialize the padded page scores.
         self.clear_pages(pages, rows).launch(grid=((rows * 4 * self.pages + 127) // 128, 1, 1),
                                            block=(128, 1, 1), stream=stream)
@@ -179,7 +206,7 @@ class _Decode(_Index):
                          (Int32(pool_pages), 64), (2112, 1)),
             self._tensor(page_table, (rows, table_width), (Int64(table_stride), 1)),
             self._tensor(cache_lengths, (rows,), (1,)),
-            self._tensor(schedule, (rows + 1, 2), (2, 1)),
+            self._tensor(schedule, (self.rows + 1, 2), (2, 1)),
             self._tensor(controls, (1,), (1,)),
             self._tensor(pages, (4, rows, self.pages), (Int64(rows) * self.pages, self.pages, 1)), stream)
         self.select(pages, scores, self._ptr(scratch, self.offsets["starts"], Int32),
@@ -206,7 +233,7 @@ class _Prefill(_Index):
         scores = self._ptr(scratch, self.offsets["scores"], Float32)
         controls = self._ptr(scratch, self.offsets["controls"], Int32)
         self.init(q_scale, weights, self._ptr(scratch, self.offsets["schedule"], Int32),
-                  controls, rows, k_rows).launch(
+                  controls, k_end, rows, k_rows).launch(
             grid=((rows * 4 + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream)
         padded_k_rows = (k_rows + 255) // 256 * 256
         dummy = self._tensor(cute.recast_ptr(controls, dtype=Float32), (1, 1), (1, 1))
