@@ -1019,6 +1019,12 @@ GLM_CAPACITIES = (256, 1024, 2752, 4096)
 GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024,
                 "spark-tp6-width384": 384, "spark-tp6-width256": 256, "spark-tp4-width512": 512}
 GLM_ROUTES = Path(__file__).resolve().parent / "fixtures/glm53_prefill_routes_realistic.json"
+COORDINATOR_FAMILIES = {
+    "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
+                model="zai-org/GLM-5.3", profiles=tuple(GLM_PROFILES), routes=GLM_ROUTES),
+    "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), swiglu_limit=10.0,
+                 model="zai-org/GLM-5.3-Flash", profiles=("rtx-tp1", "rtx-tp2"), routes=None),
+}
 
 
 def parse_coordinator_arm(text):
@@ -1053,10 +1059,13 @@ def parse_coordinator_arm(text):
     return name, options
 
 
-def coordinator_compile_options(profile, capacity, arm, props):
-    """Mirror GLM's cooperative coordinator export, with explicit experimental overrides."""
-    if profile not in GLM_PROFILES or capacity not in GLM_CAPACITIES:
+def coordinator_compile_options(profile, capacity, arm, props, family="glm"):
+    """Mirror GLM/GLMF's cooperative coordinator export, with explicit experimental overrides."""
+    spec = COORDINATOR_FAMILIES.get(family)
+    if spec is None or profile not in spec["profiles"] or capacity not in GLM_CAPACITIES:
         raise ValueError("GLM requires a supported RTX/Spark profile and capacity 256/1024/2752/4096")
+    hidden, experts, topk = spec["hidden"], spec["experts"], spec["top_k"]
+    tier0_bits, tier1_bits = spec["bits"]
     width = GLM_PROFILES[profile]
     spark = profile.startswith("spark-")
     ws = arm.get("mode", "cooperative") == "ws"
@@ -1068,16 +1077,16 @@ def coordinator_compile_options(profile, capacity, arm, props):
             or (not ws and any(arm.get(k) for k in ("wire", "stages", "dynamic")))):
         raise ValueError("WS needs block >=16 and its own rotation; wire/stages/dynamic require WS")
     tile = arm.get("tile", (64, 128 if width == 384 else 256, 64, 128 if width == 384 else 256))
-    if width % tile[1] or 6144 % tile[3] or 6144 % tile[0] or width % tile[2]:
+    if width % tile[1] or hidden % tile[3] or hidden % tile[0] or width % tile[2]:
         raise ValueError("coordinator tile must divide both projection geometries")
     if not ws and tile[1] != tile[3]:
         raise ValueError("cooperative FC1/FC2 tiles must have equal CTA thread counts")
-    slots = route_pack_capacity(capacity * 8, block, 256, topk=8)[1]
-    return dict(size_m=capacity, hidden_size=6144, intermediate_size=width,
-        tier0_num_experts=256, tier1_num_experts=256, tier0_bits=4, tier1_bits=5,
-        route_num_experts=256, top_k=8, max_m_blocks=(slots + block - 1) // block,
+    slots = route_pack_capacity(capacity * topk, block, experts, topk=topk)[1]
+    return dict(size_m=capacity, hidden_size=hidden, intermediate_size=width,
+        tier0_num_experts=experts, tier1_num_experts=experts, tier0_bits=tier0_bits, tier1_bits=tier1_bits,
+        route_num_experts=experts, top_k=topk, max_m_blocks=(slots + block - 1) // block,
         sms=int(props.multi_processor_count), max_shared_mem=int(props.shared_memory_per_block_optin),
-        force_tile_config=tile, trellis_codebook="mcg", swiglu_limit=None,
+        force_tile_config=tile, trellis_codebook="mcg", swiglu_limit=spec["swiglu_limit"],
         moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype="bf16" if spark else "fp32",
         direct_topk_routes=False, token_major_rotation=token, fused_input_rotation=fused,
         warp_specialized=ws, input_format="e4m3_k32" if arm.get("wire") else "bf16",
@@ -1085,10 +1094,16 @@ def coordinator_compile_options(profile, capacity, arm, props):
         ws_dynamic_tiles=bool(arm.get("dynamic", False)))
 
 
-def coordinator_route_waves(path, layer=None):
+def coordinator_route_waves(path, layer=None, family="glm"):
+    spec = COORDINATOR_FAMILIES.get(family)
+    if spec is None or path is None:
+        raise ValueError(f"no realistic route fixture for coordinator family {family!r}")
     data = json.loads(Path(path).read_text())
-    if data.get("schema") != 1 or data.get("model") != "zai-org/GLM-5.3":
-        raise ValueError("coordinator fixture must be schema1 GLM-5.3 histograms")
+    if (data.get("schema") != 1 or data.get("model") != spec["model"]
+            or data.get("family", family) != family
+            or data.get("experts", spec["experts"]) != spec["experts"]
+            or data.get("top_k", spec["top_k"]) != spec["top_k"]):
+        raise ValueError(f"coordinator fixture must be schema1 {spec['model']} ({family}) histograms")
     waves = [w for w in data.get("waves", []) if layer is None or w.get("layer") == layer]
     if not waves:
         raise ValueError("coordinator fixture has no selected waves")
@@ -1096,17 +1111,19 @@ def coordinator_route_waves(path, layer=None):
         rows, counts = wave.get("rows", 0), wave.get("expert_rows", [])
         if (not isinstance(rows, int) or rows < 1 or not counts
                 or any(not isinstance(e, int) or not isinstance(n, int)
-                       or not 0 <= e < 256 or not 0 < n <= rows for e, n in counts)
+                       or not 0 <= e < spec["experts"] or not 0 < n <= rows for e, n in counts)
                 or len({e for e, _ in counts}) != len(counts)
-                or sum(n for _, n in counts) != rows * 8):
+                or sum(n for _, n in counts) != rows * spec["top_k"]):
             raise ValueError("invalid GLM coordinator route histogram")
     return waves
 
 
 def coordinator_preflight(args):
-    if args.prefill_family != "glm" or args.output is None:
-        raise ValueError("GLM requires --prefill-family glm --output")
-    if (args.role == "spark") != args.profile.startswith("spark-"):
+    family = args.prefill_family
+    spec = COORDINATOR_FAMILIES.get(family)
+    if spec is None or args.output is None:
+        raise ValueError("GLM requires --prefill-family glm|glmf --output")
+    if (args.role == "spark") != args.profile.startswith("spark-") or args.profile not in spec["profiles"]:
         raise ValueError("GLM --role must match the RTX or Spark --profile")
     if (args.kimi or args.compact_fixture or args.prefill_arm or args.prefill_source_dir
             or args.rows or args.intermediate or args.prefill_exhaustive):
@@ -1123,43 +1140,47 @@ def coordinator_preflight(args):
         raise ValueError("coordinator arm names must be unique")
     if min(args.layers, args.rounds, args.replays, args.warmup, args.memory_cap_gib) < 1:
         raise ValueError("layers/rounds/replays/warmup/memory cap must be positive")
-    if not 0 <= args.k5_experts <= 256:
-        raise ValueError("K5 projection count must be 0..256")
+    if not 0 <= args.k5_experts <= spec["experts"]:
+        raise ValueError(f"upgraded projection count must be 0..{spec['experts']}")
     routes = args.route_distributions.split(",")
     if not routes or len(set(routes)) != len(routes) or set(routes) - {"random", "realistic"}:
         raise ValueError("route distributions must be random and/or realistic")
-    waves = coordinator_route_waves(args.routes or GLM_ROUTES, args.coordinator_route_layer) if "realistic" in routes else []
+    waves = (coordinator_route_waves(args.routes or spec["routes"], args.coordinator_route_layer, family)
+             if "realistic" in routes or args.routes is not None else [])
     # CPU-only placeholders validate argument plumbing, never describe a timed device.
     props = SimpleNamespace(multi_processor_count=1, shared_memory_per_block_optin=101376)
     for capacity in capacities:
         for _, arm in specs:
-            coordinator_compile_options(args.profile, capacity, arm, props)
+            coordinator_compile_options(args.profile, capacity, arm, props, family)
     return capacities, specs, routes, waves
 
 
-def _make_coordinator_layer(width, k5_experts, seed, device):
-    """Synthetic projection-major K4/K5 payloads with the export's E256 tier slots."""
+def _make_coordinator_layer(width, k5_experts, seed, device, family="glm"):
+    """Synthetic projection-major tier payloads with the export's full expert tier slots."""
+    spec = COORDINATOR_FAMILIES[family]
+    hidden, experts = spec["hidden"], spec["experts"]
+    tier0_bits, tier1_bits = spec["bits"]
     tiers = []
-    for tier, count in enumerate((256 - k5_experts, k5_experts)):
+    for tier, (bits, count) in enumerate(zip((tier0_bits, tier1_bits), (experts - k5_experts, k5_experts))):
         prepared = prepare_trellis256_moe_weights(
-            hidden_size=6144, intermediate_size=width, num_experts=max(count, 1),
+            hidden_size=hidden, intermediate_size=width, num_experts=max(count, 1),
             activation="silu", fc1_tile_n=128, fc2_tile_n=128, device=device,
             seed=seed + tier, params_dtype=torch.float16, w13_layout="trellis_t256_proj",
-            trellis_bits=4 + tier, codebook="mcg", tile_config=(64, 128, 64, 128))
+            trellis_bits=bits, codebook="mcg", tile_config=(64, 128, 64, 128))
         w13 = prepared.w13 if count else prepared.w13[:prepared.w13.numel() // 2]
-        scales = torch.ones(256, dtype=torch.float32, device=device)
+        scales = torch.ones(experts, dtype=torch.float32, device=device)
         scales[:max(count, 1)].copy_(prepared.w13_global_scale)
-        tiers.append(replace(prepared, num_experts=256, w13=w13, w13_global_scale=scales))
-    membership = [int(e >= 256 - k5_experts) for e in range(256)]
+        tiers.append(replace(prepared, num_experts=experts, w13=w13, w13_global_scale=scales))
+    membership = [int(e >= experts - k5_experts) for e in range(experts)]
     # Distinct projection memberships exercise the same per-projection descriptor ABI as checkpoints.
     mapping, descriptor = build_projection_tiered_maps(
         membership, membership[1:] + membership[:1], membership[2:] + membership[:2],
-        tier_slots=(256, 256), device=device)
+        tier_slots=(experts, experts), device=device)
     generator = torch.Generator(device=device).manual_seed(seed)
     def scales(shape):
         return (0.875 + 0.25 * torch.rand(shape, generator=generator, device=device)).half()
-    rotations = MixedTrellisRotations(scales((512, 3 * width)), scales((512, 6144)),
-                                     scales((512, 6144)), scales((512, 6144)))
+    rotations = MixedTrellisRotations(scales((2 * experts, 3 * width)), scales((2 * experts, hidden)),
+                                     scales((2 * experts, hidden)), scales((2 * experts, hidden)))
     return *tiers, mapping, descriptor, rotations
 
 
@@ -1168,6 +1189,8 @@ def _run_coordinator_benchmark(args, device, props):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     capacities, specs, distributions, waves = coordinator_preflight(args)
+    spec = COORDINATOR_FAMILIES[args.prefill_family]
+    hidden, experts, topk = spec["hidden"], spec["experts"], spec["top_k"]
     target = (12, 1) if args.role == "spark" else (12, 0)
     if (props.major, props.minor) != target:
         raise ValueError(f"GLM {args.role} benchmark requires SM{target[0]}{target[1]}")
@@ -1175,14 +1198,14 @@ def _run_coordinator_benchmark(args, device, props):
     width = GLM_PROFILES[args.profile]
     output_dtype = torch.bfloat16 if args.role == "spark" else torch.float32
     bit_dtype = torch.int16 if args.role == "spark" else torch.int32
-    layers = [_make_coordinator_layer(width, args.k5_experts, args.seed + 2*i, device)
+    layers = [_make_coordinator_layer(width, args.k5_experts, args.seed + 2*i, device, args.prefill_family)
               for i in range(args.layers)]
-    counts = (256 - args.k5_experts, args.k5_experts)
+    counts = (experts - args.k5_experts, args.k5_experts)
     records, failures = [], []
     for capacity in capacities:
         states = {}
         for name, arm in specs:
-            options = coordinator_compile_options(args.profile, capacity, arm, props)
+            options = coordinator_compile_options(args.profile, capacity, arm, props, args.prefill_family)
             print(json.dumps(dict(compiling=name, capacity=capacity, options=options)), flush=True)
             launch = mix.compile_mixed_trellis(**options)
             workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
@@ -1190,19 +1213,19 @@ def _run_coordinator_benchmark(args, device, props):
             mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
             states[name] = workspace, bindings
         generator = torch.Generator().manual_seed(args.seed + capacity)
-        raw = (torch.randn((capacity, 6144), generator=generator) * 0.02).to(device=device, dtype=torch.bfloat16)
+        raw = (torch.randn((capacity, hidden), generator=generator) * 0.02).to(device=device, dtype=torch.bfloat16)
         # The BF16 oracle consumes exactly the decoded wire values, not the pre-quantized input.
         wire = make_wire(raw)
-        exponent = wire[:, 6144:].float() - 127
-        decoded = (wire[:, :6144].contiguous().view(torch.float8_e4m3fn).float().reshape(capacity, 192, 32)
-                   * torch.exp2(exponent).unsqueeze(-1)).reshape(capacity, 6144).bfloat16()
-        weights = torch.rand((capacity, 8), generator=generator).to(device)
+        exponent = wire[:, hidden:].float() - 127
+        decoded = (wire[:, :hidden].contiguous().view(torch.float8_e4m3fn).float().reshape(capacity, hidden // 32, 32)
+                   * torch.exp2(exponent).unsqueeze(-1)).reshape(capacity, hidden).bfloat16()
+        weights = torch.rand((capacity, topk), generator=generator).to(device)
         weights /= weights.sum(-1, keepdim=True)
         for distribution in distributions:
             selected = list(enumerate(waves)) if distribution == "realistic" else [(None, None)]
             for wave_index, wave in selected:
-                ids = (real_route_ids(capacity, wave, generator) if wave else
-                       torch.rand((capacity, 256), generator=generator).topk(8, dim=1).indices).to(device=device, dtype=torch.int32)
+                ids = (real_route_ids(capacity, wave, generator, experts, topk) if wave else
+                       torch.rand((capacity, experts), generator=generator).topk(topk, dim=1).indices).to(device=device, dtype=torch.int32)
                 for layer in range(args.layers):
                     def run(name):
                         workspace, bindings = states[name]
@@ -1219,7 +1242,7 @@ def _run_coordinator_benchmark(args, device, props):
                         # Freeze routing outside the graph: time the real bound core + top-k sum
                         # without copying its raw ABI or charging precomputed route-pack work.
                         launch = bindings[layer].launch
-                        slots = route_pack_capacity(capacity * 8, launch.moe_block_size, 256, topk=8)[1]
+                        slots = route_pack_capacity(capacity * topk, launch.moe_block_size, experts, topk=topk)[1]
                         packed = (workspace.packed_route_indices[:slots], workspace.block_expert_ids, workspace.packed_route_count)
                         with patch.object(mix, "pack_topk_routes_by_expert", return_value=packed):
                             graphs[name] = _capture(lambda name=name: run(name), args.warmup)
@@ -1249,13 +1272,14 @@ def _run_coordinator_benchmark(args, device, props):
         del states, workspace, bindings, launch
         torch.cuda.empty_cache()
     source = Path(__file__).resolve().parents[1]
-    result = dict(schema=1, kind="glm_exl3_prefill", role=args.role, profile=args.profile,
-        device=props.name, sm_count=props.multi_processor_count, hidden=6144, intermediate=width,
-        experts=256, top_k=8, bits=[4, 5], k5_experts_per_projection=args.k5_experts, arms=specs,
+    result = dict(schema=1, kind="glm_exl3_prefill" if args.prefill_family == "glm" else f"{args.prefill_family}_exl3_prefill",
+        role=args.role, profile=args.profile,
+        device=props.name, sm_count=props.multi_processor_count, hidden=hidden, intermediate=width,
+        experts=experts, top_k=topk, bits=list(spec["bits"]), k5_experts_per_projection=args.k5_experts, arms=specs,
         source_sha256={p: hashlib.sha256((source / p).read_bytes()).hexdigest() for p in (
             "benchmarks/benchmark_mixed_trellis.py", "b12x/moe/_shared/kernels/w4a16/mixed_trellis.py",
             "b12x/moe/_shared/kernels/w4a16/mixed_trellis_ws.py")},
-        route_sha256=hashlib.sha256((args.routes or GLM_ROUTES).read_bytes()).hexdigest() if waves else None,
+        route_sha256=hashlib.sha256((args.routes or spec["routes"]).read_bytes()).hexdigest() if waves else None,
         output_dtype=str(output_dtype),
         conditions="synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); common E4M3/UE8M0 K32-roundtripped BF16 input; "
                    "histogram replay preserves rescaled expert counts, not original token co-occurrence; "
@@ -1304,7 +1328,7 @@ def benchmark_parser():
     parser.add_argument("--calls-per-graph", type=int, default=8)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261022)
-    parser.add_argument("--prefill-family", choices=(*PREFILL_FAMILIES, "glm"))
+    parser.add_argument("--prefill-family", choices=(*PREFILL_FAMILIES, *COORDINATOR_FAMILIES))
     parser.add_argument("--role", choices=("spark", "coordinator"), default="spark")
     parser.add_argument("--profile", choices=tuple(GLM_PROFILES), default="rtx-tp2")
     parser.add_argument("--capacities", default="256,1024,2752,4096", help="GLM coordinator compile capacities")
@@ -1335,7 +1359,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.prefill_family and (args.kimi or args.output is None or args.memory_cap_gib <= 0):
         parser.error("--prefill-family requires --output, positive memory cap, and no --kimi")
-    if args.prefill_family == "glm" or args.role == "coordinator" or args.preflight_only:
+    if args.prefill_family in COORDINATOR_FAMILIES or args.role == "coordinator" or args.preflight_only:
         try:
             capacities, specs, distributions, waves = coordinator_preflight(args)
         except ValueError as exc:
@@ -1348,7 +1372,7 @@ def main() -> None:
         parser.error("--coordinator-arm requires GLM coordinator mode")
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
-    if args.prefill_family == "glm":
+    if args.prefill_family in COORDINATOR_FAMILIES:
         _run_coordinator_benchmark(args, device, props)
         return
     if args.prefill_family:
