@@ -1337,12 +1337,12 @@ class W4A16GemmKernel:
             not self.weight_layout_trellis256
             or self.weight_layout_trellis256_pair
             or not self.schedule_whole_tiles
-            or self.direct_topk_routes
             or self.dense_route_fast_path
+            or (self.direct_topk_routes and self.l2_prefetch_k_tiles)
         ):
             raise ValueError(
-                "L2 weight schedule options require packed whole-tile "
-                "single-rate trellis_t256 weights"
+                "L2 weight schedule options require whole-tile single-rate "
+                "trellis_t256 weights; direct routes support evict-first only"
             )
         self.l2_prefetch_k_tiles = min(self.l2_prefetch_k_tiles, self.k_tiles)
         # One bulk prefetch per K16 row of the tile: its cta_n_blocks Trellis

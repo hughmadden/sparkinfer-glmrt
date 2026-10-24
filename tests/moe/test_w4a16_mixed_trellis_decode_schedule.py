@@ -75,7 +75,8 @@ def test_decode_schedule_rejects_bad_specs(spec: str) -> None:
     "options",
     [
         {"warp_specialized": True, "moe_block_size": 64},
-        {"direct_topk_routes": True},
+        {"direct_topk_routes": True, "decode_schedule": "l2=2,pf1=1"},
+        {"compact_weights": True, "decode_schedule": "l2=2,pf2=1"},
         {"paired_boundary": "first"},
     ],
 )
@@ -125,6 +126,8 @@ def test_memory_schedule_requires_whole_tile_trellis_routes() -> None:
         )
     with pytest.raises(ValueError, match="L2 weight schedule"):
         _fc2_gemm(direct_topk_routes=True, l2_prefetch_k_tiles=2)
+    direct = _fc2_gemm(direct_topk_routes=True, l2_evict_first_b=True)
+    assert direct.l2_evict_first_b and direct.l2_prefetch_k_tiles == 0
 
 
 def _fused(**options) -> W4A16FusedMoeKernel:
@@ -340,3 +343,52 @@ def test_glmf_gb10_package_shape_keeps_one_result_per_row(glmf_layer) -> None:
     assert torch.equal(alone, default_alone)
     assert torch.equal(in_8, default_alone)
     assert torch.equal(in_64, default_alone)
+
+
+@pytest.mark.parametrize("tiers", [3, 4])
+@pytest.mark.parametrize("schedule", [None, "gb10", "l2=2,pf1=0,pf2=0,pdl=1"])
+def test_multitier_schedule_reaches_every_kernel_before_cuda(monkeypatch, tiers, schedule):
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis, mixed_trellis4
+
+    module = mixed_trellis if tiers == 3 else mixed_trellis4
+    captured = []
+
+    class BeforeCuda(Exception):
+        pass
+
+    def inspect(build, **kwargs):
+        captured.append(build(False))
+        raise BeforeCuda
+
+    monkeypatch.setattr(module, "_select_mixed_fc2_kernel", inspect)
+    options = dict(size_m=80, hidden_size=HIDDEN, intermediate_size=INTERMEDIATE,
+                   tier0_num_experts=4, tier1_num_experts=4, tier2_num_experts=4,
+                   top_k=TOPK, max_m_blocks=96, sms=48, max_shared_mem=101376,
+                   force_tile_config=K64_N256, decode_schedule=schedule)
+    if tiers == 4:
+        options["tier3_num_experts"] = 4
+    compile_kernel = getattr(module, f"compile_mixed_trellis{tiers}")
+    with pytest.raises(BeforeCuda):
+        compile_kernel(**options)
+    kernel = captured[0]
+    for name in ("driver", *(f"tier{i}" for i in range(tiers))):
+        fused = getattr(kernel, name)
+        assert fused.fc1.l2_evict_first_b == (schedule is not None)
+        assert fused.fc2.l2_evict_first_b == (schedule is not None)
+        assert fused.fc1.l2_prefetch_k_tiles == fused.fc2.l2_prefetch_k_tiles == 0
+
+
+@pytest.mark.parametrize("tiers", [3, 4])
+@pytest.mark.parametrize("schedule", ["pf1=1", "pf2=1", "l2=2,pf1=1,pf2=1,pdl=2"])
+def test_multitier_prefetch_is_rejected_before_cuda(tiers, schedule):
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis, mixed_trellis4
+
+    module = mixed_trellis if tiers == 3 else mixed_trellis4
+    options = dict(size_m=80, hidden_size=HIDDEN, intermediate_size=INTERMEDIATE,
+                   tier0_num_experts=4, tier1_num_experts=4, tier2_num_experts=4,
+                   top_k=TOPK, max_m_blocks=96, sms=48, max_shared_mem=101376,
+                   force_tile_config=K64_N256, decode_schedule=schedule)
+    if tiers == 4:
+        options["tier3_num_experts"] = 4
+    with pytest.raises(ValueError, match="evict-first only"):
+        getattr(module, f"compile_mixed_trellis{tiers}")(**options)

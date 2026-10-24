@@ -2398,11 +2398,13 @@ def compile_mixed_trellis(
         raise ValueError("EXL3 A8 requires the warp-specialized prefill kernel")
     schedule = parse_decode_schedule(decode_schedule)
     if schedule is not None and (
-        warp_specialized or paired_boundary is not None or compact_weights or direct_topk_routes
+        warp_specialized or paired_boundary is not None
+        or ((compact_weights or direct_topk_routes) and (
+            schedule.fc1_prefetch_k_tiles or schedule.fc2_prefetch_k_tiles or schedule.phase_prefetch))
     ):
         raise ValueError(
-            "the L2 decode schedule applies to the cooperative packed-route "
-            "kernel with disjoint ownership"
+            "the L2 decode schedule requires cooperative disjoint weights; "
+            "compact and direct routes support evict-first only"
         )
     if input_format not in ("bf16", "e4m3_k32"):
         raise ValueError(f"unsupported mixed Trellis input format {input_format!r}")
@@ -2751,8 +2753,13 @@ def compile_mixed_trellis3(
     broadcast_svh: bool = False,
     route_num_experts: int | None = None,
     workspace_sms: int | None = None,
+    decode_schedule: str | None = None,
 ) -> MixedTrellis3CompileResult:
     """Compile the dedicated three-bitrate cooperative Trellis grid."""
+
+    schedule = parse_decode_schedule(decode_schedule)
+    if schedule is not None and (schedule.fc1_prefetch_k_tiles or schedule.fc2_prefetch_k_tiles or schedule.phase_prefetch):
+        raise ValueError("multi-tier decode schedules support evict-first only")
 
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
@@ -2820,6 +2827,7 @@ def compile_mixed_trellis3(
             rotation_input_dtype=rotation_input_dtype,
             broadcast_suh=broadcast_suh,
             schedule_whole_tiles=True,
+            **({} if schedule is None else schedule.kernel_options()),
         )
 
     def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellis3Kernel:
@@ -2864,6 +2872,7 @@ def compile_mixed_trellis3(
         use_expert_map=True,
         broadcast_svh=broadcast_svh,
     )
+    decode_schedule = None if schedule is None else schedule.canonical()
     cached = _CACHE3.get(cache_key)
     if cached is not None:
         return replace(
@@ -2875,6 +2884,7 @@ def compile_mixed_trellis3(
             sms=int(sms),
             broadcast_suh=bool(broadcast_suh),
             broadcast_svh=bool(broadcast_svh),
+            decode_schedule=decode_schedule,
         )
 
     compile_m = _fake_m_for_specialization(size_m)
@@ -2990,6 +3000,7 @@ def compile_mixed_trellis3(
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
         workspace_sms=workspace_sms,
+        decode_schedule=decode_schedule,
     )
     _CACHE3[cache_key] = result
     return result

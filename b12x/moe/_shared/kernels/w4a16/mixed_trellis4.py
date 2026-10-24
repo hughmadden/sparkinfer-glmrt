@@ -36,7 +36,7 @@ from .kernel import (
     compile_w4a16_topk_sum,
 )
 from .mixed_trellis import (
-    MixedTrellis3CompileResult, W4A16MixedTrellisKernel,
+    MixedTrellis3CompileResult, W4A16MixedTrellisKernel, parse_decode_schedule,
     _MAX_TIER_EXPERTS, _descriptor_bits,
     _select_mixed_fc2_kernel,
 )
@@ -924,8 +924,13 @@ def compile_mixed_trellis4(
     broadcast_svh: bool = False,
     route_num_experts: int | None = None,
     workspace_sms: int | None = None,
+    decode_schedule: str | None = None,
 ) -> MixedTrellis4CompileResult:
     """Compile the dedicated four-bitrate cooperative Trellis grid."""
+
+    schedule = parse_decode_schedule(decode_schedule)
+    if schedule is not None and (schedule.fc1_prefetch_k_tiles or schedule.fc2_prefetch_k_tiles or schedule.phase_prefetch):
+        raise ValueError("multi-tier decode schedules support evict-first only")
 
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
@@ -994,6 +999,7 @@ def compile_mixed_trellis4(
             rotation_input_dtype=rotation_input_dtype,
             broadcast_suh=broadcast_suh,
             schedule_whole_tiles=True,
+            **({} if schedule is None else schedule.kernel_options()),
         )
 
     def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellis4Kernel:
@@ -1039,6 +1045,7 @@ def compile_mixed_trellis4(
         use_expert_map=True,
         broadcast_svh=broadcast_svh,
     )
+    decode_schedule = None if schedule is None else schedule.canonical()
     cached = _CACHE4.get(cache_key)
     if cached is not None:
         return replace(
@@ -1051,6 +1058,7 @@ def compile_mixed_trellis4(
             sms=int(sms),
             broadcast_suh=bool(broadcast_suh),
             broadcast_svh=bool(broadcast_svh),
+            decode_schedule=decode_schedule,
         )
 
     compile_m = _fake_m_for_specialization(size_m)
@@ -1173,6 +1181,7 @@ def compile_mixed_trellis4(
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
         workspace_sms=workspace_sms,
+        decode_schedule=decode_schedule,
     )
     _CACHE4[cache_key] = result
     return result
