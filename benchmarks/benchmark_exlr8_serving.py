@@ -17,6 +17,10 @@ order, the ascending K1024 split fold or output rounding.
   wired       the shipped dispatch: the 64-row ``exlr8_a16_grouped64`` core
               (F32 FC2 partials) plus the 64-row ``exlr8_group`` glue, both at
               the runtime CTA limits the engine derives
+  k1compact   K1's serving ABI (F32 partials unchanged) with compact owned-unit
+              enumeration: only owned units are enumerated, so a rank that owns
+              three of sixteen units fills the grid instead of pinning each CTA
+              to one (unit, proj, split) family
 
 The grouped arms reuse the shipped grouped prefill kernel and grouping
 verbatim; the compact ``unit_count``/``unit_map``/``unit_limit`` tables are
@@ -329,6 +333,69 @@ def wired_arm(name, rows_max, tables, shared, owned, device="cuda"):
     return Arm(name, (core, group), buffers, (group_launch, core_launch), notes)
 
 
+def k1compact_arm(name, rows_max, tables, shared, owned, device="cuda"):
+    """K1's serving ABI with compact owned-unit enumeration.
+
+    Same streams, partials and accumulation order as K1, but FC1 and the
+    activation enumerate only the caller's owned units, so a TP6 rank that owns
+    three of sixteen units fills the whole grid instead of pinning each CTA to
+    one (unit, proj, split) family. Output must stay bit-identical to K1.
+    """
+    if rows_max > 64:
+        raise ValueError("the compact K1 instance serves at most 64 rows")
+    built = time.monotonic()
+    core = compile_exlr8_a16_aot(hidden=HIDDEN, units=UNITS, top_k=TOP_K,
+                                 max_groups=MAX_GROUPS, device_count=True,
+                                 compact_units=True)
+    group = compile_exlr8_group_aot(experts=EXPERTS, top_k=TOP_K,
+                                    max_groups=MAX_GROUPS, hidden=HIDDEN,
+                                    max_rows=64, group_rows=16)
+    build_seconds = time.monotonic() - built
+    if core.name != "exlr8_a16_serving_compact" or group.name != "exlr8_group":
+        raise RuntimeError(f"compact pairing built {core.name} + {group.name}")
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    core_cta = sms * int(core.geometry["ctas_per_sm"])
+    group_cta = sms * int(group.geometry["ctas_per_sm"])
+    unit_count, unit_map, unit_limit = unit_tables(owned, device)
+    buffers = dict(
+        group_expert=torch.full((MAX_GROUPS,), -1, dtype=torch.int32, device=device),
+        route_slots=torch.full((MAX_GROUPS, 16), -1, dtype=torch.int32, device=device),
+        route_group_lane=torch.full((rows_max, TOP_K), -1, dtype=torch.int32, device=device),
+        group_count=torch.zeros(1, dtype=torch.int32, device=device),
+        activation=torch.empty((rows_max, HIDDEN), dtype=torch.float16, device=device),
+        signs_out=shared["signs_out"],
+        signs_in=shared["signs_in"],
+        output=torch.empty((rows_max, HIDDEN), dtype=torch.bfloat16, device=device),
+        route_weights=shared["weights"],
+        ids=shared["ids"],
+        unit_count=unit_count,
+        unit_map=unit_map,
+        pointers=tables["tables"],
+        bits=tables["bits"],
+    )
+    buffers.update(alloc_scratch(core, device))
+    group_values = dict(buffers, x=shared["wire"])
+    core_values = dict(buffers, x=buffers["activation"])
+
+    def group_launch(rows):
+        launch_program(group, group_values, (rows, group_cta))
+
+    def core_launch(rows):
+        launch_program(core, core_values, (rows, core_cta, unit_limit))
+
+    notes = dict(kind="k1compact", core_cta_limit=core_cta, group_cta_limit=group_cta,
+                 threads=128, min_blocks_per_mp=core.geometry["ctas_per_sm"],
+                 group_rows=16, max_groups=MAX_GROUPS, unit_limit=unit_limit,
+                 fc1_ws=False, fc2_partials="f32 (K1 partials unchanged)",
+                 unit_enumerated="owned only (unit_count/unit_map, unit_limit=%d)"
+                                 % unit_limit,
+                 build_seconds=round(build_seconds, 3),
+                 grid_clamp="min(max_groups*unit_limit*2*splits, cta_limit) fc1; "
+                            "min(max_groups*unit_limit, cta_limit) activation",
+                 program=core.name, group_program=group.name)
+    return Arm(name, (core, group), buffers, (group_launch, core_launch), notes)
+
+
 def route_fixture(rows, distribution, generator, wave):
     if distribution == "random":
         ids = torch.stack([torch.randperm(EXPERTS, generator=generator)[:TOP_K]
@@ -428,6 +495,8 @@ def main():
                 arm_set[name] = base_arm(sms * factor, rows_max, tables, shared)
             elif name == "wired":
                 arm_set[name] = wired_arm(name, rows_max, tables, shared, owned)
+            elif name == "k1compact":
+                arm_set[name] = k1compact_arm(name, rows_max, tables, shared, owned)
             elif name.startswith("grouped"):
                 spec = name[len("grouped"):]
                 half = spec.endswith("h")

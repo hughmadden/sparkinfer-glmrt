@@ -566,3 +566,232 @@ class Exlr8A16Kernel:
                          h0 * signed_byte(signs, 0), h1 * signed_byte(signs, 1),
                          h2 * signed_byte(signs, 2), h3 * signed_byte(signs, 3))
             task += step
+
+
+class Exlr8A16CompactKernel(Exlr8A16Kernel):
+    """K1 serving ABI with compact owned-unit enumeration.
+
+    The shipped K1 fc1 tasks enumerate all sixteen units and each CTA strides by
+    the grid width. At the shipped ``cta_limit`` of ``sms * CTAS_PER_SM`` a
+    unit's task family spans the whole grid, so every CTA is pinned to one
+    (unit, proj, split) and a rank that owns three of sixteen units keeps only
+    36 of 192 CTAs busy (measured 179 GB/s against a 257 GB/s read roofline on
+    GB10). This variant enumerates the caller's owned units through the same
+    ``unit_count``/``unit_map`` tables the grouped kernel already carries, and
+    indexes its scratch by the compact task id, so the full grid covers owned
+    work. Owned units are visited in ascending unit order, so every expert's
+    accumulation order is unchanged and results stay bit-identical to K1.
+    """
+
+    CODE_VERSION = 1
+
+    @property
+    def __cache_key__(self):
+        return ("exlr8_a16_compact", self.ABI_VERSION, self.CODE_VERSION, self.hidden_size,
+                self.units, self.top_k, self.max_groups, self.fast_math, self.device_count)
+
+    @cute.jit
+    def serving_compact(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
+                        group_expert: cute.Tensor, route_slots: cute.Tensor,
+                        route_group_lane: cute.Tensor, route_weights: cute.Tensor,
+                        fc1: cute.Tensor, intermediate: cute.Tensor, fc2: cute.Tensor,
+                        signs_out: cute.Tensor, output: cute.Tensor, rows: Int32,
+                        group_count: cute.Tensor, unit_count: cute.Tensor,
+                        unit_map: cute.Tensor, cta_limit: Int32, unit_limit: Int32,
+                        stream: cuda.CUstream):
+        # Grids are static upper bounds; each kernel bounds its tasks by the
+        # device-resident group count. unit_limit is the caller's owned-unit
+        # maximum (its compact scratch stride), never the SM count.
+        if rows > Int32(0) and rows <= Int32(64) and cta_limit > Int32(0) and unit_limit > Int32(0):
+            if cutlass.const_expr(self.device_count):
+                self.fc1_kernel(x, pointers, bits, unit_count, unit_map, group_expert,
+                                route_slots, fc1, rows, group_count, unit_limit).launch(
+                    grid=(min(Int32(self.max_groups) * unit_limit * Int32(2 * self.splits),
+                              cta_limit), 1, 1),
+                    block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+                self.activation_kernel(pointers, bits, unit_count, unit_map, group_expert,
+                                       route_slots, fc1, intermediate, rows, group_count,
+                                       unit_limit).launch(
+                    grid=(min(Int32(self.max_groups) * unit_limit, cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
+                self.fc2_kernel(pointers, bits, unit_count, unit_map, group_expert, route_slots,
+                                intermediate, fc2, rows, group_count, unit_limit).launch(
+                    grid=(min(Int32(self.max_groups * self.blocks), cta_limit), 1, 1),
+                    block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+            self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
+                               rows, group_count).launch(
+                grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
+                block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def fc1_kernel(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
+                   unit_count: cute.Tensor, unit_map: cute.Tensor,
+                   group_expert: cute.Tensor, route_slots: cute.Tensor,
+                   fc1: cute.Tensor, rows: Int32, groups, unit_limit: Int32):
+        if cutlass.const_expr(self.device_count):
+            groups = groups[0]
+            # Invalid counts never index descriptor or scratch storage.
+            if groups < Int32(0) or groups > Int32(self.max_groups):
+                groups = Int32(0)
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        policy = create_l2_evict_first_policy()
+        while task < groups * unit_limit * Int32(2 * self.splits):
+            split = task % Int32(self.splits)
+            proj = (task // Int32(self.splits)) % Int32(2)
+            local = (task // Int32(2 * self.splits)) % unit_limit
+            group = task // (unit_limit * Int32(2 * self.splits))
+            expert = group_expert[group]
+            if local < unit_count[expert]:
+                unit = unit_map[expert.to(Int64) * Int64(self.units) + local.to(Int64)]
+                desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
+                width = bits[desc]
+                total = cute.make_rmem_tensor((4, 4), Float32)
+                total.fill(Float32(0.0))
+                r = lane // Int32(4)
+                slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
+                slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+                row0, row1 = Int32(-1), Int32(-1)
+                if slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k):
+                    row0 = slot0 // Int32(self.top_k)
+                if slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k):
+                    row1 = slot1 // Int32(self.top_k)
+                if width != Int32(0):
+                    payload = pointers[desc * Int64(3)]
+                    scales = pointers[desc * Int64(3) + Int64(2)]
+                    for block in cutlass.range(8):
+                        kb = split * Int32(8) + block
+                        if kb < Int32(self.blocks):
+                            scale = _side_value(scales, kb)
+                            if width == Int32(2):
+                                self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
+                                    self.hidden_size, kb, Int32(0), lane, warp, 2, False, scale, policy)
+                            elif width == Int32(3):
+                                self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
+                                    self.hidden_size, kb, Int32(0), lane, warp, 3, False, scale, policy)
+                            elif width == Int32(4):
+                                self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
+                                    self.hidden_size, kb, Int32(0), lane, warp, 4, False, scale, policy)
+                for n in cutlass.range_constexpr(4):
+                    col = warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
+                    base = task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)
+                    if width != Int32(0) and row0 >= Int32(0):
+                        fc1[base], fc1[base + Int64(1)] = total[n, 0], total[n, 1]
+                    if width != Int32(0) and row1 >= Int32(0):
+                        fc1[base + Int64(8 * 128)], fc1[base + Int64(8 * 128 + 1)] = total[n, 2], total[n, 3]
+            task += step
+
+    @cute.kernel
+    def activation_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
+                          unit_count: cute.Tensor, unit_map: cute.Tensor,
+                          group_expert: cute.Tensor, route_slots: cute.Tensor,
+                          fc1: cute.Tensor, intermediate: cute.Tensor,
+                          rows: Int32, groups, unit_limit: Int32):
+        if cutlass.const_expr(self.device_count):
+            groups = groups[0]
+            # Invalid counts never index descriptor or scratch storage.
+            if groups < Int32(0) or groups > Int32(self.max_groups):
+                groups = Int32(0)
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        while task < groups * unit_limit:
+            group, local = task // unit_limit, task % unit_limit
+            expert = group_expert[group]
+            if local < unit_count[expert]:
+                unit = unit_map[expert.to(Int64) * Int64(self.units) + local.to(Int64)]
+                desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3)
+                for iteration in cutlass.range_constexpr(self.group_rows // 4):
+                    row = warp + Int32(iteration * 4)
+                    slot = route_slots[group.to(Int64) * Int64(self.group_rows) + row.to(Int64)]
+                    g = cute.make_rmem_tensor(4, Float32)
+                    u = cute.make_rmem_tensor(4, Float32)
+                    g.fill(Float32(0.0))
+                    u.fill(Float32(0.0))
+                    if bits[desc] != Int32(0) and slot >= Int32(0) and slot < rows * Int32(self.top_k):
+                        for split in cutlass.range_constexpr(self.splits):
+                            base = (task.to(Int64) * Int64(2 * self.splits) + Int64(split)) * Int64(self.group_rows * 128) + row.to(Int64) * Int64(128) + lane.to(Int64) * Int64(4)
+                            for v in cutlass.range_constexpr(4):
+                                g[v] = g[v] + fc1[base + Int64(v)]
+                                u[v] = u[v] + fc1[base + Int64(self.splits * self.group_rows * 128 + v)]
+                        gh = _w4a8_had128_quad(g[0], g[1], g[2], g[3], lane)
+                        uh = _w4a8_had128_quad(u[0], u[1], u[2], u[3], lane)
+                        gs = pointers[desc * Int64(3) + Int64(1)]
+                        us = pointers[(desc + Int64(1)) * Int64(3) + Int64(1)]
+                        ds = pointers[(desc + Int64(2)) * Int64(3) + Int64(1)]
+                        for v in cutlass.range_constexpr(4):
+                            col = lane * Int32(4) + Int32(v)
+                            gate = gh[v] * _side_value(gs, col)
+                            up = uh[v] * _side_value(us, col)
+                            sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math))
+                            g[v] = gate * sigmoid * up * _side_value(ds, col)
+                        g[0], g[1], g[2], g[3] = _w4a8_had128_quad(g[0], g[1], g[2], g[3], lane)
+                        base = (task.to(Int64) * Int64(self.group_rows) + row.to(Int64)) * Int64(128) + lane.to(Int64) * Int64(4)
+                        for v in cutlass.range_constexpr(4):
+                            intermediate[base + Int64(v)] = g[v].to(cutlass.Float16)
+            task += step
+
+    @cute.kernel
+    def fc2_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
+                   unit_count: cute.Tensor, unit_map: cute.Tensor,
+                   group_expert: cute.Tensor, route_slots: cute.Tensor,
+                   intermediate: cute.Tensor, fc2: cute.Tensor,
+                   rows: Int32, groups, unit_limit: Int32):
+        if cutlass.const_expr(self.device_count):
+            groups = groups[0]
+            # Invalid counts never index descriptor or scratch storage.
+            if groups < Int32(0) or groups > Int32(self.max_groups):
+                groups = Int32(0)
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        r = lane >> Int32(2)
+        a_lane_off = (r * Int32(128) + (lane & Int32(3)) * Int32(2)).to(Int64) * Int64(2)
+        inter_base = intermediate.iterator.toint() + a_lane_off
+        l2_policy = create_l2_evict_first_policy()
+        max_slot = rows * Int32(self.top_k)
+        while task < groups * Int32(self.blocks):
+            group, block = task // Int32(self.blocks), task % Int32(self.blocks)
+            expert = group_expert[group]
+            total = cute.make_rmem_tensor((4, 4), Float32)
+            total.fill(Float32(0.0))
+            slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
+            slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+            valid0 = ((slot0 >= Int32(0)) & (slot0 < max_slot)).to(Int32)
+            valid1 = ((slot1 >= Int32(0)) & (slot1 < max_slot)).to(Int32)
+            # Owned units in ascending order: the same accumulation order K1
+            # performs when it skips unowned (zero-width) slots.
+            for local in cutlass.range(unit_limit):
+                if local < unit_count[expert]:
+                    unit = unit_map[expert.to(Int64) * Int64(self.units) + local.to(Int64)]
+                    desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
+                    width = bits[desc]
+                    if width != Int32(0):
+                        payload = pointers[desc * Int64(3)]
+                        packed_scale = ld_global_b16(pointers[desc * Int64(3) + Int64(2)] + block.to(Int64) * Int64(2))
+                        a_base = inter_base + (group.to(Int64) * unit_limit.to(Int64) + local.to(Int64)) * Int64(16 * 128 * 2)
+                        if width == Int32(2):
+                            self._fc2_accumulate_block(
+                                total, payload, a_base, valid0, valid1, block, lane, warp, 2, packed_scale, l2_policy
+                            )
+                        elif width == Int32(3):
+                            self._fc2_accumulate_block(
+                                total, payload, a_base, valid0, valid1, block, lane, warp, 3, packed_scale, l2_policy
+                            )
+                        elif width == Int32(4):
+                            self._fc2_accumulate_block(
+                                total, payload, a_base, valid0, valid1, block, lane, warp, 4, packed_scale, l2_policy
+                            )
+            out_group, out_block = task // Int32(self.blocks), task % Int32(self.blocks)
+            for n in cutlass.range_constexpr(4):
+                col = out_block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
+                base = (out_group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)
+                if valid0 != Int32(0):
+                    fc2[base], fc2[base + Int64(1)] = total[n, 0], total[n, 1]
+                if valid1 != Int32(0):
+                    fc2[base + Int64(8 * self.hidden_size)], fc2[base + Int64(8 * self.hidden_size + 1)] = total[n, 2], total[n, 3]
+            task += step

@@ -153,12 +153,57 @@ class _Exlr8GroupedServingPointers:
                   cta_limit, unit_limit, stream)
 
 
+class _Exlr8CompactServingPointers:
+    """K1 serving ABI plus the compact owned-unit tables and runtime unit limit.
+
+    Same operand and scalar layout as the grouped instance: `unit_count[E]` and
+    `unit_map[E,U]` describe this rank's owned units per expert in ascending
+    unit order, and `unit_limit` is their runtime maximum. It bounds the FC1 and
+    activation grids and the compact scratch stride.
+    """
+
+    def __init__(self, g):
+        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16CompactKernel
+        self.core = Exlr8A16CompactKernel(g["hidden"], g["units"], g["top_k"],
+                                          g["max_groups"], device_count=True)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
+                 group_expert: cute.Pointer, route_slots: cute.Pointer,
+                 route_group_lane: cute.Pointer, route_weights: cute.Pointer,
+                 fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
+                 signs_out: cute.Pointer, output: cute.Pointer, group_count: cute.Pointer,
+                 unit_count: cute.Pointer, unit_map: cute.Pointer,
+                 rows: cutlass.Int32, cta_limit: cutlass.Int32,
+                 unit_limit: cutlass.Int32, stream: cuda.CUstream):
+        self.core.serving_compact(cute.make_tensor(x, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(bits, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(group_expert, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_slots, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_group_lane, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_weights, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(signs_out, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(output, cute.make_layout(1, stride=1)),
+                  rows,
+                  cute.make_tensor(group_count, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(unit_count, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(unit_map, cute.make_layout(1, stride=1)),
+                  cta_limit, unit_limit, stream)
+
+
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                          device_count=False, shared_expert=False, grouped=False, group_rows=64,
-                         grouped_rows=4096, fc2_partials="f16",
+                         grouped_rows=4096, fc2_partials="f16", compact_units=False,
                          activations="a16", quantize_pass=True):
     if activations not in ("a16", "a8") or (activations == "a8" and not grouped):
         raise ValueError("EXLR8 A8 activations require grouped prefill")
+    if compact_units:
+        if not device_count or grouped or shared_expert or activations != "a16":
+            raise ValueError("compact EXLR8 units require the plain device-count serving ABI")
     if shared_expert:
         if not device_count:
             raise ValueError("shared EXLR8 requires device-count serving ABI")
@@ -210,18 +255,20 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     sizes = scratch_bytes(g)
     if device_count:
         operands += (Operand("group_count", torch.int32, "[1]"),)
-    if grouped:
+    if grouped or compact_units:
         # Compact owned-unit tables appended after the existing prefix.
         operands += (Operand("unit_count", torch.int32, "[E]"),
                      Operand("unit_map", torch.int32, f"[E,{u}]"))
     return compile_program(_Exlr8GroupedServingPointers(g) if grouped else
+                           _Exlr8CompactServingPointers(g) if compact_units else
                            _Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
                            name=(f"exlr8_{activations}_grouped64" if grouped and g["max_rows"] == 64 else
                                  f"exlr8_{activations}_grouped" if grouped else
+                                 "exlr8_a16_serving_compact" if compact_units else
                                  "exlr8_shared_a16_serving" if shared_expert else
                                  "exlr8_a16_serving" if device_count else "exlr8_a16_decode"), operands=operands,
                            scalars=tuple(Scalar(n) for n in (("rows", "cta_limit", "unit_limit")
-                                                            if grouped else
+                                                            if grouped or compact_units else
                                                             ("rows", "cta_limit") if device_count
                                                             else ("rows", "groups", "cta_limit"))),
                            key=((h, u, t, m, g["abi_version"], shared_expert, grouped, r,
@@ -230,6 +277,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  # cache policy changes.
                                  "decode_l2_fc2_prefetch_v9")
                                 + (("grouped_compact_units",) if grouped else ())
+                                + (("k1_compact_units",) if compact_units else ())
                                 + ((activations,) if grouped and activations != "a16" else ())
                                 + (("fused_quantize",) if grouped and activations != "a16" and not quantize_pass else ())
                                 + ((grouped_rows,) if grouped and grouped_rows != 4096 else ())
