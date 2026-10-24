@@ -76,14 +76,17 @@ class _Exlr8Pointers:
 
 class _Exlr8ServingPointers:
     def __init__(self, g):
-        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
+        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel, Exlr8RoutedServingKernel
         if g.get("max_rows", 64) > 64:
             from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
             self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
                                            g["max_groups"], g["group_rows"])
-        else:
+        elif g.get("serving_variant", "baseline") == "baseline":
             self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"],
                                       g["max_groups"], device_count=True)
+        else:
+            self.core = Exlr8RoutedServingKernel(g["hidden"], g["units"], g["top_k"],
+                                                 g["max_groups"], variant=g["serving_variant"])
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -122,7 +125,8 @@ class _Exlr8GroupedServingPointers:
         self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
                                        g["max_groups"], g["group_rows"],
                                        activations=g.get("activations", "a16"),
-                                       quantize_pass=g.get("quantize_pass", True))
+                                       quantize_pass=g.get("quantize_pass", True),
+                                       fc2_f32=g.get("fc2_partials", "f16") == "f32")
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -152,29 +156,99 @@ class _Exlr8GroupedServingPointers:
                   cta_limit, unit_limit, stream)
 
 
+class _Exlr8CompactServingPointers:
+    """K1 serving ABI plus the compact owned-unit tables and runtime unit limit.
+
+    Same operand and scalar layout as the grouped instance: `unit_count[E]` and
+    `unit_map[E,U]` describe this rank's owned units per expert in ascending
+    unit order, and `unit_limit` is their runtime maximum. It bounds the FC1 and
+    activation grids and the compact scratch stride.
+    """
+
+    def __init__(self, g):
+        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16CompactKernel
+        self.core = Exlr8A16CompactKernel(g["hidden"], g["units"], g["top_k"],
+                                          g["max_groups"], device_count=True)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
+                 group_expert: cute.Pointer, route_slots: cute.Pointer,
+                 route_group_lane: cute.Pointer, route_weights: cute.Pointer,
+                 fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
+                 signs_out: cute.Pointer, output: cute.Pointer, group_count: cute.Pointer,
+                 unit_count: cute.Pointer, unit_map: cute.Pointer,
+                 rows: cutlass.Int32, cta_limit: cutlass.Int32,
+                 unit_limit: cutlass.Int32, stream: cuda.CUstream):
+        self.core.serving_compact(cute.make_tensor(x, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(bits, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(group_expert, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_slots, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_group_lane, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(route_weights, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(signs_out, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(output, cute.make_layout(1, stride=1)),
+                  rows,
+                  cute.make_tensor(group_count, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(unit_count, cute.make_layout(1, stride=1)),
+                  cute.make_tensor(unit_map, cute.make_layout(1, stride=1)),
+                  cta_limit, unit_limit, stream)
+
+
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                          device_count=False, shared_expert=False, grouped=False, group_rows=64,
-                         activations="a16", quantize_pass=True):
+                         grouped_rows=4096, fc2_partials="f16", compact_units=False,
+                         activations="a16", quantize_pass=True, serving_variant=None):
     if activations not in ("a16", "a8") or (activations == "a8" and not grouped):
         raise ValueError("EXLR8 A8 activations require grouped prefill")
+    # Routed <=64-row decode defaults to the compact-unit routed serving core;
+    # "baseline" keeps the shipped K1 core as the bitwise reference arm.
+    from b12x.moe._shared.kernels.w4a16.exlr8 import SERVING_VARIANTS
+    variant = serving_variant or "k1_reg_pair_b2"
+    if variant != "baseline" and variant not in SERVING_VARIANTS:
+        raise ValueError(f"unknown EXLR8 serving variant {variant!r}")
+    routed_serving = device_count and not shared_expert and not grouped and not compact_units
+    if routed_serving:
+        if units > 16:
+            raise ValueError("EXLR8 routed serving covers at most 16 units")
+    elif serving_variant is not None:
+        raise ValueError("EXLR8 serving variant applies to the plain routed serving ABI")
+    if compact_units:
+        if not device_count or grouped or shared_expert or activations != "a16":
+            raise ValueError("compact EXLR8 units require the plain device-count serving ABI")
     if shared_expert:
         if not device_count:
             raise ValueError("shared EXLR8 requires device-count serving ABI")
         if top_k != 1 or max_groups != 4:
             raise ValueError("shared EXLR8 requires top_k=1 and max_groups=4")
+    if grouped_rows not in (64, 4096):
+        raise ValueError("EXLR8 grouped instances support 64 or 4096 planned rows")
+    if fc2_partials not in ("f16", "f32"):
+        raise ValueError("EXLR8 FC2 partials must be f16 or f32")
     g = geometry(hidden, units, top_k, max_groups)
+    if routed_serving:
+        g["serving_variant"] = variant
     if grouped:
         if not device_count or shared_expert or group_rows not in (16, 32, 64):
             raise ValueError("EXLR8 grouped prefill requires device count and group rows 16/32/64")
+        if grouped_rows == 64 and group_rows != 16:
+            raise ValueError("64-row grouped instances require 16-row groups")
         from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
-        g.update(max_rows=4096, group_rows=group_rows,
+        g.update(max_rows=grouped_rows, group_rows=group_rows,
                  ctas_per_sm=Exlr8GroupedKernel.CTAS_PER_SM)
         if activations != "a16":
             g["activations"] = activations
             if not quantize_pass:
                 g["quantize_pass"] = False
+        if fc2_partials != "f16":
+            # Declared so the engine can require the partial precision its
+            # numerics contract needs; F16 stays implicit for the shared instance.
+            g["fc2_partials"] = fc2_partials
         tasks = (max_groups * units * 2 * g["fc1_splits"] * 4,
-                 max_groups * (hidden // 128) * 4, 4096 * (hidden // 128))
+                 max_groups * (hidden // 128) * 4, grouped_rows * (hidden // 128))
         if max(tasks) > (2**31 - 1) // 2 or max_groups * group_rows > 2**31 - 1:
             raise ValueError("EXLR8 grouped task or route indexing exceeds signed int32")
         if max(scratch_bytes(g).values()) > 2**63 - 1:
@@ -198,17 +272,20 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     sizes = scratch_bytes(g)
     if device_count:
         operands += (Operand("group_count", torch.int32, "[1]"),)
-    if grouped:
+    if grouped or compact_units:
         # Compact owned-unit tables appended after the existing prefix.
         operands += (Operand("unit_count", torch.int32, "[E]"),
                      Operand("unit_map", torch.int32, f"[E,{u}]"))
     return compile_program(_Exlr8GroupedServingPointers(g) if grouped else
+                           _Exlr8CompactServingPointers(g) if compact_units else
                            _Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
-                           name=(f"exlr8_{activations}_grouped" if grouped else
+                           name=(f"exlr8_{activations}_grouped64" if grouped and g["max_rows"] == 64 else
+                                 f"exlr8_{activations}_grouped" if grouped else
+                                 "exlr8_a16_serving_compact" if compact_units else
                                  "exlr8_shared_a16_serving" if shared_expert else
                                  "exlr8_a16_serving" if device_count else "exlr8_a16_decode"), operands=operands,
                            scalars=tuple(Scalar(n) for n in (("rows", "cta_limit", "unit_limit")
-                                                            if grouped else
+                                                            if grouped or compact_units else
                                                             ("rows", "cta_limit") if device_count
                                                             else ("rows", "groups", "cta_limit"))),
                            key=((h, u, t, m, g["abi_version"], shared_expert, grouped, r,
@@ -217,7 +294,11 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  # cache policy changes.
                                  "decode_l2_fc2_prefetch_v9")
                                 + (("grouped_compact_units",) if grouped else ())
+                                + (("k1_compact_units",) if compact_units else ())
                                 + ((activations,) if grouped and activations != "a16" else ())
-                                + (("fused_quantize",) if grouped and activations != "a16" and not quantize_pass else ())), geometry=g,
+                                + (("fused_quantize",) if grouped and activations != "a16" and not quantize_pass else ())
+                                + ((grouped_rows,) if grouped and grouped_rows != 4096 else ())
+                                + ((fc2_partials,) if grouped and fc2_partials != "f16" else ())
+                                + ((variant,) if routed_serving else ())), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)

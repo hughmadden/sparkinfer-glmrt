@@ -417,9 +417,12 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
     result = [
         ("a16_decode", "exlr8_a16", {"max_rows": 64},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k, max_groups=max_groups)),
-        ("a16_serving", "exlr8_a16", {"max_rows": 64},
+        # Routed <=64-row decode: the compact-unit routed serving core (ported
+        # from the S3 Gemini duel branch) beside the 64-row grouped instance.
+        ("a16_serving", "exlr8_a16", {"max_rows": 64, "serving_variant": "k1_reg_pair_b2"},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
-                                      max_groups=max_groups, device_count=True)),
+                                      max_groups=max_groups, device_count=True,
+                                      serving_variant="k1_reg_pair_b2")),
         ("group", "exlr8_group", {"max_rows": 64},
          lambda: compile_exlr8_group_aot(top_k=top_k, max_groups=max_groups, hidden=hidden)),
         ("shared_a16_serving", "exlr8_a16", {"max_rows": 64},
@@ -440,6 +443,13 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
         ("grouped_group", "exlr8_group", {"max_rows": 4096},
          lambda: compile_exlr8_group_aot(hidden=hidden, top_k=top_k,
              max_groups=(4096 * top_k + 63)//64 + 256, max_rows=4096, group_rows=64)),
+        # 64-row grouped decode instance: the same grouped core below the K1
+        # threshold, with F32 FC2 partials so output stays bit-identical to K1.
+        # It pairs with the 64-row "group" glue entry above.
+        ("a16_grouped64", "exlr8_a16", {"max_rows": 64, "fc2_partials": "f32"},
+         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+             max_groups=max_groups, device_count=True, grouped=True, group_rows=16,
+             grouped_rows=64, fc2_partials="f32")),
     ]
     if role == "spark":
         return result[1:3] + grouped

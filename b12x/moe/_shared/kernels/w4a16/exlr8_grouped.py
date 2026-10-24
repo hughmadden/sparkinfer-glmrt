@@ -538,13 +538,17 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64,
-                 activations: str = "a16", quantize_pass: bool = True):
+                 activations: str = "a16", quantize_pass: bool = True, fc2_f32: bool | None = None):
         super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True)
         if activations not in ("a16", "a8"):
             raise ValueError("EXLR8 grouped activations must be 'a16' or 'a8'")
         self.activations = activations
         self.a8 = activations == "a8"
         self.quantize_pass = bool(quantize_pass) and self.a8
+        # FC2 partial storage precision: F16 for the shared prefill instance, F32
+        # when the instance must match the K1 serving kernel's numerics exactly.
+        if fc2_f32 is not None:
+            self.FC2_HALF = not bool(fc2_f32)
         self.group_rows = group_rows
         self.mtiles = group_rows // 16
         if group_rows not in (16, 32, 64):
