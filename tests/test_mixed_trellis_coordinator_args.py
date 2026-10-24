@@ -16,11 +16,18 @@ HOST = SOURCE.parents[1] / "b12x/moe/_shared/kernels/w4a16/host.py"
 def benchmark():
     names = {"parse_coordinator_arm", "coordinator_compile_options", "coordinator_route_waves",
              "coordinator_preflight", "benchmark_parser", "parse_prefill_arm"}
+    glm_profiles = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
+                    "spark-tp6-width256": 256, "spark-tp4-width512": 512}
+    glm_routes = SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json"
     scope = dict(argparse=argparse, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
                  PREFILL_FAMILIES={"qwen4": (), "kimik3": ()}, GLM_CAPACITIES=(256, 1024, 2752, 4096),
-                 GLM_PROFILES={"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
-                               "spark-tp6-width256": 256, "spark-tp4-width512": 512},
-                 GLM_ROUTES=SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json")
+                 GLM_PROFILES=glm_profiles, GLM_ROUTES=glm_routes,
+                 COORDINATOR_FAMILIES={
+                     "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
+                                 model="zai-org/GLM-5.3", profiles=tuple(glm_profiles), routes=glm_routes),
+                     "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), swiglu_limit=10.0,
+                                  model="zai-org/GLM-5.3-Flash", profiles=("rtx-tp1", "rtx-tp2"), routes=None),
+                 })
     host_names = {"route_pack_capacity", "route_pack_numel_capacity", "route_pack_token_capacity",
                   "max_packed_route_slots"}
     for tree, selected in ((ast.parse(HOST.read_text()), host_names), (TREE, names)):
@@ -126,3 +133,56 @@ def test_routes_filter_and_reject_malformed(tmp_path):
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="histogram"):
         b.coordinator_route_waves(path)
+
+
+@pytest.mark.parametrize("profile,width", [("rtx-tp1", 2048), ("rtx-tp2", 1024)])
+@pytest.mark.parametrize("capacity", [256, 1024, 2752, 4096])
+def test_glmf_cooperative_matches_export_contract(profile, width, capacity):
+    b = benchmark()
+    for sms in (170, 188):
+        props = SimpleNamespace(multi_processor_count=sms, shared_memory_per_block_optin=101376)
+        opts = b.coordinator_compile_options(profile, capacity, {}, props, "glmf")
+        assert (opts["hidden_size"], opts["intermediate_size"], opts["top_k"], opts["route_num_experts"]) == (4096, width, 8, 288)
+        assert opts["tier0_num_experts"] == opts["tier1_num_experts"] == 288
+        assert (opts["tier0_bits"], opts["tier1_bits"]) == (3, 4)
+        assert opts["swiglu_limit"] == 10.0
+        assert opts["sms"] == sms
+        assert opts["full_rotation_output_dtype"] == "fp32"
+        assert opts["moe_block_size"] == (8 if capacity == 256 else 64)
+        assert opts["token_major_rotation"] == (capacity > 256)
+        assert not opts["warp_specialized"] and not opts["fused_input_rotation"]
+        assert opts["max_m_blocks"] >= (capacity * 8 + 288 * (opts["moe_block_size"] - 1) + opts["moe_block_size"] - 1) // opts["moe_block_size"]
+
+
+def test_glmf_preflight_and_foreign_fixture_refusal():
+    b = benchmark()
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", "glmf", "--role", "coordinator", "--route-distributions", "random",
+        "--k5-experts", "72", "--output", "result.json",
+        "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128",
+    ])
+    capacities, specs, routes, waves = b.coordinator_preflight(args)
+    assert capacities == [256, 1024, 2752, 4096] and routes == ["random"] and waves == []
+    opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1],
+                                         SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376), "glmf")
+    assert opts["hidden_size"] == 4096 and opts["route_num_experts"] == 288
+    assert (opts["tier0_bits"], opts["tier1_bits"]) == (3, 4) and opts["swiglu_limit"] == 10.0
+    assert opts["warp_specialized"] and opts["input_format"] == "e4m3_k32"
+    assert opts["force_tile_config"] == (64, 128, 64, 128) and opts["moe_block_size"] == 32
+    with pytest.raises(ValueError, match="no realistic route fixture"):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", "glmf", "--role", "coordinator", "--output", "result.json"]))
+    with pytest.raises(ValueError, match="zai-org/GLM-5.3-Flash"):
+        b.coordinator_route_waves(b.GLM_ROUTES, family="glmf")
+    with pytest.raises(ValueError, match="zai-org/GLM-5.3-Flash"):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", "glmf", "--role", "coordinator", "--route-distributions", "random",
+            "--routes", str(b.GLM_ROUTES), "--output", "result.json"]))
+    with pytest.raises(ValueError):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", "glmf", "--role", "spark", "--profile", "spark-tp4-width512",
+            "--route-distributions", "random", "--output", "result.json"]))
+    with pytest.raises(ValueError):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", "glmf", "--role", "coordinator", "--route-distributions", "random",
+            "--k5-experts", "289", "--output", "result.json"]))
