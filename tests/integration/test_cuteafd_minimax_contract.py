@@ -55,7 +55,7 @@ def module():
     for name in ("Mxfp8ScalePrep", "SwigluOai", "RouterScores", "Route", "IndexQuant", "KvPack", "KvSplit"):
         namespace[name] = lambda *a, **kw: (a, kw)
     names = {node.name for node in ast.parse((ROOT / "minimax.py").read_text()).body if isinstance(node, ast.FunctionDef)}
-    return load_definitions("minimax.py", names | {"LINEAR_SHAPES"}, namespace)
+    return load_definitions("minimax.py", names | {"LINEAR_SHAPES", "DECODE_SPLITS"}, namespace)
 
 
 @pytest.mark.parametrize("name,k,n", [("q",6144,8192),("kv",6144,1024),("o",8192,6144),
@@ -63,7 +63,12 @@ def module():
     ("shared_down",3072,6144),("dense_gate_up",6144,24576),("dense_down",12288,6144)])
 def test_native_projection_shapes(module, name, k, n):
     kw = module["compile_minimax_linear_aot"](name, max_rows=129)
-    assert kw == dict(input_features=k, output_features=n, encoding="mxfp8", activation_encoding="mxfp8", max_rows=129)
+    assert kw == dict(input_features=k, output_features=n, encoding="mxfp8", activation_encoding="mxfp8",
+        max_rows=129, splits=1)
+    if name in module["DECODE_SPLITS"]:
+        splits = module["DECODE_SPLITS"][name]
+        assert (k // 128) % splits == 0 and (n // 128) * splits >= 16
+        assert module["compile_minimax_linear_aot"](name, max_rows=64, splits=splits)["splits"] == splits
 
 
 def test_norm_and_partial_rope_boundaries(module):
@@ -140,8 +145,9 @@ def test_native_stage_uses_k32_mxfp8_mma_and_runtime_card_grid():
     launch = lambda *args,**kwargs: SimpleNamespace(args=args,kwargs=kwargs)
     namespace = dict(Fp8LinearStage=object, cutlass=SimpleNamespace(BFloat16="bf16",Float32="f32",
         Float8E4M3FN="e4m3",Float8E8M0FNU="ue8m0"), _MXFP8RowsQuantLaunch=launch,
-        _DenseGemmLaunch=launch, _DenseGemmPolicy=launch)
-    stage = load_definitions("_mxfp8_linear.py", {"Mxfp8LinearStage"}, namespace)["Mxfp8LinearStage"](6144,128)
+        _DenseGemmLaunch=launch, _DenseGemmPolicy=launch, _DenseSplitKReduce=launch, StoreOne=launch)
+    stages = load_definitions("_mxfp8_linear.py", {"Mxfp8LinearStage"}, namespace)["Mxfp8LinearStage"]
+    stage = stages(6144,128)
     assert stage.quant.args == (6144,"bf16",4,256,32,False,0.,False)
     assert stage.gemm.kwargs["ab_dtype"] == "e4m3"
     assert stage.gemm.kwargs["sf_dtype"] == "ue8m0"
@@ -149,6 +155,13 @@ def test_native_stage_uses_k32_mxfp8_mma_and_runtime_card_grid():
     assert stage.gemm.kwargs["cluster_shape_mn"] == (1,1)
     assert stage.gemm.kwargs["alpha_is_one"]
     assert "weight_only" not in stage.gemm.kwargs
+    assert (stage.gemm.kwargs["c_l"], stage.gemm.kwargs["c_dtype"], stage.reduce) == (1, "bf16", None)
+    # Split-K writes FP32 partial planes, one per slice, reduced once.
+    split = stages(6144,128,16)
+    assert (split.gemm.kwargs["c_l"], split.gemm.kwargs["c_dtype"]) == (16, "f32")
+    assert split.gemm.kwargs["policy"].args[3] == 16 and split.reduce.args == (128, 16)
+    with pytest.raises(ValueError):
+        stages(6144,128,5)
 
 
 @pytest.mark.parametrize("heads,paged", [(4,False),(1,False),(1,True)])
