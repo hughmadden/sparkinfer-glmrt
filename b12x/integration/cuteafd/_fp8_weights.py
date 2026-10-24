@@ -374,31 +374,35 @@ FP8_GEMV_GROUPS_DEFAULT = 4
 # per-row-scale FP32 grid these shapes ship; block-scale cells the 128x128 grid):
 #   qkv 34816x5120 (2,4) 1.045/1.104/1.148 -- the column block that wins at one row loses
 #   here, and four tiles keep the 64-row step to one 178 MiB read;
-#   o 5120x17408 (1,1) 1.195/1.079/1.054 -- few column CTAs, so a CTA band per 16 rows
+#   o 5120x17408 (1,1) 1.195/1.079/1.057 -- few column CTAs, so a CTA band per 16 rows
 #   fills the machine and the doubled weight read is still cheaper than the idle SM time;
 #   gate_up 16384x5120 keeps shipped: every arm measured 0.84-1.00;
 #   KDA in 24896x4096 keeps shipped: 0.976-0.984 at 32/48 rows for the 4-tile arms;
 #   KDA o 4096x8192 keeps shipped: 0.65-1.00, best is the shipped tile at 64 rows;
 #   MLA o 4096x16384 (2,2) block 1.000/1.084/1.455, row-scale 1.023/1.500;
 #   q_b 16384x1536 keeps shipped: 0.87-1.06;
-#   qkv_a 2048x4096 (1,2) 1.063/1.223/1.445;
-#   shared gate_up 4096x4096 (2,4) 1.100/1.077/1.031;
+#   qkv_a 2048x4096 (1,1) 1.307/1.100/1.183 -- one tile per CTA wins while the batch is
+#   narrow; (1,2) trades 32-row time (1.063) for 1.445 at 64 rows and loses the worst cell;
+#   shared gate_up 4096x4096 (2,4) 1.100/1.077/1.000;
 #   shared down 4096x2048 (1,1) 1.429/1.748/1.889;
 #   dense gate_up 24576x4096 (2,4) 1.000/1.062/1.089;
 #   dense down 4096x12288 keeps shipped: 0.63-1.00;
-#   FP32 head 154880x4096 (2,4) block 0.995/1.083/1.155, row-scale 0.990/1.127 (32 rows is
+#   FP32 head 154880x4096 (2,4) block 0.995/1.083/1.151, row-scale 0.990/1.127 (32 rows is
 #   2 us on 410, inside the +-0.5% session spread the same cell shows);
 #   MiMo qkv 13568x4096 (2,2) block 1.000/1.051/1.400, row-scale 1.032/1.043;
-#   SWA qkv 14848x4096 (1,2) block 1.113/1.024/1.062, row-scale 1.150/1.031;
+#   SWA qkv 14848x4096 (2,2) block 1.000/1.049/1.378, row-scale 1.062/1.020 -- the (1,2) arm
+#   that leads at 32 rows falls to 0.826 on the 64-row row-scale cell;
 #   dense gate_up 32768x4096 keeps shipped: 0.981 at 32 rows for every 4-tile arm;
-#   LM head 152576x4096 (2,4) block 0.995/1.092/1.164, row-scale 0.995/1.108.
+#   LM head 152576x4096 (2,4) block 0.995/1.092/1.160, row-scale 0.995/1.108.
+# The two 0.99 cells are 2 us on ~410 us, inside the +-0.5% spread the same cell shows across
+# sessions; no other arm reaches 1.00 there while keeping the 64-row win.
 # Every entry keeps the thin tile's ``warps``: ``groups`` and ``cta_tiles`` only partition
 # the launch grid, so the rows 16 -> 17 program switch is still one bitwise K order.
 FP8_GEMV_WIDE = {
     (34816, 5120): (2, 4), (5120, 17408): (1, 1),
-    (4096, 16384): (2, 2), (2048, 4096): (1, 2), (4096, 4096): (2, 4), (4096, 2048): (1, 1),
+    (4096, 16384): (2, 2), (2048, 4096): (1, 1), (4096, 4096): (2, 4), (4096, 2048): (1, 1),
     (24576, 4096): (2, 4), (154880, 4096): (2, 4),
-    (13568, 4096): (2, 2), (14848, 4096): (1, 2), (152576, 4096): (2, 4),
+    (13568, 4096): (2, 2), (14848, 4096): (2, 2), (152576, 4096): (2, 4),
 }
 
 
