@@ -494,10 +494,17 @@ def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16, 
 
     FP32 output preserves the accumulator (router/partial sums); BF16 output
     materializes projection rows before norm, activation or residual updates.
-    ``compensated`` opts into K16 compensated FP32 accumulation with fixed
-    prefill tiles; the default route and its compile identity stay unchanged.
+    ``compensated`` opts into K16 compensated FP32 accumulation, with the
+    measured live-row tiles of ``COMPENSATED_TILES_BY_ROWS`` where the weight
+    shape has them (the entries retile the same canonical accumulation, so
+    they emit the canonical kernel's bits) and fixed prefill tiles otherwise;
+    the default route and its compile identity stay unchanged.
     """
-    from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection, TmaBf16Projection
+    from b12x.gemm.bf16_gemv._skinny import (
+        COMPENSATED_TILES_BY_ROWS,
+        RoutedBf16Projection,
+        TmaBf16Projection,
+    )
 
     if width <= 0 or outputs <= 0 or width % 8 or outputs % 8:
         raise ValueError("projection dimensions must be positive multiples of eight")
@@ -506,11 +513,15 @@ def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16, 
     if not isinstance(compensated, bool):
         raise ValueError("projection compensated must be boolean")
     dtype = BFloat16 if output_dtype == torch.bfloat16 else Float32
-    launch = TmaBf16Projection(outputs, width, out_dtype=dtype, tiles_by_rows=(), compensated=True) \
+    tiles_by_rows = COMPENSATED_TILES_BY_ROWS.get((int(outputs), int(width)), ()) if compensated else ()
+    launch = TmaBf16Projection(outputs, width, out_dtype=dtype, tiles_by_rows=tiles_by_rows,
+                               compensated=True) \
         if compensated else RoutedBf16Projection(outputs, width, out_dtype=dtype, max_skinny_rows=0)
     geometry = dict(width=width, outputs=outputs, output_dtype=str(output_dtype), skinny_rows=0)
     if compensated:
         geometry["compensated"] = True
+        if tiles_by_rows:
+            geometry["tiles_by_rows"] = tiles_by_rows
     return compile_program(launch, name="bf16_projection", operands=(
         Operand("x", torch.bfloat16, f"[rows,{width}]"),
         Operand("w", torch.bfloat16, f"[{outputs},{width}]"),

@@ -69,7 +69,7 @@ def test_projection_compensation_is_opt_in_and_default_key_is_unchanged(monkeypa
             return tuple(sorted(self.kwargs.items()))
 
     monkeypatch.setitem(sys.modules, "b12x.gemm.bf16_gemv._skinny", SimpleNamespace(
-        RoutedBf16Projection=Projection, TmaBf16Projection=Projection))
+        COMPENSATED_TILES_BY_ROWS={}, RoutedBf16Projection=Projection, TmaBf16Projection=Projection))
     namespace = dict(torch=SimpleNamespace(bfloat16="bf16", float32="f32"),
                      BFloat16="bf16", Float32="f32", Operand=lambda *a: a,
                      Scalar=lambda *a: a, compile_program=lambda op, **kwargs: kwargs)
@@ -86,6 +86,43 @@ def test_projection_compensation_is_opt_in_and_default_key_is_unchanged(monkeypa
     assert default["key"] != compensated["key"]
     with pytest.raises(ValueError, match="boolean"):
         build(width=6144, outputs=7168, compensated="yes")
+
+
+def _compensated_build(monkeypatch, table):
+    """``compile_bf16_projection_aot`` with stub projections; returns (build, calls)."""
+    source = _PATH.parents[1] / "b12x/integration/cuteafd/pointwise.py"
+    node = next(n for n in ast.parse(source.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == "compile_bf16_projection_aot")
+    calls = []
+
+    class Projection:
+        def __init__(self, n, k, **kwargs):
+            calls.append((n, k, kwargs))
+            self.kwargs = kwargs
+
+        def key(self):
+            return tuple(sorted(self.kwargs.items()))
+
+    monkeypatch.setitem(sys.modules, "b12x.gemm.bf16_gemv._skinny", SimpleNamespace(
+        COMPENSATED_TILES_BY_ROWS=table, RoutedBf16Projection=Projection, TmaBf16Projection=Projection))
+    namespace = dict(torch=SimpleNamespace(bfloat16="bf16", float32="f32"),
+                     BFloat16="bf16", Float32="f32", Operand=lambda *a: a,
+                     Scalar=lambda *a: a, compile_program=lambda op, **kwargs: kwargs)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+    return namespace["compile_bf16_projection_aot"], calls
+
+
+def test_compensated_route_selects_its_measured_row_tiles(monkeypatch):
+    """A shape with a ``COMPENSATED_TILES_BY_ROWS`` entry carries it; others stay fixed."""
+    table = ((16, 1, 4, 16, 32, 12), (4096, 2, 4, 64, 128, 3))
+    build, calls = _compensated_build(monkeypatch, {(6144, 4096): table})
+    program = build(width=4096, outputs=6144, compensated=True)
+    assert calls == [(6144, 4096, {"out_dtype": "bf16", "tiles_by_rows": table, "compensated": True})]
+    assert program["geometry"]["compensated"] is True
+    assert program["geometry"]["tiles_by_rows"] == table
+    plain = build(width=6144, outputs=7168, compensated=True)
+    assert calls[-1] == (7168, 6144, {"out_dtype": "bf16", "tiles_by_rows": (), "compensated": True})
+    assert "tiles_by_rows" not in plain["geometry"]
 
 
 @pytest.mark.parametrize("argv", [
