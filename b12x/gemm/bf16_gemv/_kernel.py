@@ -37,6 +37,7 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
 
 _THREADS = 128
 SMALL_M_MAX = 8  # Rows sharing a weight load, not a live-row support limit.
+_UNROLLED_SCALAR_STEPS = 64  # Longest straight-line scalar dot (k / _THREADS).
 _DTYPES = {torch.bfloat16: BFloat16, torch.float32: Float32}
 _NAMES = {torch.bfloat16: "bf16", torch.float32: "fp32"}
 
@@ -99,6 +100,7 @@ class SmallNGemvKernel:
         bf16_operands: bool,
         has_bias: bool,
         rows_per_tile: int = SMALL_M_MAX,
+        unrolled_scalar: bool = False,
     ):
         self.n, self.k = int(n), int(k)
         self.bf16_operands = bool(bf16_operands)
@@ -106,6 +108,11 @@ class SmallNGemvKernel:
         if rows_per_tile not in (1, 2, 4, 8):
             raise ValueError("SIMT projection supports 1, 2, 4, or 8 rows per tile")
         self.rows_per_tile = int(rows_per_tile)
+        # The scalar (FP32-weight) dot as straight-line code, so a thread's
+        # loads issue together instead of one dependent load per strided step;
+        # its products and sums keep the strided loop's order exactly.
+        self.unrolled_scalar = bool(unrolled_scalar) and self.k % _THREADS == 0 \
+            and self.k // _THREADS <= _UNROLLED_SCALAR_STEPS
 
     @cute.jit
     def __call__(
@@ -240,17 +247,34 @@ class SmallNGemvKernel:
         weight_column_stride: Int64,
         tid: Int32,
     ):
-        index = tid
-        while index < Int32(self.k):
-            value = Float32(weight[w_base + Int64(index) * weight_column_stride])
-            for r in cutlass.range_constexpr(self.rows_per_tile):
-                row = first_row + Int64(r)
-                if row < Int64(rows):
+        if cutlass.const_expr(self.unrolled_scalar):
+            # Rows past the live ones read the last live row (always in bounds)
+            # into accumulators that are never stored, so no branch splits the
+            # straight-line loads; live rows take every product in the same order.
+            last = Int64(rows) - Int64(1)
+            for step in cutlass.range_constexpr(self.k // _THREADS):
+                index = tid + Int32(step * _THREADS)
+                value = Float32(weight[w_base + Int64(index) * weight_column_stride])
+                for r in cutlass.range_constexpr(self.rows_per_tile):
+                    row = first_row + Int64(r)
+                    if cutlass.const_expr(r > 0):
+                        row = cutlass.min(row, last)
                     acc[r] += (
                         Float32(source[row * x_stride + Int64(index) * x_column_stride])
                         * value
                     )
-            index += Int32(_THREADS)
+        else:
+            index = tid
+            while index < Int32(self.k):
+                value = Float32(weight[w_base + Int64(index) * weight_column_stride])
+                for r in cutlass.range_constexpr(self.rows_per_tile):
+                    row = first_row + Int64(r)
+                    if row < Int64(rows):
+                        acc[r] += (
+                            Float32(source[row * x_stride + Int64(index) * x_column_stride])
+                            * value
+                        )
+                index += Int32(_THREADS)
 
 
 class Bf16GemmKernel:
