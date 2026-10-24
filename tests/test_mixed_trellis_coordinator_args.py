@@ -62,7 +62,7 @@ def test_cooperative_matches_export_contract(profile, width, capacity):
 def test_variant_plumbing_and_preflight():
     b = benchmark()
     args = arguments(b, "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128")
-    capacities, specs, routes, waves = b.coordinator_preflight(args)
+    capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
     assert capacities == [256, 1024, 2752, 4096] and routes == ["random", "realistic"]
     assert len(waves) == 72 and specs[0] == ("coop", {})
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1], SimpleNamespace(multi_processor_count=170, shared_memory_per_block_optin=101376))
@@ -104,7 +104,7 @@ def test_invalid_arguments(extra):
 def test_glm_spark_served_exports(profile, width, tile):
     b = benchmark()
     args = arguments(b, "--role", "spark", "--profile", profile, "--capacities", "1024,2752,4096")
-    capacities, specs, _, _ = b.coordinator_preflight(args)
+    capacities, specs, _, _, compact = b.coordinator_preflight(args)
     assert specs[0] == ("coop", {}) and specs[1][0] == "served"
     props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
     for capacity in capacities:
@@ -161,7 +161,7 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
         "--k5-experts", "72", "--output", "result.json",
         "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128",
     ])
-    capacities, specs, routes, waves = b.coordinator_preflight(args)
+    capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
     assert capacities == [256, 1024, 2752, 4096] and routes == ["random"] and waves == []
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1],
                                          SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376), "glmf")

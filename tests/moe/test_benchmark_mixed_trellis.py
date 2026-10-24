@@ -131,8 +131,9 @@ def test_prefill_families_carry_compact_geometry():
 @pytest.mark.parametrize("family", ["qwen4", "glm", "glmf", "v41", "dsv4f"])
 def test_compact_fixture_accepts_every_uneven_family(tmp_path, family):
     bench = _load_benchmark_module()
+    tier0_bits = bench.PREFILL_FAMILIES[family][3][0]
     entries = [dict(global_expert=e, combined_local=e, width=128,
-                    projections=[dict(projection=p, tier=0, bits=4, tier_local=e,
+                    projections=[dict(projection=p, tier=0, bits=tier0_bits, tier_local=e,
                                       payload_word_offset=0)
                                  for p in ("gate", "up", "down")]) for e in range(8)]
     rank = dict(rank=0, compiled_max_intermediate=256, experts=entries,

@@ -826,7 +826,8 @@ def compact_prefill_fixture(path, rank, family, width, experts):
         if [p["projection"] for p in e["projections"]] != ["gate", "up", "down"]:
             raise ValueError("compact fixture requires ordered gate/up/down projections")
         for projection in e["projections"]:
-            if projection["tier"] not in (0, 1) or projection["bits"] != 4 + projection["tier"]:
+            tier = projection["tier"]
+            if (tier not in (0, 1) or projection["bits"] != PREFILL_FAMILIES[family][3][tier]):
                 raise ValueError("compact fixture tier/bit mismatch")
     return dict(rank=rank, entries=entries, counts=selected["projection_counts"],
                 fingerprint=selected["unit_map_fingerprint"])
@@ -952,9 +953,9 @@ def _run_prefill_benchmark(args, device, props):
                 options.update(force_tile_config=tile, ws_dynamic_tiles="static" not in arm_options,
                                ws_input_stages=stages)
             else:
-                # The cooperative compact export keeps the B12x default tile.
-                tile_n = 256 if width % 256 == 0 else 128
-                options.update(force_tile_config=(64, tile_n, 64, tile_n))
+                # The packaged compact export pins the cooperative kernel to
+                # FC1/FC2 N128, so the oracle keeps that tile.
+                options.update(force_tile_config=(64, 128, 64, 128))
             options.update(tier0_num_experts=experts, tier1_num_experts=experts,
                            compact_weights=True)
         launch = mix.compile_mixed_trellis(**options)
