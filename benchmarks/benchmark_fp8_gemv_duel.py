@@ -31,10 +31,15 @@ QWEN_SHAPES = ("34816x5120", "5120x17408", "16384x5120")
 GLMF_SHAPES = ("24896x4096", "4096x8192", "4096x16384", "16384x1536", "2048x4096",
                "4096x4096", "4096x2048", "24576x4096", "4096x12288", "154880x4096")
 MIMO_SHAPES = ("13568x4096", "14848x4096", "32768x4096", "152576x4096")
+# Shipped per-row-scale decode projections (GLM Flash MLA in/o + FP32 head, MiMo
+# qkv/o/gate_up/down + heads): same kernels, FP32 ``[N, K/128]`` scale grid.
+ROWSCALE_SHAPES = ("24896x4096", "4096x8192", "4096x16384", "154880x4096",
+                   "13568x4096", "14848x4096", "32768x4096", "152576x4096")
 # K=6144 width family (V4-sized hidden), kept from round 1 for continuity.
 GLM_SHAPES = ("2624x6144", "16384x2048", "6144x16384", "4096x2048", "24576x6144",
               "6144x12288", "4096x6144", "6144x2048")
-SETS = {"qwen": QWEN_SHAPES, "glmf": GLMF_SHAPES, "glm": GLM_SHAPES, "mimo": MIMO_SHAPES}
+SETS = {"qwen": QWEN_SHAPES, "glmf": GLMF_SHAPES, "glm": GLM_SHAPES, "mimo": MIMO_SHAPES,
+        "rowscale": ROWSCALE_SHAPES}
 
 
 def _shipped_config() -> dict:
@@ -134,27 +139,28 @@ def variants_for(kind: str, n: int, k: int, rows: int) -> list[dict]:
     return out
 
 
-def _compile(n: int, k: int, rows: int, cfg: dict):
+def _compile(n: int, k: int, rows: int, cfg: dict, row_scales: bool = False):
     import cutlass
     import torch
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     from b12x.integration.cuteafd._fp8_weights import MmaFp8Gemv
 
     kwargs = dict(max_rows=max(16, rows), warps=cfg["warps"], groups=cfg["groups"],
-                  out_dtype=cutlass.BFloat16)
+                  out_dtype=cutlass.BFloat16, row_scales=row_scales)
+    scale_shape = f"[{n},{k // 128}]" if row_scales else f"[{n // 128},{k // 128}]"
     for extra in ("load_hint", "prefetch_blocks", "prefetch_bytes"):
         if extra in cfg:
             kwargs[extra] = cfg[extra]
     op = MmaFp8Gemv(n, k, **kwargs)
     program = compile_program(op, name=f"duel_{cfg['name']}_{n}x{k}", operands=(
         Operand("x", torch.bfloat16, f"[rows,{k}]"), Operand("w", torch.float8_e4m3fn, f"[{n},{k}]"),
-        Operand("s", torch.float32, f"[{n // 128},{k // 128}]", align=4),
+        Operand("s", torch.float32, scale_shape, align=4),
         Operand("out", torch.bfloat16, f"[rows,{n}]", "out")), scalars=(Scalar("rows"),), key=op.key())
     return op, program
 
 
 def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mode: str = "zero",
-              rows2: int = 16) -> list[dict]:
+              rows2: int = 16, row_scales: bool = False) -> list[dict]:
     import torch
     n, k = (int(v) for v in spec.split("x"))
     gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -162,11 +168,14 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
     flush = torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
     x = torch.randn(16, k, device="cuda", generator=gen).bfloat16()
     w = (torch.randn(n, k, device="cuda", generator=gen) * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
-    s = torch.rand((n + 127) // 128, (k + 127) // 128, device="cuda", generator=gen) * 2e-4 + 1e-4
+    if row_scales:
+        s = torch.rand(n, k // 128, device="cuda", generator=gen) * 2e-4 + 1e-4
+    else:
+        s = torch.rand((n + 127) // 128, (k + 127) // 128, device="cuda", generator=gen) * 2e-4 + 1e-4
     records = []
     for cfg in variants_for(kind, n, k, rows):
         try:
-            op, program = _compile(n, k, rows, cfg)
+            op, program = _compile(n, k, rows, cfg, row_scales)
             out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
             wide = torch.empty(rows2, n, device="cuda", dtype=torch.bfloat16)
 
@@ -246,6 +255,8 @@ def main():
     parser.add_argument("--flush", default="zero", choices=("zero", "read"))
     parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--seed", type=int, default=408)
+    parser.add_argument("--row-scales", action="store_true",
+                        help="per-row FP32 scales [N, K/128] instead of the 128x128 block grid")
     parser.add_argument("--rows2", type=int, default=16,
                         help="second batch width timed on the same program (0 disables)")
     parser.add_argument("--tag", default="")
@@ -260,7 +271,7 @@ def main():
                           sms=torch.cuda.get_device_properties(0).multi_processor_count)), flush=True)
     for spec in specs:
         for rec in run_shape(spec, args.rows, args.variants, args.samples, args.seed, args.flush,
-                             args.rows2 if args.rows2 > 0 else args.rows):
+                             args.rows2 if args.rows2 > 0 else args.rows, args.row_scales):
             rec["tag"] = args.tag
             print(json.dumps(rec), flush=True)
 
