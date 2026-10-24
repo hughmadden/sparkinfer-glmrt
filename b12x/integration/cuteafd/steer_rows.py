@@ -329,11 +329,11 @@ class AddRows:
                     for w in cutlass.range_constexpr(4):
                         delta[w] = u32_as_f32(lo[w])
                         delta[4 + w] = u32_as_f32(hi[w])
-                o = []
-                for w in range(4):
-                    o.append(_pack_bf16x2(_add(_bf16_lo(words[w]), delta[2 * w]),
-                                          _add(_bf16_hi(words[w]), delta[2 * w + 1])))
-                st_global_v4_u32(y_row + Int64(q) * Int64(16), o[0], o[1], o[2], o[3])
+                st_global_v4_u32(y_row + Int64(q) * Int64(16),
+                                 _pack_bf16x2(_add(_bf16_lo(words[0]), delta[0]), _add(_bf16_hi(words[0]), delta[1])),
+                                 _pack_bf16x2(_add(_bf16_lo(words[1]), delta[2]), _add(_bf16_hi(words[1]), delta[3])),
+                                 _pack_bf16x2(_add(_bf16_lo(words[2]), delta[4]), _add(_bf16_hi(words[2]), delta[5])),
+                                 _pack_bf16x2(_add(_bf16_lo(words[3]), delta[6]), _add(_bf16_hi(words[3]), delta[7])))
 
 
 ADD_FORMS = {"f32": False, "bf16": True}
