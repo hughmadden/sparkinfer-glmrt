@@ -14,6 +14,9 @@ order, the ascending K1024 split fold or output rounding.
   ctaN        same programs, cta_limit = sms * N (launch scalar only)
   grouped16   compact owned-unit grouped kernel at rows <= 64, group_rows 16
   grouped64   compact owned-unit warp-specialized grouped kernel, group_rows 64
+  wired       the shipped dispatch: the 64-row ``exlr8_a16_grouped64`` core
+              (F32 FC2 partials) plus the 64-row ``exlr8_group`` glue, both at
+              the runtime CTA limits the engine derives
 
 The grouped arms reuse the shipped grouped prefill kernel and grouping
 verbatim; the compact ``unit_count``/``unit_map``/``unit_limit`` tables are
@@ -264,6 +267,67 @@ def grouped_arm(name, group_rows, cta_limit, rows_max, tables, shared, owned,
                lossy=bool(half))
 
 
+def wired_arm(name, rows_max, tables, shared, owned, device="cuda"):
+    """The shipped decode dispatch exactly as the engine admits it.
+
+    Below the K1 threshold the engine runs the 64-row grouped instance
+    (``exlr8_a16_grouped64``: 16-row groups, F32 FC2 partials so output stays
+    bit-identical to K1) paired with the shipped 64-row ``exlr8_group`` glue.
+    Each launch uses the runtime limit the engine derives from that export's
+    own ``ctas_per_sm`` hint, so this arm is the production package rather
+    than a harness-only configuration.
+    """
+    if rows_max > 64:
+        raise ValueError("the wired decode instance serves at most 64 rows")
+    core = compile_exlr8_a16_aot(hidden=HIDDEN, units=UNITS, top_k=TOP_K,
+                                 max_groups=MAX_GROUPS, device_count=True,
+                                 grouped=True, group_rows=16, grouped_rows=64,
+                                 fc2_partials="f32")
+    group = compile_exlr8_group_aot(experts=EXPERTS, top_k=TOP_K,
+                                    max_groups=MAX_GROUPS, hidden=HIDDEN,
+                                    max_rows=64, group_rows=16)
+    if core.name != "exlr8_a16_grouped64" or group.name != "exlr8_group":
+        raise RuntimeError(f"wired pairing built {core.name} + {group.name}")
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    core_cta = sms * Exlr8GroupedKernel.CTAS_PER_SM
+    group_cta = sms * int(group.geometry["ctas_per_sm"])
+    unit_count, unit_map, unit_limit = unit_tables(owned, device)
+    buffers = dict(
+        group_expert=torch.full((MAX_GROUPS,), -1, dtype=torch.int32, device=device),
+        route_slots=torch.full((MAX_GROUPS, 16), -1, dtype=torch.int32, device=device),
+        route_group_lane=torch.full((rows_max, TOP_K), -1, dtype=torch.int32, device=device),
+        group_count=torch.zeros(1, dtype=torch.int32, device=device),
+        activation=torch.empty((rows_max, HIDDEN), dtype=torch.float16, device=device),
+        signs_out=shared["signs_out"],
+        signs_in=shared["signs_in"],
+        output=torch.empty((rows_max, HIDDEN), dtype=torch.bfloat16, device=device),
+        route_weights=shared["weights"],
+        ids=shared["ids"],
+        unit_count=unit_count,
+        unit_map=unit_map,
+        pointers=tables["tables"],
+        bits=tables["bits"],
+    )
+    buffers.update(alloc_scratch(core, device))
+    group_values = dict(buffers, x=shared["wire"])
+    core_values = dict(buffers, x=buffers["activation"])
+
+    def group_launch(rows):
+        launch_program(group, group_values, (rows, group_cta))
+
+    def core_launch(rows):
+        launch_program(core, core_values, (rows, core_cta, unit_limit))
+
+    notes = dict(kind="wired", core_cta_limit=core_cta, group_cta_limit=group_cta,
+                 threads=256, min_blocks_per_mp=Exlr8GroupedKernel.CTAS_PER_SM,
+                 group_rows=16, max_groups=MAX_GROUPS, unit_limit=unit_limit,
+                 fc1_ws=False, fc2_partials="f32 (bit-identical to K1)",
+                 unit_enumerated="owned only (unit_count/unit_map, unit_limit=%d)"
+                                 % unit_limit,
+                 program=core.name, group_program=group.name)
+    return Arm(name, (core, group), buffers, (group_launch, core_launch), notes)
+
+
 def route_fixture(rows, distribution, generator, wave):
     if distribution == "random":
         ids = torch.stack([torch.randperm(EXPERTS, generator=generator)[:TOP_K]
@@ -361,6 +425,8 @@ def main():
             if name.startswith("cta"):
                 factor = int(name[3:])
                 arm_set[name] = base_arm(sms * factor, rows_max, tables, shared)
+            elif name == "wired":
+                arm_set[name] = wired_arm(name, rows_max, tables, shared, owned)
             elif name.startswith("grouped"):
                 spec = name[len("grouped"):]
                 half = spec.endswith("h")
