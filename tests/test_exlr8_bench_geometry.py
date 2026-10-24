@@ -226,3 +226,32 @@ def test_compact_ownership_cpu():
     bits[0, 0, 0] = 2
     with pytest.raises(ValueError, match="agree"):
         build(bits)
+
+
+def test_dense_bf16_comparison_argument_plumbing():
+    import argparse
+    from types import SimpleNamespace
+    source = SOURCE.with_name("benchmark_exlr8_dense.py")
+    tree = ast.parse(source.read_text())
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    body = []
+    for node in main.body:
+        body.append(node)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "args.mxfp8_prefill":
+            break
+    main.body = body
+    seen = []
+    class Parser(argparse.ArgumentParser):
+        def parse_args(self):
+            return super().parse_args(["--mxfp8-prefill", "--compare-native-bf16",
+                "--formats", "trellis", "--shapes", "q_b,o,gate_up,down", "--rows", "4096",
+                "--output", "/unused/results.json"])
+    scope = dict(argparse=SimpleNamespace(ArgumentParser=Parser), Path=Path, __doc__="test",
+                 validate_timing=lambda *a: None,
+                 benchmark_native_bf16=lambda args: seen.append(args) or 17,
+                 benchmark_mx8=lambda args: pytest.fail("legacy route selected"))
+    exec(compile(ast.Module(body=[main], type_ignores=[]), str(source), "exec"), scope)
+    assert scope["main"]() == 17
+    args, = seen
+    assert args.rows == "4096" and args.formats == "trellis"
+    assert args.shapes == "q_b,o,gate_up,down"
