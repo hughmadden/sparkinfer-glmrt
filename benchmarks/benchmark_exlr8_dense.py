@@ -353,6 +353,85 @@ def benchmark_unpacked(args):
     return False
 
 
+def benchmark_native_bf16(args):
+    """Full-output A8 vs current A16, including the serving companions.
+
+    The existing dense harness has no checkpoint record loader; use synthetic
+    trellis payloads and deterministic BF16 inputs, with identical signs/scales.
+    """
+    import statistics
+    from b12x.integration.cuteafd.dense_mxfp8 import (
+        compile_dense_mxfp8_aot, compile_dense_mxfp8_quant_aot, record_bytes)
+    from b12x.integration.cuteafd.trellis_transform import (
+        compile_trellis_input_aot, compile_trellis_output_aot)
+    if args.formats != "trellis" or args.rows != "4096" or args.output is None:
+        raise ValueError("--compare-native-bf16 requires --formats trellis --rows 4096 --output")
+    names = set(args.shapes.split(",")) if args.shapes else {"q_b", "o", "gate_up", "down"}
+    shapes = [s for s in SHAPES if s[0] == "trellis" and s[1] in names]
+    if not shapes or names - {s[1] for s in shapes}:
+        raise ValueError("--compare-native-bf16 requires full trellis projection names")
+    torch.manual_seed(408)
+    props = torch.cuda.get_device_properties(0)
+    rows, limit = 4096, props.multi_processor_count * 4
+    report = dict(device=props.name, sms=props.multi_processor_count,
+                  scope="synthetic trellis K4/e4m3; BF16 input; input/output companions included; A8 quant included",
+                  seed=408, measurements=[])
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    for _, op, k, n, side in shapes:
+        x = torch.randn((rows, k), device="cuda", dtype=torch.bfloat16) * .1
+        payload = torch.randint(0, 256, (n*k//2,), dtype=torch.uint8, device="cuda")
+        suh = torch.ones(k, dtype=torch.float16, device="cuda")
+        svh = torch.ones(n, dtype=torch.float16, device="cuda")
+        scales = torch.empty(k//128, dtype=torch.float16, device="cuda")
+        records = torch.empty(record_bytes(rows, k), dtype=torch.uint8, device="cuda")
+        partial = torch.empty(256, dtype=torch.float32, device="cuda")
+        acc = torch.empty((rows, n), dtype=torch.float32, device="cuda")
+        outputs = {arm: torch.empty((rows, n), dtype=torch.bfloat16, device="cuda") for arm in ("a16", "a8")}
+        rotated_inputs = {arm: torch.empty_like(x, dtype=dtype) for arm, dtype in
+                          (("a16", torch.bfloat16), ("a8", torch.float16))}
+        tables = {arm: torch.tensor([value.data_ptr()]*4, device="cuda", dtype=torch.int64)
+                  for arm, value in rotated_inputs.items()}
+        transforms = {arm: compile_trellis_input_aot(features=k, output_dtype=dtype)
+                      for arm, dtype in (("a16", "bf16"), ("a8", "f16"))}
+        output = compile_trellis_output_aot(features=n)
+        a16 = compile_native("trellis", k, n, side, input_dtype="bf16")
+        a8 = compile_dense_mxfp8_aot(input_features=k, output_features=n, sharded_side=side)
+        quant = compile_dense_mxfp8_quant_aot(input_features=k)
+        def run(arm):
+            transforms[arm].launch(x, suh, rotated_inputs[arm], scales, scalars=(rows, limit))
+            if arm == "a8":
+                quant.launch(tables[arm], records, scalars=(rows, 0, limit))
+                a8.launch(tables[arm], payload, scales, records, acc, scalars=(rows, 0, limit))
+            else:
+                a16.launch(tables[arm], payload, scales, partial, acc, scalars=(rows, 0, limit))
+            output.launch(acc, svh, outputs[arm], scalars=(rows, limit))
+        # Capture warms both arms before correctness and timing.
+        graphs = {arm: capture(lambda arm=arm: run(arm)) for arm in ("a16", "a8")}
+        for graph in graphs.values():
+            graph.replay()
+        torch.cuda.synchronize()
+        for arm in outputs:
+            finite_nonzero(outputs[arm].float(), arm)
+        delta = outputs["a8"].double() - outputs["a16"].double()
+        relative = (torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(outputs["a16"].double())).item()
+        max_abs = delta.abs().max().item()
+        samples = {arm: [] for arm in graphs}
+        for iteration in range(3):
+            for arm in timing_order(graphs, iteration):
+                samples[arm].append(timing(graphs[arm], args.replays))
+        us = {arm: statistics.median(values) for arm, values in samples.items()}
+        entry = dict(projection=op, k=k, n=n, rows=rows, relative_frobenius=relative,
+                     max_abs_error=max_abs, samples_us=samples,
+                     a16_ms=us["a16"]/1000, a8_ms=us["a8"]/1000,
+                     a16_tflops=2*rows*k*n/(us["a16"]*1e6),
+                     a8_tflops=2*rows*k*n/(us["a8"]*1e6), speedup=us["a16"]/us["a8"])
+        report["measurements"].append(entry)
+        args.output.write_text(json.dumps(report, indent=2)+"\n")
+        print(json.dumps(entry), flush=True)
+        del graphs, delta, outputs, rotated_inputs, tables, payload, records, acc, x
+    return False
+
+
 def benchmark_mx8(args):
     """Shared-record native prefill, quantized-A oracle and frozen row checks."""
     from b12x.integration.cuteafd.dense_mxfp8 import (
@@ -494,6 +573,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--mxfp8-prefill", action="store_true", help="shared MXFP8 records at whole and TP2 native dense shapes")
+    parser.add_argument("--compare-native-bf16", action="store_true", help="full-output A8 vs serving A16 with companions; requires --mxfp8-prefill")
     parser.add_argument("--trellis-input-dtype", choices=("f16", "bf16"), default="f16")
     parser.add_argument("--unpacked-trellis", action="store_true", help="measure exact E4M3 unpack plus F32 W8A16 at full/TP2 trellis shapes")
     parser.add_argument("--arm", action="append", help="NAME=git-rev; repeatable")
@@ -517,6 +597,10 @@ def main():
         validate_timing(args.interleave_rounds, args.replays)
     except ValueError as error:
         parser.error(str(error))
+    if args.compare_native_bf16:
+        if not args.mxfp8_prefill:
+            parser.error("--compare-native-bf16 requires --mxfp8-prefill")
+        return benchmark_native_bf16(args)
     if args.mxfp8_prefill:
         return benchmark_mx8(args)
     if args.unpacked_trellis:
