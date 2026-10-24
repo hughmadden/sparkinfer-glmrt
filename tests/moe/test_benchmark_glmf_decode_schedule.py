@@ -30,6 +30,14 @@ def test_a_repeated_name_stops_the_run_before_any_gpu_work(monkeypatch, capsys) 
     assert stop.value.code == 2 and "default repeated" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("capacity,rows", [(1, "2"), (16, "2,32"), (80, "81")])
+def test_explicit_capacity_rejects_oversized_rows_before_cuda(monkeypatch, capsys, capacity, rows):
+    monkeypatch.setattr("sys.argv", ["bench", "--capacity", str(capacity), "--rows", rows])
+    with pytest.raises(SystemExit) as stop:
+        bench.main()
+    assert stop.value.code == 2 and "rows" in capsys.readouterr().err
+
+
 def test_every_layer_must_run_in_the_timed_graph(monkeypatch, capsys) -> None:
     monkeypatch.setattr("sys.argv", ["bench", "--layers", "3", "--calls-per-graph", "2"])
     with pytest.raises(SystemExit) as stop:

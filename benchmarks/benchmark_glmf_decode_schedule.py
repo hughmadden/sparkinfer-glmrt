@@ -226,6 +226,8 @@ def make_layer(seed: int, device: torch.device, geometry: Geometry = Geometry(),
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rows", default="1,2,4,8,16,32,64")
+    parser.add_argument("--capacity", type=int, choices=(1, 16, 80),
+                        help="qualify an exact decode artifact instead of m1/m80 selection")
     parser.add_argument("--variant", action="append", default=[])
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--calls-per-graph", type=int, default=8)
@@ -258,6 +260,8 @@ def main() -> None:
     rows_list = [int(v) for v in args.rows.split(",")]
     if not rows_list or any(r < 1 or r > 80 for r in rows_list):
         parser.error("decode rows are 1..80")
+    if args.capacity is not None and max(rows_list) > args.capacity:
+        parser.error("decode rows must not exceed --capacity")
     if args.artifacts is not None:
         os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     device = torch.device("cuda", torch.cuda.current_device())
@@ -316,7 +320,7 @@ def main() -> None:
                 run_bound_mixed_trellis(x[r:r+1], weights[r:r+1], ids[r:r+1], binding, buffers).clone()
                 for r in range(80)]) for binding in bindings]
     for rows in rows_list:
-        capacity = 1 if rows == 1 else 80
+        capacity = args.capacity if args.capacity is not None else (1 if rows == 1 else 80)
         xs, ws, ks = x[:rows].contiguous(), weights[:rows].contiguous(), ids[:rows].contiguous()
         distinct = torch.unique(ks).tolist()
         weight_bytes = sum(3 * g.hidden * g.widths(3)[e] * g.bits[0 if e in g.tier0_ids else 1] // 8
