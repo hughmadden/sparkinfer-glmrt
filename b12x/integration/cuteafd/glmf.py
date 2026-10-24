@@ -189,18 +189,20 @@ class _Fp8Switch:
         if fp8 and prefill_rows is not None:
             self.prefill = BlockFp8Projection(self.n, self.k, int(prefill_rows), row_scales=row_scales)
         elif fp8:
-            warps, groups = fp8_gemv_tuning(self.n, self.k)
+            warps, groups = fp8_gemv_tuning(self.n, self.k,
+                                            warps=fp8_gemv_shipped_warps(self.n, self.k))
             self.fp8 = MmaFp8Gemv(self.n, self.k, max_rows=FP8_ROWS, warps=warps, groups=groups,
                                   row_scales=row_scales)
             # One K order covers the decode range: steps of FP8_ROWS < rows <= the capacity run a
-            # multi-tile GEMV over the same E4M3 copy with the thin tile's (warps, groups) instead
-            # of the BF16 projection. wide_rows only raises the capacity (FP8_DECODE_ROWS by
-            # default), so the decode route never changes reduction order with the batch width.
+            # multi-tile GEMV over the same E4M3 copy with the thin tile's warps and the shape's
+            # measured wide grid instead of the BF16 projection. wide_rows only raises the capacity
+            # (FP8_DECODE_ROWS by default), so the decode route never changes reduction order with
+            # the batch width.
             cap = max(FP8_DECODE_ROWS if decode_rows is None else int(decode_rows), int(wide_rows))
             if cap > FP8_ROWS:
                 from ._fp8_weights import fp8_gemv_wide
 
-                wide_groups, wide_tiles = fp8_gemv_wide(self.n, self.k, groups=groups)
+                wide_groups, wide_tiles = fp8_gemv_wide(self.n, self.k, warps=warps, groups=groups)
                 self.fp8_wide = MmaFp8Gemv(self.n, self.k, max_rows=cap, warps=warps,
                                            groups=wide_groups, cta_tiles=wide_tiles,
                                            row_scales=row_scales)
@@ -249,10 +251,12 @@ class _Fp8Switch:
 # Python: it is the GEMV's own M-tile ceiling, and the multi-tile GEMV that covers the
 # decode range above it carries this tile's (warps, groups).
 FP8_ROWS = FP8_GEMV_ROWS
-# The decode GEMV tuning (per-shape warps, 8-column CTAs) lives in ``_fp8_weights`` with the
-# kernel it configures: ``FP8_GEMV_CONFIG`` and ``fp8_gemv_tuning`` cover the GLM 5.3 Flash
-# and MiMo V2 projections as well as dense Qwen's.
-from ._fp8_weights import FP8_GEMV_CONFIG, fp8_gemv_tuning  # noqa: E402,F401  (the table is re-exported for callers)
+# The decode GEMV tuning lives in ``_fp8_weights`` with the kernel it configures:
+# ``FP8_GEMV_CONFIG`` and ``fp8_gemv_tuning`` cover the GLM 5.3 Flash and MiMo V2 projections
+# as well as dense Qwen's. The table never supplies warps to a caller that did not ship them:
+# ``fp8_gemv_shipped_warps`` is this family's pre-existing per-shape rule, and the table's
+# ``groups`` apply only where the caller's warps are the ones the entry was measured at.
+from ._fp8_weights import FP8_GEMV_CONFIG, fp8_gemv_shipped_warps, fp8_gemv_tuning  # noqa: E402,F401  (the table is re-exported for callers)
 
 
 def fp8_ops(name: str, n: int, k: int, row_scales: bool, prefill: bool = False) -> tuple:
@@ -306,7 +310,7 @@ def _w8(n: int, k: int, prefill_rows: int | None, *, row_scales: bool = False, p
     from ._fp8_weights import Fp8Projection
 
     if warps is None:
-        warps, groups = fp8_gemv_tuning(n, k)
+        warps, groups = fp8_gemv_tuning(n, k, warps=fp8_gemv_shipped_warps(n, k))
     return Fp8Projection(n, k, prefill_rows=prefill_rows, gemv_rows=FP8_ROWS, warps=warps, groups=groups,
                          row_scales=row_scales, kmajor=row_scales, prefill_mask=prefill_mask, out_dtype=out_dtype,
                          wide_rows=wide_rows, decode_rows=decode_rows)
@@ -728,7 +732,8 @@ class _KdaW8(_Kda):
         # tile (8 warps over K, 2 column groups) after N slicing, so a row's in-projection
         # reads the same K order whether the heads are split across ranks or not.
         in_tile = ((8, 2) if (g.hidden, g.kda_heads, g.kda_head_dim) == (4096, 32, 128)
-                   else fp8_gemv_tuning(self.p, g.hidden))
+                   else fp8_gemv_tuning(self.p, g.hidden,
+                                         warps=fp8_gemv_shipped_warps(self.p, g.hidden)))
         self.in_proj = _W8Run(_w8(self.p, g.hidden, prefill_rows, row_scales=True,
                                   prefill_mask=1, decode_rows=decode_rows,
                                   warps=in_tile[0], groups=in_tile[1]))
@@ -1646,12 +1651,13 @@ class _HeadFp8:
         from ._fp8_weights import MmaFp8Gemv
 
         self.max_rows = int(max_rows)
-        warps, groups = fp8_gemv_tuning(vocab, hidden, warps=4)
+        warps, groups = fp8_gemv_tuning(vocab, hidden,
+                                        warps=fp8_gemv_shipped_warps(vocab, hidden, warps=4))
         self.gemv = MmaFp8Gemv(vocab, hidden, max_rows=FP8_ROWS, warps=warps, groups=groups,
                                out_dtype=cutlass.Float32, row_scales=True)
         from ._fp8_weights import fp8_gemv_wide
 
-        wide_groups, wide_tiles = fp8_gemv_wide(vocab, hidden, groups=groups)
+        wide_groups, wide_tiles = fp8_gemv_wide(vocab, hidden, warps=warps, groups=groups)
         self.gemv_wide = MmaFp8Gemv(vocab, hidden, max_rows=self.max_rows, warps=warps,
                                     groups=wide_groups, cta_tiles=wide_tiles,
                                     out_dtype=cutlass.Float32, row_scales=True) \
