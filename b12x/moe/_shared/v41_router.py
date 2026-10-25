@@ -375,28 +375,60 @@ class _V41RouterScores:
 
 
 
-def v41_router_gemm_min_rows(*, experts: int) -> int:
-    """Measured SM120 crossover against the native FP32 GEMV router.
-
-    Exported as immutable dispatch metadata; this does not resolve at replay.
-    """
-    if experts not in (128, 384):
-        raise ValueError("V4.1 router experts must be 128 or 384")
-    return 16 if experts == 384 else 26
+# One canonical reduction order for every V4.1 decode/verify width (#736).
+# Keep the kernel choice here so a measured row-invariant winner can replace it.
+V41_ROUTER_SKINNY_MAX_ROWS = 64
 
 
-def compile_v41_router_scores_aot(*, experts: int, hidden: int = 5120):
+from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
+
+
+class _V41ActivatedSkinnyScores(SkinnyBf16Gemv):
+    @cute.jit
+    def _epilogue(self, value: Float32):
+        softplus = value
+        if value <= Float32(20.0):
+            softplus = cute.math.log1p(cute.math.exp(value, fastmath=False), fastmath=False)
+        return cute.math.sqrt(softplus, fastmath=False)
+
+
+class _V41DecodeRouterScores:
+    def __init__(self, experts: int, hidden: int, activated: bool = False):
+
+        skinny = _V41ActivatedSkinnyScores if activated else SkinnyBf16Gemv
+        self.skinny = skinny(
+            experts, hidden, out_dtype=Float32,
+            **skinny_config(experts, hidden, Float32))
+        self.mma = _V41RouterScores(experts, hidden=hidden)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w: cute.Pointer, logits: cute.Pointer,
+                 live_rows: Int32, stream: cuda.CUstream):
+        if live_rows <= Int32(V41_ROUTER_SKINNY_MAX_ROWS):
+            self.skinny(x, w, logits, live_rows, stream)
+        else:
+            self.mma(x, w, logits, live_rows, stream)
+
+
+def compile_v41_router_scores_aot(*, experts: int, hidden: int = 5120, activated: bool = False):
     """Compile BF16 [rows,hidden] @ gate.T -> FP32 [rows,experts].
 
     Supports the V4.1 384-expert backbone and 128-expert dSpark gates (hidden
     5120) and the DeepSeek V4 gates (Flash: 256 x 4096, Pro: 384 x 7168).
+    With activated=True, only the skinny path writes sqrtsoftplus scores.
     Caller owns all buffers; no scratch, packing, allocation, or live-row cache
     keys. Score transform, bias and top-k selection are separate operations.
     """
     if experts not in (128, 256, 384) or hidden not in (4096, 5120, 7168):
         raise ValueError("router scores support 128/256/384 experts over hidden 4096/5120/7168")
-    kernel = _V41RouterScores(experts, hidden=hidden)
-    key = (experts, hidden, 64, torch.cuda.current_device())
+    if hidden == 5120 and experts in (128, 384):
+        kernel = _V41DecodeRouterScores(experts, hidden, activated)
+        s = kernel.skinny
+        route_key = (V41_ROUTER_SKINNY_MAX_ROWS, s.cols, s.rows_per_tile, s.threads, activated)
+    else:
+        kernel = _V41RouterScores(experts, hidden=hidden)
+        route_key = ()
+    key = (experts, hidden, 64, route_key, torch.cuda.current_device())
     raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
     return b12x_compile(
         kernel,
