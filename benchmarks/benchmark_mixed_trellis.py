@@ -895,13 +895,13 @@ def _make_compact_prefill_layer(fixture, width, seed, device, mix, *,
     return (*tiers, torch.tensor(mapping, dtype=torch.int32, device=device), descriptor, rotations)
 
 
-def prefill_compile_options(family, width, block, mode, props, *, compact=False):
+def prefill_compile_options(family, width, block, mode, props, *, compact=False, capacity=4096):
     hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
     if width <= 0 or width % 128 or (family == "kimik3" and width != 512):
         raise ValueError("prefill width must follow an H128-aligned family package")
     tokens = set(mode.split("+")[1:]) if mode != "cooperative" else set()
     ws = mode == "ws" or mode.startswith("ws+")
-    slots = route_pack_capacity(4096 * topk, block, experts, topk=topk)[1]
+    slots = route_pack_capacity(capacity * topk, block, experts, topk=topk)[1]
     swiglu_limit = PREFILL_SWIGLU_LIMITS[family]
     if compact:
         counts = (experts, experts)
@@ -932,7 +932,7 @@ def prefill_compile_options(family, width, block, mode, props, *, compact=False)
             tile = (64, tile_n, 64, tile_n)
         token_major = family == "qwen4" and mode == "cooperative"
         ws_dynamic = "dynamic" in tokens
-    opts = dict(size_m=4096, hidden_size=hidden, intermediate_size=width,
+    opts = dict(size_m=capacity, hidden_size=hidden, intermediate_size=width,
         tier0_num_experts=counts[0], tier1_num_experts=counts[1],
         top_k=topk, route_num_experts=experts, max_m_blocks=(slots + block - 1) // block,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
@@ -957,6 +957,17 @@ def _run_prefill_benchmark(args, device, props):
         materialize_k4_arm, load_k4_arm, k4_noise_summary, real_route_ids, make_wire,
     )
     from b12x._lib.runtime_control import kernel_resolution_guard
+    capacities = list(map(int, args.capacities.split(","))) if args.capacities else [4096]
+    if len(capacities) > 1:
+        for capacity in capacities:
+            child = argparse.Namespace(**vars(args))
+            child.capacities = str(capacity)
+            child.output = args.output.with_name(f"{args.output.stem}-m{capacity}{args.output.suffix}")
+            _run_prefill_benchmark(child, device, props)
+        return
+    capacity = capacities[0]
+    if not 1 <= capacity <= 4096:
+        raise ValueError("prefill capacity must be 1..4096")
     if (props.major, props.minor) != (12, 1):
         raise ValueError("prefill policy gate requires SM121")
     if args.rounds < 3 or args.layers < 2 or args.replays < 1:
@@ -967,9 +978,9 @@ def _run_prefill_benchmark(args, device, props):
     names = [name for name, _, _ in specs]
     if len(names) < 2 or len(names) != len(set(names)):
         raise ValueError("prefill needs at least two uniquely named arms")
-    rows_spec = args.rows or (args.capacities if args.compact_fixture else "1408,2688,4096")
+    rows_spec = args.rows or (args.capacities if args.compact_fixture else str(capacity))
     rows_list = list(map(int, rows_spec.split(",")))
-    if not rows_list or any(not 1 <= rows <= 4096 for rows in rows_list):
+    if not rows_list or any(not 1 <= rows <= capacity for rows in rows_list):
         raise ValueError("prefill rows must be 1..4096")
     family = args.prefill_family
     hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
@@ -995,7 +1006,7 @@ def _run_prefill_benchmark(args, device, props):
     states = {}
     resources = {}
     for name, block, mode in specs:
-        options = prefill_compile_options(family, width, block, mode, props, compact=compact is not None)
+        options = prefill_compile_options(family, width, block, mode, props, compact=compact is not None, capacity=capacity)
         launch = mix.compile_mixed_trellis(**options)
         resources[name] = _kernel_resource_info(launch, props.shared_memory_per_block_optin)
         workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
@@ -1007,12 +1018,12 @@ def _run_prefill_benchmark(args, device, props):
         mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
         states[name] = workspace, bindings
     generator = torch.Generator().manual_seed(args.seed)
-    ids = [(real_route_ids(4096, waves[i % len(waves)], generator, experts, topk)
-            if waves else torch.rand((4096, experts), generator=generator).topk(topk, dim=1).indices
+    ids = [(real_route_ids(capacity, waves[i % len(waves)], generator, experts, topk)
+            if waves else torch.rand((capacity, experts), generator=generator).topk(topk, dim=1).indices
             ).to(device=device, dtype=torch.int32) for i in range(args.layers)]
-    weights = torch.rand((4096, topk), generator=generator).to(device)
+    weights = torch.rand((capacity, topk), generator=generator).to(device)
     weights /= weights.sum(-1, keepdim=True)
-    x = (torch.randn((4096, hidden), generator=generator) * 0.02).to(device=device, dtype=torch.bfloat16)
+    x = (torch.randn((capacity, hidden), generator=generator) * 0.02).to(device=device, dtype=torch.bfloat16)
     wire = None
     if any(b[0].launch.input_format == "e4m3_k32" for _, b in states.values()):
         wire = make_wire(x)
@@ -1022,9 +1033,9 @@ def _run_prefill_benchmark(args, device, props):
             .contiguous()
             .view(torch.float8_e4m3fn)
             .float()
-            .reshape(4096, hidden // 32, 32)
+            .reshape(capacity, hidden // 32, 32)
             * torch.exp2(exponent).unsqueeze(-1)
-        ).reshape(4096, hidden).bfloat16()
+        ).reshape(capacity, hidden).bfloat16()
 
     def run(name, rows, layer=0):
         workspace, bindings = states[name]
@@ -1032,9 +1043,9 @@ def _run_prefill_benchmark(args, device, props):
         return mix.run_bound_mixed_trellis(inp, weights[:rows], ids[layer][:rows], bindings[layer], workspace)
 
     for name in names:
-        for rows in (1, 17, 4096):
+        for rows in sorted({1, min(17, capacity), capacity}):
             run(name, rows)
-    checked = list(range(1, 4097)) if args.prefill_exhaustive else sorted({1, 17, 63, 64, 65, 4096, *rows_list})
+    checked = list(range(1, capacity + 1)) if args.prefill_exhaustive else sorted({v for v in (1, 17, 63, 64, 65, capacity, *rows_list) if v <= capacity})
     records = []
     with kernel_resolution_guard("family prefill bitwise and frozen timing"):
         if compact:
@@ -1042,7 +1053,7 @@ def _run_prefill_benchmark(args, device, props):
                 workspace.fc1.fill_(float("nan"))
                 workspace.activated.fill_(float("nan"))
         for layer in range(args.layers if compact else 1):
-            full = run(names[0], 4096, layer).clone()
+            full = run(names[0], capacity, layer).clone()
             if not bool(torch.isfinite(full).all()) or not bool(full.any()):
                 raise RuntimeError("reference output is not finite and nonzero")
             for rows in checked:
@@ -1103,7 +1114,7 @@ def _run_prefill_benchmark(args, device, props):
             record = dict(rows=rows, samples_us=samples, **k4_noise_summary(samples, names[0]))
             records.append(record)
             print(json.dumps(record), flush=True)
-    result = dict(schema=1, family=family, intermediate=width, arms=specs, resources=resources, source=provenance,
+    result = dict(schema=1, capacity=capacity, family=family, intermediate=width, arms=specs, resources=resources, source=provenance,
         fixture=(("synthetic weights; synthetic rotated compact ownership" if compact.get("synthetic")
                   else "synthetic weights; actual compact ownership") if compact else
                  "synthetic weights; K4/K5 expert split 384/128" if family == "qwen4"
@@ -1125,7 +1136,7 @@ def _run_prefill_benchmark(args, device, props):
         raise RuntimeError("identical-control spread exceeds 2%; no performance verdict")
 
 
-GLM_CAPACITIES = (256, 1024, 2752, 4096)
+GLM_CAPACITIES = (256, 1024, 2048, 2752, 4096)
 GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024,
                 "spark-tp6-width384": 384, "spark-tp6-width256": 256, "spark-tp4-width512": 512}
 GLM_ROUTES = Path(__file__).resolve().parent / "fixtures/glm53_prefill_routes_realistic.json"
@@ -1152,12 +1163,11 @@ COORDINATOR_FAMILIES = {
                   swiglu_limit=10.0, model="deepseek-ai/DeepSeek-V4-Pro",
                   profiles={"rtx-tp1": 3072, "rtx-tp2": 1536},
                   capacities=GLM_CAPACITIES, routes=None),
-    # Kimi EXL3 packages the K64 capacity set only (`package_capacities`), so
-    # 2752 is not a served cell and is not measured here either.
+    # Adaptive prefill adds m2048 and m2752 to Kimi's K64 capacity ladder.
     "kimik3": dict(hidden=3584, experts=896, top_k=16, bits=(2, 3), activation="situ",
                    swiglu_limit=None, model="moonshotai/Kimi-K3",
                    profiles={"rtx-tp1": 3072, "rtx-tp2": 1536},
-                   capacities=(256, 1024, 4096), routes=None),
+                   capacities=GLM_CAPACITIES, routes=None),
 }
 # Shipped cooperative coordinator policy (`package_exl3_aot.py`): the route
 # block and rotation a family's exports actually use, so `served` arms and the
@@ -1185,7 +1195,7 @@ SERVED_TOKEN_ROTATION = {
 def parse_coordinator_arm(text):
     """NAME:key=value,...; slash-separated tile dimensions keep commas unambiguous."""
     name, separator, tail = text.partition(":")
-    if not separator or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) or name == "coop":
+    if not separator or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) or name in ("coop", "coop_control"):
         raise argparse.ArgumentTypeError("coordinator arm needs a unique NAME:key=value,... (coop is reserved)")
     options = {}
     try:
@@ -1306,7 +1316,7 @@ def coordinator_preflight(args):
         raise ValueError(f"coordinator --role must match the family's RTX or Spark --profile "
                          f"(one of {sorted(spec['profiles'])})")
     if (args.kimi or args.prefill_arm or args.prefill_source_dir
-            or args.rows or args.intermediate or args.prefill_exhaustive):
+            or args.rows or args.intermediate):
         raise ValueError("coordinator uses --profile/--capacities/--coordinator-arm, not Spark/decode controls")
     compact = None
     if args.compact_fixture:
@@ -1377,7 +1387,7 @@ def _make_coordinator_layer(width, k5_experts, seed, device, family="glm"):
 
 
 def _run_coordinator_benchmark(args, device, props):
-    from benchmarks.benchmark_exlr8_a16 import make_wire, real_route_ids
+    from benchmarks.benchmark_exlr8_a16 import make_wire, real_route_ids, k4_noise_summary
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     capacities, specs, distributions, waves, compact = coordinator_preflight(args)
@@ -1457,7 +1467,8 @@ def _run_coordinator_benchmark(args, device, props):
                                 workspace.activated.fill_(float("nan"))
                             graphs[name].replay()
                             checks[name] &= torch.equal(workspace.output.view(bit_dtype), expected.view(bit_dtype))
-                    samples = {name: [] for name, _ in specs}
+                    graphs["coop_control"] = graphs["coop"]
+                    samples = {name: [] for name in graphs}
                     if all(checks.values()) and not args.correctness_only:
                         names = list(graphs)
                         with kernel_resolution_guard("SM120 coordinator frozen graph timing"):
@@ -1475,6 +1486,14 @@ def _run_coordinator_benchmark(args, device, props):
                     # TP2 m256 wire cell read 1604us with the probe after the
                     # samples and 3416us with it before).
                     prefix_detail = None
+                    if all(checks.values()) and args.prefill_exhaustive:
+                        for rows in range(1, capacity + 1):
+                            oracle = run("coop", rows).clone()
+                            if not torch.equal(oracle.view(bit_dtype), expected[:rows].view(bit_dtype)):
+                                raise RuntimeError(f"oracle prefix differs at {rows}/{capacity}")
+                            for name, _ in specs[1:]:
+                                if not torch.equal(run(name, rows).view(bit_dtype), oracle.view(bit_dtype)):
+                                    raise RuntimeError(f"{name} differs at {rows}/{capacity}")
                     if all(checks.values()):
                         # Prefix row-invariance with poisoned tails: a short prefill
                         # must reproduce the capacity batch's first rows bit for bit
@@ -1543,6 +1562,8 @@ def _run_coordinator_benchmark(args, device, props):
                         wave_index=wave_index, route_layer=wave.get("layer") if wave else None,
                         content=wave.get("content") if wave else None, bitwise=checks,
                         prefix=prefix_detail,
+                        checked_rows=capacity if args.prefill_exhaustive else None,
+                        noise=(k4_noise_summary(samples, "coop") if all(samples.values()) else None),
                         samples_us=samples, median_us={name: statistics.median(v) for name, v in samples.items() if v},
                         output_sha256=hashlib.sha256(expected.view(torch.uint8).cpu().numpy().tobytes()).hexdigest())
                     records.append(record)
@@ -1639,7 +1660,7 @@ def benchmark_parser():
     parser.add_argument("--intermediate", type=int, help="per-rank H128 width, default Qwen256/Kimi512")
     parser.add_argument("--routes", type=Path, help="family-labelled recorded histogram JSON; absent means correctness only")
     parser.add_argument("--route-layer", type=int, default=23)
-    parser.add_argument("--prefill-exhaustive", action="store_true", help="check every prefix row count 1..4096")
+    parser.add_argument("--prefill-exhaustive", action="store_true", help="check every prefix row count 1..compiled capacity")
     parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--prefill-revision", default="HEAD", help="freeze implementation from this git revision")
     parser.add_argument("--prefill-source-dir", type=Path, help="pre-materialized K4 sibling-module bundle")
@@ -1658,7 +1679,7 @@ def main() -> None:
         and not args.coordinator_arm
         and not args.preflight_only
         and args.role != "coordinator"
-        and (args.prefill_arm or args.intermediate or args.rows or args.prefill_source_dir or args.prefill_exhaustive)
+        and (args.prefill_arm or args.intermediate or args.rows or args.prefill_source_dir or (args.prefill_exhaustive and not args.profile.startswith("spark-")))
     )
     if (args.prefill_family in COORDINATOR_FAMILIES and not is_spark_prefill) or args.role == "coordinator" or args.preflight_only:
         try:

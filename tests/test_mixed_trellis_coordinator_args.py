@@ -44,7 +44,7 @@ def arguments(b, *extra):
 
 
 @pytest.mark.parametrize("profile,width", [("rtx-tp1", 2048), ("rtx-tp2", 1024)])
-@pytest.mark.parametrize("capacity", [256, 1024, 2752, 4096])
+@pytest.mark.parametrize("capacity", [256, 1024, 2048, 2752, 4096])
 def test_cooperative_matches_export_contract(profile, width, capacity):
     b = benchmark()
     for sms in (170, 188):
@@ -66,7 +66,7 @@ def test_variant_plumbing_and_preflight():
     args = arguments(b, "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128")
     capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
     assert compact is None
-    assert capacities == [256, 1024, 2752, 4096] and routes == ["random", "realistic"]
+    assert capacities == [256, 1024, 2048, 2752, 4096] and routes == ["random", "realistic"]
     assert len(waves) == 72 and specs[0] == ("coop", {})
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1], SimpleNamespace(multi_processor_count=170, shared_memory_per_block_optin=101376))
     assert opts["warp_specialized"] and opts["input_format"] == "e4m3_k32"
@@ -140,7 +140,7 @@ def test_routes_filter_and_reject_malformed(tmp_path):
 
 
 @pytest.mark.parametrize("profile,width", [("rtx-tp1", 2048), ("rtx-tp2", 1024)])
-@pytest.mark.parametrize("capacity", [256, 1024, 2752, 4096])
+@pytest.mark.parametrize("capacity", [256, 1024, 2048, 2752, 4096])
 def test_glmf_cooperative_matches_export_contract(profile, width, capacity):
     b = benchmark()
     for sms in (170, 188):
@@ -167,7 +167,7 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
     ])
     capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
     assert compact is None
-    assert capacities == [256, 1024, 2752, 4096] and routes == ["random"] and waves == []
+    assert capacities == [256, 1024, 2048, 2752, 4096] and routes == ["random"] and waves == []
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1],
                                          SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376), "glmf")
     assert opts["hidden_size"] == 4096 and opts["route_num_experts"] == 288
@@ -241,8 +241,8 @@ def test_family_compact_ws_arm_plumbing(family, profile, capacity, width):
     assert not options["token_major_rotation"]
 
 
-FAMILY_CAPACITIES = {"qwen4": [256, 1024, 2752, 4096], "v41": [256, 1024, 2752, 4096],
-                     "dsv4p": [256, 1024, 2752, 4096], "kimik3": [256, 1024, 4096]}
+FAMILY_CAPACITIES = {"qwen4": [256, 1024, 2048, 2752, 4096], "v41": [256, 1024, 2048, 2752, 4096],
+                     "dsv4p": [256, 1024, 2048, 2752, 4096], "kimik3": [256, 1024, 2048, 2752, 4096]}
 
 
 @pytest.mark.parametrize("family", sorted(FAMILY_CAPACITIES))
@@ -256,5 +256,50 @@ def test_family_capacity_contract(family):
     with pytest.raises(ValueError, match="no measured export"):
         b.coordinator_preflight(b.benchmark_parser().parse_args([
             "--prefill-family", family, "--role", "coordinator", "--profile", FAMILY_PROFILE[family],
-            "--capacities", "2752" if family == "kimik3" else "2048",
+            "--capacities", "2049",
             "--route-distributions", "random", "--output", "result.json"]))
+
+
+@pytest.mark.parametrize("family", sorted(FAMILY_CAPACITIES))
+@pytest.mark.parametrize("capacity", [2048, 2752])
+def test_adaptive_capacities_and_exhaustive_preflight(family, capacity):
+    b = benchmark()
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", family, "--role", "coordinator", "--profile", FAMILY_PROFILE[family],
+        "--capacities", str(capacity), "--prefill-exhaustive",
+        "--route-distributions", "random", "--output", "result.json"])
+    capacities, _, _, _, _ = b.coordinator_preflight(args)
+    assert capacities == [capacity]
+
+
+def test_control_name_is_reserved():
+    with pytest.raises(argparse.ArgumentTypeError):
+        benchmark().parse_coordinator_arm("coop_control:mode=ws")
+
+
+def test_n192_ws_requires_whole_projection_tiles():
+    b = benchmark()
+    props = SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376)
+    options = b.coordinator_compile_options("rtx-tp2", 2048,
+        dict(mode="ws", tile=(64, 192, 64, 256)), props, "v41")
+    assert options["force_tile_config"] == (64, 192, 64, 256)
+    with pytest.raises(ValueError):
+        b.coordinator_compile_options("rtx-tp2-rank1", 2048,
+            dict(mode="ws", tile=(64, 192, 64, 256)), props, "qwen4")
+
+
+def test_prefill_capacity_controls_allocation():
+    b = benchmark()
+    nodes = [n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "prefill_compile_options"]
+    tables = [n for n in TREE.body if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id in ("PREFILL_TIER_COUNTS", "PREFILL_SWIGLU_LIMITS")
+                      for t in n.targets)]
+    scope = dict(vars(b))
+    exec(compile(ast.Module(body=tables + nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    for capacity in (1024, 2048, 2752, 4096):
+        options = scope["prefill_compile_options"]("glm", 384, 64, "ws+t384", props,
+                                                  compact=True, capacity=capacity)
+        assert options["size_m"] == capacity
+        slots = b.route_pack_capacity(capacity * 8, 64, 256, topk=8)[1]
+        assert options["max_m_blocks"] == (slots + 63) // 64
