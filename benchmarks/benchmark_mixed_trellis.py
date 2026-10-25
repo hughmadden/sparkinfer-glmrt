@@ -974,11 +974,9 @@ def _run_prefill_benchmark(args, device, props):
     family = args.prefill_family
     hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
     width = args.intermediate or (256 if family == "qwen4" else 384 if family in ("glm", "glmf", "dsv4f") else 512)
-    waves = (
-        coordinator_route_waves(args.routes, args.route_layer, family)
-        if args.routes and family in COORDINATOR_FAMILIES
-        else prefill_route_waves(args.routes, family, args.route_layer) if args.routes else None
-    )
+    # Compact prefill always takes the family-labelled histogram fixture; the
+    # coordinator's schema1 (model-tagged) fixture belongs to its own runner.
+    waves = prefill_route_waves(args.routes, family, args.route_layer) if args.routes else None
     # No recorded family routes means correctness only unless running a compact fixture.
     torch.cuda.set_per_process_memory_fraction(min(
         0.5 if args.compact_fixture else 0.25, (args.memory_cap_gib << 30) / props.total_memory), device)
