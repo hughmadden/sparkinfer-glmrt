@@ -21,11 +21,8 @@ order, the ascending K1024 split fold or output rounding.
               enumeration: only owned units are enumerated, so a rank that owns
               three of sixteen units fills the grid instead of pinning each CTA
               to one (unit, proj, split) family
-  gemini      the routed serving core ported from the S3 Gemini duel branch
-              (``k1_reg_pair_b2``: shared-memory live-unit compaction, bitmask
-              owned-unit FC2 iteration, B-first register prefetch, row-bounded
-              grid clamps) at the shipped ABI and CTA policy; its output must
-              stay bit-identical to K1
+  k23         the S3 coalesced K2/K3 routed serving core at the shipped ABI
+              and CTA policy; its output must stay bit-identical to K1
 
 The grouped arms reuse the shipped grouped prefill kernel and grouping
 verbatim; the compact ``unit_count``/``unit_map``/``unit_limit`` tables are
@@ -503,9 +500,9 @@ def main():
                 arm_set[name] = base_arm(sms * factor, rows_max, tables, shared)
             elif name == "wired":
                 arm_set[name] = wired_arm(name, rows_max, tables, shared, owned)
-            elif name == "gemini":
+            elif name == "k23":
                 arm_set[name] = base_arm(sms * 4, rows_max, tables, shared,
-                                         variant="k1_reg_pair_b2", arm_name=name)
+                                         variant="k1_k23_coalesced", arm_name=name)
             elif name == "k1compact":
                 arm_set[name] = k1compact_arm(name, rows_max, tables, shared, owned)
             elif name.startswith("grouped"):
