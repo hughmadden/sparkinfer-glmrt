@@ -198,7 +198,8 @@ SERVED = {
     ("qwen4", 256): (32, False), ("qwen4", 1024): (32, True), ("qwen4", 4096): (32, True),
     ("v41", 256): (8, False), ("v41", 1024): (8, False), ("v41", 4096): (8, False),
     ("dsv4p", 256): (8, False), ("dsv4p", 1024): (64, True), ("dsv4p", 2752): (64, True),
-    ("kimik3", 256): (8, False), ("kimik3", 1024): (64, True), ("kimik3", 4096): (64, False),
+    ("kimik3", 256): (8, False), ("kimik3", 1024): (64, True), ("kimik3", 4096): (8, False),
+    ("kimik3", 2048): (8, False), ("kimik3", 2752): (8, False),
 }
 
 

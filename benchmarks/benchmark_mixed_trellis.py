@@ -1189,7 +1189,7 @@ SERVED_ROUTE_BLOCKS = {
     "qwen4": lambda capacity: 8 if capacity <= 80 else 32,
     "v41": lambda capacity: 8,
     "dsv4p": lambda capacity: 8 if capacity <= 256 else 64,
-    "kimik3": lambda capacity: 8 if capacity <= 256 else 64,
+    "kimik3": lambda capacity: 64 if capacity == 1024 else 8,
 }
 SERVED_TOKEN_ROTATION = {
     "glm": lambda capacity: capacity > 256,
