@@ -275,6 +275,9 @@ def test_audit_existing_arm_inventory_and_balanced_order():
     assert prefill[:2] == [("current", 64, {}), ("current_control", 64, {})]
     assert {rows for _, rows, _ in prefill} == {16, 32, 64}
     assert all("FC2_HALF" not in knobs and "REDUCE_MLP" not in knobs for _, _, knobs in prefill)
+    # FC2 ring indexes with sequence & (stages - 1), unlike FC1's modulo.
+    assert all((knobs.get("FC2_STAGES", 4) & (knobs.get("FC2_STAGES", 4) - 1)) == 0
+               for _, _, knobs in prefill)
     decode = scope["audit_specs"](True)
     assert {label for label, _, _ in decode} >= {"k1", "k23", "compact", "current"}
     labels = [label for label, _, _ in prefill]

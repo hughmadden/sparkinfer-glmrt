@@ -177,8 +177,7 @@ def audit_specs(decode):
             ("fc2_coop", 64, {"FC2_WS": False}),
             ("fc1_s2", 64, {"FC1_STAGES": 2}),
             ("fc1_s4", 64, {"FC1_STAGES": 4}),
-            ("fc2_s3", 64, {"FC2_STAGES": 3}),
-            ("fc2_s5", 64, {"FC2_STAGES": 5}),
+            ("fc2_s2", 64, {"FC2_STAGES": 2}),
             ("cta1", 64, {"CTAS_PER_SM": 1}),
             ("cta4", 64, {"CTAS_PER_SM": 4})]
 
