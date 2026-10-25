@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -172,7 +174,7 @@ def audit_specs(decode):
                 ("group16", 16, {}), ("group32", 32, {}),
                 ("group64", 64, {})]
     return [("current", 64, {}), ("current_control", 64, {}),
-            ("group16", 16, {}), ("group32", 32, {}),
+            ("candidate", 64, {}), ("group16", 16, {}), ("group32", 32, {}),
             ("fc1_coop", 64, {"FC1_WS": False}),
             ("fc2_coop", 64, {"FC2_WS": False}),
             ("fc1_s2", 64, {"FC1_STAGES": 2}),
@@ -226,7 +228,26 @@ def audit_weights(widths, hidden, seed):
     return pointers.cuda(), bits.cuda(), owners
 
 
-def audit_compile(label, group_rows, knobs, capacity, decode):
+def load_reference_core(spec):
+    """Verify an immutable git blob before executing any frozen Python source."""
+    path_text, separator, expected = spec.rpartition("@")
+    if not separator or not re.fullmatch(r"[0-9a-f]{40}", expected):
+        raise ValueError("--reference-core requires PATH@40-character-git-blob-SHA")
+    path = Path(path_text).resolve()
+    source = path.read_bytes()
+    actual = hashlib.sha1(b"blob " + str(len(source)).encode() + b"\0" + source).hexdigest()
+    if actual != expected:
+        raise ValueError("frozen reference-core git blob mismatch")
+    name = "b12x.moe._shared.kernels.w4a16._exlr8_reference_" + actual
+    module_spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(module_spec)
+    module.__package__ = "b12x.moe._shared.kernels.w4a16"
+    sys.modules[name] = module
+    exec(compile(source, str(path), "exec"), module.__dict__)
+    return module.Exlr8GroupedKernel, (str(path), actual, hashlib.sha256(source).hexdigest())
+
+
+def audit_compile(label, group_rows, knobs, capacity, decode, reference=None):
     """Keep benchmark knob sweeps out of the production AOT cache namespace."""
     from b12x.integration.cuteafd import _common, exlr8
     from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
@@ -240,7 +261,16 @@ def audit_compile(label, group_rows, knobs, capacity, decode):
     factory = exlr8.compile_program
     def keyed(wrapper, **kwargs):
         kwargs["name"] = "exlr8_audit_" + kwargs["name"]
-        kwargs["key"] = (source, tuple(sorted(knobs.items())), kwargs["key"])
+        arm_source = source
+        if reference is not None:
+            reference_type, identity = reference
+            if not grouped or knobs:
+                raise ValueError("frozen reference requires an unmodified grouped arm")
+            wrapper.core = reference_type(6144, 16, 8, capacity, group_rows,
+                                          fc2_f32=decode)
+            arm_source = (identity,)
+            kwargs["name"] = "exlr8_audit_frozen_reference"
+        kwargs["key"] = (arm_source, tuple(sorted(knobs.items())), kwargs["key"])
         return _common.compile_program(wrapper, **kwargs)
     exlr8.compile_program = keyed
     try:
@@ -309,6 +339,9 @@ def audit_main(args):
         raise ValueError("audit rows must be in 1..4096")
     if args.exhaustive and (max(rows_list) != 4096 or min(rows_list) <= 64):
         raise ValueError("exhaustive mode requires prefill only, including rows4096")
+    reference_core = load_reference_core(args.reference_core) if args.reference_core else None
+    if reference_core and min(rows_list) <= 64:
+        raise ValueError("frozen grouped reference is prefill-only")
     waves = load_route_waves(args.routes or "realistic")
     indices = [int(i) for i in args.wave_indices.split(",")]
     manifest_path = Path(args.manifest).resolve()
@@ -319,6 +352,7 @@ def audit_main(args):
     report = dict(manifest=str(manifest_path), manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
                   routes=str(route_path), routes_sha256=hashlib.sha256(route_path.read_bytes()).hexdigest(),
                   gpu=str(props), rank=args.rank, seed=args.seed,
+                  reference_core=reference_core[1] if reference_core else None,
                   payload="independent random trellis bytes, real manifest tiers and global expert IDs",
                   timing=dict(warmup=args.warmup, rounds=args.repeats, replays=args.iters), cases=[])
     print(json.dumps({k: v for k, v in report.items() if k != "cases"}), flush=True)
@@ -356,7 +390,8 @@ def audit_main(args):
                     capacity = 512
                 state = audit_state(planned, capacity, group_rows, scratch)
                 audit_pack(ids, state, group_rows)
-                program, source = audit_compile(actual_label, group_rows, knobs, capacity, decode)
+                program, source = audit_compile(actual_label, group_rows, knobs, capacity, decode,
+                    reference=reference_core if label in ("current", "current_control") else None)
                 limit = args.cta_limit or props.multi_processor_count * int(program.geometry["ctas_per_sm"])
                 extra = compact[:2] if any(o.name == "unit_count" for o in program.operands) else ()
                 def launch(live=rows, program=program, state=state, extra=extra, limit=limit):
@@ -450,6 +485,7 @@ def main():
     ap.add_argument("--dump", default=None, help="save the output rows here for a bitwise arm comparison")
     ap.add_argument("--audit", action="store_true", help="graph-first real-manifest TP2 existing-kernel audit")
     ap.add_argument("--manifest", help="actual EXLR8 width manifest, never synthetic cyclic tiers")
+    ap.add_argument("--reference-core", help="frozen grouped source PATH@git-blob-SHA; current/current_control use it")
     ap.add_argument("--rank", type=int, choices=(0, 1), default=0)
     ap.add_argument("--wave-indices", default="0,12,24,36,48,60")
     ap.add_argument("--arms", help="comma-separated audit arms; current is always included")

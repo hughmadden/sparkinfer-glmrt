@@ -249,6 +249,29 @@ def audit_helpers(*names, **scope):
     return scope
 
 
+def test_audit_frozen_reference_rejects_edits_and_ignores_candidate(tmp_path):
+    import hashlib
+    import importlib.util
+    import re
+    candidate = tmp_path / "candidate.py"
+    frozen = tmp_path / "reference.py"
+    source = b"class Exlr8GroupedKernel:\n    VALUE = 'frozen'\n"
+    candidate.write_bytes(source)
+    frozen.write_bytes(source)
+    blob = hashlib.sha1(b"blob " + str(len(source)).encode() + b"\0" + source).hexdigest()
+    load = audit_helpers("load_reference_core", Path=Path, hashlib=hashlib,
+                         importlib=importlib, re=re, sys=sys)["load_reference_core"]
+    first, identity = load(str(frozen) + "@" + blob)
+    candidate.write_text("raise RuntimeError('candidate edited')\n")
+    second, second_identity = load(str(frozen) + "@" + blob)
+    assert first.VALUE == second.VALUE == "frozen" and identity == second_identity
+    frozen.write_text("raise RuntimeError('must not execute altered reference')\n")
+    with pytest.raises(ValueError, match="blob mismatch"):
+        load(str(frozen) + "@" + blob)
+    with pytest.raises(ValueError, match="PATH@"):
+        load(str(frozen))
+
+
 @pytest.mark.parametrize("layer", [7, 47])
 def test_audit_manifest_tp2_keeps_exact_tiers_and_global_ids(layer):
     entry = dict(gate=[[2, 3, 4, 2] for _ in range(3)],
