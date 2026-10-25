@@ -188,11 +188,10 @@ class _RouterScores:
     """Skinny GEMV (FP32 out) for live_rows <= 64, else the V4.1 TMA MMA kernel."""
 
     def __init__(self, experts: int, hidden: int):
-        from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
+        from b12x.gemm.bf16_gemv._skinny import router_skinny
         from b12x.moe._shared.v41_router import _V41RouterScores
 
-        self.skinny = SkinnyBf16Gemv(experts, hidden, out_dtype=cutlass.Float32,
-                                     **skinny_config(experts, hidden, cutlass.Float32))
+        self.skinny = router_skinny(experts, hidden)
         self.mma = _V41RouterScores(experts, hidden=hidden)
 
     @cute.jit
@@ -218,7 +217,7 @@ def compile_dsv4_router_scores_aot(geometry: DSV4Geometry = FLASH, experts: int 
                   Operand("w", torch.bfloat16, f"[{e},{h}]", note="ffn.gate.weight"),
                   Operand("logits", torch.float32, f"[rows,{e}]", "out")),
         scalars=(Scalar("live_rows"),),
-        key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.cols, s.rows_per_tile, s.threads),
+        key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.tiles_by_rows),
         geometry={"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS}, doc=__doc__,
     )
 

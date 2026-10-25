@@ -339,7 +339,7 @@ def compile_glm_router_scores_aot(g: GLMGeometry = GLM53) -> AotProgram:
                   Operand("w", torch.bfloat16, f"[{e},{h}]", note="mlp.gate.weight"),
                   Operand("logits", torch.float32, f"[rows,{e}]", "out")),
         scalars=(Scalar("live_rows"),),
-        key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.cols, s.rows_per_tile, s.threads),
+        key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.tiles_by_rows),
         geometry={"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS}, doc=__doc__,
     )
 

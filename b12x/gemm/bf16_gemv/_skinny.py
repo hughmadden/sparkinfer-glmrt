@@ -249,6 +249,24 @@ SKINNY_TILES_BY_ROWS = {
 }
 
 
+# Router-only tiles preserve each shape's original K partition and fold order.
+ROUTER_TILES_BY_ROWS = {
+    (384, 5120): ((16, 2, 4, 128), (64, 8, 4, 128)),
+    (128, 5120): ((64, 2, 4, 128),),
+    (256, 6144): ((16, 2, 4, 128), (64, 8, 4, 128)),
+    (256, 4096): ((16, 4, 2, 256), (64, 8, 4, 256)),
+    (384, 7168): ((16, 4, 2, 224), (64, 4, 4, 224)),
+}
+
+
+def router_skinny(n: int, k: int, *, kernel_type=SkinnyBf16Gemv):
+    tiles = ROUTER_TILES_BY_ROWS.get((n, k))
+    if tiles is None:
+        cfg = skinny_config(n, k, Float32)
+        tiles = ((64, cfg['cols'], cfg['rows_per_tile'], cfg['threads']),)
+    return RowTiledSkinnyBf16Gemv(n, k, tiles, out_dtype=Float32, kernel_type=kernel_type)
+
+
 class RowTiledSkinnyBf16Gemv:
     """``SkinnyBf16Gemv`` with ``(cols, rows_per_tile)`` picked by live rows.
 
@@ -256,7 +274,8 @@ class RowTiledSkinnyBf16Gemv:
     invariant across row counts and matches a single-row launch bit for bit.
     """
 
-    def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16):
+    def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16,
+                 kernel_type=SkinnyBf16Gemv):
         self.n, self.k = int(n), int(k)
         self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
         if not self.tiles_by_rows or any(len(entry) != 4 for entry in self.tiles_by_rows):
@@ -268,7 +287,7 @@ class RowTiledSkinnyBf16Gemv:
         if any(limit <= floor for floor, limit in zip(self.floors, self.limits)):
             raise ValueError("skinny_tiles_by_rows rows must be positive and ascending")
         self.cols, self.rows_per_tile, self.threads = self.tiles_by_rows[0][1:]
-        self.tiled = [SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, cols=c, rows_per_tile=r,
+        self.tiled = [kernel_type(self.n, self.k, out_dtype=out_dtype, cols=c, rows_per_tile=r,
                                      threads=t) for _, c, r, t in self.tiles_by_rows]
         self.default = self.tiled[-1]
 
