@@ -303,3 +303,28 @@ def test_prefill_capacity_controls_allocation():
         assert options["size_m"] == capacity
         slots = b.route_pack_capacity(capacity * 8, 64, 256, topk=8)[1]
         assert options["max_m_blocks"] == (slots + 63) // 64
+
+
+@pytest.mark.parametrize("family,profile,width", [
+    ("glm", "spark-compact-width384", 384), ("glm", "spark-compact-width768", 768),
+    ("glmf", "spark-compact-width384", 384), ("glmf", "spark-compact-width768", 768),
+    ("qwen4", "spark-compact-width384", 384), ("qwen4", "spark-compact-width256", 256),
+    ("v41", "spark-compact-width640", 640),
+    ("dsv4p", "spark-tp4-width768", 768), ("kimik3", "spark-tp6-width512", 512),
+])
+def test_spark_tuning_profile_options(family, profile, width):
+    b = benchmark()
+    compact = "compact" in profile
+    options = b.coordinator_compile_options(profile, 2048,
+        dict(mode="ws", route_block=64, dynamic=1, tile=(64, 128, 64, 256)),
+        SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376),
+        family, compact=compact)
+    assert options["size_m"] == 2048 and options["intermediate_size"] == width
+    assert options["compact_weights"] == compact
+    assert options["full_rotation_output_dtype"] == "bf16"
+    if compact and width >= 384:
+        options = b.coordinator_compile_options(profile, 2752,
+            dict(mode="ws", tile=(64, 192, 64, 256)),
+            SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376),
+            family, compact=True)
+        assert options["force_tile_config"] == (64, 192, 64, 256)
