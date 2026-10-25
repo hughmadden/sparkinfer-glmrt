@@ -241,6 +241,70 @@ def test_dense_mx8_geometry_has_distinct_record_abi():
     assert scope["record_bytes"](4096, 2048) == 256 * 64 * 528
 
 
+def audit_helpers(*names, **scope):
+    source = SOURCE.with_name("bench_exlr8_grouped_prefill.py")
+    tree = ast.parse(source.read_text())
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), scope)
+    return scope
+
+
+@pytest.mark.parametrize("layer", [7, 47])
+def test_audit_manifest_tp2_keeps_exact_tiers_and_global_ids(layer):
+    entry = dict(gate=[[2, 3, 4, 2] for _ in range(3)],
+                 up=[[4, 3, 2, 4] for _ in range(3)], down=[2, 3, 4])
+    manifest = {"layers": {str(layer): entry}}
+    build = audit_helpers("manifest_widths")["manifest_widths"]
+    halves = [build(manifest, layer, rank, experts=3, units=4) for rank in (0, 1)]
+    for expert in range(3):
+        for unit in range(4):
+            owner = (4 * expert + unit + layer) % 2
+            assert halves[owner][expert][unit] == [entry["gate"][expert][unit],
+                entry["up"][expert][unit], entry["down"][expert]]
+            assert halves[1-owner][expert][unit] == [0, 0, 0]
+    entry["down"][0] = 5
+    with pytest.raises(ValueError, match="K2/K3/K4"):
+        build(manifest, layer, 0, experts=3, units=4)
+    with pytest.raises(ValueError, match="rank"):
+        build(manifest, layer, 2, experts=3, units=4)
+
+
+def test_audit_existing_arm_inventory_and_balanced_order():
+    scope = audit_helpers("audit_specs", "audit_order")
+    prefill = scope["audit_specs"](False)
+    assert prefill[:2] == [("current", 64, {}), ("current_control", 64, {})]
+    assert {rows for _, rows, _ in prefill} == {16, 32, 64}
+    assert all("FC2_HALF" not in knobs and "REDUCE_MLP" not in knobs for _, _, knobs in prefill)
+    decode = scope["audit_specs"](True)
+    assert {label for label, _, _ in decode} >= {"k1", "k23", "compact", "current"}
+    labels = [label for label, _, _ in prefill]
+    orders = [scope["audit_order"](labels, r) for r in range(len(labels))]
+    assert all(sorted(order) == sorted(labels) for order in orders)
+    assert all(len({order[i] for order in orders}) == len(labels) for i in range(len(labels)))
+
+
+@pytest.mark.parametrize("group_rows", [16, 32, 64])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_audit_packing_uses_global_ids_and_invalid_tails(group_rows, reverse):
+    torch = pytest.importorskip("torch")
+    pack = audit_helpers("audit_pack", torch=torch)["audit_pack"]
+    ids = torch.tensor([[255, 1], [1, 128], [255, 128]])
+    capacity = 256
+    state = dict(group_expert=torch.empty(capacity, dtype=torch.int32),
+                 route_slots=torch.empty((capacity, group_rows), dtype=torch.int32),
+                 inverse=torch.empty((3, 2), dtype=torch.int32), count=torch.empty(1, dtype=torch.int32))
+    active = pack(ids, state, group_rows, reverse)
+    assert active == int(state["count"][0]) == 3
+    assert set(state["group_expert"][:active].tolist()) == {1, 128, 255}
+    flat = state["route_slots"].flatten()
+    for slot, inverse in enumerate(state["inverse"].flatten().tolist()):
+        assert int(flat[inverse]) == slot
+        group = inverse // group_rows
+        assert int(state["group_expert"][group]) == int(ids.flatten()[slot])
+    assert bool((state["route_slots"][active:] == -1).all())
+    assert bool((state["group_expert"][active:] == -1).all())
+
+
 def test_dense_bf16_comparison_argument_plumbing():
     import argparse
     from types import SimpleNamespace
