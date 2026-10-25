@@ -204,8 +204,9 @@ def test_router_scores_match_fp32_gate(programs, name, rows):
 
 
 
-@pytest.mark.parametrize("name", ["flash", "pro", "glm"])
-def test_router_scores_rows_match_single_row_decode(programs, name):
+@pytest.mark.parametrize("mode", ["random", "cancellation", "dynamic"])
+@pytest.mark.parametrize("name", ["flash", "pro", "glm", "v41", "v41_draft"])
+def test_router_scores_rows_match_single_row_decode(programs, name, mode):
     """Every decode/verify width 1..64 gives each row its M=1 logits bit for bit
     (#736: the MMA route above 32 rows reordered each logit's FP32 sum, so a
     33-64-row verify routed differently from plain decode)."""
@@ -214,11 +215,33 @@ def test_router_scores_rows_match_single_row_decode(programs, name):
     device = require_b12x()
     if name == "glm":
         program, e, h = glm_ffn.compile_glm_router_scores_aot(GLM53), GLM53.routed_experts, GLM53.hidden
+    elif name in ("v41", "v41_draft"):
+        from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
+        from b12x.integration.cuteafd._common import compile_program, Operand, Scalar
+        import cutlass
+
+        e, h = (384 if name == "v41" else 128), 5120
+        program = compile_program(
+            SkinnyBf16Gemv(e, h, out_dtype=cutlass.Float32, **skinny_config(e, h, cutlass.Float32)),
+            name=f"test_{name}_router", key=(e, h),
+            operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                      Operand("w", torch.bfloat16, f"[{e},{h}]"),
+                      Operand("out", torch.float32, f"[rows,{e}]", "out")),
+            scalars=(Scalar("rows"),))
     else:
         geometry = _geometry(name)
         program, e, h = programs[("router", name)], geometry.routed_experts, geometry.hidden
     gate = (torch.randn((e, h), generator=torch.Generator().manual_seed(e + h)) / 64).bfloat16().to(device)
     x = _x(64, h, 736, device)
+    if mode == "cancellation":
+        gate[:, 1::2] = -gate[:, ::2]
+        x[:, 1::2] = x[:, ::2]
+        x[:, ::257] *= 1.0078125
+    elif mode == "dynamic":
+        scale = torch.pow(2., (torch.arange(h, device=device) % 41 - 20).float())
+        x = (x.float() * scale).bfloat16()
+        gate = (gate.float() / scale).bfloat16()
+        x[0].zero_()
 
     def run(rows, rows_x):
         logits = torch.full((rows, e), float("nan"), device=device)
