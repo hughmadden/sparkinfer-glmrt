@@ -23,8 +23,10 @@ moe_inter, 2048 Flash / 3072 Pro)::
     rows       int32 (1 <= rows <= max_rows)
 
 ``compile_dsv4_router_scores_aot(geometry)``: FP32-accumulated BF16 scores.
-Live rows <= 32 run a bandwidth-bound skinny GEMV (FP32 output); more rows run
-the V4.1 TMA-fed warp-MMA kernel (``_V41RouterScores``); the branch is on the
+Live rows <= 64 (every decode and verify width) run a bandwidth-bound skinny
+GEMV (FP32 output) whose per-logit K order does not depend on the row count, so
+each verify row is bitwise its M=1 decode logit; prefill-width launches run the
+V4.1 TMA-fed warp-MMA kernel (``_V41RouterScores``); the branch is on the
 ``live_rows`` scalar inside the program. V4.1 header names::
 
     x          bf16 [rows,H]      in   ffn input (after ffn_norm)
@@ -173,11 +175,17 @@ def compile_dsv4_shared_ffn_aot(geometry: DSV4Geometry = FLASH, *, max_rows: int
     )
 
 
-ROUTER_SKINNY_MAX_ROWS = 32
+# Every decode/verify width (DECODE_ROWS = 64 in GLM 5.3 and DeepSeek V4) stays
+# on the skinny GEMV: the MMA kernel sums each logit in a different FP32 order,
+# so a 33..64-row verify would route differently from M=1 decode (#736). Cold-L2
+# SM120 medians, skinny vs MMA at 33/48/64 rows: GLM 22.5/24.6/32.8 vs
+# 28.7/28.7/30.7 us, V4 Flash 14.3/16.4/18.4 vs 20.5/20.5/22.5, V4 Pro
+# 24.6/30.7/36.9 vs 32.8/32.8/34.8.
+ROUTER_SKINNY_MAX_ROWS = 64
 
 
 class _RouterScores:
-    """Skinny GEMV (FP32 out) for live_rows <= 32, else the V4.1 TMA MMA kernel."""
+    """Skinny GEMV (FP32 out) for live_rows <= 64, else the V4.1 TMA MMA kernel."""
 
     def __init__(self, experts: int, hidden: int):
         from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config

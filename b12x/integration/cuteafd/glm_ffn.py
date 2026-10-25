@@ -327,7 +327,7 @@ def compile_glm_ffn_aot(g: GLMGeometry = GLM53, *, inter: int, max_rows: int, fp
 
 
 def compile_glm_router_scores_aot(g: GLMGeometry = GLM53) -> AotProgram:
-    """FP32 router logits (skinny GEMV <= 32 rows, TMA warp-MMA above)."""
+    """FP32 router logits (skinny GEMV <= 64 rows, row-invariant; TMA warp-MMA above)."""
     from .dsv4_ffn import ROUTER_SKINNY_MAX_ROWS, _RouterScores
 
     e, h = g.routed_experts, g.hidden
