@@ -723,8 +723,8 @@ PREFILL_FAMILIES = {
     "kimik3": (3584, 896, 16, (2, 3), "situ"),
     "glm": (6144, 256, 8, (4, 5), "silu"),
     "glmf": (4096, 288, 8, (3, 4), "silu"),
-    "v41": (5120, 384, 6, (3, 4), "silu"),
     "dsv4f": (4096, 256, 6, (4, 5), "silu"),
+    "v41": (5120, 384, 6, (3, 4), "silu"),
 }
 
 PREFILL_SWIGLU_LIMITS = {
@@ -732,8 +732,8 @@ PREFILL_SWIGLU_LIMITS = {
     "qwen4": None,
     "kimik3": None,
     "glmf": 10.0,
-    "v41": 10.0,
     "dsv4f": 10.0,
+    "v41": 10.0,
 }
 
 PREFILL_TIER_COUNTS = {
@@ -741,8 +741,8 @@ PREFILL_TIER_COUNTS = {
     "kimik3": (896, 1),
     "glm": (192, 64),
     "glmf": (216, 72),
-    "v41": (288, 96),
     "dsv4f": (192, 64),
+    "v41": (288, 96),
 }
 
 
@@ -908,8 +908,8 @@ def prefill_compile_options(family, width, block, mode, props, *, compact=False)
         if not ws:
             tile = (64, 128, 64, 128)
         elif "t384" in tokens:
-            if width % 192:
-                raise ValueError("t384 requires width divisible by 192")
+            if width < 384 or width % 128:
+                raise ValueError("t384 requires compact H128 width >= 384")
             tile = (64, 192, 64, 256)
         elif "n128" in tokens:
             tile = (64, 128, 64, 128)
@@ -973,7 +973,7 @@ def _run_prefill_benchmark(args, device, props):
         raise ValueError("prefill rows must be 1..4096")
     family = args.prefill_family
     hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
-    width = args.intermediate or (256 if family == "qwen4" else 384 if family in ("glm", "glmf", "dsv4f") else 512)
+    width = args.intermediate or (256 if family == "qwen4" else 384 if family in ("glm", "glmf", "dsv4f") else 640 if family == "v41" else 512)
     # Compact prefill always takes the family-labelled histogram fixture; the
     # coordinator's schema1 (model-tagged) fixture belongs to its own runner.
     waves = prefill_route_waves(args.routes, family, args.route_layer) if args.routes else None

@@ -435,7 +435,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         inter = int(self.intermediate_size)
         if hidden % 128 or inter % 128:
             raise ValueError("warp-specialized mixed Trellis needs H128-aligned K")
-        if inter % tile_fc1 or hidden % tile_fc2:
+        if (inter < tile_fc1 if compact_weights else inter % tile_fc1) or hidden % tile_fc2:
             raise ValueError("gate/up halves and FC2 must hold whole N tiles")
         self.ws_m = block
         self.ws_mb = block // 16
@@ -1188,7 +1188,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     projection = Int64(0)
                     if nt >= n_tiles // Int32(2):
                         projection = Int64(1)
-                        local_n16 -= Int64(n_total // 32)
+                        local_n16 -= Int64((n_total // 2 + self.ws_n - 1) // self.ws_n * self.ws_n16)
                     width = descriptor_map[Int64(3) * Int64(total_experts) + Int64(combined)].to(Int64)
                     stride_u32 = (width // Int64(16)) * tile_u32
                     if cutlass.const_expr(self.ws_n == 192):
@@ -1719,7 +1719,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         units ahead of the consumers."""
         lane = ptid & Int32(31)
         l16 = lane & Int32(15)
-        n_tiles = Int32(n_total // self.ws_n)
+        half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
+        n_tiles = Int32(2 * half_tiles if (self.compact_weights and is_fc1) else n_total // self.ws_n)
         route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(self.ws_m)
         total_tiles = route_blocks * n_tiles
         live = active_m * Int32(self.top_k)
@@ -2242,8 +2243,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         col = nt * Int32(self.ws_n) + cw * Int32(32) + Int32(8) * q
         col_valid = Int32(1)
         if cutlass.const_expr(self.compact_weights and self.ws_n == 192):
+            half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
             live_n = ld_shared_i32_relaxed(hdr + Int32(24))
-            local_col = (nt % Int32(n_total // (2 * self.ws_n))) * Int32(self.ws_n) + cw * Int32(32) + Int32(8) * q
+            local_col = (nt % Int32(half_tiles)) * Int32(self.ws_n) + cw * Int32(32) + Int32(8) * q
+            if cutlass.const_expr(n_total % (2 * self.ws_n) != 0):
+                col = (nt // Int32(half_tiles)) * Int32(n_total // 2) + local_col
             col_valid = (local_col < live_n).to(Int32)
         for mb in cutlass.range_constexpr(active):
             for rh in cutlass.range_constexpr(2):
