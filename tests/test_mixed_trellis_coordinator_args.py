@@ -185,7 +185,7 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
             "--routes", str(b.GLM_ROUTES), "--output", "result.json"]))
     with pytest.raises(ValueError):
         b.coordinator_preflight(b.benchmark_parser().parse_args([
-            "--prefill-family", "glmf", "--role", "spark", "--profile", "spark-tp4-width512",
+            "--prefill-family", "glmf", "--role", "spark", "--profile", "spark-tp6-width512",
             "--route-distributions", "random", "--output", "result.json"]))
     with pytest.raises(ValueError):
         b.coordinator_preflight(b.benchmark_parser().parse_args([
@@ -329,3 +329,30 @@ def test_spark_tuning_profile_options(family, profile, width):
             SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376),
             family, compact=True)
         assert options["force_tile_config"] == (64, 192, 64, 256)
+
+
+@pytest.mark.parametrize("family,widths", [
+    ("glm", {256, 384, 512, 640, 768, 1024}),
+    ("glmf", {256, 384, 512, 640, 768, 1024}),
+    ("qwen4", {128, 256, 384, 640}),
+    ("v41", {384, 512, 640, 768, 1152}),
+    ("dsv4p", {512, 768, 1024, 1536}),
+    ("kimik3", {512}),
+])
+def test_served_spark_width_coverage(family, widths):
+    b = benchmark()
+    profiles = b.COORDINATOR_FAMILIES[family]["profiles"]
+    served = {width for profile, width in profiles.items()
+              if profile.startswith("spark-") and "compact" not in profile
+              and (family != "kimik3" or profile == "spark-tp6-width512")}
+    assert served == widths
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    for profile, width in profiles.items():
+        if not profile.startswith("spark-") or "compact" in profile:
+            continue
+        for capacity in (2048, 2752):
+            options = b.coordinator_compile_options(profile, capacity, {}, props, family)
+            assert options["intermediate_size"] == width
+            assert options["full_rotation_output_dtype"] == "bf16"
+            assert options["moe_block_size"] == (8 if family in ("v41", "kimik3")
+                                                else 32 if family == "qwen4" else 64)

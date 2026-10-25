@@ -1143,6 +1143,7 @@ def _run_prefill_benchmark(args, device, props):
 GLM_CAPACITIES = (256, 1024, 2048, 2752, 4096)
 GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024,
                 "spark-tp6-width384": 384, "spark-tp6-width256": 256, "spark-tp4-width512": 512,
+                "spark-tp2-width1024": 1024, "spark-tp3-width768": 768, "spark-tp3-width640": 640,
                 "spark-compact-width384": 384, "spark-compact-width768": 768}
 GLM_ROUTES = Path(__file__).resolve().parent / "fixtures/glm53_prefill_routes_realistic.json"
 COORDINATOR_FAMILIES = {
@@ -1152,24 +1153,35 @@ COORDINATOR_FAMILIES = {
     "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), activation="silu",
                  swiglu_limit=10.0, model="zai-org/GLM-5.3-Flash",
                  profiles={"rtx-tp1": 2048, "rtx-tp2": 1024,
-                           "spark-compact-width384": 384, "spark-compact-width768": 768},
+                           "spark-compact-width384": 384, "spark-compact-width768": 768,
+                           "spark-tp2-width1024": 1024, "spark-tp3-width768": 768,
+                           "spark-tp3-width640": 640, "spark-tp4-width512": 512,
+                           "spark-tp6-width384": 384, "spark-tp6-width256": 256},
                  capacities=GLM_CAPACITIES, routes=None),
     # Qwen 3.8 Flash Next: I=640 is five H128 blocks, so the dual-RTX split is
     # uneven (3 + 2 blocks) exactly as `shard_profiles` compiles it.
     "qwen4": dict(hidden=2560, experts=512, top_k=10, bits=(4, 5), activation="silu",
                   swiglu_limit=None, model="Qwen/Qwen3.8-Flash-Next",
                   profiles={"rtx-tp1": 640, "rtx-tp2-rank0": 384, "rtx-tp2-rank1": 256,
-                            "spark-compact-width384": 384, "spark-compact-width256": 256},
+                            "spark-compact-width384": 384, "spark-compact-width256": 256,
+                            "spark-tp1-width640": 640, "spark-tp2-width384": 384,
+                            "spark-tp2-width256": 256, "spark-tp3-width256": 256,
+                            "spark-tp3-width128": 128, "spark-tp4-width256": 256,
+                            "spark-tp4-width128": 128},
                   capacities=GLM_CAPACITIES, routes=None),
     # V4.1 EXL3 K3.25: a quarter of the projections carry the 4-bit tier.
     "v41": dict(hidden=5120, experts=384, top_k=6, bits=(3, 4), activation="silu",
                 swiglu_limit=10.0, model="deepseek-ai/DeepSeek-V4.1-Flash",
-                profiles={"rtx-tp1": 2304, "rtx-tp2": 1152, "spark-compact-width640": 640},
+                profiles={"rtx-tp1": 2304, "rtx-tp2": 1152, "spark-compact-width640": 640,
+                          "spark-tp2-width1152": 1152, "spark-tp3-width768": 768,
+                          "spark-tp4-width640": 640, "spark-tp4-width512": 512,
+                          "spark-tp6-width384": 384},
                 capacities=GLM_CAPACITIES, routes=None),
     "dsv4p": dict(hidden=7168, experts=384, top_k=6, bits=(2, 3), activation="silu",
                   swiglu_limit=10.0, model="deepseek-ai/DeepSeek-V4-Pro",
                   profiles={"rtx-tp1": 3072, "rtx-tp2": 1536,
-                            "spark-tp4-width768": 768, "spark-tp6-width512": 512},
+                            "spark-tp4-width768": 768, "spark-tp6-width512": 512,
+                            "spark-tp2-width1536": 1536, "spark-tp3-width1024": 1024},
                   capacities=GLM_CAPACITIES, routes=None),
     # Adaptive prefill adds m2048 and m2752 to Kimi's K64 capacity ladder.
     "kimik3": dict(hidden=3584, experts=896, top_k=16, bits=(2, 3), activation="situ",
@@ -1264,7 +1276,9 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
             raise ValueError("coordinator tile must divide both projection geometries")
     else:
         block = arm.get("route_block", 64 if ws else
-                        8 if spark and family == "kimik3" else SERVED_ROUTE_BLOCKS[family](capacity))
+                        8 if spark and family == "kimik3" else
+                        (16 if capacity <= 1024 else 64) if spark and family == "dsv4p" and capacity > 256 else
+                        SERVED_ROUTE_BLOCKS[family](capacity))
         rotation = arm.get("rotation", "route" if ws else "served")
         token = rotation == "token" or (rotation == "served" and SERVED_TOKEN_ROTATION[family](capacity))
         fused = rotation == "fused"
@@ -1344,7 +1358,8 @@ def coordinator_preflight(args):
     if unknown:
         raise ValueError(f"{family} has no measured export at capacities {unknown}")
     specs = [("coop", {})]
-    if args.role == "spark" and family == "glm" and not args.profile.startswith("spark-compact-"):
+    if args.role == "spark" and family == "glm" and args.profile in (
+            "spark-tp6-width384", "spark-tp6-width256", "spark-tp4-width512"):
         specs.append(("served", (dict(mode="ws") if compact else
                                 dict(mode="ws", wire=1, stages=3, dynamic=1, ctas=1,
                                      tile=((64, 192, 64, 256) if spec["profiles"][args.profile] == 384
