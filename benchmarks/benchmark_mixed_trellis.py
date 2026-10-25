@@ -1169,16 +1169,16 @@ SERVED_ROUTE_BLOCKS = {
     "glmf": lambda capacity: 8 if capacity <= 256 else 64,
     "qwen4": lambda capacity: 8 if capacity <= 80 else 32,
     "v41": lambda capacity: 8,
-    "dsv4p": lambda capacity: 8 if capacity <= 256 else 16 if capacity <= 1024 else 64,
-    "kimik3": lambda capacity: 8,
+    "dsv4p": lambda capacity: 8 if capacity <= 256 else 64,
+    "kimik3": lambda capacity: 8 if capacity <= 256 else 64,
 }
 SERVED_TOKEN_ROTATION = {
     "glm": lambda capacity: capacity > 256,
     "glmf": lambda capacity: capacity > 256,
     "qwen4": lambda capacity: capacity > 256,
     "v41": lambda capacity: False,
-    "dsv4p": lambda capacity: capacity > 1024,
-    "kimik3": lambda capacity: False,
+    "dsv4p": lambda capacity: capacity > 256,
+    "kimik3": lambda capacity: capacity == 1024,
 }
 
 

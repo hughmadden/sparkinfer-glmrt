@@ -127,10 +127,39 @@ AUTO_W8A8_STREAM_ROWS_SM121 = 768
 # 4101 / 7300; 1024 5724 / 4178 / 7492; 2048 10528 / 4438 / 10246; 4096 21160 /
 # 5916 / 16882.
 AUTO_W8A8_STREAM_ROWS_SM120 = 512
-# MXFP4 live rows above which ``auto`` streams (wire or native BF16 input);
-# RTX PRO 6000 (us, GEMV / stream): TP6 1024 rows 1662 / 1729, 2048 2598 / 1907;
-# TP1 512 8965 / 7952, 1024 13654 / 10653.
-AUTO_MXFP4_STREAM_ROWS = 1024
+# MXFP4 live rows above which ``auto`` streams on SM120 (``rows <= threshold``
+# takes GEMV; ``rows > threshold`` streams). Coordinator packages ship ``tp1``
+# and ``tp2`` (``tp6`` is a Spark/SM121 layout governed by
+# ``AUTO_MXFP4_STREAM_ROWS_SM121 = 640`` and is shown below for context only).
+# Native BF16 coordinator input (--input bf16, --graph, --check, 2x20
+# interleaved decode/stream replays, RTX PRO 6000 188 SMs, 450 W cap, zero
+# throttle; pass-mean GEMV / stream us):
+#   coarse      256          384          512          640          768          1024         1536          2048
+#   mimop tp1   5317 / 7552  5568 / 7677  5764 / 7629  6202 / 7733  6849 / 7824  8083 / 8021  10202 / 8683  12425 / 9689
+#   mimop tp2   2563 / 3814  2688 / 3853  2859 / 3896  3098 / 3915  3375 / 3939  3956 / 3994   4990 / 4215   6168 / 4633
+#   mimof tp1   2174 / 3384  2324 / 3421  2602 / 3459  2953 / 3500  3207 / 3520  3928 / 3667   5463 / 4072   7298 / 4927
+#   mimof tp2   1123 / 1751  1197 / 1768  1336 / 1786  1486 / 1804  1592 / 1820  1894 / 1879   2621 / 2014   3546 / 2404
+#   (context)
+#   mimop tp6   1160 / 1542  1201 / 1566  1249 / 1582  1324 / 1598  1428 / 1616  1655 / 1646   2107 / 1725   2606 / 1827
+#   mimof tp6    528 /  716   554 /  725   611 /  736   677 /  748   724 /  760   839 /  789   1099 /  852   1492 / 1006
+# Fine boundary screen across the four coordinator layouts (GEMV / stream us,
+# with stream/decode at row in parentheses):
+#   fine        832                  896                  928                  960                  992                  1024
+#   mimop tp1   7265 / 8002 (1.101)  7581 / 8011 (1.057)  7644 / 7921 (1.036)  7761 / 7934 (1.022)  7950 / 7984 (1.004)  8110 / 8046 (0.992)
+#   mimop tp2   3576 / 3950 (1.104)  3742 / 3984 (1.065)  3798 / 3995 (1.052)  3897 / 4010 (1.029)  3946 / 4032 (1.022)  3968 / 3994 (1.007)
+#   mimof tp1   3385 / 3556 (1.050)  3598 / 3638 (1.011)  3696 / 3667 (0.992)  3812 / 3701 (0.971)  3923 / 3744 (0.954)  3928 / 3666 (0.933)
+#   mimof tp2   1653 / 1828 (1.106)  1730 / 1841 (1.064)  1752 / 1851 (1.057)  1813 / 1859 (1.026)  1850 / 1868 (1.009)  1891 / 1879 (0.994)
+# Routing geomean across the 4 coordinator layouts x 6 fine-band rows
+# (routed / decode: decode for rows <= threshold, stream for rows > threshold):
+#   threshold   896     928     960     992     1000    1024
+#   geomean     1.0038  0.9983  0.9963  0.9968  0.9968  1.0000
+# At 928..992 three of the four coordinator layouts still favour GEMV (mimop
+# tp1 1.036..1.004, mimop tp2 1.052..1.022, mimof tp2 1.057..1.009), so
+# streaming below 1000 taxes prefill tail chunks on those layouts. Setting
+# 1000 keeps rows <= 1000 on GEMV and routes full 1024-row prefill chunks to
+# stream (stream/decode at 1024: mimop tp1 0.992, mimop tp2 1.007, mimof tp1
+# 0.933, mimof tp2 0.994; 4-layout geomean 0.981).
+AUTO_MXFP4_STREAM_ROWS = 1000
 # GB10 (SM121), TP6 slice, us, GEMV / stream (block-scaled gate/up): 512 rows
 # 7458 / 8537, 768 8771 / 8454, 1024 10057 / 8946.
 AUTO_MXFP4_STREAM_ROWS_SM121 = 640

@@ -12,7 +12,7 @@ SOURCE = Path(__file__).resolve().parents[2] / "b12x/integration/cuteafd/fp8_moe
 
 def policy(sm):
     tree = ast.parse(SOURCE.read_text())
-    names = {"_w8a8", "_streams", "auto_large_rows", "_large_route", "_resolve"}
+    names = {"_w8a8", "_mxfp4_down_a8", "_streams", "auto_large_rows", "_large_route", "prefill_forms", "_resolve"}
     nodes = [n for n in tree.body if isinstance(n, ast.Assign)
              and all(isinstance(t, ast.Name) for t in n.targets)
              and isinstance(n.value, (ast.Constant, ast.Tuple))]
@@ -119,6 +119,18 @@ def test_weight_read_groups_reject_different_gate_and_down_tiles():
 def test_mxfp4_stream_preserves_native_bf16():
     _, env = policy(120)
     assert env["_streams"](False, "mxfp4")
+    assert env["auto_large_rows"](False, "mxfp4") == 1000
+    assert env["_resolve"]("auto", 1000, False, "mxfp4") == "decode"
+    assert env["_resolve"]("auto", 1001, False, "mxfp4") == "auto"
+    assert env["_resolve"]("auto", 1024, False, "mxfp4") == "auto"
     assert env["_resolve"]("stream", 4096, False, "mxfp4") == "stream"
+    g = SimpleNamespace(kind="mxfp4")
+    assert env["prefill_forms"](g, 1000, True) == []
+    assert env["prefill_forms"](g, 1024, True) == ["w8a16"]
+    assert env["prefill_forms"](g, 1024, False) == []
     with pytest.raises(ValueError, match="use stream"):
         env["_resolve"]("prefill", 4096, False, "mxfp4")
+    _, env121 = policy(121)
+    assert env121["auto_large_rows"](True, "mxfp4") == 640
+    assert env121["prefill_forms"](g, 640, True) == []
+    assert env121["prefill_forms"](g, 1024, True) == ["w8a16"]
