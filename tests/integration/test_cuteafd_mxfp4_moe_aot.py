@@ -166,7 +166,7 @@ def test_mxfp4_moe_stream(tp, real, capacity, rows, hot, route):
 
 
 @pytest.mark.parametrize("family", ["mimof", "mimop"])
-@pytest.mark.parametrize("rows,hot", [(1, 0), (1024, 0), (1025, 0), (4096, 0), (4096, 8)])
+@pytest.mark.parametrize("rows,hot", [(1, 0), (999, 0), (1000, 0), (1001, 0), (1024, 0), (1025, 0), (4096, 0), (4096, 8)])
 def test_mxfp4_coordinator_native_bf16_auto(family, rows, hot):
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES
 
