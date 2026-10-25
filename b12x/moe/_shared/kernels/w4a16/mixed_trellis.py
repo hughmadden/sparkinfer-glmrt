@@ -3652,7 +3652,7 @@ def bind_mixed_trellis(
             bits=bits, descriptor_bits=_descriptor_bits(int(launch.topk_sum.route_num_experts)))
         if host_rows != expected:
             raise ValueError("compact descriptor projection offsets are not canonical")
-        if any(width > 0 and width % launch.fc1_tile_n for width in host_rows[3]):
+        if not launch.warp_specialized and any(width > 0 and width % launch.fc1_tile_n for width in host_rows[3]):
             raise ValueError("compact live widths must align to the FC1 N tile")
     for tier_id, (tier, expected_experts, tier_bits) in enumerate(
         zip(tiers, counts, bits, strict=True)
