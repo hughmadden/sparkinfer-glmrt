@@ -15,11 +15,11 @@ SHAPES = ((384, 5120), (128, 5120), (256, 6144), (256, 4096), (384, 7168))
 ROWS = (1, 2, 4, 8, 16, 32, 48, 64)
 
 
-def build(e, h, c, r, t):
+def build(e, h, c, r, t, launch=None):
     # Serialize only compilation, never timing or correctness launches.
     with open(os.environ['CUTEAFD_LOCK_DIR'] + '/build.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return compile_program(SkinnyBf16Gemv(e, h, out_dtype=cutlass.Float32,
+        return compile_program(launch or SkinnyBf16Gemv(e, h, out_dtype=cutlass.Float32,
                                cols=c, rows_per_tile=r, threads=t),
             name=f'router_{e}_{h}_{c}_{r}_{t}',
             operands=(Operand('x', torch.bfloat16, f'[rows,{h}]'),
@@ -40,9 +40,13 @@ def main():
         cfg = skinny_config(e, h, cutlass.Float32)
         t = cfg['threads']
         base = (cfg['cols'], cfg['rows_per_tile'])
-        tiles = list(dict.fromkeys([base, (2, 4), (4, 4), (4, 2), (8, 2), (8, 4), (2, 16), (1, 16)]))
+        tiles = list(dict.fromkeys([base, (2, 4), (8, 4)]))
         arms = {f'c{c}r{r}': build(e, h, c, r, t) for c, r in tiles}
         baseline = f'c{base[0]}r{base[1]}'
+        from b12x.integration.cuteafd.dsv4_ffn import _RouterScores
+        from b12x.moe._shared.v41_router import _V41DecodeRouterScores, _V41RouterScores
+        cls = _V41DecodeRouterScores if h == 5120 else _RouterScores
+        arms['dispatch'] = build(e, h, 0, 0, t, cls(e, h))
         good = set(arms)
         for mode in ('random', 'cancellation', 'dynamic'):
             x = torch.randn(64, h, device='cuda').bfloat16()
@@ -70,10 +74,12 @@ def main():
                         print('FAIL', e, h, name, mode, m, flush=True)
                         break
             print('GATE', e, h, mode, sorted(good), flush=True)
+        if (e, h) == (384, 5120):
+            arms["mma"] = build(e, h, 99, 99, t, _V41RouterScores(e, hidden=h))
         telemetry()
         for m in ROWS:
             out = torch.empty(m, e, device='cuda')
-            active = [(name, p) for name, p in arms.items() if name in good]
+            active = [(name, p) for name, p in arms.items() if name in good or (name == "mma" and m >= 48)]
             for name, p in active:
                 p.launch(x[:m], w, out, scalars=(m,))
             torch.cuda.synchronize()

@@ -216,13 +216,13 @@ def test_router_scores_rows_match_single_row_decode(programs, name, mode):
     if name == "glm":
         program, e, h = glm_ffn.compile_glm_router_scores_aot(GLM53), GLM53.routed_experts, GLM53.hidden
     elif name in ("v41", "v41_draft"):
-        from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
+        from b12x.moe._shared.v41_router import _V41DecodeRouterScores
         from b12x.integration.cuteafd._common import compile_program, Operand, Scalar
         import cutlass
 
         e, h = (384 if name == "v41" else 128), 5120
         program = compile_program(
-            SkinnyBf16Gemv(e, h, out_dtype=cutlass.Float32, **skinny_config(e, h, cutlass.Float32)),
+            _V41DecodeRouterScores(e, h),
             name=f"test_{name}_router", key=(e, h),
             operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
                       Operand("w", torch.bfloat16, f"[{e},{h}]"),
@@ -243,14 +243,26 @@ def test_router_scores_rows_match_single_row_decode(programs, name, mode):
         gate = (gate.float() / scale).bfloat16()
         x[0].zero_()
 
-    def run(rows, rows_x):
+    from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
+    from b12x.integration.cuteafd._common import compile_program, Operand, Scalar
+    import cutlass
+
+    reference = compile_program(
+        SkinnyBf16Gemv(e, h, out_dtype=cutlass.Float32, **skinny_config(e, h, cutlass.Float32)),
+        name=f"test_{name}_router_reference", key=(e, h),
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("w", torch.bfloat16, f"[{e},{h}]"),
+                  Operand("out", torch.float32, f"[rows,{e}]", "out")),
+        scalars=(Scalar("rows"),))
+
+    def run(rows, rows_x, selected=program):
         logits = torch.full((rows, e), float("nan"), device=device)
-        program.launch(rows_x.contiguous(), gate, logits, scalars=(rows,))
+        selected.launch(rows_x.contiguous(), gate, logits, scalars=(rows,))
         torch.cuda.synchronize()
         return logits
 
-    single = torch.cat([run(1, x[r:r + 1]) for r in range(64)])
-    for rows in range(2, 65):
+    single = torch.cat([run(1, x[r:r + 1], reference) for r in range(64)])
+    for rows in range(1, 65):
         assert_bitwise(run(rows, x[:rows]), single[:rows], f"{name} router rows={rows}")
 
 def _wire_reference(x, hidden):
