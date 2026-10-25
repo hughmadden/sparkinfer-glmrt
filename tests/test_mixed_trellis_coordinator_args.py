@@ -1,6 +1,7 @@
 """CPU-only coordinator argument contracts (no CUDA/DSL imports)."""
 import argparse
 import ast
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -11,6 +12,42 @@ import pytest
 SOURCE = Path(__file__).resolve().parents[1] / "benchmarks/benchmark_mixed_trellis.py"
 TREE = ast.parse(SOURCE.read_text())
 HOST = SOURCE.parents[1] / "b12x/moe/_shared/kernels/w4a16/host.py"
+
+
+def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
+    runner = tmp_path / "benchmarks/benchmark_mixed_trellis.py"
+    runner.parent.mkdir()
+    runner.write_text("runner-v1")
+    package = tmp_path / "b12x"
+    package.mkdir()
+    first, second = package / "a.py", package / "z.py"
+    first.write_text("a-v1")
+    second.write_text("z-v1")
+    scope = dict(Path=Path, hashlib=hashlib)
+    nodes = [node for node in TREE.body
+             if isinstance(node, ast.FunctionDef) and node.name == "snapshot_prefill_sources"]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
+    snapshot = scope["snapshot_prefill_sources"]
+    frozen = snapshot(tmp_path)
+    entries = sorted(f"{path.relative_to(tmp_path).as_posix()}:{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
+                     for path in (runner, first, second))
+    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 3)
+    monkeypatch.setattr(Path, "rglob", lambda self, pattern: iter((second, first)))
+    assert snapshot(tmp_path) == frozen
+    first.write_text("a-v2")
+    assert snapshot(tmp_path) != frozen
+    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 3)
+    startup = next(i for i, node in enumerate(TREE.body) if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Tuple)
+                           and any(isinstance(name, ast.Name) and name.id == "PREFILL_SOURCE_SHA256"
+                                   for name in target.elts) for target in node.targets))
+    imports = [i for i, node in enumerate(TREE.body)
+               if (isinstance(node, ast.Import) and any(alias.name == "torch" for alias in node.names))
+               or (isinstance(node, ast.ImportFrom) and (node.module or "").startswith("b12x"))]
+    assert imports and all(startup < index for index in imports)
+    result = next(node for node in ast.walk(TREE) if isinstance(node, ast.keyword)
+                  and node.arg == "source_sha256")
+    assert isinstance(result.value, ast.Name) and result.value.id == "PREFILL_SOURCE_SHA256"
 
 
 def benchmark():
@@ -44,7 +81,7 @@ def arguments(b, *extra):
 
 
 @pytest.mark.parametrize("profile,width", [("rtx-tp1", 2048), ("rtx-tp2", 1024)])
-@pytest.mark.parametrize("capacity", [256, 1024, 2752, 4096])
+@pytest.mark.parametrize("capacity", [256, 1024, 2048, 2752, 4096])
 def test_cooperative_matches_export_contract(profile, width, capacity):
     b = benchmark()
     for sms in (170, 188):
@@ -66,7 +103,7 @@ def test_variant_plumbing_and_preflight():
     args = arguments(b, "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128")
     capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
     assert compact is None
-    assert capacities == [256, 1024, 2752, 4096] and routes == ["random", "realistic"]
+    assert capacities == [256, 1024, 2048, 2752, 4096] and routes == ["random", "realistic"]
     assert len(waves) == 72 and specs[0] == ("coop", {})
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1], SimpleNamespace(multi_processor_count=170, shared_memory_per_block_optin=101376))
     assert opts["warp_specialized"] and opts["input_format"] == "e4m3_k32"
@@ -140,7 +177,7 @@ def test_routes_filter_and_reject_malformed(tmp_path):
 
 
 @pytest.mark.parametrize("profile,width", [("rtx-tp1", 2048), ("rtx-tp2", 1024)])
-@pytest.mark.parametrize("capacity", [256, 1024, 2752, 4096])
+@pytest.mark.parametrize("capacity", [256, 1024, 2048, 2752, 4096])
 def test_glmf_cooperative_matches_export_contract(profile, width, capacity):
     b = benchmark()
     for sms in (170, 188):
@@ -167,7 +204,7 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
     ])
     capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
     assert compact is None
-    assert capacities == [256, 1024, 2752, 4096] and routes == ["random"] and waves == []
+    assert capacities == [256, 1024, 2048, 2752, 4096] and routes == ["random"] and waves == []
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1],
                                          SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376), "glmf")
     assert opts["hidden_size"] == 4096 and opts["route_num_experts"] == 288
@@ -185,7 +222,7 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
             "--routes", str(b.GLM_ROUTES), "--output", "result.json"]))
     with pytest.raises(ValueError):
         b.coordinator_preflight(b.benchmark_parser().parse_args([
-            "--prefill-family", "glmf", "--role", "spark", "--profile", "spark-tp4-width512",
+            "--prefill-family", "glmf", "--role", "spark", "--profile", "spark-tp6-width512",
             "--route-distributions", "random", "--output", "result.json"]))
     with pytest.raises(ValueError):
         b.coordinator_preflight(b.benchmark_parser().parse_args([
@@ -198,7 +235,8 @@ SERVED = {
     ("qwen4", 256): (32, False), ("qwen4", 1024): (32, True), ("qwen4", 4096): (32, True),
     ("v41", 256): (8, False), ("v41", 1024): (8, False), ("v41", 4096): (8, False),
     ("dsv4p", 256): (8, False), ("dsv4p", 1024): (64, True), ("dsv4p", 2752): (64, True),
-    ("kimik3", 256): (8, False), ("kimik3", 1024): (64, True), ("kimik3", 4096): (64, False),
+    ("kimik3", 256): (8, False), ("kimik3", 1024): (64, True), ("kimik3", 4096): (8, False),
+    ("kimik3", 2048): (8, False), ("kimik3", 2752): (8, False),
 }
 
 
@@ -241,8 +279,8 @@ def test_family_compact_ws_arm_plumbing(family, profile, capacity, width):
     assert not options["token_major_rotation"]
 
 
-FAMILY_CAPACITIES = {"qwen4": [256, 1024, 2752, 4096], "v41": [256, 1024, 2752, 4096],
-                     "dsv4p": [256, 1024, 2752, 4096], "kimik3": [256, 1024, 4096]}
+FAMILY_CAPACITIES = {"qwen4": [256, 1024, 2048, 2752, 4096], "v41": [256, 1024, 2048, 2752, 4096],
+                     "dsv4p": [256, 1024, 2048, 2752, 4096], "kimik3": [256, 1024, 2048, 2752, 4096]}
 
 
 @pytest.mark.parametrize("family", sorted(FAMILY_CAPACITIES))
@@ -256,5 +294,123 @@ def test_family_capacity_contract(family):
     with pytest.raises(ValueError, match="no measured export"):
         b.coordinator_preflight(b.benchmark_parser().parse_args([
             "--prefill-family", family, "--role", "coordinator", "--profile", FAMILY_PROFILE[family],
-            "--capacities", "2752" if family == "kimik3" else "2048",
+            "--capacities", "2049",
             "--route-distributions", "random", "--output", "result.json"]))
+
+
+@pytest.mark.parametrize("family", sorted(FAMILY_CAPACITIES))
+@pytest.mark.parametrize("capacity", [2048, 2752])
+def test_adaptive_capacities_and_exhaustive_preflight(family, capacity):
+    b = benchmark()
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", family, "--role", "coordinator", "--profile", FAMILY_PROFILE[family],
+        "--capacities", str(capacity), "--prefill-exhaustive",
+        "--route-distributions", "random", "--output", "result.json"])
+    capacities, _, _, _, _ = b.coordinator_preflight(args)
+    assert capacities == [capacity]
+
+
+def test_control_name_is_reserved():
+    with pytest.raises(argparse.ArgumentTypeError):
+        benchmark().parse_coordinator_arm("coop_control:mode=ws")
+
+
+def test_n192_ws_requires_whole_projection_tiles():
+    b = benchmark()
+    props = SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376)
+    options = b.coordinator_compile_options("rtx-tp2", 2048,
+        dict(mode="ws", tile=(64, 192, 64, 256)), props, "v41")
+    assert options["force_tile_config"] == (64, 192, 64, 256)
+    with pytest.raises(ValueError):
+        b.coordinator_compile_options("rtx-tp2-rank1", 2048,
+            dict(mode="ws", tile=(64, 192, 64, 256)), props, "qwen4")
+
+
+def test_prefill_capacity_controls_allocation():
+    b = benchmark()
+    nodes = [n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "prefill_compile_options"]
+    tables = [n for n in TREE.body if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id in ("PREFILL_TIER_COUNTS", "PREFILL_SWIGLU_LIMITS")
+                      for t in n.targets)]
+    scope = dict(vars(b))
+    exec(compile(ast.Module(body=tables + nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    for capacity in (1024, 2048, 2752, 4096):
+        options = scope["prefill_compile_options"]("glm", 384, 64, "ws+t384", props,
+                                                  compact=True, capacity=capacity)
+        assert options["size_m"] == capacity
+        slots = b.route_pack_capacity(capacity * 8, 64, 256, topk=8)[1]
+        assert options["max_m_blocks"] == (slots + 63) // 64
+
+
+@pytest.mark.parametrize("family,profile,width", [
+    ("glm", "spark-compact-width384", 384), ("glm", "spark-compact-width768", 768),
+    ("glmf", "spark-compact-width384", 384), ("glmf", "spark-compact-width768", 768),
+    ("qwen4", "spark-compact-width384", 384), ("qwen4", "spark-compact-width256", 256),
+    ("v41", "spark-compact-width640", 640),
+    ("dsv4p", "spark-tp4-width768", 768), ("kimik3", "spark-tp6-width512", 512),
+])
+def test_spark_tuning_profile_options(family, profile, width):
+    b = benchmark()
+    compact = "compact" in profile
+    options = b.coordinator_compile_options(profile, 2048,
+        dict(mode="ws", route_block=64, dynamic=1, tile=(64, 128, 64, 256)),
+        SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376),
+        family, compact=compact)
+    assert options["size_m"] == 2048 and options["intermediate_size"] == width
+    assert options["compact_weights"] == compact
+    assert options["full_rotation_output_dtype"] == "bf16"
+    if compact and width >= 384:
+        options = b.coordinator_compile_options(profile, 2752,
+            dict(mode="ws", tile=(64, 192, 64, 256)),
+            SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376),
+            family, compact=True)
+        assert options["force_tile_config"] == (64, 192, 64, 256)
+
+
+@pytest.mark.parametrize("family,width,block,token", [
+    ("glm", 384, 64, True), ("glmf", 768, 64, True),
+    ("qwen4", 384, 32, True), ("qwen4", 256, 32, True),
+    ("v41", 640, 8, False),
+])
+@pytest.mark.parametrize("capacity", [2048, 2752])
+def test_compact_cooperative_matches_family_export(family, width, block, token, capacity):
+    b = benchmark()
+    options = b.coordinator_compile_options(f"spark-compact-width{width}", capacity, {},
+        SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376),
+        family, compact=True)
+    assert options["moe_block_size"] == block
+    assert options["token_major_rotation"] is token
+    assert options["compact_weights"] and not options["warp_specialized"]
+    assert options["force_tile_config"] == (64, 128, 64, 128)
+    assert options["full_rotation_output_dtype"] == "bf16"
+    slots = b.route_pack_capacity(capacity * options["top_k"], block,
+        options["route_num_experts"], topk=options["top_k"])[1]
+    assert options["max_m_blocks"] == (slots + block - 1) // block
+
+
+@pytest.mark.parametrize("family,widths", [
+    ("glm", {256, 384, 512, 640, 768, 1024}),
+    ("glmf", {256, 384, 512, 640, 768, 1024}),
+    ("qwen4", {128, 256, 384, 640}),
+    ("v41", {384, 512, 640, 768, 1152}),
+    ("dsv4p", {512, 768, 1024, 1536}),
+    ("kimik3", {512}),
+])
+def test_served_spark_width_coverage(family, widths):
+    b = benchmark()
+    profiles = b.COORDINATOR_FAMILIES[family]["profiles"]
+    served = {width for profile, width in profiles.items()
+              if profile.startswith("spark-") and "compact" not in profile
+              and (family != "kimik3" or profile == "spark-tp6-width512")}
+    assert served == widths
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    for profile, width in profiles.items():
+        if not profile.startswith("spark-") or "compact" in profile:
+            continue
+        for capacity in (2048, 2752):
+            options = b.coordinator_compile_options(profile, capacity, {}, props, family)
+            assert options["intermediate_size"] == width
+            assert options["full_rotation_output_dtype"] == "bf16"
+            assert options["moe_block_size"] == (8 if family in ("v41", "kimik3")
+                                                else 32 if family == "qwen4" else 64)
