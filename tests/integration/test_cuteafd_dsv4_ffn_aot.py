@@ -203,6 +203,33 @@ def test_router_scores_match_fp32_gate(programs, name, rows):
     assert float((top == ref).all(dim=-1).float().mean()) > 0.99
 
 
+
+@pytest.mark.parametrize("name", ["flash", "pro", "glm"])
+def test_router_scores_rows_match_single_row_decode(programs, name):
+    """Every decode/verify width 1..64 gives each row its M=1 logits bit for bit
+    (#736: the MMA route above 32 rows reordered each logit's FP32 sum, so a
+    33-64-row verify routed differently from plain decode)."""
+    from b12x.integration.cuteafd import GLM53, glm_ffn
+
+    device = require_b12x()
+    if name == "glm":
+        program, e, h = glm_ffn.compile_glm_router_scores_aot(GLM53), GLM53.routed_experts, GLM53.hidden
+    else:
+        geometry = _geometry(name)
+        program, e, h = programs[("router", name)], geometry.routed_experts, geometry.hidden
+    gate = (torch.randn((e, h), generator=torch.Generator().manual_seed(e + h)) / 64).bfloat16().to(device)
+    x = _x(64, h, 736, device)
+
+    def run(rows, rows_x):
+        logits = torch.full((rows, e), float("nan"), device=device)
+        program.launch(rows_x.contiguous(), gate, logits, scalars=(rows,))
+        torch.cuda.synchronize()
+        return logits
+
+    single = torch.cat([run(1, x[r:r + 1]) for r in range(64)])
+    for rows in range(2, 65):
+        assert_bitwise(run(rows, x[:rows]), single[:rows], f"{name} router rows={rows}")
+
 def _wire_reference(x, hidden):
     rows = x.shape[0]
     blocks = x.float().reshape(rows, -1, 32)
