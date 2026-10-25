@@ -15,12 +15,18 @@ HOST = SOURCE.parents[1] / "b12x/moe/_shared/kernels/w4a16/host.py"
 
 def benchmark():
     names = {"parse_coordinator_arm", "coordinator_compile_options", "coordinator_route_waves",
-             "coordinator_preflight", "benchmark_parser", "parse_prefill_arm"}
+             "coordinator_preflight", "benchmark_parser", "parse_prefill_arm", "compact_prefill_fixture"}
     glm_profiles = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
                     "spark-tp6-width256": 256, "spark-tp4-width512": 512}
     glm_routes = SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json"
     scope = dict(argparse=argparse, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
-                 PREFILL_FAMILIES={"qwen4": (), "kimik3": ()}, GLM_CAPACITIES=(256, 1024, 2752, 4096),
+                 PREFILL_FAMILIES={
+                     "qwen4": (2560, 512, 10, (4, 5), "silu"),
+                     "kimik3": (3584, 896, 16, (2, 3), "situ"),
+                     "glm": (6144, 256, 8, (4, 5), "silu"),
+                     "glmf": (4096, 288, 8, (3, 4), "silu"),
+                     "dsv4f": (4096, 256, 6, (4, 5), "silu"),
+                 }, GLM_CAPACITIES=(256, 1024, 2752, 4096),
                  GLM_PROFILES=glm_profiles, GLM_ROUTES=glm_routes,
                  COORDINATOR_FAMILIES={
                      "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
@@ -62,7 +68,7 @@ def test_cooperative_matches_export_contract(profile, width, capacity):
 def test_variant_plumbing_and_preflight():
     b = benchmark()
     args = arguments(b, "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128")
-    capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
+    capacities, specs, routes, waves, *_ = b.coordinator_preflight(args)
     assert capacities == [256, 1024, 2752, 4096] and routes == ["random", "realistic"]
     assert len(waves) == 72 and specs[0] == ("coop", {})
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1], SimpleNamespace(multi_processor_count=170, shared_memory_per_block_optin=101376))
@@ -104,7 +110,7 @@ def test_invalid_arguments(extra):
 def test_glm_spark_served_exports(profile, width, tile):
     b = benchmark()
     args = arguments(b, "--role", "spark", "--profile", profile, "--capacities", "1024,2752,4096")
-    capacities, specs, _, _, compact = b.coordinator_preflight(args)
+    capacities, specs, _, _, *_ = b.coordinator_preflight(args)
     assert specs[0] == ("coop", {}) and specs[1][0] == "served"
     props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
     for capacity in capacities:
@@ -161,7 +167,7 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
         "--k5-experts", "72", "--output", "result.json",
         "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128",
     ])
-    capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
+    capacities, specs, routes, waves, *_ = b.coordinator_preflight(args)
     assert capacities == [256, 1024, 2752, 4096] and routes == ["random"] and waves == []
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1],
                                          SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376), "glmf")

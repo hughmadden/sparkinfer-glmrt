@@ -85,62 +85,14 @@ def test_benchmark_kimi_variant_parsing_and_geometry() -> None:
 def test_prefill_arm(value):
     bench = _load_benchmark_module()
     name, block, mode = value.split(":")
-    assert bench.parse_prefill_arm(value) == (name, int(block), mode, ())
+    assert bench.parse_prefill_arm(value) == (name, int(block), mode)
 
 
-@pytest.mark.parametrize("value,options", [
-    ("ws:32:ws:dynamic", ("dynamic",)),
-    ("ws:32:ws:n256,s3,static", ("n256", "s3", "static")),
-])
-def test_prefill_arm_compact_options(value, options):
-    bench = _load_benchmark_module()
-    name, block, mode, parsed = bench.parse_prefill_arm(value)
-    assert (name, block, mode, parsed) == ("ws", 32, "ws", options)
-
-
-@pytest.mark.parametrize("value", [
-    "bad", "ws:8:ws", "a:17:ws", "a_control:32:ws", ":32:ws", "a:32:other",
-    "a:32:cooperative:dynamic", "ws:32:ws:dynamic,static", "ws:32:ws:n128,n256",
-    "ws:32:ws:s2,s3", "ws:32:ws:wire", "ws:32:ws:dynamic,dynamic", "ws:32:ws:",
-])
+@pytest.mark.parametrize("value", ["bad", "ws:8:ws", "a:17:ws", "a_control:32:ws", ":32:ws", "a:32:other"])
 def test_prefill_arm_rejects_invalid(value):
     bench = _load_benchmark_module()
     with pytest.raises(bench.argparse.ArgumentTypeError):
         bench.parse_prefill_arm(value)
-
-
-def test_prefill_families_carry_compact_geometry():
-    from types import SimpleNamespace
-    bench = _load_benchmark_module()
-    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
-    expected = {
-        "glm": (6144, 256, 8, (4, 5), None),
-        "glmf": (4096, 288, 8, (3, 4), 10.0),
-        "v41": (5120, 384, 6, (3, 4), 10.0),
-        "dsv4f": (4096, 256, 6, (3, 4), 10.0),
-    }
-    for family, (hidden, experts, topk, bits, limit) in expected.items():
-        options = bench.prefill_compile_options(family, 640, 32, "ws", props)
-        assert (options["hidden_size"], options["route_num_experts"], options["top_k"]) == (
-            hidden, experts, topk)
-        assert (options["tier0_bits"], options["tier1_bits"]) == bits
-        assert options["swiglu_limit"] == limit and options["activation"] == "silu"
-    assert set(bench.PREFILL_FAMILIES) == set(bench.COMPACT_PREFILL_FAMILIES) | {"kimik3"}
-
-
-@pytest.mark.parametrize("family", ["qwen4", "glm", "glmf", "v41", "dsv4f"])
-def test_compact_fixture_accepts_every_uneven_family(tmp_path, family):
-    bench = _load_benchmark_module()
-    tier0_bits = bench.PREFILL_FAMILIES[family][3][0]
-    entries = [dict(global_expert=e, combined_local=e, width=128,
-                    projections=[dict(projection=p, tier=0, bits=tier0_bits, tier_local=e,
-                                      payload_word_offset=0)
-                                 for p in ("gate", "up", "down")]) for e in range(8)]
-    rank = dict(rank=0, compiled_max_intermediate=256, experts=entries,
-                projection_counts=[[8, 8, 8], [0, 0, 0]], unit_map_fingerprint="test")
-    path = tmp_path / "ownership.json"
-    path.write_text(bench.json.dumps(dict(ranks=[rank])))
-    assert len(bench.compact_prefill_fixture(path, 0, family, 256, 8)["entries"]) == 8
 
 
 def test_prefill_policy_separates_route_block_from_ws():
@@ -204,7 +156,7 @@ def test_compact_prefill_fixture_requires_complete_ownership(tmp_path):
     assert len(bench.compact_prefill_fixture(path, 0, "qwen4", 256, 512)["entries"]) == 512
     with pytest.raises(ValueError, match="requested rank"):
         bench.compact_prefill_fixture(path, 1, "qwen4", 256, 512)
-    with pytest.raises(ValueError, match="uneven-world"):
+    with pytest.raises(ValueError, match="requires Qwen"):
         bench.compact_prefill_fixture(path, 0, "kimik3", 256, 512)
     with pytest.raises(ValueError, match="geometry"):
         bench.compact_prefill_fixture(path, 0, "qwen4", 128, 512)
@@ -247,3 +199,93 @@ def test_compact_glm_fixture_uses_live_width_ownership(tmp_path):
                                                 {"mode": "ws", "tile": (64, 128, 64, 256)},
                                                 props, "glm", compact=True)
     assert widened["force_tile_config"] == (64, 128, 64, 256)
+    t384 = bench.coordinator_compile_options("spark-tp6-width384", 4096,
+                                             {"mode": "ws", "tile": (64, 192, 64, 256)},
+                                             props, "glm", compact=True)
+    assert t384["force_tile_config"] == (64, 192, 64, 256)
+
+
+def test_compact_prefill_compile_options_match_served_exports(tmp_path):
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+
+    # Qwen4 compact (TP4/TP3 w256, TP2 w384): cooperative must force (64,128,64,128) and no token rotation.
+    for width in (256, 384):
+        qwen_coop = bench.prefill_compile_options("qwen4", width, 32, "cooperative", props, compact=True)
+        assert qwen_coop["compact_weights"] is True
+        assert qwen_coop["warp_specialized"] is False
+        assert qwen_coop["force_tile_config"] == (64, 128, 64, 128)
+        assert qwen_coop["token_major_rotation"] is False
+        assert qwen_coop["ws_dynamic_tiles"] is False
+        assert qwen_coop["swiglu_limit"] is None
+        assert (qwen_coop["tier0_num_experts"], qwen_coop["tier1_num_experts"]) == (512, 512)
+
+        qwen_ws = bench.prefill_compile_options("qwen4", width, 64, "ws", props, compact=True)
+        assert qwen_ws["compact_weights"] is True
+        assert qwen_ws["warp_specialized"] is True
+        assert qwen_ws["force_tile_config"] == (64, 128, 64, 256)
+        assert qwen_ws["token_major_rotation"] is False
+        assert qwen_ws["ws_dynamic_tiles"] is True
+        assert qwen_ws["swiglu_limit"] is None
+
+    qwen_t384 = bench.prefill_compile_options("qwen4", 384, 64, "ws+t384", props, compact=True)
+    assert qwen_t384["force_tile_config"] == (64, 192, 64, 256) and qwen_t384["ws_dynamic_tiles"] is True
+    with pytest.raises(ValueError, match="t384"):
+        bench.prefill_compile_options("qwen4", 256, 64, "ws+t384", props, compact=True)
+
+    # GLM Flash (glmf, bits=(3,4), swiglu_limit=10.0) and V4 Flash (dsv4f, bits=(4,5), swiglu_limit=10.0)
+    for family, experts, topk, bits, block in (
+        ("glmf", 288, 8, (3, 4), 64),
+        ("dsv4f", 256, 6, (4, 5), 8),
+    ):
+        for width in (384, 768):
+            coop = bench.prefill_compile_options(family, width, block, "cooperative", props, compact=True)
+            assert coop["compact_weights"] is True and not coop["warp_specialized"]
+            assert coop["force_tile_config"] == (64, 128, 64, 128)
+            assert not coop["token_major_rotation"] and not coop["ws_dynamic_tiles"]
+            assert coop["swiglu_limit"] == 10.0
+            assert (coop["tier0_bits"], coop["tier1_bits"]) == bits
+            assert (coop["tier0_num_experts"], coop["tier1_num_experts"], coop["route_num_experts"]) == (experts, experts, experts)
+            assert coop["top_k"] == topk and coop["moe_block_size"] == block
+
+            ws = bench.prefill_compile_options(family, width, 64, "ws", props, compact=True)
+            assert ws["compact_weights"] is True and ws["warp_specialized"]
+            assert ws["force_tile_config"] == (64, 128, 64, 256)
+            assert ws["ws_dynamic_tiles"] is True and ws["swiglu_limit"] == 10.0
+
+            ws_t384 = bench.prefill_compile_options(family, width, 64, "ws+t384", props, compact=True)
+            assert ws_t384["force_tile_config"] == (64, 192, 64, 256) and ws_t384["ws_dynamic_tiles"] is True
+
+    # Validate compact_prefill_fixture for glmf (bits 3/4) and dsv4f (bits 4/5)
+    glmf_entries = [dict(global_expert=e, combined_local=e, width=384 if e < 96 else 256,
+                         projections=[dict(projection=p, tier=e & 1, bits=3 + (e & 1),
+                                           tier_local=e // 2, payload_word_offset=0)
+                                      for p in ("gate", "up", "down")]) for e in range(288)]
+    glmf_rank = dict(rank=0, compiled_max_intermediate=384, experts=glmf_entries,
+                     projection_counts=[[144, 144, 144], [144, 144, 144]], unit_map_fingerprint="glmf-test")
+    glmf_path = tmp_path / "glmf-ownership.json"
+    glmf_path.write_text(bench.json.dumps(dict(synthetic=True, source="synthetic", ranks=[glmf_rank])))
+    glmf_fix = bench.compact_prefill_fixture(glmf_path, 0, "glmf", 384)
+    assert glmf_fix["synthetic"] is True and len(glmf_fix["entries"]) == 288
+
+
+    # V4.1 compact TP4 w640: (3,4) bits, swiglu_limit 10.0, and no 192-wide FC1 tile.
+    v41 = bench.prefill_compile_options("v41", 640, 64, "ws", props, compact=True)
+    assert v41["force_tile_config"] == (64, 128, 64, 256)
+    assert (v41["tier0_bits"], v41["tier1_bits"]) == (3, 4)
+    assert (v41["tier0_num_experts"], v41["route_num_experts"], v41["top_k"]) == (384, 384, 6)
+    assert v41["swiglu_limit"] == 10.0
+    with pytest.raises(ValueError, match="t384"):
+        bench.prefill_compile_options("v41", 640, 64, "ws+t384", props, compact=True)
+
+    v41_entries = [dict(global_expert=e, combined_local=e, width=640,
+                        projections=[dict(projection=p, tier=e & 1, bits=3 + (e & 1),
+                                          tier_local=e // 2, payload_word_offset=0)
+                                     for p in ("gate", "up", "down")]) for e in range(384)]
+    v41_rank = dict(rank=0, compiled_max_intermediate=640, experts=v41_entries,
+                    projection_counts=[[192, 192, 192], [192, 192, 192]], unit_map_fingerprint="v41-test")
+    v41_path = tmp_path / "v41-ownership.json"
+    v41_path.write_text(bench.json.dumps(dict(synthetic=True, source="synthetic", ranks=[v41_rank])))
+    v41_fix = bench.compact_prefill_fixture(v41_path, 0, "v41", 640)
+    assert v41_fix["synthetic"] is True and len(v41_fix["entries"]) == 384
