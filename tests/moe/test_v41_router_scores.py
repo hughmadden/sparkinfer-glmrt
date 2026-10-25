@@ -28,9 +28,11 @@ def test_router_scores(experts, hidden):
 
 
 @pytest.mark.parametrize("experts", [384, 128])
-def test_router_scores_rows_match_single_row_decode(experts):
+@pytest.mark.parametrize("activated", [False, True])
+def test_router_scores_rows_match_single_row_decode(experts, activated):
     """The canonical skinny M=1 logits must survive every verify width (#736)."""
     from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
+    from b12x.moe._shared.v41_router import _V41ActivatedSkinnyScores
     from b12x._lib.compiler import compile as compile_kernel
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
@@ -43,11 +45,12 @@ def test_router_scores_rows_match_single_row_decode(experts):
     scratch = torch.empty(64, experts, device="cuda")
     args = (ptr(x, cutlass.BFloat16), ptr(w, cutlass.BFloat16),
             ptr(scratch, cutlass.Float32))
+    skinny_type = _V41ActivatedSkinnyScores if activated else SkinnyBf16Gemv
     skinny = compile_kernel(
-        SkinnyBf16Gemv(experts, hidden, out_dtype=cutlass.Float32,
-                       **skinny_config(experts, hidden, cutlass.Float32)),
+        skinny_type(experts, hidden, out_dtype=cutlass.Float32,
+                    **skinny_config(experts, hidden, cutlass.Float32)),
         *args, cutlass.Int32(1), current_cuda_stream())
-    compiled = compile_v41_router_scores_aot(experts=experts)
+    compiled = compile_v41_router_scores_aot(experts=experts, activated=activated)
 
     def run(kernel, row_x):
         out = torch.full((len(row_x), experts), float("nan"), device="cuda")

@@ -199,9 +199,13 @@ class SkinnyBf16Gemv:
             total = total + partial[src, index]
         address = Int64(out.toint()) + ((Int64(row0) + Int64(m)) * Int64(self.n) + col0 + Int64(c)) * Int64(out_bytes)
         target = cute.make_ptr(self.out_dtype, address, cute.AddressSpace.gmem, assumed_align=out_bytes)
-        converted = total.to(self.out_dtype)
+        converted = self._epilogue(total).to(self.out_dtype)
         if m < live:
             target[0] = converted
+
+    @cute.jit
+    def _epilogue(self, value: Float32):
+        return value
 
 
 def skinny_config(n: int, k: int, out_dtype) -> dict:
