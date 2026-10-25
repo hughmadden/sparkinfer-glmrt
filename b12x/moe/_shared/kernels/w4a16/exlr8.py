@@ -867,33 +867,16 @@ def _ctz_u32(val: Uint32, *, loc=None, ip=None) -> Int32:
     )
 
 
-SERVING_VARIANTS = (
-    "k1_compact_prefetch",
-    "k1_paired_fc1",
-    "k1_reg_pair_b2",
-    "k1_k23_coalesced",
-)
-
+SERVING_VARIANTS = ("k1_k23_coalesced",)
 
 class Exlr8RoutedServingKernel:
     """Routed <=64-row EXLR8 A16 serving kernel with compact owned-unit tasking
     and constant-offset B-first register prefetch in both FC1 and FC2.
 
-    Variants:
-    - ``k1_compact_prefetch``: shared-memory live-unit compaction in FC1/activation
-      (eliminating the ``units * 2 * splits == 192`` CTA-pinning bug where
-      12/16 CTAs on TP4 and >=8/16 CTAs on TP6 did zero work), bitmask owned-unit
-      iteration in FC2, constant-offset B-first register prefetch in FC1/FC2,
-      vectorized activation/reduce loads and stores, and row-bounded grid clamps.
-    - ``k1_paired_fc1``: ``k1_compact_prefetch`` plus adaptive paired ``gate`` +
-      ``up`` per ``(u_idx, split)`` task in FC1 so ``up`` reuses warm L1 ``x``
-      activations from ``gate`` on the same SM.
-    - ``k1_reg_pair_b2``: ``k1_paired_fc1`` plus register-shared ``a0..a3_buf[8]``
-      across ``gate`` and ``up`` per K128 block in FC1 and paired 2-block
-      ``(b0, b1)`` tasks with register-shared ``a0..a3_buf[8]`` in FC2.
-    - ``k1_k23_coalesced``: coalesced 128B warp weight loads + register shuffle
-      on K2 (8 loads/block vs 32) and K3 (16 loads/block vs 32) in FC1/FC2,
-      plus compact ``slot_out``-indexed FC2 partials and constant-offset reduce.
+    Coalesced 128B warp weight loads + register shuffle on K2 (8 loads/block
+    vs 32) and K3 (16 loads/block vs 32) in FC1/FC2, plus compact
+    ``slot_out``-indexed FC2 partials and constant-offset reduce. The S3
+    same-session receipts supersede the earlier paired-register variants.
     """
 
     ABI_VERSION = 3
@@ -922,9 +905,6 @@ class Exlr8RoutedServingKernel:
         self.max_groups = int(max_groups)
         self.fast_math = bool(fast_math)
         self.variant = str(variant)
-        self.paired_fc1 = variant in ("k1_paired_fc1", "k1_reg_pair_b2")
-        self.reg_pair_fc1 = variant == "k1_reg_pair_b2"
-        self.pair_fc2 = variant == "k1_reg_pair_b2" and (hidden_size // 128) % 2 == 0
         self.k23_coalesced = variant == "k1_k23_coalesced"
         self.compact_fc2 = variant == "k1_k23_coalesced"
         self.group_rows = 16
@@ -1108,178 +1088,7 @@ class Exlr8RoutedServingKernel:
             u = _ctz_u32(mask16)
         return u, g, expert
 
-    @cute.jit
-    def _load_a_block(
-        self,
-        a_base0: Int64,
-        a_base1: Int64,
-        valid0: Int32,
-        valid1: Int32,
-    ):
-        a0_buf = cute.make_rmem_tensor(8, Uint32)
-        a1_buf = cute.make_rmem_tensor(8, Uint32)
-        a2_buf = cute.make_rmem_tensor(8, Uint32)
-        a3_buf = cute.make_rmem_tensor(8, Uint32)
-        for k16 in cutlass.range_constexpr(8):
-            a0_buf[k16] = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32)
-            a2_buf[k16] = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32 + 16)
-            a1_buf[k16] = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32)
-            a3_buf[k16] = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32 + 16)
-        return a0_buf, a1_buf, a2_buf, a3_buf
 
-    @cute.jit
-    def _mma_with_loaded_a(
-        self,
-        total: cute.Tensor,
-        payload: Int64,
-        a0_buf: cute.Tensor,
-        a1_buf: cute.Tensor,
-        a2_buf: cute.Tensor,
-        a3_buf: cute.Tensor,
-        tile_block: Int32,
-        lane: Int32,
-        warp: Int32,
-        prev_lane: Int32,
-        ia: Int32,
-        ib: Int32,
-        shift_lo: Int64,
-        shift_hi: Int64,
-        width: cutlass.Constexpr,
-        scale: Float32,
-        l2_policy: Uint64,
-    ):
-        acc = cute.make_rmem_tensor((4, 4), Float32)
-        acc.fill(Float32(0.0))
-        base_tile = (tile_block * Int32(64) + warp * Int32(2)).to(Int64) * Int64(32 * width)
-        if cutlass.const_expr(width == 4):
-            b_ptr = payload + base_tile + lane.to(Int64) * Int64(4)
-            wb_buf = cute.make_rmem_tensor((8, 2), Uint32)
-            for k16 in cutlass.range_constexpr(8):
-                for n16 in cutlass.range_constexpr(2):
-                    wb_buf[k16, n16] = ld_global_nc_u32_l2hint(
-                        b_ptr, l2_policy, (k16 * 8 + n16) * 128
-                    )
-            for k16 in cutlass.range_constexpr(8):
-                a0, a1, a2, a3 = a0_buf[k16], a1_buf[k16], a2_buf[k16], a3_buf[k16]
-                for n16 in cutlass.range_constexpr(2):
-                    b = wb_buf[k16, n16]
-                    a = cute.arch.shuffle_sync(b, prev_lane)
-                    wa = b
-                    wb = (a << Uint32(16)) | (b >> Uint32(16))
-                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
-                    b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
-                    b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
-                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                        acc[2 * n16, 0], acc[2 * n16, 1], acc[2 * n16, 2], acc[2 * n16, 3],
-                        a0, a1, a2, a3, b0, b1,
-                    )
-                    acc[2 * n16, 0], acc[2 * n16, 1] = d0, d1
-                    acc[2 * n16, 2], acc[2 * n16, 3] = d2, d3
-                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                        acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1], acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3],
-                        a0, a1, a2, a3, b2, b3,
-                    )
-                    acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1] = d0, d1
-                    acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3] = d2, d3
-        elif cutlass.const_expr(self.k23_coalesced and width == 2):
-            b_ptr = payload + base_tile + lane.to(Int64) * Int64(4)
-            ia_hi = ia + Int32(16)
-            ib_hi = ib + Int32(16)
-            w_buf = cute.make_rmem_tensor(8, Uint32)
-            for k16 in cutlass.range_constexpr(8):
-                w_buf[k16] = ld_global_nc_u32_l2hint(b_ptr, l2_policy, k16 * 512)
-            for k16 in cutlass.range_constexpr(8):
-                a0, a1, a2, a3 = a0_buf[k16], a1_buf[k16], a2_buf[k16], a3_buf[k16]
-                w = w_buf[k16]
-                for n16 in cutlass.range_constexpr(2):
-                    src_a = ia if cutlass.const_expr(n16 == 0) else ia_hi
-                    src_b = ib if cutlass.const_expr(n16 == 0) else ib_hi
-                    a = cute.arch.shuffle_sync(w, src_a)
-                    b = cute.arch.shuffle_sync(w, src_b)
-                    window = (a.to(Int64) << Int64(32)) | b.to(Int64)
-                    wa = (window >> shift_lo).to(Uint32)
-                    wb = (window >> shift_hi).to(Uint32)
-                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 2)
-                    b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
-                    b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
-                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                        acc[2 * n16, 0], acc[2 * n16, 1], acc[2 * n16, 2], acc[2 * n16, 3],
-                        a0, a1, a2, a3, b0, b1,
-                    )
-                    acc[2 * n16, 0], acc[2 * n16, 1] = d0, d1
-                    acc[2 * n16, 2], acc[2 * n16, 3] = d2, d3
-                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                        acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1], acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3],
-                        a0, a1, a2, a3, b2, b3,
-                    )
-                    acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1] = d0, d1
-                    acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3] = d2, d3
-        elif cutlass.const_expr(self.k23_coalesced and width == 3):
-            b_ptr = payload + base_tile + min(lane, Int32(23)).to(Int64) * Int64(4)
-            w_buf = cute.make_rmem_tensor((8, 2), Uint32)
-            for k16 in cutlass.range_constexpr(8):
-                for n16 in cutlass.range_constexpr(2):
-                    w_buf[k16, n16] = ld_global_nc_u32_l2hint(b_ptr, l2_policy, k16 * 768 + n16 * 96)
-            for k16 in cutlass.range_constexpr(8):
-                a0, a1, a2, a3 = a0_buf[k16], a1_buf[k16], a2_buf[k16], a3_buf[k16]
-                for n16 in cutlass.range_constexpr(2):
-                    w = w_buf[k16, n16]
-                    a = cute.arch.shuffle_sync(w, ia)
-                    b = cute.arch.shuffle_sync(w, ib)
-                    window = (a.to(Int64) << Int64(32)) | b.to(Int64)
-                    wa = (window >> shift_lo).to(Uint32)
-                    wb = (window >> shift_hi).to(Uint32)
-                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 3)
-                    b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
-                    b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
-                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                        acc[2 * n16, 0], acc[2 * n16, 1], acc[2 * n16, 2], acc[2 * n16, 3],
-                        a0, a1, a2, a3, b0, b1,
-                    )
-                    acc[2 * n16, 0], acc[2 * n16, 1] = d0, d1
-                    acc[2 * n16, 2], acc[2 * n16, 3] = d2, d3
-                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                        acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1], acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3],
-                        a0, a1, a2, a3, b2, b3,
-                    )
-                    acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1] = d0, d1
-                    acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3] = d2, d3
-        else:
-            b_ptr_a = payload + base_tile + ia.to(Int64) * Int64(4)
-            b_ptr_b = payload + base_tile + ib.to(Int64) * Int64(4)
-            wa_buf = cute.make_rmem_tensor((8, 2), Uint32)
-            wb_buf = cute.make_rmem_tensor((8, 2), Uint32)
-            for k16 in cutlass.range_constexpr(8):
-                for n16 in cutlass.range_constexpr(2):
-                    off = (k16 * 8 + n16) * 32 * width
-                    wa_buf[k16, n16] = ld_global_nc_u32_l2hint(b_ptr_a, l2_policy, off)
-                    wb_buf[k16, n16] = ld_global_nc_u32_l2hint(b_ptr_b, l2_policy, off)
-            for k16 in cutlass.range_constexpr(8):
-                a0, a1, a2, a3 = a0_buf[k16], a1_buf[k16], a2_buf[k16], a3_buf[k16]
-                for n16 in cutlass.range_constexpr(2):
-                    a = wa_buf[k16, n16]
-                    b = wb_buf[k16, n16]
-                    window = (a.to(Int64) << Int64(32)) | b.to(Int64)
-                    wa = (window >> shift_lo).to(Uint32)
-                    wb = (window >> shift_hi).to(Uint32)
-                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
-                    b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
-                    b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
-                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                        acc[2 * n16, 0], acc[2 * n16, 1], acc[2 * n16, 2], acc[2 * n16, 3],
-                        a0, a1, a2, a3, b0, b1,
-                    )
-                    acc[2 * n16, 0], acc[2 * n16, 1] = d0, d1
-                    acc[2 * n16, 2], acc[2 * n16, 3] = d2, d3
-                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                        acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1], acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3],
-                        a0, a1, a2, a3, b2, b3,
-                    )
-                    acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1] = d0, d1
-                    acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3] = d2, d3
-        for n in cutlass.range_constexpr(4):
-            for v in cutlass.range_constexpr(4):
-                total[n, v] = total[n, v] + acc[n, v] * scale
 
     @cute.jit
     def _fc1_accumulate_block(
@@ -1547,191 +1356,41 @@ class Exlr8RoutedServingKernel:
             ia3, ib3, shift3, _ = trellis256_lane_geom_bits(lane, 0, 8, 3)
             shift3_lo, shift3_hi = shift3.to(Int64), (shift3 + Int32(12)).to(Int64)
 
-            if cutlass.const_expr(self.paired_fc1):
-                if total_units * Int32(self.splits) >= Int32(step):
-                    while task < total_units * Int32(self.splits):
-                        split = task % Int32(self.splits)
-                        u_idx = task // Int32(self.splits)
-                        unit, group, expert = self._lookup_live_unit(
-                            u_idx, live_groups, total_units, s_gu, s_offset, s_meta
-                        )
-                        slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
-                        slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-                        valid0 = ((slot0 >= Int32(0)) & (slot0 < max_slot)).to(Int32)
-                        valid1 = ((slot1 >= Int32(0)) & (slot1 < max_slot)).to(Int32)
-                        row0 = max(slot0 // Int32(self.top_k), Int32(0))
-                        row1 = max(slot1 // Int32(self.top_k), Int32(0))
-                        x_row0_base = x_addr + row0.to(Int64) * Int64(self.hidden_size * 2)
-                        x_row1_base = x_addr + row1.to(Int64) * Int64(self.hidden_size * 2)
-                        desc_base = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3)
-
-                        if cutlass.const_expr(self.reg_pair_fc1):
-                            w_g = bits[desc_base]
-                            w_u = bits[desc_base + Int64(1)]
-                            pay_g = pointers[desc_base * Int64(3)]
-                            sc_g = pointers[desc_base * Int64(3) + Int64(2)]
-                            pay_u = pointers[(desc_base + Int64(1)) * Int64(3)]
-                            sc_u = pointers[(desc_base + Int64(1)) * Int64(3) + Int64(2)]
-                            total_g = cute.make_rmem_tensor((4, 4), Float32)
-                            total_u = cute.make_rmem_tensor((4, 4), Float32)
-                            total_g.fill(Float32(0.0))
-                            total_u.fill(Float32(0.0))
-                            for block in cutlass.range(8):
-                                kb = split * Int32(8) + block
-                                if kb < Int32(self.blocks):
-                                    kb_off = kb.to(Int64) * Int64(256)
-                                    a0_b, a1_b, a2_b, a3_b = self._load_a_block(
-                                        x_row0_base + kb_off, x_row1_base + kb_off, valid0, valid1
-                                    )
-                                    if w_g != Int32(0):
-                                        scale_g = _side_value(sc_g, kb)
-                                        if w_g == Int32(2):
-                                            self._mma_with_loaded_a(
-                                                total_g, pay_g, a0_b, a1_b, a2_b, a3_b, kb,
-                                                lane, warp, prev_lane, ia2, ib2, shift2_lo, shift2_hi,
-                                                2, scale_g, policy,
-                                            )
-                                        elif w_g == Int32(3):
-                                            self._mma_with_loaded_a(
-                                                total_g, pay_g, a0_b, a1_b, a2_b, a3_b, kb,
-                                                lane, warp, prev_lane, ia3, ib3, shift3_lo, shift3_hi,
-                                                3, scale_g, policy,
-                                            )
-                                        elif w_g == Int32(4):
-                                            self._mma_with_loaded_a(
-                                                total_g, pay_g, a0_b, a1_b, a2_b, a3_b, kb,
-                                                lane, warp, prev_lane, Int32(0), Int32(0), Int64(0), Int64(0),
-                                                4, scale_g, policy,
-                                            )
-                                    if w_u != Int32(0):
-                                        scale_u = _side_value(sc_u, kb)
-                                        if w_u == Int32(2):
-                                            self._mma_with_loaded_a(
-                                                total_u, pay_u, a0_b, a1_b, a2_b, a3_b, kb,
-                                                lane, warp, prev_lane, ia2, ib2, shift2_lo, shift2_hi,
-                                                2, scale_u, policy,
-                                            )
-                                        elif w_u == Int32(3):
-                                            self._mma_with_loaded_a(
-                                                total_u, pay_u, a0_b, a1_b, a2_b, a3_b, kb,
-                                                lane, warp, prev_lane, ia3, ib3, shift3_lo, shift3_hi,
-                                                3, scale_u, policy,
-                                            )
-                                        elif w_u == Int32(4):
-                                            self._mma_with_loaded_a(
-                                                total_u, pay_u, a0_b, a1_b, a2_b, a3_b, kb,
-                                                lane, warp, prev_lane, Int32(0), Int32(0), Int64(0), Int64(0),
-                                                4, scale_u, policy,
-                                            )
-                            fc1_g_task = (u_idx * Int32(2)) * Int32(self.splits) + split
-                            fc1_u_task = (u_idx * Int32(2) + Int32(1)) * Int32(self.splits) + split
-                            for n in cutlass.range_constexpr(4):
-                                col = col_in_warp + Int32(n * 8)
-                                base_g = fc1_addr + (fc1_g_task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
-                                base_u = fc1_addr + (fc1_u_task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
-                                if w_g != Int32(0) and valid0 != Int32(0):
-                                    st_global_v2_f32(base_g, total_g[n, 0], total_g[n, 1])
-                                if w_g != Int32(0) and valid1 != Int32(0):
-                                    st_global_v2_f32(base_g + Int64(8 * 128 * 4), total_g[n, 2], total_g[n, 3])
-                                if w_u != Int32(0) and valid0 != Int32(0):
-                                    st_global_v2_f32(base_u, total_u[n, 0], total_u[n, 1])
-                                if w_u != Int32(0) and valid1 != Int32(0):
-                                    st_global_v2_f32(base_u + Int64(8 * 128 * 4), total_u[n, 2], total_u[n, 3])
-                        else:
-                            for proj in cutlass.range(2):
-                                desc = desc_base + proj.to(Int64)
-                                width = bits[desc]
-                                total = cute.make_rmem_tensor((4, 4), Float32)
-                                total.fill(Float32(0.0))
-                                if width != Int32(0):
-                                    payload = pointers[desc * Int64(3)]
-                                    scales = pointers[desc * Int64(3) + Int64(2)]
-                                    self._run_fc1_proj(
-                                        total, width, payload, scales, x_row0_base, x_row1_base,
-                                        valid0, valid1, split, lane, warp, prev_lane,
-                                        ia2, ib2, shift2_lo, shift2_hi, ia3, ib3, shift3_lo, shift3_hi, policy,
-                                    )
-                                fc1_task = (u_idx * Int32(2) + proj) * Int32(self.splits) + split
-                                for n in cutlass.range_constexpr(4):
-                                    col = col_in_warp + Int32(n * 8)
-                                    base = fc1_addr + (fc1_task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
-                                    if width != Int32(0) and valid0 != Int32(0):
-                                        st_global_v2_f32(base, total[n, 0], total[n, 1])
-                                    if width != Int32(0) and valid1 != Int32(0):
-                                        st_global_v2_f32(base + Int64(8 * 128 * 4), total[n, 2], total[n, 3])
-                        task += step
-                else:
-                    while task < total_units * Int32(2 * self.splits):
-                        split = task % Int32(self.splits)
-                        proj = (task // Int32(self.splits)) % Int32(2)
-                        u_idx = task // Int32(2 * self.splits)
-                        unit, group, expert = self._lookup_live_unit(
-                            u_idx, live_groups, total_units, s_gu, s_offset, s_meta
-                        )
-                        desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
-                        width = bits[desc]
-                        total = cute.make_rmem_tensor((4, 4), Float32)
-                        total.fill(Float32(0.0))
-                        slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
-                        slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-                        valid0 = ((slot0 >= Int32(0)) & (slot0 < max_slot)).to(Int32)
-                        valid1 = ((slot1 >= Int32(0)) & (slot1 < max_slot)).to(Int32)
-                        row0 = max(slot0 // Int32(self.top_k), Int32(0))
-                        row1 = max(slot1 // Int32(self.top_k), Int32(0))
-                        x_row0_base = x_addr + row0.to(Int64) * Int64(self.hidden_size * 2)
-                        x_row1_base = x_addr + row1.to(Int64) * Int64(self.hidden_size * 2)
-                        if width != Int32(0):
-                            payload = pointers[desc * Int64(3)]
-                            scales = pointers[desc * Int64(3) + Int64(2)]
-                            self._run_fc1_proj(
-                                total, width, payload, scales, x_row0_base, x_row1_base,
-                                valid0, valid1, split, lane, warp, prev_lane,
-                                ia2, ib2, shift2_lo, shift2_hi, ia3, ib3, shift3_lo, shift3_hi, policy,
-                            )
-                        for n in cutlass.range_constexpr(4):
-                            col = col_in_warp + Int32(n * 8)
-                            base = fc1_addr + (task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
-                            if width != Int32(0) and valid0 != Int32(0):
-                                st_global_v2_f32(base, total[n, 0], total[n, 1])
-                            if width != Int32(0) and valid1 != Int32(0):
-                                st_global_v2_f32(base + Int64(8 * 128 * 4), total[n, 2], total[n, 3])
-                        task += step
-            else:
-                while task < total_units * Int32(2 * self.splits):
-                    split = task % Int32(self.splits)
-                    proj = (task // Int32(self.splits)) % Int32(2)
-                    u_idx = task // Int32(2 * self.splits)
-                    unit, group, expert = self._lookup_live_unit(
-                        u_idx, live_groups, total_units, s_gu, s_offset, s_meta
+            while task < total_units * Int32(2 * self.splits):
+                split = task % Int32(self.splits)
+                proj = (task // Int32(self.splits)) % Int32(2)
+                u_idx = task // Int32(2 * self.splits)
+                unit, group, expert = self._lookup_live_unit(
+                    u_idx, live_groups, total_units, s_gu, s_offset, s_meta
+                )
+                desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
+                width = bits[desc]
+                total = cute.make_rmem_tensor((4, 4), Float32)
+                total.fill(Float32(0.0))
+                slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
+                slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+                valid0 = ((slot0 >= Int32(0)) & (slot0 < max_slot)).to(Int32)
+                valid1 = ((slot1 >= Int32(0)) & (slot1 < max_slot)).to(Int32)
+                row0 = max(slot0 // Int32(self.top_k), Int32(0))
+                row1 = max(slot1 // Int32(self.top_k), Int32(0))
+                x_row0_base = x_addr + row0.to(Int64) * Int64(self.hidden_size * 2)
+                x_row1_base = x_addr + row1.to(Int64) * Int64(self.hidden_size * 2)
+                if width != Int32(0):
+                    payload = pointers[desc * Int64(3)]
+                    scales = pointers[desc * Int64(3) + Int64(2)]
+                    self._run_fc1_proj(
+                        total, width, payload, scales, x_row0_base, x_row1_base,
+                        valid0, valid1, split, lane, warp, prev_lane,
+                        ia2, ib2, shift2_lo, shift2_hi, ia3, ib3, shift3_lo, shift3_hi, policy,
                     )
-                    desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
-                    width = bits[desc]
-                    total = cute.make_rmem_tensor((4, 4), Float32)
-                    total.fill(Float32(0.0))
-                    slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
-                    slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-                    valid0 = ((slot0 >= Int32(0)) & (slot0 < max_slot)).to(Int32)
-                    valid1 = ((slot1 >= Int32(0)) & (slot1 < max_slot)).to(Int32)
-                    row0 = max(slot0 // Int32(self.top_k), Int32(0))
-                    row1 = max(slot1 // Int32(self.top_k), Int32(0))
-                    x_row0_base = x_addr + row0.to(Int64) * Int64(self.hidden_size * 2)
-                    x_row1_base = x_addr + row1.to(Int64) * Int64(self.hidden_size * 2)
-                    if width != Int32(0):
-                        payload = pointers[desc * Int64(3)]
-                        scales = pointers[desc * Int64(3) + Int64(2)]
-                        self._run_fc1_proj(
-                            total, width, payload, scales, x_row0_base, x_row1_base,
-                            valid0, valid1, split, lane, warp, prev_lane,
-                            ia2, ib2, shift2_lo, shift2_hi, ia3, ib3, shift3_lo, shift3_hi, policy,
-                        )
-                    for n in cutlass.range_constexpr(4):
-                        col = col_in_warp + Int32(n * 8)
-                        base = fc1_addr + (task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
-                        if width != Int32(0) and valid0 != Int32(0):
-                            st_global_v2_f32(base, total[n, 0], total[n, 1])
-                        if width != Int32(0) and valid1 != Int32(0):
-                            st_global_v2_f32(base + Int64(8 * 128 * 4), total[n, 2], total[n, 3])
-                    task += step
+                for n in cutlass.range_constexpr(4):
+                    col = col_in_warp + Int32(n * 8)
+                    base = fc1_addr + (task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
+                    if width != Int32(0) and valid0 != Int32(0):
+                        st_global_v2_f32(base, total[n, 0], total[n, 1])
+                    if width != Int32(0) and valid1 != Int32(0):
+                        st_global_v2_f32(base + Int64(8 * 128 * 4), total[n, 2], total[n, 3])
+                task += step
 
     @cute.kernel
     def activation_kernel(
@@ -1872,187 +1531,62 @@ class Exlr8RoutedServingKernel:
             ia3, ib3, shift3, _ = trellis256_lane_geom_bits(lane, 0, 8, 3)
             shift3_lo, shift3_hi = shift3.to(Int64), (shift3 + Int32(12)).to(Int64)
 
-            if cutlass.const_expr(self.pair_fc2):
-                half_blocks = Int32(self.blocks // 2)
-                if live_groups * half_blocks >= Int32(step):
-                    while task < live_groups * half_blocks:
-                        group, bp = task // half_blocks, task % half_blocks
-                        b0 = bp * Int32(2)
-                        b1 = b0 + Int32(1)
-                        meta = s_meta[group]
-                        expert = (meta >> Uint32(16)).to(Int32)
-                        mask = meta & Uint32(0xFFFF)
-                        total0 = cute.make_rmem_tensor((4, 4), Float32)
-                        total1 = cute.make_rmem_tensor((4, 4), Float32)
-                        total0.fill(Float32(0.0))
-                        total1.fill(Float32(0.0))
-                        slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
-                        slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-                        valid0 = ((slot0 >= Int32(0)) & (slot0 < max_slot)).to(Int32)
-                        valid1 = ((slot1 >= Int32(0)) & (slot1 < max_slot)).to(Int32)
-                        while mask != Uint32(0):
-                            unit = _ctz_u32(mask)
-                            mask = mask & (mask - Uint32(1))
-                            desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
-                            width = bits[desc]
-                            if width != Int32(0):
-                                payload = pointers[desc * Int64(3)]
-                                sc_ptr = pointers[desc * Int64(3) + Int64(2)]
-                                scale0 = _side_value(sc_ptr, b0)
-                                scale1 = _side_value(sc_ptr, b1)
-                                a_base = inter_base + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
-                                a0_b, a1_b, a2_b, a3_b = self._load_a_block(
-                                    a_base, a_base + Int64(2048), valid0, valid1
-                                )
-                                if width == Int32(2):
-                                    self._mma_with_loaded_a(
-                                        total0, payload, a0_b, a1_b, a2_b, a3_b, b0,
-                                        lane, warp, prev_lane, ia2, ib2, shift2_lo, shift2_hi,
-                                        2, scale0, l2_policy,
-                                    )
-                                    self._mma_with_loaded_a(
-                                        total1, payload, a0_b, a1_b, a2_b, a3_b, b1,
-                                        lane, warp, prev_lane, ia2, ib2, shift2_lo, shift2_hi,
-                                        2, scale1, l2_policy,
-                                    )
-                                elif width == Int32(3):
-                                    self._mma_with_loaded_a(
-                                        total0, payload, a0_b, a1_b, a2_b, a3_b, b0,
-                                        lane, warp, prev_lane, ia3, ib3, shift3_lo, shift3_hi,
-                                        3, scale0, l2_policy,
-                                    )
-                                    self._mma_with_loaded_a(
-                                        total1, payload, a0_b, a1_b, a2_b, a3_b, b1,
-                                        lane, warp, prev_lane, ia3, ib3, shift3_lo, shift3_hi,
-                                        3, scale1, l2_policy,
-                                    )
-                                elif width == Int32(4):
-                                    self._mma_with_loaded_a(
-                                        total0, payload, a0_b, a1_b, a2_b, a3_b, b0,
-                                        lane, warp, prev_lane, Int32(0), Int32(0), Int64(0), Int64(0),
-                                        4, scale0, l2_policy,
-                                    )
-                                    self._mma_with_loaded_a(
-                                        total1, payload, a0_b, a1_b, a2_b, a3_b, b1,
-                                        lane, warp, prev_lane, Int32(0), Int32(0), Int64(0), Int64(0),
-                                        4, scale1, l2_policy,
-                                    )
-                        for n in cutlass.range_constexpr(4):
-                            col0 = b0 * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
-                            col1 = col0 + Int32(128)
-                            base0 = fc2_addr + ((group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col0.to(Int64)) * Int64(4)
-                            base1 = fc2_addr + ((group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col1.to(Int64)) * Int64(4)
-                            if valid0 != Int32(0):
-                                st_global_v2_f32(base0, total0[n, 0], total0[n, 1])
-                                st_global_v2_f32(base1, total1[n, 0], total1[n, 1])
-                            if valid1 != Int32(0):
-                                st_global_v2_f32(base0 + Int64(8 * self.hidden_size * 4), total0[n, 2], total0[n, 3])
-                                st_global_v2_f32(base1 + Int64(8 * self.hidden_size * 4), total1[n, 2], total1[n, 3])
-                        task += step
+            while task < live_groups * Int32(self.blocks):
+                group, block = task // Int32(self.blocks), task % Int32(self.blocks)
+                meta = s_meta[group]
+                expert = (meta >> Uint32(16)).to(Int32)
+                mask = meta & Uint32(0xFFFF)
+                total = cute.make_rmem_tensor((4, 4), Float32)
+                total.fill(Float32(0.0))
+                slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
+                slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+                valid0 = ((slot0 >= Int32(0)) & (slot0 < max_slot)).to(Int32)
+                valid1 = ((slot1 >= Int32(0)) & (slot1 < max_slot)).to(Int32)
+                while mask != Uint32(0):
+                    unit = _ctz_u32(mask)
+                    mask = mask & (mask - Uint32(1))
+                    desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
+                    width = bits[desc]
+                    if width != Int32(0):
+                        payload = pointers[desc * Int64(3)]
+                        scale = _side_value(pointers[desc * Int64(3) + Int64(2)], block)
+                        a_base = inter_base + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
+                        if width == Int32(2):
+                            self._fc1_accumulate_block(
+                                total, payload, a_base, a_base + Int64(2048), valid0, valid1,
+                                block, lane, warp, prev_lane, ia2, ib2, shift2_lo, shift2_hi,
+                                2, scale, l2_policy,
+                            )
+                        elif width == Int32(3):
+                            self._fc1_accumulate_block(
+                                total, payload, a_base, a_base + Int64(2048), valid0, valid1,
+                                block, lane, warp, prev_lane, ia3, ib3, shift3_lo, shift3_hi,
+                                3, scale, l2_policy,
+                            )
+                        elif width == Int32(4):
+                            self._fc1_accumulate_block(
+                                total, payload, a_base, a_base + Int64(2048), valid0, valid1,
+                                block, lane, warp, prev_lane, Int32(0), Int32(0), Int64(0), Int64(0),
+                                4, scale, l2_policy,
+                            )
+                if cutlass.const_expr(self.compact_fc2):
+                    for n in cutlass.range_constexpr(4):
+                        col_in_block = warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
+                        if valid0 != Int32(0):
+                            base0 = fc2_addr + ((block * max_slot + slot0).to(Int64) * Int64(128) + col_in_block.to(Int64)) * Int64(4)
+                            st_global_v2_f32(base0, total[n, 0], total[n, 1])
+                        if valid1 != Int32(0):
+                            base1 = fc2_addr + ((block * max_slot + slot1).to(Int64) * Int64(128) + col_in_block.to(Int64)) * Int64(4)
+                            st_global_v2_f32(base1, total[n, 2], total[n, 3])
                 else:
-                    while task < live_groups * Int32(self.blocks):
-                        group, block = task // Int32(self.blocks), task % Int32(self.blocks)
-                        meta = s_meta[group]
-                        expert = (meta >> Uint32(16)).to(Int32)
-                        mask = meta & Uint32(0xFFFF)
-                        total = cute.make_rmem_tensor((4, 4), Float32)
-                        total.fill(Float32(0.0))
-                        slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
-                        slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-                        valid0 = ((slot0 >= Int32(0)) & (slot0 < max_slot)).to(Int32)
-                        valid1 = ((slot1 >= Int32(0)) & (slot1 < max_slot)).to(Int32)
-                        while mask != Uint32(0):
-                            unit = _ctz_u32(mask)
-                            mask = mask & (mask - Uint32(1))
-                            desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
-                            width = bits[desc]
-                            if width != Int32(0):
-                                payload = pointers[desc * Int64(3)]
-                                scale = _side_value(pointers[desc * Int64(3) + Int64(2)], block)
-                                a_base = inter_base + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
-                                if width == Int32(2):
-                                    self._fc1_accumulate_block(
-                                        total, payload, a_base, a_base + Int64(2048), valid0, valid1,
-                                        block, lane, warp, prev_lane, ia2, ib2, shift2_lo, shift2_hi,
-                                        2, scale, l2_policy,
-                                    )
-                                elif width == Int32(3):
-                                    self._fc1_accumulate_block(
-                                        total, payload, a_base, a_base + Int64(2048), valid0, valid1,
-                                        block, lane, warp, prev_lane, ia3, ib3, shift3_lo, shift3_hi,
-                                        3, scale, l2_policy,
-                                    )
-                                elif width == Int32(4):
-                                    self._fc1_accumulate_block(
-                                        total, payload, a_base, a_base + Int64(2048), valid0, valid1,
-                                        block, lane, warp, prev_lane, Int32(0), Int32(0), Int64(0), Int64(0),
-                                        4, scale, l2_policy,
-                                    )
-                        for n in cutlass.range_constexpr(4):
-                            col = block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
-                            base = fc2_addr + ((group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)) * Int64(4)
-                            if valid0 != Int32(0):
-                                st_global_v2_f32(base, total[n, 0], total[n, 1])
-                            if valid1 != Int32(0):
-                                st_global_v2_f32(base + Int64(8 * self.hidden_size * 4), total[n, 2], total[n, 3])
-                        task += step
-            else:
-                while task < live_groups * Int32(self.blocks):
-                    group, block = task // Int32(self.blocks), task % Int32(self.blocks)
-                    meta = s_meta[group]
-                    expert = (meta >> Uint32(16)).to(Int32)
-                    mask = meta & Uint32(0xFFFF)
-                    total = cute.make_rmem_tensor((4, 4), Float32)
-                    total.fill(Float32(0.0))
-                    slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
-                    slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-                    valid0 = ((slot0 >= Int32(0)) & (slot0 < max_slot)).to(Int32)
-                    valid1 = ((slot1 >= Int32(0)) & (slot1 < max_slot)).to(Int32)
-                    while mask != Uint32(0):
-                        unit = _ctz_u32(mask)
-                        mask = mask & (mask - Uint32(1))
-                        desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
-                        width = bits[desc]
-                        if width != Int32(0):
-                            payload = pointers[desc * Int64(3)]
-                            scale = _side_value(pointers[desc * Int64(3) + Int64(2)], block)
-                            a_base = inter_base + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
-                            if width == Int32(2):
-                                self._fc1_accumulate_block(
-                                    total, payload, a_base, a_base + Int64(2048), valid0, valid1,
-                                    block, lane, warp, prev_lane, ia2, ib2, shift2_lo, shift2_hi,
-                                    2, scale, l2_policy,
-                                )
-                            elif width == Int32(3):
-                                self._fc1_accumulate_block(
-                                    total, payload, a_base, a_base + Int64(2048), valid0, valid1,
-                                    block, lane, warp, prev_lane, ia3, ib3, shift3_lo, shift3_hi,
-                                    3, scale, l2_policy,
-                                )
-                            elif width == Int32(4):
-                                self._fc1_accumulate_block(
-                                    total, payload, a_base, a_base + Int64(2048), valid0, valid1,
-                                    block, lane, warp, prev_lane, Int32(0), Int32(0), Int64(0), Int64(0),
-                                    4, scale, l2_policy,
-                                )
-                    if cutlass.const_expr(self.compact_fc2):
-                        for n in cutlass.range_constexpr(4):
-                            col_in_block = warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
-                            if valid0 != Int32(0):
-                                base0 = fc2_addr + ((block * max_slot + slot0).to(Int64) * Int64(128) + col_in_block.to(Int64)) * Int64(4)
-                                st_global_v2_f32(base0, total[n, 0], total[n, 1])
-                            if valid1 != Int32(0):
-                                base1 = fc2_addr + ((block * max_slot + slot1).to(Int64) * Int64(128) + col_in_block.to(Int64)) * Int64(4)
-                                st_global_v2_f32(base1, total[n, 2], total[n, 3])
-                    else:
-                        for n in cutlass.range_constexpr(4):
-                            col = block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
-                            base = fc2_addr + ((group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)) * Int64(4)
-                            if valid0 != Int32(0):
-                                st_global_v2_f32(base, total[n, 0], total[n, 1])
-                            if valid1 != Int32(0):
-                                st_global_v2_f32(base + Int64(8 * self.hidden_size * 4), total[n, 2], total[n, 3])
-                    task += step
+                    for n in cutlass.range_constexpr(4):
+                        col = block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
+                        base = fc2_addr + ((group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)) * Int64(4)
+                        if valid0 != Int32(0):
+                            st_global_v2_f32(base, total[n, 0], total[n, 1])
+                        if valid1 != Int32(0):
+                            st_global_v2_f32(base + Int64(8 * self.hidden_size * 4), total[n, 2], total[n, 3])
+                task += step
 
     @cute.kernel
     def reduce_kernel(

@@ -697,7 +697,7 @@ def main():
                         help="<=64-row EXLR8 Spark serving duel benchmark (TP4/TP6 rotated ownership)")
     parser.add_argument("--tier-mix", choices=("mixed", "k4"), default="mixed",
                         help="EXLR8 tier distribution for --serving: 'mixed' ((2,3,4)[(u+p)%%3]) or 'k4'")
-    parser.add_argument("--serving-variants", default="k1_compact_prefetch,k1_reg_pair_b2,k1_k23_coalesced",
+    parser.add_argument("--serving-variants", default="k1_k23_coalesced",
                         help="comma-separated <=64 serving variant arms to benchmark against baseline")
     args = parser.parse_args()
     if args.serving:

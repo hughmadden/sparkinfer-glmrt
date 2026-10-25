@@ -233,9 +233,6 @@ def test_routed_serving_variant_keys_keep_unrelated_programs_unchanged(monkeypat
     grouped = compile_exlr8_a16_aot(device_count=True, grouped=True, group_rows=64)
     default_srv = compile_exlr8_a16_aot(device_count=True)
     base_srv = compile_exlr8_a16_aot(device_count=True, serving_variant="baseline")
-    v1 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_compact_prefetch")
-    v2 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_paired_fc1")
-    v3 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_reg_pair_b2")
     v4 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_k23_coalesced")
     assert DEFAULT_SERVING_VARIANT == "k1_k23_coalesced"
     assert decode.key[-1] == "decode_l2_fc2_prefetch_v9"
@@ -244,5 +241,12 @@ def test_routed_serving_variant_keys_keep_unrelated_programs_unchanged(monkeypat
     assert default_srv.key == v4.key
     assert default_srv.geometry["serving_variant"] == "k1_k23_coalesced"
     assert base_srv.key[-1] == "baseline"
-    assert len({base_srv.key, v1.key, v2.key, v3.key, v4.key}) == 5
+    assert base_srv.key != v4.key
+    from b12x.moe._shared.kernels.w4a16.exlr8 import SERVING_VARIANTS, Exlr8RoutedServingKernel
+    assert SERVING_VARIANTS == (DEFAULT_SERVING_VARIANT,)
+    for variant in ("k1_compact_prefetch", "k1_paired_fc1", "k1_reg_pair_b2"):
+        with pytest.raises(ValueError):
+            compile_exlr8_a16_aot(device_count=True, serving_variant=variant)
+        with pytest.raises(ValueError):
+            Exlr8RoutedServingKernel(6144, 16, 8, 512, variant=variant)
 
