@@ -1,6 +1,7 @@
 """CPU-only coordinator argument contracts (no CUDA/DSL imports)."""
 import argparse
 import ast
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -11,6 +12,42 @@ import pytest
 SOURCE = Path(__file__).resolve().parents[1] / "benchmarks/benchmark_mixed_trellis.py"
 TREE = ast.parse(SOURCE.read_text())
 HOST = SOURCE.parents[1] / "b12x/moe/_shared/kernels/w4a16/host.py"
+
+
+def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
+    runner = tmp_path / "benchmarks/benchmark_mixed_trellis.py"
+    runner.parent.mkdir()
+    runner.write_text("runner-v1")
+    package = tmp_path / "b12x"
+    package.mkdir()
+    first, second = package / "a.py", package / "z.py"
+    first.write_text("a-v1")
+    second.write_text("z-v1")
+    scope = dict(Path=Path, hashlib=hashlib)
+    nodes = [node for node in TREE.body
+             if isinstance(node, ast.FunctionDef) and node.name == "snapshot_prefill_sources"]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
+    snapshot = scope["snapshot_prefill_sources"]
+    frozen = snapshot(tmp_path)
+    entries = sorted(f"{path.relative_to(tmp_path).as_posix()}:{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
+                     for path in (runner, first, second))
+    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 3)
+    monkeypatch.setattr(Path, "rglob", lambda self, pattern: iter((second, first)))
+    assert snapshot(tmp_path) == frozen
+    first.write_text("a-v2")
+    assert snapshot(tmp_path) != frozen
+    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 3)
+    startup = next(i for i, node in enumerate(TREE.body) if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Tuple)
+                           and any(isinstance(name, ast.Name) and name.id == "PREFILL_SOURCE_SHA256"
+                                   for name in target.elts) for target in node.targets))
+    imports = [i for i, node in enumerate(TREE.body)
+               if (isinstance(node, ast.Import) and any(alias.name == "torch" for alias in node.names))
+               or (isinstance(node, ast.ImportFrom) and (node.module or "").startswith("b12x"))]
+    assert imports and all(startup < index for index in imports)
+    result = next(node for node in ast.walk(TREE) if isinstance(node, ast.keyword)
+                  and node.arg == "source_sha256")
+    assert isinstance(result.value, ast.Name) and result.value.id == "PREFILL_SOURCE_SHA256"
 
 
 def benchmark():

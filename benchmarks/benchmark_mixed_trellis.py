@@ -14,6 +14,18 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
+def snapshot_prefill_sources(root: Path) -> tuple[str, int]:
+    """Freeze runner and compiler-input provenance before loading CUDA modules."""
+    paths = [root / "benchmarks/benchmark_mixed_trellis.py", *(root / "b12x").rglob("*.py")]
+    entries = sorted(
+        f"{path.relative_to(root).as_posix()}:{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
+        for path in paths
+    )
+    return hashlib.sha256("".join(entries).encode("utf-8")).hexdigest(), len(entries)
+
+
+PREFILL_SOURCE_SHA256, PREFILL_SOURCE_FILES = snapshot_prefill_sources(Path(__file__).resolve().parents[1])
+
 import torch
 
 from b12x.moe._shared.kernels.w4a16.host import (
@@ -1609,7 +1621,6 @@ def _run_coordinator_benchmark(args, device, props):
                     del graphs, expected, actual
         del states, workspace, bindings, launch
         torch.cuda.empty_cache()
-    source = Path(__file__).resolve().parents[1]
     result = dict(schema=1, kind="glm_exl3_prefill" if args.prefill_family == "glm" else f"{args.prefill_family}_exl3_prefill",
         role=args.role, profile=args.profile,
         device=props.name, sm_count=props.multi_processor_count, hidden=hidden, intermediate=width,
@@ -1620,9 +1631,9 @@ def _run_coordinator_benchmark(args, device, props):
                       sha256=hashlib.sha256(args.compact_fixture.read_bytes()).hexdigest())
                  if compact else None),
         arms=specs,
-        source_sha256={p: hashlib.sha256((source / p).read_bytes()).hexdigest() for p in (
-            "benchmarks/benchmark_mixed_trellis.py", "b12x/moe/_shared/kernels/w4a16/mixed_trellis.py",
-            "b12x/moe/_shared/kernels/w4a16/mixed_trellis_ws.py")},
+        source_sha256=PREFILL_SOURCE_SHA256,
+        source_provenance=dict(snapshot="startup-before-torch-b12x", files=PREFILL_SOURCE_FILES,
+                               scope="runner+b12x/**/*.py", digest="sha256(sorted(path:sha256\\n))"),
         route_sha256=hashlib.sha256((args.routes or spec["routes"]).read_bytes()).hexdigest() if waves else None,
         output_dtype=str(output_dtype),
         conditions="synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); common E4M3/UE8M0 K32-roundtripped BF16 input; "
