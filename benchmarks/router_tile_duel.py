@@ -4,6 +4,7 @@ import json
 import os
 import statistics
 import subprocess
+import time
 
 import torch
 import cutlass
@@ -39,7 +40,7 @@ def main():
         cfg = skinny_config(e, h, cutlass.Float32)
         t = cfg['threads']
         base = (cfg['cols'], cfg['rows_per_tile'])
-        tiles = list(dict.fromkeys([base, (1, 4), (2, 4), (2, 8), (4, 4), (4, 8)]))
+        tiles = list(dict.fromkeys([base, (2, 4), (4, 4), (4, 2), (8, 2), (8, 4), (2, 16), (1, 16)]))
         arms = {f'c{c}r{r}': build(e, h, c, r, t) for c, r in tiles}
         baseline = f'c{base[0]}r{base[1]}'
         good = set(arms)
@@ -77,12 +78,14 @@ def main():
                 p.launch(x[:m], w, out, scalars=(m,))
             torch.cuda.synchronize()
             samples = {name: [] for name, _ in active}
+            intervals = {name: [] for name, _ in active}
             # Rotate and reverse arm order; flush before every timed launch.
             for rep in range(30):
                 order = active[rep % len(active):] + active[:rep % len(active)]
                 if rep % 2:
                     order = order[::-1]
                 for name, p in order:
+                    started = time.time()
                     flush.zero_()
                     a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                     a.record()
@@ -90,12 +93,14 @@ def main():
                     b.record()
                     b.synchronize()
                     samples[name].append(a.elapsed_time(b) * 1000)
+                    intervals[name].append((started, time.time()))
             stats = {}
             for name, ss in samples.items():
                 ordered = sorted(ss)
                 stats[name] = dict(median=statistics.median(ss), p10=ordered[3], p90=ordered[26],
                                    blocks=[statistics.median(ss[i:i+10]) for i in (0, 10, 20)])
-            record = dict(e=e, h=h, rows=m, baseline=baseline, stats=stats, exact=sorted(good))
+            record = dict(e=e, h=h, rows=m, baseline=baseline, stats=stats,
+                          samples=samples, intervals=intervals, exact=sorted(good))
             results.append(record)
             print(json.dumps(record), flush=True)
         telemetry()
