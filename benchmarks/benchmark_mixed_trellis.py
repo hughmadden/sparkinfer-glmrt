@@ -1262,9 +1262,9 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         if not spark or (not profile.startswith("spark-compact-")
                          and (family, profile) != ("glm", "spark-tp6-width384")):
             raise ValueError("compact coordinator requires a Spark compact profile or GLM spark-tp6-width384")
-        block = arm.get("route_block", 32 if ws else 64)
-        rotation = arm.get("rotation", "route" if ws else "token")
-        token = rotation == "token" or (rotation == "served" and capacity > 256)
+        block = arm.get("route_block", 32 if ws else SERVED_ROUTE_BLOCKS[family](capacity))
+        rotation = arm.get("rotation", "route" if ws else "served")
+        token = rotation == "token" or (rotation == "served" and SERVED_TOKEN_ROTATION[family](capacity))
         fused = rotation == "fused"
         if ((ws and (block < 16 or token or fused)) or (fused and block < 16)
                 or (not ws and any(arm.get(k) for k in ("wire", "stages", "dynamic")))):

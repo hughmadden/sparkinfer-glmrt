@@ -331,6 +331,27 @@ def test_spark_tuning_profile_options(family, profile, width):
         assert options["force_tile_config"] == (64, 192, 64, 256)
 
 
+@pytest.mark.parametrize("family,width,block,token", [
+    ("glm", 384, 64, True), ("glmf", 768, 64, True),
+    ("qwen4", 384, 32, True), ("qwen4", 256, 32, True),
+    ("v41", 640, 8, False),
+])
+@pytest.mark.parametrize("capacity", [2048, 2752])
+def test_compact_cooperative_matches_family_export(family, width, block, token, capacity):
+    b = benchmark()
+    options = b.coordinator_compile_options(f"spark-compact-width{width}", capacity, {},
+        SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376),
+        family, compact=True)
+    assert options["moe_block_size"] == block
+    assert options["token_major_rotation"] is token
+    assert options["compact_weights"] and not options["warp_specialized"]
+    assert options["force_tile_config"] == (64, 128, 64, 128)
+    assert options["full_rotation_output_dtype"] == "bf16"
+    slots = b.route_pack_capacity(capacity * options["top_k"], block,
+        options["route_num_experts"], topk=options["top_k"])[1]
+    assert options["max_m_blocks"] == (slots + block - 1) // block
+
+
 @pytest.mark.parametrize("family,widths", [
     ("glm", {256, 384, 512, 640, 768, 1024}),
     ("glmf", {256, 384, 512, 640, 768, 1024}),
