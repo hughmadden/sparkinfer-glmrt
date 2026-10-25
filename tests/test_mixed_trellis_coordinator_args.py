@@ -16,26 +16,22 @@ HOST = SOURCE.parents[1] / "b12x/moe/_shared/kernels/w4a16/host.py"
 def benchmark():
     names = {"parse_coordinator_arm", "coordinator_compile_options", "coordinator_route_waves",
              "coordinator_preflight", "benchmark_parser", "parse_prefill_arm", "compact_prefill_fixture"}
+    tables = {"GLM_CAPACITIES", "GLM_PROFILES", "GLM_ROUTES", "COORDINATOR_FAMILIES",
+              "COORDINATOR_PROFILES", "SERVED_ROUTE_BLOCKS", "SERVED_TOKEN_ROTATION",
+              "PREFILL_FAMILIES"}
     glm_profiles = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
                     "spark-tp6-width256": 256, "spark-tp4-width512": 512}
     glm_routes = SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json"
     scope = dict(argparse=argparse, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
-                 PREFILL_FAMILIES={
-                     "qwen4": (2560, 512, 10, (4, 5), "silu"),
-                     "kimik3": (3584, 896, 16, (2, 3), "situ"),
-                     "glm": (6144, 256, 8, (4, 5), "silu"),
-                     "glmf": (4096, 288, 8, (3, 4), "silu"),
-                     "dsv4f": (4096, 256, 6, (4, 5), "silu"),
-                 }, GLM_CAPACITIES=(256, 1024, 2752, 4096),
-                 GLM_PROFILES=glm_profiles, GLM_ROUTES=glm_routes,
-                 COORDINATOR_FAMILIES={
-                     "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
-                                 model="zai-org/GLM-5.3", profiles=tuple(glm_profiles), routes=glm_routes),
-                     "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), swiglu_limit=10.0,
-                                  model="zai-org/GLM-5.3-Flash", profiles=("rtx-tp1", "rtx-tp2"), routes=None),
-                 })
+                 __file__=str(SOURCE),
+                 GLM_PROFILES=glm_profiles, GLM_ROUTES=glm_routes)
     host_names = {"route_pack_capacity", "route_pack_numel_capacity", "route_pack_token_capacity",
                   "max_packed_route_slots"}
+    # Exec the source's own family tables, so the contracts below run against
+    # the shipped table rather than a copy that can drift from it.
+    table_nodes = [n for n in TREE.body if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id in tables for t in n.targets)]
+    exec(compile(ast.Module(body=table_nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
     for tree, selected in ((ast.parse(HOST.read_text()), host_names), (TREE, names)):
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in selected]
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
@@ -68,7 +64,8 @@ def test_cooperative_matches_export_contract(profile, width, capacity):
 def test_variant_plumbing_and_preflight():
     b = benchmark()
     args = arguments(b, "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128")
-    capacities, specs, routes, waves, *_ = b.coordinator_preflight(args)
+    capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
+    assert compact is None
     assert capacities == [256, 1024, 2752, 4096] and routes == ["random", "realistic"]
     assert len(waves) == 72 and specs[0] == ("coop", {})
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1], SimpleNamespace(multi_processor_count=170, shared_memory_per_block_optin=101376))
@@ -110,7 +107,8 @@ def test_invalid_arguments(extra):
 def test_glm_spark_served_exports(profile, width, tile):
     b = benchmark()
     args = arguments(b, "--role", "spark", "--profile", profile, "--capacities", "1024,2752,4096")
-    capacities, specs, _, _, *_ = b.coordinator_preflight(args)
+    capacities, specs, _, _, compact = b.coordinator_preflight(args)
+    assert compact is None
     assert specs[0] == ("coop", {}) and specs[1][0] == "served"
     props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
     for capacity in capacities:
@@ -167,7 +165,8 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
         "--k5-experts", "72", "--output", "result.json",
         "--coordinator-arm", "wire:mode=ws,wire=1,stages=3,dynamic=1,ctas=1,route_block=32,tile=64/128/64/128",
     ])
-    capacities, specs, routes, waves, *_ = b.coordinator_preflight(args)
+    capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
+    assert compact is None
     assert capacities == [256, 1024, 2752, 4096] and routes == ["random"] and waves == []
     opts = b.coordinator_compile_options(args.profile, 2752, specs[1][1],
                                          SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376), "glmf")
@@ -192,3 +191,70 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
         b.coordinator_preflight(b.benchmark_parser().parse_args([
             "--prefill-family", "glmf", "--role", "coordinator", "--route-distributions", "random",
             "--k5-experts", "289", "--output", "result.json"]))
+
+
+# Shipped cooperative coordinator policy per family: (capacity, block, token).
+SERVED = {
+    ("qwen4", 256): (32, False), ("qwen4", 1024): (32, True), ("qwen4", 4096): (32, True),
+    ("v41", 256): (8, False), ("v41", 1024): (8, False), ("v41", 4096): (8, False),
+    ("dsv4p", 256): (8, False), ("dsv4p", 1024): (16, False), ("dsv4p", 2752): (64, True),
+    ("kimik3", 256): (8, False), ("kimik3", 1024): (8, False), ("kimik3", 4096): (8, False),
+}
+
+
+FAMILY_PROFILE = {"qwen4": "rtx-tp1", "v41": "rtx-tp2", "dsv4p": "rtx-tp2", "kimik3": "rtx-tp2"}
+
+
+@pytest.mark.parametrize("family,capacity", sorted(SERVED))
+def test_family_served_defaults_match_exporter(family, capacity):
+    b = benchmark()
+    block, token = SERVED[(family, capacity)]
+    options = b.coordinator_compile_options(FAMILY_PROFILE[family], capacity, {}, SimpleNamespace(
+        multi_processor_count=188, shared_memory_per_block_optin=101376), family)
+    assert options["moe_block_size"] == block
+    assert options["token_major_rotation"] == token
+    assert not options["warp_specialized"]
+    assert options["full_rotation_output_dtype"] == "fp32"
+
+
+@pytest.mark.parametrize("family,profile,capacity,width", [
+    ("qwen4", "rtx-tp1", 4096, 640), ("qwen4", "rtx-tp2-rank0", 2752, 384),
+    ("qwen4", "rtx-tp2-rank1", 1024, 256), ("v41", "rtx-tp1", 4096, 2304),
+    ("v41", "rtx-tp2", 1024, 1152), ("dsv4p", "rtx-tp1", 4096, 3072),
+    ("dsv4p", "rtx-tp2", 2752, 1536), ("kimik3", "rtx-tp1", 1024, 3072),
+    ("kimik3", "rtx-tp2", 4096, 1536)])
+def test_family_compact_ws_arm_plumbing(family, profile, capacity, width):
+    b = benchmark()
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", family, "--role", "coordinator", "--profile", profile,
+        "--capacities", str(capacity), "--route-distributions", "random",
+        "--output", "result.json",
+        "--coordinator-arm", "s14:mode=ws,route_block=64,dynamic=1,tile=64/128/64/256"])
+    capacities, specs, routes, waves, compact = b.coordinator_preflight(args)
+    assert capacities == [capacity] and specs[1][0] == "s14" and compact is None
+    options = b.coordinator_compile_options(profile, capacity, specs[1][1], SimpleNamespace(
+        multi_processor_count=188, shared_memory_per_block_optin=101376), family)
+    assert options["intermediate_size"] == width and options["hidden_size"] == b.COORDINATOR_FAMILIES[family]["hidden"]
+    assert options["warp_specialized"] and options["force_tile_config"] == (64, 128, 64, 256)
+    assert options["ws_dynamic_tiles"] and options["input_format"] == "bf16"
+    assert options["activation"] == b.COORDINATOR_FAMILIES[family]["activation"]
+    assert not options["token_major_rotation"]
+
+
+FAMILY_CAPACITIES = {"qwen4": [256, 1024, 2752, 4096], "v41": [256, 1024, 2752, 4096],
+                     "dsv4p": [256, 1024, 2752, 4096], "kimik3": [256, 1024, 4096]}
+
+
+@pytest.mark.parametrize("family", sorted(FAMILY_CAPACITIES))
+def test_family_capacity_contract(family):
+    b = benchmark()
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", family, "--role", "coordinator", "--profile", FAMILY_PROFILE[family],
+        "--route-distributions", "random", "--output", "result.json"])
+    capacities, _, _, _, _ = b.coordinator_preflight(args)
+    assert capacities == FAMILY_CAPACITIES[family]
+    with pytest.raises(ValueError, match="no measured export"):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", family, "--role", "coordinator", "--profile", FAMILY_PROFILE[family],
+            "--capacities", "2752" if family == "kimik3" else "2048",
+            "--route-distributions", "random", "--output", "result.json"]))
