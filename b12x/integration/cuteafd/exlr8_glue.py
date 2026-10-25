@@ -454,5 +454,7 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
     if role == "spark":
         return result[1:3] + grouped
     if role == "coordinator":
-        return result[3:]
+        # RTX-onboarded experts use the same FP8K32 ingress and BF16 partial
+        # contract as Spark experts; every grid is bounded by runtime cta_limit.
+        return result[1:] + grouped
     return result + grouped
