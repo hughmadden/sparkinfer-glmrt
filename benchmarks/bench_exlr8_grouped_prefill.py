@@ -10,6 +10,7 @@ SM12x has twice the F16/F32 rate).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 import sys
@@ -163,6 +164,274 @@ def load_wave(routes_arg):
     return data["waves"][0]
 
 
+def audit_specs(decode):
+    """Existing implementations/knobs only, without changing partial precision."""
+    if decode:
+        return [("current", 16, {}), ("k23", 16, {}),
+                ("k1", 16, {}), ("compact", 16, {}),
+                ("group16", 16, {}), ("group32", 32, {}),
+                ("group64", 64, {})]
+    return [("current", 64, {}), ("current_control", 64, {}),
+            ("group16", 16, {}), ("group32", 32, {}),
+            ("fc1_coop", 64, {"FC1_WS": False}),
+            ("fc2_coop", 64, {"FC2_WS": False}),
+            ("fc1_s2", 64, {"FC1_STAGES": 2}),
+            ("fc1_s4", 64, {"FC1_STAGES": 4}),
+            ("fc2_s3", 64, {"FC2_STAGES": 3}),
+            ("fc2_s5", 64, {"FC2_STAGES": 5}),
+            ("cta1", 64, {"CTAS_PER_SM": 1}),
+            ("cta4", 64, {"CTAS_PER_SM": 4})]
+
+
+def manifest_widths(manifest, layer, rank, experts=256, units=16):
+    """Retain global slots and ascending sparse TP2 ownership."""
+    if rank not in (0, 1):
+        raise ValueError("audit rank must be 0 or 1")
+    entry = manifest["layers"][str(layer)]
+    result = []
+    for expert in range(experts):
+        row = []
+        for unit in range(units):
+            widths = [entry["gate"][expert][unit], entry["up"][expert][unit],
+                      entry["down"][expert]]
+            if any(type(w) is not int or w not in (2, 3, 4) for w in widths):
+                raise ValueError("manifest requires K2/K3/K4 integer widths")
+            row.append(widths if (units * expert + unit + layer) % 2 == rank else [0, 0, 0])
+        result.append(row)
+    return result
+
+
+def audit_order(labels, round_index):
+    offset = round_index % len(labels)
+    return labels[offset:] + labels[:offset]
+
+
+def audit_weights(widths, hidden, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    bits = torch.tensor(widths, dtype=torch.int32)
+    pointers = torch.zeros((*bits.shape, 3), dtype=torch.int64)
+    owners = []
+    for expert in range(bits.shape[0]):
+        for unit in range(bits.shape[1]):
+            for projection in range(3):
+                width = int(bits[expert, unit, projection])
+                if not width:
+                    continue
+                # Independent bytes/scales per real expert ID, never aliased payloads.
+                tensors = (torch.randint(256, (hidden * 16 * width,), generator=gen,
+                                         dtype=torch.uint8, device="cuda"),
+                           (0.075 + 0.05 * torch.rand(128, generator=gen, device="cuda")).half(),
+                           (0.075 + 0.05 * torch.rand(hidden // 128, generator=gen, device="cuda")).half())
+                owners.extend(tensors)
+                pointers[expert, unit, projection] = torch.tensor([t.data_ptr() for t in tensors])
+    return pointers.cuda(), bits.cuda(), owners
+
+
+def audit_compile(label, group_rows, knobs, capacity, decode):
+    """Keep benchmark knob sweeps out of the production AOT cache namespace."""
+    from b12x.integration.cuteafd import _common, exlr8
+    from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+    root = Path(__file__).resolve().parents[1]
+    paths = ("b12x/integration/cuteafd/exlr8.py",
+             "b12x/moe/_shared/kernels/w4a16/exlr8.py",
+             "b12x/moe/_shared/kernels/w4a16/exlr8_grouped.py")
+    source = tuple((p, hashlib.sha256((root / p).read_bytes()).hexdigest()) for p in paths)
+    grouped = not decode or label not in ("k23", "k1", "compact")
+    saved = {key: getattr(Exlr8GroupedKernel, key) for key in knobs}
+    factory = exlr8.compile_program
+    def keyed(wrapper, **kwargs):
+        kwargs["name"] = "exlr8_audit_" + kwargs["name"]
+        kwargs["key"] = (source, tuple(sorted(knobs.items())), kwargs["key"])
+        return _common.compile_program(wrapper, **kwargs)
+    exlr8.compile_program = keyed
+    try:
+        for key, value in knobs.items():
+            setattr(Exlr8GroupedKernel, key, value)
+        program = exlr8.compile_exlr8_a16_aot(
+            hidden=6144, units=16, top_k=8, max_groups=capacity,
+            device_count=True, grouped=grouped, group_rows=group_rows,
+            grouped_rows=64 if decode and group_rows == 16 else 4096,
+            fc2_partials="f32" if decode else "f16",
+            compact_units=label == "compact",
+            serving_variant="baseline" if label == "k1" else None)
+    finally:
+        exlr8.compile_program = factory
+        for key, value in saved.items():
+            setattr(Exlr8GroupedKernel, key, value)
+    return program, source
+
+
+def audit_pack(ids, state, group_rows, reverse=False):
+    """Host metadata is prepared outside captured/timed kernel work."""
+    flat = ids.flatten()
+    experts = torch.full_like(state["group_expert"], -1, device="cpu")
+    slots = torch.full_like(state["route_slots"], -1, device="cpu")
+    inverse = torch.full_like(ids, -1, dtype=torch.int32)
+    cursor = 0
+    for expert in range(256):
+        hits = torch.nonzero(flat == expert, as_tuple=False).flatten().int()
+        count = hits.numel()
+        groups = (count + group_rows - 1) // group_rows
+        experts[cursor:cursor + groups] = expert
+        slots.flatten()[cursor * group_rows:cursor * group_rows + count] = hits
+        cursor += groups
+    if cursor > experts.numel():
+        raise ValueError("route grouping exceeded planned capacity")
+    if reverse:
+        experts[:cursor] = experts[:cursor].flip(0)
+        slots[:cursor] = slots[:cursor].flip((0, 1))
+    packed = slots[:cursor].flatten()
+    valid = packed >= 0
+    inverse.flatten()[packed[valid].long()] = torch.arange(packed.numel(), dtype=torch.int32)[valid]
+    for key, value in (("group_expert", experts), ("route_slots", slots), ("inverse", inverse)):
+        state[key][:value.shape[0]].copy_(value)
+    state["count"].fill_(cursor)
+    return cursor
+
+
+def audit_state(planned, capacity, group_rows, scratch):
+    return dict(group_expert=torch.empty(capacity, dtype=torch.int32, device="cuda"),
+                route_slots=torch.empty((capacity, group_rows), dtype=torch.int32, device="cuda"),
+                inverse=torch.empty((planned, 8), dtype=torch.int32, device="cuda"),
+                count=torch.empty(1, dtype=torch.int32, device="cuda"),
+                output=torch.empty((planned + 1, 6144), dtype=torch.bfloat16, device="cuda"),
+                **scratch)
+
+
+def audit_main(args):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from benchmarks.benchmark_exlr8_a16 import real_route_ids, load_route_waves
+    if not args.manifest or args.activations != "a16" or args.units != 16 or args.hidden != 6144:
+        raise ValueError("--audit requires --manifest, A16 and global GLM geometry H6144/U16")
+    if min(args.warmup, args.iters, args.repeats) < 1:
+        raise ValueError("audit timing counts must be positive")
+    rows_list = [int(r) for r in args.rows.split(",")]
+    if any(not 1 <= r <= 4096 for r in rows_list):
+        raise ValueError("audit rows must be in 1..4096")
+    if args.exhaustive and (max(rows_list) != 4096 or min(rows_list) <= 64):
+        raise ValueError("exhaustive mode requires prefill only, including rows4096")
+    waves = load_route_waves(args.routes or "realistic")
+    indices = [int(i) for i in args.wave_indices.split(",")]
+    manifest_path = Path(args.manifest).resolve()
+    manifest = json.loads(manifest_path.read_text())
+    route_path = (Path(__file__).resolve().parent / "fixtures/glm53_prefill_routes_realistic.json"
+                  if args.routes in (None, "realistic") else Path(args.routes))
+    props = torch.cuda.get_device_properties(0)
+    report = dict(manifest=str(manifest_path), manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                  routes=str(route_path), routes_sha256=hashlib.sha256(route_path.read_bytes()).hexdigest(),
+                  gpu=str(props), rank=args.rank, seed=args.seed,
+                  payload="independent random trellis bytes, real manifest tiers and global expert IDs",
+                  timing=dict(warmup=args.warmup, rounds=args.repeats, replays=args.iters), cases=[])
+    print(json.dumps({k: v for k, v in report.items() if k != "cases"}), flush=True)
+    for index in indices:
+        wave = waves[index]
+        layer = wave["layer"]
+        pointers, bits, owners = audit_weights(manifest_widths(manifest, layer, args.rank), 6144, args.seed + layer)
+        compact = compact_unit_descriptors(bits)
+        assert compact[2] == 8
+        planned = 4096 if max(rows_list) > 64 else 64
+        gen = torch.Generator(device="cuda").manual_seed(args.seed)
+        activation = torch.randn((planned, 6144), generator=gen, device="cuda").half() * 0.02
+        weights = torch.rand((planned, 8), generator=gen, device="cuda") / 8
+        signs = torch.ones(6144, dtype=torch.int8, device="cuda")
+        # Sequential arms alias one maximum-size workspace, never parallel streams.
+        slots = ((planned * 8 + 63) // 64 + 256) * 64
+        scratch = dict(fc1=torch.empty(slots * 16 * 2 * 6 * 128, device="cuda"),
+                       intermediate=torch.empty(slots * 16 * 128, dtype=torch.float16, device="cuda"),
+                       fc2=torch.empty(slots * 6144, device="cuda"))
+        for rows in rows_list:
+            decode = rows <= 64
+            arm_capacity = 64 if decode else 4096
+            ids = real_route_ids(rows, wave, torch.Generator().manual_seed(args.seed + rows))
+            arms = {}
+            specs = audit_specs(decode)
+            known = {s[0] for s in specs}
+            if args.arms and not set(args.arms.split(",")) <= known:
+                raise ValueError(f"unknown arms; choose from {sorted(known)}")
+            for label, group_rows, knobs in specs:
+                if args.arms and label not in args.arms.split(",") and label != "current":
+                    continue
+                actual_label = "k23" if decode and rows < 8 and label == "current" else label
+                capacity = (arm_capacity * 8 + group_rows - 1) // group_rows + 256
+                if actual_label in ("k23", "k1", "compact"):
+                    capacity = 512
+                state = audit_state(planned, capacity, group_rows, scratch)
+                audit_pack(ids, state, group_rows)
+                program, source = audit_compile(actual_label, group_rows, knobs, capacity, decode)
+                limit = args.cta_limit or props.multi_processor_count * int(program.geometry["ctas_per_sm"])
+                extra = compact[:2] if any(o.name == "unit_count" for o in program.operands) else ()
+                def launch(live=rows, program=program, state=state, extra=extra, limit=limit):
+                    scalars = (live, limit, 8) if extra else (live, limit)
+                    program.launch(activation, pointers, bits, state["group_expert"], state["route_slots"],
+                        state["inverse"], weights, state["fc1"], state["intermediate"], state["fc2"],
+                        signs, state["output"], state["count"], *extra, scalars=scalars)
+                launch()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    launch()
+                graph.replay()
+                torch.cuda.synchronize()
+                output = state["output"][:rows].clone()
+                arms[label] = dict(graph=graph, launch=launch, state=state, output=output,
+                                   group_rows=group_rows, program=program, limit=limit, source=source)
+            reference = arms["current"]["output"]
+            if not bool(torch.isfinite(reference).all()) or not bool(reference.ne(0).any()):
+                raise AssertionError("current output must be finite and nonzero")
+            exact = {label: torch.equal(arm["output"].view(torch.int16), reference.view(torch.int16))
+                     for label, arm in arms.items()}
+            # Repacking and poisoned scratch/output catch stale lanes before timing.
+            with kernel_resolution_guard("EXLR8 audit frozen planned kernels"):
+                for label, arm in arms.items():
+                    state = arm["state"]
+                    for key in ("fc1", "intermediate", "fc2", "output"):
+                        state[key].fill_(float("nan"))
+                    audit_pack(ids, state, arm["group_rows"], reverse=True)
+                    arm["graph"].replay()
+                    torch.cuda.synchronize()
+                    if not torch.equal(state["output"][:rows].view(torch.int16), arm["output"].view(torch.int16)):
+                        raise AssertionError(f"{label}: packing/poison changed live output")
+                    if not bool(torch.isnan(state["output"][rows:]).all()):
+                        raise AssertionError(f"{label}: wrote output tail")
+                    audit_pack(ids, state, arm["group_rows"])
+                if args.exhaustive and rows == 4096:
+                    for live in range(1, 4097):
+                        for label, arm in arms.items():
+                            if not exact[label]:
+                                continue
+                            state = arm["state"]
+                            for key in ("fc1", "intermediate", "fc2", "output"):
+                                state[key].fill_(float("nan"))
+                            audit_pack(ids[:live], state, arm["group_rows"], reverse=bool(live % 2))
+                            arm["launch"](live)
+                            if not torch.equal(state["output"][:live].view(torch.int16), reference[:live].view(torch.int16)):
+                                raise AssertionError(f"{label}: exhaustive live={live} differs from current full prefix")
+                            if not bool(torch.isnan(state["output"][live:]).all()):
+                                raise AssertionError(f"{label}: exhaustive live={live} wrote tail")
+                    for arm in arms.values():
+                        audit_pack(ids, arm["state"], arm["group_rows"])
+            samples = {label: [] for label in arms if exact[label]}
+            for label in samples:
+                for _ in range(args.warmup):
+                    arms[label]["graph"].replay()
+            torch.cuda.synchronize()
+            for round_index in range(args.repeats):
+                for label in audit_order(list(samples), round_index):
+                    samples[label].append(timeit(arms[label]["graph"].replay, 0, args.iters))
+            case = dict(rows=rows, wave_index=index, layer=layer, content=wave.get("content"),
+                        bitwise=exact, samples_ms=samples,
+                        median_ms={label: statistics.median(s) for label, s in samples.items()},
+                        source=arms["current"]["source"], packing_poison=True,
+                        exhaustive=args.exhaustive and rows == 4096, unit_limit=8)
+            print(json.dumps(case), flush=True)
+            report["cases"].append(case)
+            if args.json_output:
+                Path(args.json_output).write_text(json.dumps(report, indent=2) + "\n")
+            del arms, arm, state, program, graph, launch, output, reference
+            torch.cuda.empty_cache()
+        del pointers, bits, owners, compact, activation, weights, signs, scratch
+        torch.cuda.empty_cache()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hidden", type=int, default=6144)
@@ -174,13 +443,26 @@ def main():
     ap.add_argument("--activations", choices=("a16", "a8", "both", "all"), default="a16")
     ap.add_argument("--quantize-pass", action="store_true")
     ap.add_argument("--routes", default=None)
-    ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--iters", type=int, default=10)
-    ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--warmup", type=int, default=None)
+    ap.add_argument("--iters", type=int, default=None)
+    ap.add_argument("--repeats", type=int, default=None)
     ap.add_argument("--seed", type=int, default=408)
     ap.add_argument("--cta-limit", type=int, default=0)
     ap.add_argument("--dump", default=None, help="save the output rows here for a bitwise arm comparison")
+    ap.add_argument("--audit", action="store_true", help="graph-first real-manifest TP2 existing-kernel audit")
+    ap.add_argument("--manifest", help="actual EXLR8 width manifest, never synthetic cyclic tiers")
+    ap.add_argument("--rank", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--wave-indices", default="0,12,24,36,48,60")
+    ap.add_argument("--arms", help="comma-separated audit arms; current is always included")
+    ap.add_argument("--exhaustive", action="store_true", help="check frozen prefill kernels at every live row 1..4096")
+    ap.add_argument("--json-output", help="raw audit provenance, equality and interleaved event samples")
     args = ap.parse_args()
+    args.warmup = args.warmup if args.warmup is not None else (200 if args.audit else 3)
+    args.iters = args.iters if args.iters is not None else (20 if args.audit else 10)
+    args.repeats = args.repeats if args.repeats is not None else (7 if args.audit else 3)
+
+    if args.audit:
+        return audit_main(args)
 
     wave = load_wave(args.routes)
     row_list = [int(r) for r in str(args.rows).split(",")]
