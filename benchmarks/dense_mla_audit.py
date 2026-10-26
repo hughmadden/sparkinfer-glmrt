@@ -27,6 +27,8 @@ def arguments(argv=None):
     parser.add_argument("--reference-core", required=True, help="PATH@git-blob-SHA")
     parser.add_argument("--rows", default="2752,2688,2673,1,63,65")
     parser.add_argument("--prior-contexts", default="0,8192,32768,65536")
+    parser.add_argument("--heads", type=int, choices=(48, 96), default=96,
+                        help="local MLA heads (48 for head-split TP2; checkpoint remains 96)")
     parser.add_argument("--capacity", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=1048576)
     parser.add_argument("--warmup", type=int, default=10)
@@ -114,7 +116,7 @@ def engine_program(args, core=None):
     try:
         kimi_mla_prefill_fp8.DenseMlaFp8PrefillKernel = module.DenseMlaFp8PrefillKernel
         kimi_mla.compile_program = compile_keyed
-        program = kimi_mla.compile_kimi_dense_mla_aot(kimi_mla.KimiMlaGeometry(kv_cache="fp8"),
+        program = kimi_mla.compile_kimi_dense_mla_aot(kimi_mla.KimiMlaGeometry(heads=args.heads, kv_cache="fp8"),
             max_rows=args.capacity, max_context=args.max_context, mode="extend")
     finally:
         kimi_mla_prefill_fp8.DenseMlaFp8PrefillKernel = saved_core
@@ -140,7 +142,8 @@ def main():
         commit=commit, commit_supplied_by_host=args.source_commit is not None,
         worktree=str(ROOT), source_sha256=source_hashes(),
         reference_blob=core[2], reference_sha256=ref_hash, candidate_sha256=cand_hash,
-        geometry=geometry, export=f"kimik3_dense_mla_extend_h96_fp8_m{args.capacity}",
+        geometry=geometry, local_heads=args.heads,
+        export=f"kimik3_dense_mla_extend_h{args.heads}_fp8_m{args.capacity}",
         program_geometry=dict(reference.geometry), seed=args.seed,
         device=props.name, device_uuid=str(props.uuid), sm_count=props.multi_processor_count,
         torch_version=torch.__version__, cuda_version=torch.version.cuda,
@@ -165,14 +168,14 @@ def audit_case(args, programs, rows, prior, pack, unpack):
     cache = torch.empty_like(records)
     cache[slots] = records
     cache = cache.reshape(pages, 64, 656)
-    query = torch.full((args.capacity, 96, 576), float("nan"), device="cuda", dtype=torch.bfloat16)
-    query[:rows] = (torch.randn(rows, 96, 576, device="cuda") * .1).bfloat16()
+    query = torch.full((args.capacity, args.heads, 576), float("nan"), device="cuda", dtype=torch.bfloat16)
+    query[:rows] = (torch.randn(rows, args.heads, 576, device="cuda") * .1).bfloat16()
     lengths = torch.tensor([length], device="cuda", dtype=torch.int32)
     cu = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
     arms = {}
     for label, program in programs.items():
-        out = torch.full((args.capacity, 96, 512), float("nan"), device="cuda", dtype=torch.bfloat16)
-        lse = torch.full((args.capacity, 96), float("nan"), device="cuda")
+        out = torch.full((args.capacity, args.heads, 512), float("nan"), device="cuda", dtype=torch.bfloat16)
+        lse = torch.full((args.capacity, args.heads), float("nan"), device="cuda")
 
         def launch(p=program, o=out, l=lse):
             p.launch(query, cache, table, lengths, cu, o, l, None,
@@ -235,6 +238,6 @@ def audit_case(args, programs, rows, prior, pack, unpack):
         reference_over_candidate=medians["current"] / medians["candidate"],
         us_per_row=medians["current"] * 1000 / rows,
         ns_per_row_context_pair=medians["current"] * 1e6 / pairs,
-        qk_pv_flops=2 * 96 * (576 + 512) * pairs,
+        qk_pv_flops=2 * args.heads * (576 + 512) * pairs,
         unique_kv_bytes=length * 656, oracle_relative_l2=relative_l2,
         output_lse_byte_exact=True, poisoned_tail=True, allocation_stable=True)
