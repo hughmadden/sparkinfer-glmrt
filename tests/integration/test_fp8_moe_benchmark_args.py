@@ -31,6 +31,8 @@ def test_capacity_is_independent_of_live_rows():
     ["--routes", "routes.json", "--exact-sweep", "out"],
     ["--route", "auto,auto"], ["--route", "auto,"],
     ["--compare-routes-exact"],
+    ["--continue-on-fail"],
+    ["--continue-on-fail", "--check", "--exact-sweep", "out"],
     ["--compare-routes-exact", "--route", "decode,auto", "--exact-sweep", "out"],
 ])
 def test_invalid_cases_fail_before_cuda(argv):
@@ -89,6 +91,35 @@ def test_exact_comparison_distinguishes_signed_zero():
 def test_exact_comparison_rejects_output_contract_mismatch(actual):
     with pytest.raises(ValueError, match="shapes and dtypes"):
         bench.compare_route_outputs(dict(a=torch.ones(2, 2), b=actual))
+
+
+def test_oracle_reports_global_rms_and_outlier_location():
+    reference = torch.tensor([[0., 1.], [1., 1.]])
+    output = reference.clone()
+    output[0, 0] = .2
+    result = bench.oracle_metrics(output, reference, nvfp4_a4=True)
+    assert result["reference_rms"] == pytest.approx(3 ** .5 / 2)
+    assert result["max_error"] == pytest.approx(dict(row=0, col=0, output=.2, reference=0., abs_error=.2))
+    assert result["normalized_max"] == pytest.approx(.2 / (3 ** .5 / 2))
+    assert result["elements_over_threshold"] == 1
+    assert not result["passed"]
+    with pytest.raises(AssertionError):
+        bench.enforce_oracle(result, False)
+    bench.enforce_oracle(result, True)
+    assert bench.parse_args(["--check", "--continue-on-fail"]).continue_on_fail
+
+
+@pytest.mark.parametrize("value", [0., float("nan"), float("inf")])
+def test_oracle_continuation_never_turns_invalid_outputs_green(value):
+    result = bench.oracle_metrics(torch.full((2, 2), value), torch.ones(2, 2), nvfp4_a4=True)
+    assert not result["passed"]
+    bench.enforce_oracle(result, True)
+
+
+def test_oracle_equal_nonzero_output_passes():
+    result = bench.oracle_metrics(torch.ones(2, 2), torch.ones(2, 2), nvfp4_a4=True)
+    assert result["passed"] and result["elements_over_threshold"] == 0
+    bench.enforce_oracle(result, False)
 
 
 def fixture(tmp_path, **updates):

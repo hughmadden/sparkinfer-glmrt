@@ -161,6 +161,8 @@ def parse_args(argv=None):
     parser.add_argument("--route", default="auto")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--continue-on-fail", action="store_true",
+                        help="record failed oracle gates and continue; failed timings are ineligible")
     parser.add_argument("--compare-routes-exact", action="store_true",
                         help="compare every route's raw output bytes against the first route outside timing")
     parser.add_argument("--prefill", choices=("auto", "w8a8", "w8a16"), default="auto")
@@ -176,6 +178,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.iters <= 0:
         parser.error("iters must be positive")
+    if args.continue_on_fail and (not args.check or args.exact_sweep):
+        parser.error("--continue-on-fail requires --check and no --exact-sweep")
     if args.exact_baseline and not args.exact_sweep:
         parser.error("--exact-baseline requires --exact-sweep")
     try:
@@ -221,6 +225,36 @@ def compare_route_outputs(outputs):
                                  first_mismatch=mismatch,
                                  max_abs_diff=float((actual.float() - reference.float()).abs().max()))
     return comparisons
+
+
+def oracle_metrics(output, reference, *, nvfp4_a4=False):
+    """Normalize by global reference RMS, never by an individual element."""
+    a, b = output.float(), reference.float()
+    if a.ndim != 2 or a.shape != b.shape or not a.numel():
+        raise ValueError("oracle tensors must have identical nonempty matrix shapes")
+    error = (a - b).abs()
+    flat_index = int(error.nan_to_num(nan=float("inf")).argmax())
+    row, col = divmod(flat_index, a.shape[1])
+    rms = b.square().mean().sqrt()
+    threshold = 0.15 * rms
+    result = dict(cosine=float((a * b).sum() / (a.norm() * b.norm())),
+                  relative_l2=float((a - b).norm() / b.norm()),
+                  normalized_max=float(error.max() / rms), reference_rms=float(rms),
+                  max_error=dict(row=row, col=col, output=float(a[row, col]),
+                                 reference=float(b[row, col]), abs_error=float(error[row, col])),
+                  error_threshold_abs=float(threshold), error_threshold_rms=0.15,
+                  elements_over_threshold=int((error > threshold).sum()),
+                  finite=bool(torch.isfinite(a).all() and torch.isfinite(b).all()),
+                  nonzero=bool(a.count_nonzero()))
+    result["passed"] = (result["finite"] and result["nonzero"] and result["cosine"] >= 0.9999
+                        and (not nvfp4_a4 or (result["relative_l2"] <= 0.02
+                                             and result["normalized_max"] <= 0.15)))
+    return result
+
+
+def enforce_oracle(result, continue_on_fail):
+    if not result["passed"] and not continue_on_fail:
+        raise AssertionError(result)
 
 
 def recorded_waves(path, g):
@@ -375,7 +409,6 @@ def main() -> None:
                 run()
             torch.cuda.synchronize()
             if args.check:
-                assert torch.isfinite(out).all() and out.count_nonzero() > 0
                 if g.weights == "nvfp4":
                     ref = cached_ref.get(g.activations)
                     if ref is None:
@@ -414,13 +447,8 @@ def main() -> None:
                             y = activation(gate, up, g.swiglu_limit, g.activation) @ dequant(w[4][expert], w[5][expert]).T
                             acc.index_add_(0, r, y.float() * weights[r, slots][:, None])
                         ref = cached_ref["fp8"] = acc.bfloat16()
-                a, b = out.float(), ref.float()
-                correctness = {"cosine": float((a * b).sum() / (a.norm() * b.norm())),
-                               "relative_l2": float((a - b).norm() / b.norm()),
-                               "normalized_max": float((a - b).abs().max() / b.square().mean().sqrt())}
-                assert correctness["cosine"] >= 0.9999, correctness
-                if g.weights == "nvfp4" and g.activations == "a4":
-                    assert correctness["relative_l2"] <= 0.02 and correctness["normalized_max"] <= 0.15, correctness
+                correctness = oracle_metrics(out, ref, nvfp4_a4=g.weights == "nvfp4" and g.activations == "a4")
+                enforce_oracle(correctness, args.continue_on_fail)
             else:
                 correctness = {"checked": False}
             graph = None
@@ -459,7 +487,8 @@ def main() -> None:
                       "route_fixture": route_fixture, "us_per_row": us / rows,
                       "us": us, "samples_us": samples, "scratch_bytes": scratch.numel(),
                       "experts": experts, "gbps": experts * per_expert / us / 1e3,
-                      "tflops": rows * k * 3 * 2 * i * h / us / 1e6, "correctness": correctness_by_route[route_name]}
+                      "tflops": rows * k * 3 * 2 * i * h / us / 1e6, "correctness": correctness_by_route[route_name],
+                      "timing_eligible": correctness_by_route[route_name].get("passed", False)}
             if comparisons is not None:
                 record["route_comparison"] = comparisons[route_name]
             if args.profile_dir:
