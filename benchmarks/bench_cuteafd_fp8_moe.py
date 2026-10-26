@@ -3,6 +3,8 @@
 
 Use --graph for the serving replay path, --routing hot to put the requested
 row count in each selected expert, and --profile-dir for launch/stage traces.
+Use --capacity for a fixed export across live --rows and --routes for the
+schema-1 recorded histograms used by the EXL3/EXLR8 benches.
 NVFP4 and native BF16 require --input bf16. A historical checkout may be used to measure the
 old A16 ceiling; it is not a serving arithmetic override.
 """
@@ -147,13 +149,15 @@ def exact_sweep(g, w, args):
     (args.exact_sweep / "summary.json").write_text(json.dumps({**config, "results": results}, indent=2) + "\n")
 
 
-def main() -> None:
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--geometry", default="mimo")
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--activation", choices=("silu_bf16_product", "silu_post_clamp_fp32_product"),
                         help="explicit activation contract; defaults to the geometry contract")
     parser.add_argument("--rows", default="1,16,80,1024,4096")
+    parser.add_argument("--capacity", type=int, help="fixed compiled export/workspace capacity; defaults to each live row count")
+    parser.add_argument("--routes", type=Path, help="recorded schema-1 histogram fixture (EXL3/EXLR8 format)")
     parser.add_argument("--route", default="auto")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--check", action="store_true")
@@ -167,20 +171,81 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--exact-sweep", type=Path, help="correctness only: dump exact outputs and check row invariance (widths 1..64)")
     parser.add_argument("--exact-baseline", type=Path, help="compare --exact-sweep byte for byte with this baseline dump")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.iters <= 0:
         parser.error("iters must be positive")
     if args.exact_baseline and not args.exact_sweep:
         parser.error("--exact-baseline requires --exact-sweep")
+    try:
+        rows = [int(r) for r in args.rows.split(",")]
+    except ValueError:
+        parser.error("rows must be comma-separated positive integers")
+    if not rows or min(rows) < 1:
+        parser.error("rows must be positive")
+    if args.capacity is not None and (args.capacity < 1 or max(rows) > args.capacity):
+        parser.error("capacity must be positive and cover every live row count")
+    if args.routes and args.routing != "random":
+        parser.error("--routes cannot be combined with --routing hot")
+    if args.exact_sweep and (args.capacity is not None or args.routes):
+        parser.error("--capacity/--routes are timing options, not --exact-sweep options")
+    if not args.route or len(set(args.route.split(","))) != len(args.route.split(",")) or "" in args.route.split(","):
+        parser.error("routes must be nonempty and unique")
+    return args
+
+
+def recorded_waves(path, g):
+    from benchmarks.benchmark_exlr8_a16 import load_route_waves
+
+    data = json.loads(path.read_text())
+    family = g.name.split("_")[0]
+    if data.get("family") != family:
+        # The original GLM histogram predates explicit family metadata.
+        if not (family == "glm" and "family" not in data and data.get("model") == "zai-org/GLM-5.3"):
+            raise ValueError("recorded route fixture family does not match geometry")
+    if data.get("experts", g.experts) != g.experts or data.get("top_k", g.top_k) != g.top_k:
+        raise ValueError("recorded route fixture expert/top-k metadata mismatch")
+    waves = load_route_waves(str(path))
+    for wave in waves:
+        rows, counts = wave.get("rows", 0), wave.get("expert_rows", [])
+        if (type(rows) is not int or rows < 1 or not counts
+                or any(type(e) is not int or type(n) is not int or not 0 <= e < g.experts
+                       or not 0 < n <= rows for e, n in counts)
+                or len({e for e, _ in counts}) != len(counts)
+                or sum(n for _, n in counts) != rows * g.top_k):
+            raise ValueError("invalid recorded route histogram")
+    return waves
+
+
+def compiled_case(g, args, rows, route, cache):
+    """Resolve once per planned capacity; live rows remain launch scalars."""
+    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
+
+    capacity = args.capacity if args.capacity is not None else rows
+    key = (route, capacity)
+    if key not in cache:
+        wire = args.input == "wire"
+        program = compile_fp8_moe_aot(g, route=route, max_rows=capacity, wire=wire, prefill=args.prefill)
+        scratch = torch.empty(fp8_moe_scratch_bytes(g, route, capacity, wire, args.prefill),
+                              dtype=torch.uint8, device="cuda")
+        cache[key] = program, scratch
+    return cache[key]
+
+
+def main() -> None:
+    args = parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
 
-    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, compile_fp8_moe_aot, fp8_moe_scratch_bytes
+    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES
 
     g = GEOMETRIES[args.geometry].with_tp(args.tp)
     if args.activation is not None:
         g = replace(g, activation=args.activation)
     if g.weights in ("nvfp4", "bf16") and args.input != "bf16":
-        parser.error("NVFP4 and native BF16 require original BF16 input")
+        raise ValueError("NVFP4 and native BF16 require original BF16 input")
+    waves = recorded_waves(args.routes, g) if args.routes else None
+    route_fixture = ({"path": str(args.routes), "sha256": hashlib.sha256(args.routes.read_bytes()).hexdigest(),
+                      "waves": len(waves), "kind": "rescaled recorded histogram; reconstructed token co-occurrence"}
+                     if waves else None)
     dev = "cuda"
     gen = torch.Generator(device=dev).manual_seed(args.seed)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
@@ -224,15 +289,14 @@ def main() -> None:
         w = (bf16((e, i, h)), unused, bf16((e, i, h)), unused, bf16((e, h, i)), unused)
         per_expert = 3 * i * h * 2
     else:
-        parser.error("this benchmark supports FP8, MXFP4, NVFP4 and native BF16 weights")
+        raise ValueError("this benchmark supports FP8, MXFP4, NVFP4 and native BF16 weights")
     if args.exact_sweep:
         exact_sweep(g, w, args)
         return
     routes = [r for r in args.route.split(",") if r]
-    if not routes or len(routes) != len(set(routes)):
-        parser.error("routes must be nonempty and unique")
     flush = torch.zeros(256 << 20, dtype=torch.uint8, device=dev)
     results = []
+    compiled = {}
     for rows in [int(r) for r in args.rows.split(",")]:
         wire_in = args.input == "wire"
         x = torch.randn(rows, h, device=dev, generator=gen).bfloat16()
@@ -246,9 +310,18 @@ def main() -> None:
         ids = torch.empty(rows, k, dtype=torch.int32, device=dev)
         weights = torch.rand(rows, k, device=dev, generator=gen).contiguous()
         unique = []
+        route_ids = []
+        if waves:
+            from benchmarks.benchmark_exlr8_a16 import real_route_ids
+
+            cpu_gen = torch.Generator().manual_seed(args.seed)
+            route_ids = [real_route_ids(rows, wave, cpu_gen, e, k).to(device=dev, dtype=torch.int32)
+                         for wave in waves]
 
         def prepare(seed):
-            if args.routing == "hot":
+            if route_ids:
+                ids.copy_(route_ids[seed % len(route_ids)])
+            elif args.routing == "hot":
                 selected = torch.randperm(e, device=dev, generator=gen)[:k].int()
                 ids.copy_(selected.expand(rows, k))
             else:
@@ -259,10 +332,8 @@ def main() -> None:
         programs, outs, scratches, runs, fns, graphs, correctness_by_route = {}, {}, {}, {}, {}, {}, {}
         cached_ref = {}
         for route_name in routes:
-            program = compile_fp8_moe_aot(g, route=route_name, max_rows=rows, wire=wire_in, prefill=args.prefill)
+            program, scratch = compiled_case(g, args, rows, route_name, compiled)
             out = torch.empty(rows, h, dtype=torch.bfloat16, device=dev)
-            scratch = torch.empty(fp8_moe_scratch_bytes(g, route_name, rows, wire_in, args.prefill), dtype=torch.uint8,
-                                  device=dev)
 
             def make_run(prog, out_buf, scratch_buf):
                 def _run():
@@ -345,7 +416,9 @@ def main() -> None:
             run = runs[route_name]
             record = {"geometry": g.name, "tp": g.tp, "input": args.input, "arithmetic": g.activations,
                       "activation": g.activation, "projection": g.projection, "weight_format": g.weights,
-                      "route": route_name, "routing": args.routing, "graph": args.graph, "rows": rows,
+                      "route": route_name, "routing": "recorded" if waves else args.routing, "graph": args.graph, "rows": rows,
+                      "capacity": args.capacity if args.capacity is not None else rows,
+                      "route_fixture": route_fixture, "us_per_row": us / rows,
                       "us": us, "samples_us": samples, "scratch_bytes": scratch.numel(),
                       "experts": experts, "gbps": experts * per_expert / us / 1e3,
                       "tflops": rows * k * 3 * 2 * i * h / us / 1e6, "correctness": correctness_by_route[route_name]}
@@ -372,6 +445,8 @@ def main() -> None:
                   " ".join(f"{key}={value}" for key, value in record.items() if key not in ("samples_us", "kernels")),
                   flush=True)
         del graphs, fns, runs, programs, outs, scratches
+        if args.capacity is None:
+            compiled.clear()
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         props = torch.cuda.get_device_properties(0)
