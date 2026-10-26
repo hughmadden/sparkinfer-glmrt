@@ -161,6 +161,8 @@ def parse_args(argv=None):
     parser.add_argument("--route", default="auto")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--compare-routes-exact", action="store_true",
+                        help="compare every route's raw output bytes against the first route outside timing")
     parser.add_argument("--prefill", choices=("auto", "w8a8", "w8a16"), default="auto")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--input", choices=("wire", "bf16"), default="wire")
@@ -190,7 +192,35 @@ def parse_args(argv=None):
         parser.error("--capacity/--routes are timing options, not --exact-sweep options")
     if not args.route or len(set(args.route.split(","))) != len(args.route.split(",")) or "" in args.route.split(","):
         parser.error("routes must be nonempty and unique")
+    if args.compare_routes_exact and (args.exact_sweep or len(args.route.split(",")) < 2):
+        parser.error("--compare-routes-exact requires at least two timing routes and no --exact-sweep")
     return args
+
+
+def compare_route_outputs(outputs):
+    """Compare immutable snapshots after running every route on identical inputs."""
+    reference_name = next(iter(outputs))
+    reference = outputs[reference_name].detach().contiguous().cpu()
+    reference_bytes = reference.view(torch.uint8)
+    comparisons = {}
+    for name, output in outputs.items():
+        actual = output.detach().contiguous().cpu()
+        if actual.shape != reference.shape or actual.dtype != reference.dtype:
+            raise ValueError("route outputs must have identical shapes and dtypes")
+        actual_bytes = actual.view(torch.uint8)
+        exact = torch.equal(reference_bytes, actual_bytes)
+        mismatch = None
+        if not exact:
+            location = (reference_bytes != actual_bytes).nonzero()[0].tolist()
+            element = list(location)
+            element[-1] //= reference.element_size()
+            mismatch = dict(byte_index=location, element_index=element,
+                            reference_byte=int(reference_bytes[tuple(location)]),
+                            actual_byte=int(actual_bytes[tuple(location)]))
+        comparisons[name] = dict(reference_route=reference_name, bitwise_equal=exact,
+                                 first_mismatch=mismatch,
+                                 max_abs_diff=float((actual.float() - reference.float()).abs().max()))
+    return comparisons
 
 
 def recorded_waves(path, g):
@@ -406,6 +436,14 @@ def main() -> None:
             runs[route_name], fns[route_name], graphs[route_name] = run, fn, graph
             correctness_by_route[route_name] = correctness
 
+        comparisons = None
+        if args.compare_routes_exact:
+            prepare(0)
+            for fn in fns.values():
+                fn()
+            torch.cuda.synchronize()
+            comparisons = compare_route_outputs(outs)
+
         unique.clear()
         samples_by_route = time_interleaved_samples(fns, args.iters, flush, prepare)
         experts = statistics.mean(unique)
@@ -422,6 +460,8 @@ def main() -> None:
                       "us": us, "samples_us": samples, "scratch_bytes": scratch.numel(),
                       "experts": experts, "gbps": experts * per_expert / us / 1e3,
                       "tflops": rows * k * 3 * 2 * i * h / us / 1e6, "correctness": correctness_by_route[route_name]}
+            if comparisons is not None:
+                record["route_comparison"] = comparisons[route_name]
             if args.profile_dir:
                 args.profile_dir.mkdir(parents=True, exist_ok=True)
                 flush.max()

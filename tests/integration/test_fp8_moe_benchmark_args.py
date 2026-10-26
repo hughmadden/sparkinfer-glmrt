@@ -30,6 +30,8 @@ def test_capacity_is_independent_of_live_rows():
     ["--capacity", "4096", "--exact-sweep", "out"],
     ["--routes", "routes.json", "--exact-sweep", "out"],
     ["--route", "auto,auto"], ["--route", "auto,"],
+    ["--compare-routes-exact"],
+    ["--compare-routes-exact", "--route", "decode,auto", "--exact-sweep", "out"],
 ])
 def test_invalid_cases_fail_before_cuda(argv):
     with pytest.raises(SystemExit):
@@ -61,6 +63,32 @@ def test_fixed_capacity_reuses_compiled_callable_and_workspace(monkeypatch):
     args.capacity = None
     bench.compiled_case(None, args, 2048, "auto", cache)
     assert calls[-2][1]["max_rows"] == 2048
+
+
+def test_exact_comparison_reports_raw_bytes_and_first_element():
+    reference = torch.tensor([[1., 2.], [3., 4.]], dtype=torch.bfloat16)
+    changed = reference.clone()
+    changed[1, 0] = 3.5
+    result = bench.compare_route_outputs(dict(decode=reference, auto=reference.clone(), prefill=changed))
+    assert result["auto"] == dict(reference_route="decode", bitwise_equal=True,
+                                  first_mismatch=None, max_abs_diff=0.)
+    assert not result["prefill"]["bitwise_equal"]
+    assert result["prefill"]["first_mismatch"]["element_index"] == [1, 0]
+    assert result["prefill"]["max_abs_diff"] == .5
+    assert bench.parse_args(["--compare-routes-exact", "--route", "decode,auto"]).compare_routes_exact
+
+
+def test_exact_comparison_distinguishes_signed_zero():
+    result = bench.compare_route_outputs(dict(a=torch.tensor([[0.]], dtype=torch.bfloat16),
+                                             b=torch.tensor([[-0.]], dtype=torch.bfloat16)))
+    assert not result["b"]["bitwise_equal"]
+    assert result["b"]["max_abs_diff"] == 0.
+
+
+@pytest.mark.parametrize("actual", [torch.ones(1, 3), torch.ones(2, 2, dtype=torch.bfloat16)])
+def test_exact_comparison_rejects_output_contract_mismatch(actual):
+    with pytest.raises(ValueError, match="shapes and dtypes"):
+        bench.compare_route_outputs(dict(a=torch.ones(2, 2), b=actual))
 
 
 def fixture(tmp_path, **updates):
