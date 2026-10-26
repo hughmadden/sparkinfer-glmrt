@@ -24,6 +24,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
 
 
+def runtime_l2_bytes(cap_mib=None):
+    """Query this CUDA device; a benchmark cap may only reduce its L2 budget."""
+    from cuda.bindings import driver as cuda
+    if cap_mib is not None and (not 0 < cap_mib < float("inf") or int(cap_mib * 2**20) < 1):
+        raise ValueError("--l2-cap-mib must be finite and positive")
+    status, device = cuda.cuDeviceGet(torch.cuda.current_device())
+    if status != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuDeviceGet failed: {status}")
+    status, queried = cuda.cuDeviceGetAttribute(
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, device)
+    if status != cuda.CUresult.CUDA_SUCCESS or not 0 < queried <= 2**31 - 1:
+        raise RuntimeError(f"cuDeviceGetAttribute(L2CacheSize) failed: {status}, {queried}")
+    return queried if cap_mib is None else min(queried, int(cap_mib * 2**20))
+
+
+def launch_scalars(program, rows, cta_limit, unit_limit, l2_bytes):
+    values = dict(rows=rows, cta_limit=cta_limit, unit_limit=unit_limit, l2_bytes=l2_bytes)
+    return tuple(values[scalar.name] for scalar in program.scalars)
+
+
 def compact_unit_descriptors(bits):
     host = bits.detach().cpu()
     active = host != 0
@@ -266,6 +286,7 @@ def audit_compile(label, group_rows, knobs, capacity, decode, reference=None):
             reference_type, identity = reference
             if not grouped or knobs:
                 raise ValueError("frozen reference requires an unmodified grouped arm")
+            wrapper.runtime_l2 = False
             wrapper.core = reference_type(6144, 16, 8, capacity, group_rows,
                                           fc2_f32=decode)
             arm_source = (identity,)
@@ -349,9 +370,11 @@ def audit_main(args):
     route_path = (Path(__file__).resolve().parent / "fixtures/glm53_prefill_routes_realistic.json"
                   if args.routes in (None, "realistic") else Path(args.routes))
     props = torch.cuda.get_device_properties(0)
+    l2_bytes = runtime_l2_bytes(args.l2_cap_mib)
     report = dict(manifest=str(manifest_path), manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
                   routes=str(route_path), routes_sha256=hashlib.sha256(route_path.read_bytes()).hexdigest(),
                   gpu=str(props), rank=args.rank, seed=args.seed,
+                  l2_bytes=l2_bytes, l2_cap_mib=args.l2_cap_mib,
                   reference_core=reference_core[1] if reference_core else None,
                   payload="independent random trellis bytes, real manifest tiers and global expert IDs",
                   timing=dict(warmup=args.warmup, rounds=args.repeats, replays=args.iters), cases=[])
@@ -395,7 +418,7 @@ def audit_main(args):
                 limit = args.cta_limit or props.multi_processor_count * int(program.geometry["ctas_per_sm"])
                 extra = compact[:2] if any(o.name == "unit_count" for o in program.operands) else ()
                 def launch(live=rows, program=program, state=state, extra=extra, limit=limit):
-                    scalars = (live, limit, 8) if extra else (live, limit)
+                    scalars = launch_scalars(program, live, limit, 8, l2_bytes)
                     program.launch(activation, pointers, bits, state["group_expert"], state["route_slots"],
                         state["inverse"], weights, state["fc1"], state["intermediate"], state["fc2"],
                         signs, state["output"], state["count"], *extra, scalars=scalars)
@@ -482,6 +505,7 @@ def main():
     ap.add_argument("--repeats", type=int, default=None)
     ap.add_argument("--seed", type=int, default=408)
     ap.add_argument("--cta-limit", type=int, default=0)
+    ap.add_argument("--l2-cap-mib", type=float, help="cap the queried runtime L2 budget (MiB)")
     ap.add_argument("--dump", default=None, help="save the output rows here for a bitwise arm comparison")
     ap.add_argument("--audit", action="store_true", help="graph-first real-manifest TP2 existing-kernel audit")
     ap.add_argument("--manifest", help="actual EXLR8 width manifest, never synthetic cyclic tiers")
@@ -503,6 +527,7 @@ def main():
     row_list = [int(r) for r in str(args.rows).split(",")]
     cta_limit = args.cta_limit or 2 * torch.cuda.get_device_properties(0).multi_processor_count
     props = torch.cuda.get_device_properties(0)
+    l2_bytes = runtime_l2_bytes(args.l2_cap_mib)
 
     if args.activations in ("both", "all"):
         if args.activations == "both":
@@ -524,7 +549,7 @@ def main():
                 prog.launch(activation, pointers, bits, state["group_expert"], state["route_slots"],
                             state["inverse"], weights, state["fc1"], state["intermediate"], state["fc2"],
                             signs[1], state["output"], state["count"], count, mapping,
-                            scalars=(rows, cta_limit, unit_limit))
+                            scalars=launch_scalars(prog, rows, cta_limit, unit_limit, l2_bytes))
                 torch.cuda.synchronize()
                 outputs[label] = state["output"].clone().float()
             samples = {label: [] for label, _, _ in arm_specs}
@@ -539,7 +564,7 @@ def main():
                     prog.launch(activation, pointers, bits, state["group_expert"], state["route_slots"],
                                 state["inverse"], weights, state["fc1"], state["intermediate"], state["fc2"],
                                 signs[1], state["output"], state["count"], count, mapping,
-                                scalars=(rows, cta_limit, unit_limit))
+                                scalars=launch_scalars(prog, rows, cta_limit, unit_limit, l2_bytes))
                     stop.record()
                     stop.synchronize()
                     samples[label].append(start.elapsed_time(stop))
@@ -548,7 +573,7 @@ def main():
             ref_norm = float(torch.linalg.vector_norm(ref).clamp_min(1e-30))
             print(f"{props.name} sm{props.major}{props.minor} sms={props.multi_processor_count} "
                   f"rows={rows} active_groups={state['active_groups']} capacity={capacity} "
-                  f"routes={'realistic' if wave else 'uniform'} group_rows={args.group_rows} cta_limit={cta_limit}")
+                  f"routes={'realistic' if wave else 'uniform'} group_rows={args.group_rows} cta_limit={cta_limit} l2_bytes={l2_bytes}")
             for label in labels:
                 diff = outputs[label] - ref
                 rel_l2 = float(torch.linalg.vector_norm(diff) / ref_norm)
@@ -577,7 +602,7 @@ def main():
         k1.launch(activation, pointers, bits, state["group_expert"], state["route_slots"],
                   state["inverse"], weights, state["fc1"], state["intermediate"], state["fc2"],
                   signs[1], state["output"], state["count"], count, mapping,
-                  scalars=(rows, cta_limit, unit_limit))
+                  scalars=launch_scalars(k1, rows, cta_limit, unit_limit, l2_bytes))
 
     ms = timeit(run, args.warmup, args.iters)
     if args.dump:
@@ -588,7 +613,7 @@ def main():
     print(f"{props.name} sm{props.major}{props.minor} sms={props.multi_processor_count} "
           f"groups={state['active_groups']}/{capacity} rows={rows} hidden={args.hidden} units={args.units} "
           f"top_k={args.top_k} group_rows={args.group_rows} activations={args.activations} "
-          f"quantize_pass={args.quantize_pass} cta_limit={cta_limit}")
+          f"quantize_pass={args.quantize_pass} cta_limit={cta_limit} l2_bytes={l2_bytes}")
     print(f"ms {ms:.4f}  TFLOP/s {tf:.1f}  ({100 * tf / 508.7:.1f}% of the 508.7 F16/F32 ceiling)")
     print(f"fc1 {state['fc1'].numel() * 4 / 2**30:.2f} GiB  fc2 {state['fc2'].numel() * 4 / 2**30:.2f} GiB "
           f"inter {state['intermediate'].numel() * 2 / 2**20:.0f} MiB")

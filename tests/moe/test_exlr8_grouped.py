@@ -121,6 +121,9 @@ def reference_a8_grouped(case, activation_f16, ids, weights):
 def compute(k1, state, weights, pointers, bits, signs, rows, limit):
     extra = state["compact"][:2] if compact_program(k1) else ()
     scalars = (rows, limit, state["compact"][2]) if extra else (rows, limit)
+    if any(s.name == "l2_bytes" for s in k1.scalars):
+        from benchmarks.bench_exlr8_grouped_prefill import runtime_l2_bytes
+        scalars += (runtime_l2_bytes(),)
     k1.launch(state["activation"], pointers, bits, state["group_expert"], state["route_slots"],
               state["inverse"], weights, state["fc1"], state["intermediate"], state["fc2"],
               signs[1], state["output"], state["count"], *extra, scalars=scalars)
