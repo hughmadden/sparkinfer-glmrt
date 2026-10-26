@@ -33,6 +33,7 @@ def arguments(argv=None):
     parser.add_argument("--samples", type=int, default=6)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20261026)
+    parser.add_argument("--source-commit", help="host revision when worktree Git metadata is not mounted")
     parser.add_argument("--json-output", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
@@ -46,6 +47,14 @@ def arguments(argv=None):
     except ValueError as error:
         parser.error(str(error))
     return args
+
+
+def source_commit(override=None):
+    if override is not None:
+        if not re.fullmatch(r"[0-9a-f]{40}", override):
+            raise ValueError("--source-commit requires a full Git revision")
+        return override
+    return subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
 
 
 def verified_core(spec):
@@ -116,6 +125,7 @@ def engine_program(args, core=None):
 def main():
     args = arguments()
     geometry = checkpoint_geometry(args.checkpoint_config)
+    commit = source_commit(args.source_commit)
     core = verified_core(args.reference_core)
     from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference, unpack_mla_kv_cache_reference
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
@@ -127,7 +137,7 @@ def main():
     programs = dict(current=reference, current_control=reference, candidate=candidate)
     props = torch.cuda.get_device_properties(0)
     report = dict(command=shlex.join(sys.argv),
-        commit=subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip(),
+        commit=commit, commit_supplied_by_host=args.source_commit is not None,
         worktree=str(ROOT), source_sha256=source_hashes(),
         reference_blob=core[2], reference_sha256=ref_hash, candidate_sha256=cand_hash,
         geometry=geometry, export=f"kimik3_dense_mla_extend_h96_fp8_m{args.capacity}",

@@ -19,6 +19,15 @@ def base():
             "--json-output", "result.json"]
 
 
+def test_host_revision_does_not_require_container_git(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise AssertionError("Git metadata is not mounted")
+    monkeypatch.setattr(bench.subprocess, "check_output", unavailable)
+    assert bench.source_commit("a" * 40) == "a" * 40
+    with pytest.raises(ValueError, match="full Git revision"):
+        bench.source_commit("short")
+
+
 def test_defaults_are_real_fixed_capacity():
     args = bench.arguments(base())
     assert args.capacity == 4096
