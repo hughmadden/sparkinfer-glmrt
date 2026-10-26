@@ -575,6 +575,9 @@ def resolve_fc2_slice_geometry(
         slice_shift = 1
     else:
         slice_shift = 0
+    # Minimum slices cannot retain the live intermediate; avoid launch churn.
+    if slice_shift == 0 and block_fc2_bytes * 2 + inter_bytes > l2_budget:
+        return 0, blocks
     return slice_shift, slice_blocks_for_shift(slice_shift, blocks=blocks)
 
 
@@ -886,8 +889,8 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 128
-    A8_CODE_VERSION = 128
+    CODE_VERSION = 129
+    A8_CODE_VERSION = 129
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
@@ -1173,6 +1176,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                           else (Int32(3) << slice_shift))
                 )
                 slice_blocks = max(Int32(2), slice_blocks)
+                if (slice_shift == Int32(0)
+                        and block_fc2_bytes * Int32(2) + inter_bytes > l2_budget):
+                    slice_blocks = Int32(self.blocks)
                 if (slice_shift >= Int32(0) and slice_shift <= Int32(4)
                         and (Int32(48) % slice_blocks) == Int32(0)
                         and fc2_cta_limit > Int32(0)):

@@ -82,8 +82,12 @@ def test_fc1_ws_register_budget_within_ctapool():
         (1024, 340, 8, 96, 3, 24),
         (2752, 340, 8, 96, 1, 6),
         (4096, 340, 8, 96, 1, 6),
-        # Tight L2 / 32 MiB cap triggers the minimum 2-block (slice_shift=0) fallback
-        (4096, 376, 8, 32, 0, 2),
+        # Minimum slices cannot retain the live intermediate in a tight L2.
+        (4096, 376, 8, 32, 0, 48),
+        # GB10: retain the winning six-block schedule, avoid 24 minimum slices.
+        (1024, 96, 8, 24, 1, 6),
+        (2752, 96, 8, 24, 0, 48),
+        (4096, 96, 8, 24, 0, 48),
     ],
 )
 def test_resolved_l2_slice_geometries(
@@ -112,6 +116,27 @@ def test_resolved_l2_slice_geometries(
         max_groups=512,
         ctas_per_sm=2,
     )
+
+
+@pytest.mark.parametrize(
+    "cta_limit,l2_mib,segments",
+    [
+        (376, 128, [(285, 1, 6), (1664, 3, 24), (2662, 2, 12),
+                    (3803, 1, 6), (4095, 0, 2), (4096, 2, 12)]),
+        (376, 96, [(285, 1, 6), (1216, 3, 24), (1945, 2, 12),
+                   (2779, 1, 6), (2943, 0, 2), (3072, 2, 12), (4096, 1, 6)]),
+        (340, 96, [(258, 1, 6), (1216, 3, 24), (1945, 2, 12),
+                   (2779, 1, 6), (2943, 0, 2), (3072, 2, 12), (4096, 1, 6)]),
+    ],
+)
+def test_rtx_every_row_preserves_duel_winner_geometry(cta_limit, l2_mib, segments):
+    # Frozen ff602159 selector boundaries, including its narrow two-block bands.
+    start = 1
+    for end, shift, blocks in segments:
+        for rows in range(start, end + 1):
+            assert resolve_fc2_slice_geometry(rows, cta_limit, 8, l2_mib * 1024**2) == (shift, blocks)
+        start = end + 1
+    assert start == 4097
 
 
 @pytest.mark.parametrize(
