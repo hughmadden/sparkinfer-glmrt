@@ -50,8 +50,8 @@ from .mixed_trellis_ws import (
 # streams the tile's K128 blocks through an mbarrier ring.
 _FC1_CONSUMER_THREADS = 256
 _FC1_PRODUCER_THREADS = 128
-_FC1_PRODUCER_REGS = 48
-_FC1_CONSUMER_REGS = 232
+_FC1_PRODUCER_REGS = 56
+_FC1_CONSUMER_REGS = 224
 _FC1_TILE_STAGES = 4
 _FC1_HEADER_WORDS = 8
 from .exlr8 import Exlr8A16Kernel, _e4m3_round_half2, _side_value, signed_byte, store_bf16x4
@@ -1873,6 +1873,64 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         st_global_v2_f32(row_addr + Int64(96), g30 + total[idx, 1, 4 + 2 * v], g31 + total[idx, 1, 4 + 2 * v + 1])
 
     @cute.jit
+    def fc1_ws_fold_tail4(self, total: cute.Tensor, fc1_addr: Int64, hdr: Int32,
+                          lane: Int32, cw: Int32, split: Int32):
+        hdr_s = bind_loop_i32(hdr, split)
+        v_hi = ld_shared_i32_relaxed(hdr_s + Int32(12))
+        task = ld_shared_i32_relaxed(hdr_s + Int32(16))
+        proj = cw >> Int32(2)
+        col = (cw & Int32(3)) * Int32(32) + (lane & Int32(3)) * Int32(2)
+        out_base = fc1_addr + (
+            (task * Int32(2) + proj).to(Int64) * Int64(self.group_rows * 128)
+            + col.to(Int64)) * Int64(4)
+        r_lane = lane >> Int32(2)
+        for v in cutlass.range_constexpr(2):
+            bit = Int32(16 + v * 8) + r_lane
+            if ((v_hi >> bit) & Int32(1)) != Int32(0):
+                local = Int32(32) + bit
+                row_addr = out_base + local.to(Int64) * Int64(128 * 4)
+                if split == Int32(0):
+                    for j in cutlass.range_constexpr(2):
+                        for h in cutlass.range_constexpr(2):
+                            addr = row_addr + Int64(64 * j + 32 * h)
+                            e0 = total[3, j, 4 * h + 2 * v]
+                            e1 = total[3, j, 4 * h + 2 * v + 1]
+                            st_global_v2_f32(addr, Float32(0.0) + e0, Float32(0.0) + e1)
+                else:
+                    g00, g01 = ld_global_v2_f32(row_addr)
+                    g10, g11 = ld_global_v2_f32(row_addr + Int64(32))
+                    g20, g21 = ld_global_v2_f32(row_addr + Int64(64))
+                    g30, g31 = ld_global_v2_f32(row_addr + Int64(96))
+                    st_global_v2_f32(row_addr, g00 + total[3, 0, 2 * v], g01 + total[3, 0, 2 * v + 1])
+                    st_global_v2_f32(row_addr + Int64(32), g10 + total[3, 0, 4 + 2 * v], g11 + total[3, 0, 4 + 2 * v + 1])
+                    st_global_v2_f32(row_addr + Int64(64), g20 + total[3, 1, 2 * v], g21 + total[3, 1, 2 * v + 1])
+                    st_global_v2_f32(row_addr + Int64(96), g30 + total[3, 1, 4 + 2 * v], g31 + total[3, 1, 4 + 2 * v + 1])
+
+    @cute.jit
+    def fc1_ws_store_head4(self, grand012: cute.Tensor, fc1_addr: Int64, hdr: Int32,
+                           lane: Int32, cw: Int32):
+        v_lo = ld_shared_i32_relaxed(hdr + Int32(8))
+        v_hi = ld_shared_i32_relaxed(hdr + Int32(12))
+        task = ld_shared_i32_relaxed(hdr + Int32(16))
+        proj = cw >> Int32(2)
+        col = (cw & Int32(3)) * Int32(32) + (lane & Int32(3)) * Int32(2)
+        out_base = fc1_addr + (
+            (task * Int32(2) + proj).to(Int64) * Int64(self.group_rows * 128)
+            + col.to(Int64)) * Int64(4)
+        r_lane = lane >> Int32(2)
+        for idx in cutlass.range_constexpr(3):
+            for v in cutlass.range_constexpr(2):
+                local = Int32(idx * 16 + v * 8) + r_lane
+                word = v_lo if cutlass.const_expr(idx < 2) else v_hi
+                bit = local if cutlass.const_expr(idx < 2) else (Int32(v * 8) + r_lane)
+                if ((word >> bit) & Int32(1)) != Int32(0):
+                    row_addr = out_base + local.to(Int64) * Int64(128 * 4)
+                    for j in cutlass.range_constexpr(2):
+                        for h in cutlass.range_constexpr(2):
+                            addr = row_addr + Int64(64 * j + 32 * h)
+                            st_global_v2_f32(addr, grand012[idx, j, 4 * h + 2 * v], grand012[idx, j, 4 * h + 2 * v + 1])
+
+    @cute.jit
     def fc1_ws_tile(self, ring: Int32, hdr: Int32, seq: Int32,
                     lane: Int32, cw: Int32, fc1_addr: Int64, width: cutlass.Constexpr,
                     active: cutlass.Constexpr):
@@ -1883,7 +1941,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         proj = cw >> Int32(2)
         n16_0 = (cw & Int32(3)) * Int32(2)
         scale_base = hdr + Int32(4 * _FC1_HEADER_WORDS) + proj * Int32(4 * self.blocks)
-        if cutlass.const_expr((active <= 3 if self.a8 else active <= 4) and width != 0):
+        if cutlass.const_expr(active <= 3 and width != 0):
             grand = cute.make_rmem_tensor((active, 2, 8), Float32)
             grand.fill(Float32(0.0))
             for split in cutlass.range(self.splits):
@@ -1904,6 +1962,28 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         for v in cutlass.range_constexpr(8):
                             grand[idx, j, v] = grand[idx, j, v] + total[idx, j, v]
             self.fc1_ws_fold(grand, fc1_addr, hdr, lane, cw, Int32(0), active)
+        elif cutlass.const_expr(active == 4 and width != 0 and not self.a8):
+            grand012 = cute.make_rmem_tensor((3, 2, 8), Float32)
+            grand012.fill(Float32(0.0))
+            for split in cutlass.range(self.splits):
+                total.fill(Float32(0.0))
+                for block in cutlass.range(8):
+                    kb = split * Int32(8) + block
+                    if kb < Int32(self.blocks):
+                        slot = seq % Int32(stages)
+                        _mbar_wait(bar_full + slot * Int32(8), (seq // Int32(stages)) & Int32(1))
+                        stage = ring + slot * Int32(self.fc1_stage_bytes)
+                        self.fc1_ws_block(total, stage,
+                                          stage + Int32(self.fc1_a_bytes) + proj * Int32(8192),
+                                          lane, n16_0, width, scale_base + kb * Int32(4), 4)
+                        _mbar_arrive(bar_empty + slot * Int32(8))
+                        seq += Int32(1)
+                for idx in cutlass.range_constexpr(3):
+                    for j in cutlass.range_constexpr(2):
+                        for v in cutlass.range_constexpr(8):
+                            grand012[idx, j, v] = grand012[idx, j, v] + total[idx, j, v]
+                self.fc1_ws_fold_tail4(total, fc1_addr, hdr, lane, cw, split)
+            self.fc1_ws_store_head4(grand012, fc1_addr, hdr, lane, cw)
         else:
             for split in cutlass.range(self.splits):
                 if cutlass.const_expr(width != 0):
