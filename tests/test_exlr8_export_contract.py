@@ -98,7 +98,7 @@ def test_expert_program_abi(contract, name):
     grouped = "grouped" in name
     expected = POINTERS + (("unit_count", "unit_map") if grouped else ())
     assert tuple(o.name for o in program.operands) == expected
-    assert tuple(s.name for s in program.scalars) == (("rows", "cta_limit", "unit_limit") if grouped
+    assert tuple(s.name for s in program.scalars) == (("rows", "cta_limit", "unit_limit", "l2_bytes") if grouped
                                                    else ("rows", "cta_limit"))
     assert program.geometry["abi_version"] == 3
     assert program.geometry["ctas_per_sm"] == (2 if grouped else 4)
@@ -160,3 +160,36 @@ def test_export_builders_have_no_device_geometry_inputs(contract):
         assert not {"sms", "sm_count", "physical_sms", "l2_bytes"} & program.geometry.keys(), name
         assert "cta_limit" in {s.name for s in program.scalars}
         assert 170 not in program.key and 188 not in program.key
+
+
+def test_grouped_wrapper_forwards_l2_only_to_runtime_core():
+    import __future__
+    tree = ast.parse((INTEGRATION / "exlr8.py").read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Exlr8GroupedServingPointers")
+    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__call__"]
+    calls = []
+    scope = dict(cutlass=SimpleNamespace(const_expr=lambda v: v), cute=SimpleNamespace(
+        jit=lambda f: f, make_tensor=lambda pointer, layout: pointer,
+        make_layout=lambda *a, **kw: None))
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), "wrapper", "exec",
+                 flags=__future__.annotations.compiler_flag), scope)
+    wrapper = scope[cls.name]()
+    wrapper.core = SimpleNamespace(serving=lambda *args: calls.append(args))
+    pointers = tuple(range(15))
+    for runtime in (True, False):
+        wrapper.runtime_l2 = runtime
+        wrapper(*pointers, 17, 376, 8, 96 * 2**20, "stream")
+    assert calls[0] == pointers[:12] + (17,) + pointers[12:] + (376, 8, 96 * 2**20, "stream")
+    assert calls[1] == pointers[:12] + (17,) + pointers[12:] + (376, 8, "stream")
+
+
+def test_grouped_l2_scalar_is_runtime_only(contract):
+    for name in ("a16_grouped", "a8_grouped", "a16_grouped64"):
+        program = programs(contract, "coordinator")[name]
+        assert program.scalars[-1].name == "l2_bytes"
+        assert "runtime_l2_v1" in program.key
+        assert "l2_bytes" not in program.geometry
+    kernel = ast.parse((ROOT / "b12x/moe/_shared/kernels/w4a16/exlr8_grouped.py").read_text())
+    core = next(n for n in kernel.body if isinstance(n, ast.ClassDef) and n.name == "Exlr8GroupedKernel")
+    serving = next(n for n in core.body if isinstance(n, ast.FunctionDef) and n.name == "serving")
+    assert tuple(a.arg for a in serving.args.args[-4:]) == ("cta_limit", "unit_limit", "l2_bytes", "stream")

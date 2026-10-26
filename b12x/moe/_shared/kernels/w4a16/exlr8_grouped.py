@@ -692,7 +692,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 signs_out: cute.Tensor, output: cute.Tensor, rows: Int32,
                 group_count: cute.Tensor, unit_count: cute.Tensor,
                 unit_map: cute.Tensor, cta_limit: Int32, unit_limit: Int32,
-                stream: cuda.CUstream):
+                l2_bytes: Int32, stream: cuda.CUstream):
         if (rows > Int32(0) and rows <= Int32(4096) and cta_limit > Int32(0)
                 and unit_limit > Int32(0)):
             if cutlass.const_expr(self.quantize_pass):
