@@ -554,14 +554,14 @@ def resolve_fc2_slice_geometry(
     fc2_cta_limit = max(1, cta_limit // int(ctas_per_sm))
     elem_bytes = 2 if fc2_half else 4
     block_fc2_bytes = rows * (top_k * 128 * elem_bytes)
-    inter_bytes = rows * unit_limit * (top_k * 256)
+    inter_bytes = (rows * top_k + 128 * int(group_rows)) * unit_limit * 256
     wave_inter_bytes = (fc2_cta_limit >> 1) * unit_limit * (int(group_rows) * 256)
     l2_budget = (l2_bytes >> 3) * 7
     full_slice_budget = l2_budget - inter_bytes
     wave_slice_budget = min((l2_bytes >> 2) * 3, l2_budget - wave_inter_bytes)
     slice_budget = (
         full_slice_budget
-        if (inter_bytes < (l2_bytes >> 1) or block_fc2_bytes * 12 <= full_slice_budget)
+        if (inter_bytes < (l2_bytes >> 3) * 5 or block_fc2_bytes * 12 <= full_slice_budget)
         else wave_slice_budget
     )
     low_occ = (rows * top_k) <= ((cta_limit + 4) * 6)
@@ -597,12 +597,12 @@ def fc2_ws_slice_task_mapping(
     chunks_per_group = blocks // b_chunk_const
     sliced = slice_blocks < blocks
     two_chunks = (slice_shift == 2) or (slice_shift == 4)
-    slice_chunks = 1 if slice_shift == 0 else (2 if two_chunks else 3)
+    slice_chunks = 1 if slice_shift <= 1 else (2 if two_chunks else 3)
     group_tasks = groups * (slice_chunks if sliced else chunks_per_group)
     use_chunks = group_tasks >= step
     pair_slices = slice_blocks >> 1
     limit_tasks = group_tasks if use_chunks else (groups * pair_slices)
-    b_pairs_sliced = 1 if slice_shift <= 1 else (3 if slice_shift == 2 else 4)
+    b_pairs_sliced = 1 if slice_shift == 0 else (3 if slice_shift <= 2 else 4)
     b_pairs = (b_pairs_sliced if sliced else (b_chunk_const // 2)) if use_chunks else 1
     tasks: list[tuple[int, int]] = []
     for cta in range(step):
@@ -613,6 +613,13 @@ def fc2_ws_slice_task_mapping(
                     if slice_shift == 0:
                         group = task
                         b_local_base = 0
+                    elif slice_shift == 1:
+                        if use_chunks:
+                            group = task
+                            b_local_base = 0
+                        else:
+                            group = task // 3
+                            b_local_base = (task - group * 3) << 1
                     elif two_chunks:
                         if use_chunks:
                             group = task >> 1
@@ -1141,19 +1148,20 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 fc2_cta_limit = max(Int32(1), cta_limit // Int32(self.CTAS_PER_SM))
                 elem_bytes = 2 if self.FC2_HALF else 4
                 block_fc2_bytes = rows * Int32(self.top_k * 128 * elem_bytes)
-                inter_bytes = rows * unit_limit * Int32(self.top_k * 256)
+                inter_bytes = (rows * Int32(self.top_k) + Int32(128 * self.group_rows)) * unit_limit * Int32(256)
                 wave_inter_bytes = (fc2_cta_limit >> Int32(1)) * unit_limit * Int32(self.group_rows * 256)
-                # Keep the FC2 slice partials plus live intermediate within 7/8
-                # (87.5%) of the runtime-queried L2 cache when intermediate is
-                # under half of L2, and otherwise keep the slice partials plus
-                # active-wave intermediate within 7/8 of L2 and slice partials
-                # within 3/4 (75%) of L2.
+                # Keep the FC2 slice partials plus live intermediate (including
+                # 256-expert group tail padding) within 7/8 (87.5%) of the
+                # runtime-queried L2 cache when intermediate is under 5/8 of L2,
+                # and otherwise keep the slice partials plus active-wave
+                # intermediate within 7/8 of L2 and slice partials within 3/4
+                # (75%) of L2.
                 l2_budget = (l2_bytes >> Int32(3)) * Int32(7)
                 full_slice_budget = l2_budget - inter_bytes
                 wave_slice_budget = min((l2_bytes >> Int32(2)) * Int32(3), l2_budget - wave_inter_bytes)
                 slice_budget = (
                     full_slice_budget
-                    if ((inter_bytes < (l2_bytes >> Int32(1))) | (block_fc2_bytes * Int32(12) <= full_slice_budget))
+                    if ((inter_bytes < (l2_bytes >> Int32(3)) * Int32(5)) | (block_fc2_bytes * Int32(12) <= full_slice_budget))
                     else wave_slice_budget
                 )
                 low_occ = rows * Int32(self.top_k) <= (cta_limit + Int32(4)) * Int32(6)
@@ -2644,7 +2652,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         sliced = slice_blocks < Int32(self.blocks)
         two_chunks = (slice_shift == Int32(2)) | (slice_shift == Int32(4))
         slice_chunks = (
-            Int32(1) if slice_shift == Int32(0)
+            Int32(1) if slice_shift <= Int32(1)
             else (Int32(2) if two_chunks else Int32(3))
         )
         group_tasks = groups * (slice_chunks if sliced else Int32(chunks_per_group))
@@ -2652,8 +2660,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         pair_slices = max(Int32(1), slice_blocks >> Int32(1))
         limit_tasks = group_tasks if use_chunks else (groups * pair_slices)
         b_pairs_sliced = (
-            Int32(1) if slice_shift <= Int32(1)
-            else (Int32(3) if slice_shift == Int32(2) else Int32(4))
+            Int32(1) if slice_shift == Int32(0)
+            else (Int32(3) if slice_shift <= Int32(2) else Int32(4))
         )
         b_pairs = (
             (b_pairs_sliced if sliced else Int32(b_chunk_const // 2))
@@ -2671,6 +2679,13 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     if slice_shift == Int32(0):
                         group = task
                         b_local_base = Int32(0)
+                    elif slice_shift == Int32(1):
+                        if use_chunks:
+                            group = task
+                            b_local_base = Int32(0)
+                        else:
+                            group = task // Int32(3)
+                            b_local_base = (task - group * Int32(3)) << Int32(1)
                     elif two_chunks:
                         if use_chunks:
                             group = task >> Int32(1)
