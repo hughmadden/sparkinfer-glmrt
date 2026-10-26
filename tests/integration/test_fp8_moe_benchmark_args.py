@@ -32,6 +32,9 @@ def test_capacity_is_independent_of_live_rows():
     ["--route", "auto,auto"], ["--route", "auto,"],
     ["--compare-routes-exact"],
     ["--continue-on-fail"],
+    ["--check-prefix-rows", "2048"],
+    ["--check", "--check-prefix-rows", "0", "--capacity", "4096"],
+    ["--check", "--check-prefix-rows", "4096", "--capacity", "4096"],
     ["--continue-on-fail", "--check", "--exact-sweep", "out"],
     ["--compare-routes-exact", "--route", "decode,auto", "--exact-sweep", "out"],
 ])
@@ -91,6 +94,25 @@ def test_exact_comparison_distinguishes_signed_zero():
 def test_exact_comparison_rejects_output_contract_mismatch(actual):
     with pytest.raises(ValueError, match="shapes and dtypes"):
         bench.compare_route_outputs(dict(a=torch.ones(2, 2), b=actual))
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_shared_prefix_compares_snapshot_before_scratch_reuse(changed):
+    full = torch.arange(12).reshape(4, 3).to(torch.bfloat16)
+    prefix = full[:3].clone()
+    if changed:
+        prefix[1, 2] += 1
+    def execute(rows):
+        assert rows == 3
+        full.fill_(99)
+        return prefix
+    result = bench.check_shared_prefix(full, 3, execute)
+    assert result["bitwise_equal"] == (not changed)
+    assert result["differing_rows"] == int(changed)
+    assert (result["prefix_sha256"] == result["full_prefix_sha256"]) == (not changed)
+    if changed:
+        assert result["first_mismatch"]["element_index"] == [1, 2]
+    assert bench.parse_args(["--check", "--capacity", "4096", "--check-prefix-rows", "2048"]).check_prefix_rows == 2048
 
 
 def test_oracle_reports_global_rms_and_outlier_location():
