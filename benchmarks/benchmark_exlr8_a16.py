@@ -394,7 +394,8 @@ def compile_grouped_arm(directory, candidate):
     program = _common.compile_program(wrapper, name="exlr8_frozen_grouped",
         operands=tuple(o for o in candidate.operands
                        if compact or o.name not in ("unit_count", "unit_map")),
-        scalars=tuple(v for v in candidate.scalars if compact or v.name != "unit_limit"),
+        scalars=tuple(v for v in candidate.scalars
+                      if v.name != "l2_bytes" and (compact or v.name != "unit_limit")),
         key=(source_key, tuple(sorted(g.items()))), geometry=g, scratch=candidate.scratch)
     # Invoke the frozen factory, which selects its own grouping class.
     compile_program = glue.compile_program
@@ -1239,7 +1240,8 @@ def grouped_main(args):
                                t["signs_out"],state["output"],state["count"],
                                *(compact[:2] if compact_program(program) else ()),
                                scalars=((total,cta_lim,compact[2]) if compact_program(program)
-                                        else (total,cta_lim)))
+                                        else (total,cta_lim))
+                               + ((l2,) if any(s.name == "l2_bytes" for s in program.scalars) else ()))
 
         def candidate_exchange(program=grouped, ingress=group, cta_lim=limit):
             main_stream = torch.cuda.current_stream()
@@ -1261,7 +1263,8 @@ def grouped_main(args):
                                t["signs_out"],state["output"],state["count"],
                                *(compact[:2] if compact_program(program) else ()),
                                scalars=((total,cta_lim,compact[2]) if compact_program(program)
-                                        else (total,cta_lim)))
+                                        else (total,cta_lim))
+                               + ((l2,) if any(s.name == "l2_bytes" for s in program.scalars) else ()))
                 exch_response.copy_(state["output"][:total])
                 main_stream.wait_event(join_events[idx])
 

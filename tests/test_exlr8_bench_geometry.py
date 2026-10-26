@@ -358,3 +358,52 @@ def test_dense_bf16_comparison_argument_plumbing():
     args, = seen
     assert args.rows == "4096" and args.formats == "trellis"
     assert args.shapes == "q_b,o,gate_up,down"
+
+
+@pytest.mark.parametrize("queried,cap,expected", [(128, None, 128), (128, 96, 96), (96, 128, 96)])
+def test_grouped_runtime_l2_query_and_cap(monkeypatch, queried, cap, expected):
+    from types import SimpleNamespace
+    import types
+    calls = []
+    driver = SimpleNamespace(
+        CUresult=SimpleNamespace(CUDA_SUCCESS=0),
+        CUdevice_attribute=SimpleNamespace(CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE=38),
+        cuDeviceGet=lambda ordinal: (0, ordinal + 10),
+        cuDeviceGetAttribute=lambda attr, device: calls.append((attr, device)) or (0, queried * 2**20))
+    module = types.ModuleType("cuda.bindings")
+    module.driver = driver
+    monkeypatch.setitem(sys.modules, "cuda.bindings", module)
+    function = audit_helpers("runtime_l2_bytes", torch=SimpleNamespace(
+        cuda=SimpleNamespace(current_device=lambda: 2)))["runtime_l2_bytes"]
+    assert function(cap) == expected * 2**20
+    assert calls == [(38, 12)]
+    for invalid in (0, -1, float("nan"), float("inf"), 1e-10):
+        with pytest.raises(ValueError, match="finite and positive"):
+            function(invalid)
+    driver.cuDeviceGetAttribute = lambda *a: (1, 0)
+    with pytest.raises(RuntimeError, match="L2CacheSize"):
+        function()
+    driver.cuDeviceGet = lambda *a: (1, 0)
+    with pytest.raises(RuntimeError, match="cuDeviceGet failed"):
+        function()
+
+
+def test_grouped_launch_scalars_preserve_non_grouped_abi():
+    from types import SimpleNamespace
+    launch = audit_helpers("launch_scalars")["launch_scalars"]
+    for names, expected in [(("rows", "cta_limit"), (17, 376)),
+                            (("rows", "cta_limit", "unit_limit"), (17, 376, 8)),
+                            (("rows", "cta_limit", "unit_limit", "l2_bytes"),
+                             (17, 376, 8, 96 * 2**20))]:
+        program = SimpleNamespace(scalars=[SimpleNamespace(name=n) for n in names])
+        assert launch(program, 17, 376, 8, 96 * 2**20) == expected
+
+
+def test_grouped_frozen_audit_disables_l2_forwarding():
+    source = SOURCE.with_name("bench_exlr8_grouped_prefill.py").read_text()
+    tree = ast.parse(source)
+    compile_arm = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "audit_compile")
+    keyed = next(n for n in compile_arm.body if isinstance(n, ast.FunctionDef) and n.name == "keyed")
+    branch = next(n for n in keyed.body if isinstance(n, ast.If))
+    assert "wrapper.runtime_l2 = False" in ast.unparse(branch)
+    assert "wrapper.core = reference_type" in ast.unparse(branch)

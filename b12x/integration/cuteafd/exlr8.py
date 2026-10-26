@@ -122,6 +122,7 @@ class _Exlr8GroupedServingPointers:
 
     def __init__(self, g):
         from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+        self.runtime_l2 = True
         self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
                                        g["max_groups"], g["group_rows"],
                                        activations=g.get("activations", "a16"),
@@ -136,24 +137,44 @@ class _Exlr8GroupedServingPointers:
                  signs_out: cute.Pointer, output: cute.Pointer, group_count: cute.Pointer,
                  unit_count: cute.Pointer, unit_map: cute.Pointer,
                  rows: cutlass.Int32, cta_limit: cutlass.Int32,
-                 unit_limit: cutlass.Int32, stream: cuda.CUstream):
-        self.core.serving(cute.make_tensor(x, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(bits, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(group_expert, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(route_slots, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(route_group_lane, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(route_weights, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(signs_out, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(output, cute.make_layout(1, stride=1)),
-                  rows,
-                  cute.make_tensor(group_count, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(unit_count, cute.make_layout(1, stride=1)),
-                  cute.make_tensor(unit_map, cute.make_layout(1, stride=1)),
-                  cta_limit, unit_limit, stream)
+                 unit_limit: cutlass.Int32, l2_bytes: cutlass.Int32, stream: cuda.CUstream):
+        if cutlass.const_expr(self.runtime_l2):
+            self.core.serving(cute.make_tensor(x, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(bits, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(group_expert, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(route_slots, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(route_group_lane, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(route_weights, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(signs_out, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(output, cute.make_layout(1, stride=1)),
+                      rows,
+                      cute.make_tensor(group_count, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(unit_count, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(unit_map, cute.make_layout(1, stride=1)),
+                      cta_limit, unit_limit, l2_bytes, stream)
+        else:
+            # Archived audit cores retain their original scalar ABI.
+            self.core.serving(cute.make_tensor(x, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(bits, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(group_expert, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(route_slots, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(route_group_lane, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(route_weights, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(signs_out, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(output, cute.make_layout(1, stride=1)),
+                      rows,
+                      cute.make_tensor(group_count, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(unit_count, cute.make_layout(1, stride=1)),
+                      cute.make_tensor(unit_map, cute.make_layout(1, stride=1)),
+                      cta_limit, unit_limit, stream)
 
 
 class _Exlr8CompactServingPointers:
@@ -287,8 +308,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  "exlr8_a16_serving_compact" if compact_units else
                                  "exlr8_shared_a16_serving" if shared_expert else
                                  "exlr8_a16_serving" if device_count else "exlr8_a16_decode"), operands=operands,
-                           scalars=tuple(Scalar(n) for n in (("rows", "cta_limit", "unit_limit")
-                                                            if grouped or compact_units else
+                           scalars=tuple(Scalar(n) for n in (("rows", "cta_limit", "unit_limit", "l2_bytes") if grouped else
+                                                            ("rows", "cta_limit", "unit_limit") if compact_units else
                                                             ("rows", "cta_limit") if device_count
                                                             else ("rows", "groups", "cta_limit"))),
                            key=((h, u, t, m, g["abi_version"], shared_expert, grouped, r,
@@ -296,6 +317,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  # source: bump the tag when decode's weight-load
                                  # cache policy changes.
                                  "decode_l2_fc2_prefetch_v9")
+                                + (("runtime_l2_v1",) if grouped else ())
                                 + (("grouped_compact_units",) if grouped else ())
                                 + (("k1_compact_units",) if compact_units else ())
                                 + ((activations,) if grouped and activations != "a16" else ())

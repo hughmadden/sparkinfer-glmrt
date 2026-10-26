@@ -235,6 +235,8 @@ def grouped_arm(name, group_rows, cta_limit, rows_max, tables, shared, owned,
                                     max_groups=GROUPED_MAX_GROUPS, hidden=HIDDEN,
                                     max_rows=4096, group_rows=group_rows)
     unit_count, unit_map, unit_limit = unit_tables(owned, device)
+    from benchmarks.bench_exlr8_grouped_prefill import runtime_l2_bytes
+    l2_bytes = runtime_l2_bytes()
     buffers = dict(
         group_expert=torch.full((GROUPED_MAX_GROUPS,), -1, dtype=torch.int32, device=device),
         route_slots=torch.full((GROUPED_MAX_GROUPS, group_rows), -1, dtype=torch.int32,
@@ -260,7 +262,7 @@ def grouped_arm(name, group_rows, cta_limit, rows_max, tables, shared, owned,
         launch_program(group, group_values, (rows, cta_limit))
 
     def core_launch(rows):
-        launch_program(core, core_values, (rows, cta_limit, unit_limit))
+        launch_program(core, core_values, (rows, cta_limit, unit_limit, l2_bytes))
 
     notes = dict(kind="grouped", cta_limit=cta_limit, threads=256,
                  min_blocks_per_mp=Exlr8GroupedKernel.CTAS_PER_SM,
