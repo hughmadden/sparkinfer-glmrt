@@ -17,8 +17,6 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from b12x.attention import dense_mla
-
 FP8 = torch.float8_e4m3fn
 
 
@@ -66,6 +64,11 @@ def _arguments() -> argparse.Namespace:
 
 
 def main() -> None:
+    if "--engine-aot" in sys.argv:
+        from dense_mla_audit import main as audit_main
+        audit_main()
+        return
+    from b12x.attention import dense_mla
     args = _arguments()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
