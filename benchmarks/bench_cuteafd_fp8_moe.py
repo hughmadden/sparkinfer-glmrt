@@ -163,6 +163,8 @@ def parse_args(argv=None):
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--continue-on-fail", action="store_true",
                         help="record failed oracle gates and continue; failed timings are ineligible")
+    parser.add_argument("--check-prefix-rows", type=int,
+                        help="compare longer cases with this identical-input prefix under the same export")
     parser.add_argument("--compare-routes-exact", action="store_true",
                         help="compare every route's raw output bytes against the first route outside timing")
     parser.add_argument("--prefill", choices=("auto", "w8a8", "w8a16"), default="auto")
@@ -190,6 +192,9 @@ def parse_args(argv=None):
         parser.error("rows must be positive")
     if args.capacity is not None and (args.capacity < 1 or max(rows) > args.capacity):
         parser.error("capacity must be positive and cover every live row count")
+    if args.check_prefix_rows is not None and (not args.check or args.exact_sweep
+            or args.capacity is None or not 1 <= args.check_prefix_rows < max(rows)):
+        parser.error("--check-prefix-rows requires --check, fixed --capacity, a longer case and no --exact-sweep")
     if args.routes and args.routing != "random":
         parser.error("--routes cannot be combined with --routing hot")
     if args.exact_sweep and (args.capacity is not None or args.routes):
@@ -225,6 +230,20 @@ def compare_route_outputs(outputs):
                                  first_mismatch=mismatch,
                                  max_abs_diff=float((actual.float() - reference.float()).abs().max()))
     return comparisons
+
+
+def check_shared_prefix(full_output, prefix_rows, execute):
+    """Snapshot full output before reusing the same callable and scratch."""
+    full = full_output.detach().clone()
+    prefix = execute(prefix_rows)
+    comparison = compare_route_outputs(dict(full=full[:prefix_rows], prefix=prefix))["prefix"]
+    actual_bytes = prefix.detach().contiguous().cpu().view(torch.uint8)
+    full_bytes = full[:prefix_rows].contiguous().cpu().view(torch.uint8)
+    comparison["rows"] = prefix_rows
+    comparison["differing_rows"] = int((actual_bytes != full_bytes).any(dim=1).sum())
+    comparison["full_prefix_sha256"] = hashlib.sha256(full_bytes.numpy().tobytes()).hexdigest()
+    comparison["prefix_sha256"] = hashlib.sha256(actual_bytes.numpy().tobytes()).hexdigest()
+    return comparison
 
 
 def oracle_metrics(output, reference, *, nvfp4_a4=False):
@@ -472,6 +491,33 @@ def main() -> None:
             torch.cuda.synchronize()
             comparisons = compare_route_outputs(outs)
 
+        prefix_checks = {}
+        if args.check_prefix_rows is not None and rows > args.check_prefix_rows:
+            prepare(0)
+            for route_name in routes:
+                program, scratch = programs[route_name], scratches[route_name]
+                fns[route_name]()
+                torch.cuda.synchronize()
+
+                def execute_prefix(count):
+                    prefix_out = torch.full((count, h), float("nan"), dtype=torch.bfloat16, device=dev)
+                    scratch.fill_(0xA5)
+                    def launch():
+                        program.launch(source[:count], ids[:count], weights[:count], *w,
+                                       prefix_out, scratch, scalars=(count,))
+                    launch()
+                    if args.graph:
+                        prefix_graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(prefix_graph):
+                            launch()
+                        prefix_graph.replay()
+                    torch.cuda.synchronize()
+                    return prefix_out
+
+                prefix_checks[route_name] = check_shared_prefix(outs[route_name], args.check_prefix_rows, execute_prefix)
+                fns[route_name]()
+                torch.cuda.synchronize()
+
         unique.clear()
         samples_by_route = time_interleaved_samples(fns, args.iters, flush, prepare)
         experts = statistics.mean(unique)
@@ -491,6 +537,9 @@ def main() -> None:
                       "timing_eligible": correctness_by_route[route_name].get("passed", False)}
             if comparisons is not None:
                 record["route_comparison"] = comparisons[route_name]
+            if route_name in prefix_checks:
+                record["prefix_comparison"] = prefix_checks[route_name]
+                record["timing_eligible"] &= prefix_checks[route_name]["bitwise_equal"]
             if args.profile_dir:
                 args.profile_dir.mkdir(parents=True, exist_ok=True)
                 flush.max()
