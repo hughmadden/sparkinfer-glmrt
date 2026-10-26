@@ -77,10 +77,10 @@ def test_fc1_ws_register_budget_within_ctapool():
         (4096, 376, 8, 128, 2, 12),
         # 96 MiB L2 cap on RTX PRO 6000 (cta_limit=376) and RTX 5090 (170 SMs -> cta_limit=340)
         (1024, 376, 8, 96, 3, 24),
-        (2752, 376, 8, 96, 0, 2),
+        (2752, 376, 8, 96, 1, 6),
         (4096, 376, 8, 96, 1, 6),
         (1024, 340, 8, 96, 3, 24),
-        (2752, 340, 8, 96, 0, 2),
+        (2752, 340, 8, 96, 1, 6),
         (4096, 340, 8, 96, 1, 6),
         # Tight L2 / 32 MiB cap triggers the minimum 2-block (slice_shift=0) fallback
         (4096, 376, 8, 32, 0, 2),
