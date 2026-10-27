@@ -13,6 +13,7 @@ import torch
 
 from ..conftest import require_b12x
 from .test_cuteafd_fp8_moe_aot import wire_rows
+from b12x.moe._shared.kernels.reference import _apply_gated_activation
 
 COS = 0.9999
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -144,7 +145,11 @@ def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
             (alpha * inscale if a4 else alpha)).bfloat16().to(dtype)
         gate = project(xr, operand(w1, q1), a1[expert], in1[expert])
         up = project(xr, operand(w3, q3), a3[expert], in1[expert])
-        if g.activation == "silu_post_clamp_fp32_product":
+        if g.activation == "swigluoai_uninterleave":
+            # MiniMax: the shared reference contract, one BF16 rounding of the product.
+            act = _apply_gated_activation(gate, up, activation=g.activation, swiglu_limit=limit,
+                                          swiglu_alpha=1.702, swiglu_beta=1.0).float().bfloat16().to(dtype)
+        elif g.activation == "silu_post_clamp_fp32_product":
             silu = torch.nn.functional.silu(gate.float())
             up32 = up.float()
             if limit > 0:
@@ -273,6 +278,11 @@ A4_CASES = [
     ("qwen4_nvfp4a4", 1, 640, 4096, 4096, False, 0, 1.0, "auto"), ("qwen4_nvfp4a4", 3, 224, 2048, 2000, False, 0, 1.0, "stream"),
     ("qwen4_nvfp4a4", 1, 640, 4096, 300, False, 0, 1.0, "auto"),
     ("glmfdense_nvfp4a4", 1, 12288, 4096, 1500, False, 0, 1.0, "auto"),
+    # MiniMax M3.1 Flash (SwiGLU-OAI, 128 experts, top-4): the RTX's own layers and every Spark TP slice;
+    # decode, a clamped input, prefill tails and a full 4096-row unit.
+    ("minimax_nvfp4", 1, 3072, 1, 1, False, 0, 1.0, "auto"), ("minimax_nvfp4", 2, 1536, 256, 17, False, 0, 40.0, "stream"),
+    ("minimax_nvfp4", 3, 1024, 1024, 1000, False, 8, 1.0, "auto"), ("minimax_nvfp4", 4, 768, 4096, 4096, False, 0, 1.0, "stream"),
+    ("minimax_nvfp4", 6, 512, 4096, 2639, False, 0, 1.0, "auto"),
 ]
 
 
