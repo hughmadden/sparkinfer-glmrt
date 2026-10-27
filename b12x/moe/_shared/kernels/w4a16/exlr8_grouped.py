@@ -2971,7 +2971,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             for k in cutlass.range(owned):
                                 slot = sequence % Int32(self.FC2_STAGES)
                                 phase = (sequence // Int32(self.FC2_STAGES)) & Int32(1)
-                                if (not stage_a_now) | (slice_blocks <= Int32(2)):
+                                if (not reuse_a) | (not stage_a_now) | (slice_blocks <= Int32(2)):
                                     _mbar_wait(bar_empty + slot * Int32(8), phase ^ Int32(1))
                                 stage_b = ring + slot * Int32(self.group_rows * 256 + 16384) + Int32(self.group_rows * 256)
                                 if producer < Int32(32):

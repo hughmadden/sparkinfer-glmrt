@@ -53,6 +53,26 @@ reduce_slice_task_mapping = HELPERS["reduce_slice_task_mapping"]
 validate_fc2_slice_geometry = HELPERS["validate_fc2_slice_geometry"]
 
 
+def test_fc2_nonreuse_stages_always_wait_for_empty_slot():
+    kernel = next(node for node in ast.walk(TREE)
+                  if isinstance(node, ast.FunctionDef) and node.name == "grouped_fc2_ws_kernel")
+    waits = [node for node in ast.walk(kernel) if isinstance(node, ast.If)
+             and {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+             >= {"reuse_a", "stage_a_now", "slice_blocks"}]
+    assert len(waits) == 1
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "_mbar_wait" for node in ast.walk(waits[0]))
+    condition = compile(ast.Expression(waits[0].test), str(SOURCE), "eval")
+    for owned in (1, 3, 4, 8, 16):
+        for slice_blocks in (2, 6, 12, 16, 24, 48):
+            reuse_a = owned <= 3 and slice_blocks > 2
+            for pair in range(slice_blocks // 2):
+                stage_a_now = pair == 0 if reuse_a else True
+                wait = eval(condition, {"Int32": int, "reuse_a": reuse_a,
+                                       "stage_a_now": stage_a_now, "slice_blocks": slice_blocks})
+                assert bool(wait) == (not reuse_a or pair > 0)
+
+
 def test_fc1_ws_register_budget_within_ctapool():
     producer_regs = HELPERS["_FC1_PRODUCER_REGS"]
     consumer_regs = HELPERS["_FC1_CONSUMER_REGS"]
