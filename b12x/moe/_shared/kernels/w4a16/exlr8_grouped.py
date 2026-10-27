@@ -2017,9 +2017,38 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 if num_live > Int32(0) and (w0 != Int32(0) or w1 != Int32(0)):
                     pay0 = pointers[d0 * Int64(3)]
                     pay1 = pointers[(d0 + Int64(1)) * Int64(3)]
-                    hslot = ti % Int32(_FC1_TILE_STAGES)
+                    last_reader = Int32(1)
+                    if group > Int32(0):
+                        if group_expert[group - Int32(1)] == expert:
+                            last_reader = Int32(0)
+                    if group + Int32(1) < groups:
+                        if group_expert[group + Int32(1)] == expert:
+                            last_reader = Int32(0)
+                    sc0 = Uint32(0)
+                    if ptid < Int32(2 * self.blocks):
+                        proj_s = Int32(0) if ptid < Int32(self.blocks) else Int32(1)
+                        kb_s = ptid - proj_s * Int32(self.blocks)
+                        wp_s = w0 if proj_s == Int32(0) else w1
+                        if wp_s != Int32(0):
+                            scp = pointers[(d0 + proj_s.to(Int64)) * Int64(3) + Int64(2)]
+                            sc0 = ld_global_b16(scp + kb_s.to(Int64) * Int64(2))
+                    r0 = ptid >> Int32(4)
+                    rr = r0 & Int32(15)
+                    valid_mask = Int32(0)
+                    for i in cutlass.range_constexpr(8):
+                        idx = Int32(i // 2)
+                        tok = Int32(-1)
+                        if idx < num_live:
+                            m = (live >> (idx * Int32(2))) & Int32(3)
+                            src_s = s_hi if m >= Int32(2) else s_lo
+                            sl = cute.arch.shuffle_sync(src_s, (m & Int32(1)) * Int32(16) + rr + Int32(8 * (i & 1)))
+                            if sl >= Int32(0) and sl < max_slot:
+                                tok = sl // Int32(self.top_k)
+                                valid_mask = valid_mask | Int32(1 << i)
+                        token[i] = max(tok, Int32(0))
+                    hslot = (Uint32(ti) % Uint32(_FC1_TILE_STAGES)).to(Int32)
                     _mbar_wait(bar_tempty + hslot * Int32(8),
-                               ((ti // Int32(_FC1_TILE_STAGES)) & Int32(1)) ^ Int32(1))
+                               (((Uint32(ti) // Uint32(_FC1_TILE_STAGES)) & Uint32(1)) ^ Uint32(1)).to(Int32))
                     hdr = hdr_base + hslot * Int32(self.fc1_hdr_bytes)
                     if ptid == Int32(0):
                         st_shared_i32(hdr, num_live)
@@ -2029,7 +2058,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         st_shared_i32(hdr + Int32(16), group * unit_limit + k)
                         st_shared_i32(hdr + Int32(20), w0)
                         st_shared_i32(hdr + Int32(24), w1)
-                    for q in cutlass.range_constexpr((2 * self.blocks + 127) // 128):
+                    if ptid < Int32(2 * self.blocks):
+                        st_shared_i32(hdr + Int32(4 * _FC1_HEADER_WORDS) + ptid * Int32(4), sc0.to(Int32))
+                    for q in cutlass.range_constexpr(1, (2 * self.blocks + 127) // 128):
                         e = ptid + Int32(128 * q)
                         if e < Int32(2 * self.blocks):
                             proj = Int32(0) if e < Int32(self.blocks) else Int32(1)
@@ -2043,30 +2074,13 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     _mbar_arrive(bar_tfull + hslot * Int32(8))
                     ti += Int32(1)
 
-                    for i in cutlass.range_constexpr(8):
-                        r = (ptid >> Int32(4)) + Int32(8 * i)
-                        idx = Int32(i // 2)
-                        rr = r & Int32(15)
-                        tok = Int32(-1)
-                        if idx < num_live:
-                            m = (live >> (idx * Int32(2))) & Int32(3)
-                            src_s = s_hi if m >= Int32(2) else s_lo
-                            sl = cute.arch.shuffle_sync(src_s, (m & Int32(1)) * Int32(16) + rr)
-                            if sl >= Int32(0) and sl < max_slot:
-                                tok = sl // Int32(self.top_k)
-                        token[i] = tok
                     bytes_tx = (w0 + w1) * Int32(2048)
-                    last_reader = Int32(1)
-                    if group > Int32(0):
-                        if group_expert[group - Int32(1)] == expert:
-                            last_reader = Int32(0)
-                    if group + Int32(1) < groups:
-                        if group_expert[group + Int32(1)] == expert:
-                            last_reader = Int32(0)
+                    smem_row0 = bind_loop_i32(r0 * Int32(256) + (c ^ (r0 & Int32(7))) * Int32(16), ti)
+                    x_col_base = x_addr + c.to(Int64) * Int64(16)
                     for kb in cutlass.range(self.blocks):
-                        slot = seq % Int32(stages)
+                        slot = (Uint32(seq) % Uint32(stages)).to(Int32)
                         _mbar_wait(bar_empty + slot * Int32(8),
-                                   ((seq // Int32(stages)) & Int32(1)) ^ Int32(1))
+                                   (((Uint32(seq) // Uint32(stages)) & Uint32(1)) ^ Uint32(1)).to(Int32))
                         stage = ring + slot * Int32(self.fc1_stage_bytes)
                         full = bar_full + slot * Int32(8)
                         if ptid == Int32(0):
@@ -2096,37 +2110,35 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             if c <= Int32(8):
                                 for i in cutlass.range_constexpr(8):
                                     if Int32(i // 2) < num_live:
-                                        r = (ptid >> Int32(4)) + Int32(8 * i)
+                                        r = r0 + Int32(8 * i)
                                         tok = token[i]
-                                        valid = (tok >= Int32(0)).to(Int32)
+                                        valid = (valid_mask >> Int32(i)) & Int32(1)
                                         row_src = x_addr + (
-                                            max(tok, Int32(0)).to(Int64) * Int64(self.blocks)
+                                            tok.to(Int64) * Int64(self.blocks)
                                             + kb.to(Int64)
                                         ) * Int64(256)
                                         self.stage_prequant_a_row_ws(
                                             stage + Int32((i // 2) * 4096), r & Int32(15), c, row_src, valid)
                             _cp_async_mbar_arrive_noinc(full)
                         elif cutlass.const_expr(self.a8):
-                            col_bytes = (kb.to(Int64) * Int64(128) + c.to(Int64) * Int64(8)) * Int64(2)
+                            x_kb = x_col_base + kb.to(Int64) * Int64(256)
                             for i in cutlass.range_constexpr(8):
                                 if Int32(i // 2) < num_live:
-                                    r = (ptid >> Int32(4)) + Int32(8 * i)
+                                    r = r0 + Int32(8 * i)
                                     tok = token[i]
-                                    valid = (tok >= Int32(0)).to(Int32)
-                                    src = x_addr + max(tok, Int32(0)).to(Int64) * Int64(self.hidden_size * 2) + col_bytes
+                                    valid = (valid_mask >> Int32(i)) & Int32(1)
+                                    src = x_kb + tok.to(Int64) * Int64(self.hidden_size * 2)
                                     self.quantize_stage_a_row(
                                         stage + Int32((i // 2) * 4096), r & Int32(15), c, src, valid)
                             _mbar_arrive(full)
                         else:
-                            col_bytes = (kb.to(Int64) * Int64(128) + c.to(Int64) * Int64(8)) * Int64(2)
+                            x_kb = x_col_base + kb.to(Int64) * Int64(256)
+                            stage_row0 = stage + smem_row0
                             for i in cutlass.range_constexpr(8):
                                 if Int32(i // 2) < num_live:
-                                    r = (ptid >> Int32(4)) + Int32(8 * i)
-                                    tok = token[i]
-                                    valid = (tok >= Int32(0)).to(Int32)
-                                    src = x_addr + max(tok, Int32(0)).to(Int64) * Int64(self.hidden_size * 2) + col_bytes
+                                    src = x_kb + token[i].to(Int64) * Int64(self.hidden_size * 2)
                                     cp_async4_shared_global_cg_pred(
-                                        stage + r * Int32(256) + (c ^ (r & Int32(7))) * Int32(16), src, valid)
+                                        stage_row0 + Int32(2048 * i), src, (valid_mask >> Int32(i)) & Int32(1))
                             _cp_async_mbar_arrive_noinc(full)
                         seq += Int32(1)
                 t += grid
@@ -2216,13 +2228,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         acc[idx, j, 6] = fma_rn_f32(d6, sa1, acc[idx, j, 6])
                         acc[idx, j, 7] = fma_rn_f32(d7, sa1, acc[idx, j, 7])
         else:
-            sel_a = Int32(0)
-            sel_b8 = Int32(0)
-            if cutlass.const_expr(width == 2):
-                sel_a = Int32(0x3210) + ((lane & Int32(1)) ^ Int32(1)) * Int32(0x2222)
-            elif cutlass.const_expr(width == 3):
-                sel_a = Int32(0x3210) + ((lane + Int32(1)) & Int32(3)) * Int32(0x1111)
-                sel_b8 = sel_a + Int32(0x1111)
+            shift_b5 = Int32(0)
+            if cutlass.const_expr(width == 3):
+                shift_b5 = shift0 + Int32(5)
             b_next0 = ld_ring_u32_offset(rec_b0, 0)
             b_next1 = ld_ring_u32_offset(rec_b0, 32 * width)
             dq_ret_ty = llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()])
@@ -2235,10 +2243,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, 0x8fff8fff, 0x3b603b60, 0x6a;
                 mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, 0x8fff8fff, 0x3b603b60, 0x6a;
                 mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, 0x8fff8fff, 0x3b603b60, 0x6a;
-                prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 $0, lo, hi;
-                prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 $1, lo, hi;
-                prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 $2, lo, hi;
-                prmt.b32 lo, w6, w7, 0x5410;  prmt.b32 hi, w6, w7, 0x7632;  add.rn.f16x2 $3, lo, hi;
+                shf.r.wrap.b32 lo, w0, w1, 16;  lop3.b32 hi, w0, w1, 0x0000ffff, 0xe4;  add.rn.f16x2 $0, lo, hi;
+                shf.r.wrap.b32 lo, w2, w3, 16;  lop3.b32 hi, w2, w3, 0x0000ffff, 0xe4;  add.rn.f16x2 $1, lo, hi;
+                shf.r.wrap.b32 lo, w4, w5, 16;  lop3.b32 hi, w4, w5, 0x0000ffff, 0xe4;  add.rn.f16x2 $2, lo, hi;
+                prmt.b32 lo, w6, w7, 0x5432;    lop3.b32 hi, w6, w7, 0x0000ffff, 0xe4;  add.rn.f16x2 $3, lo, hi;
                 cvt.rn.satfinite.e4m3x2.f16x2 e0, $0;  cvt.rn.f16x2.e4m3x2 $0, e0;
                 cvt.rn.satfinite.e4m3x2.f16x2 e1, $1;  cvt.rn.f16x2.e4m3x2 $1, e1;
                 cvt.rn.satfinite.e4m3x2.f16x2 e2, $2;  cvt.rn.f16x2.e4m3x2 $2, e2;
@@ -2258,18 +2266,14 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             [Uint32(b).ir_value(), Uint32(a).ir_value()],
                             """
                             {
-                                .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, wb, lo, hi, M;
+                                .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
                                 .reg .b16 e0, e1, e2, e3;
                                 mov.b32 M, 0xCBAC1FED;
-                                shf.r.wrap.b32 wb, $4, $5, 16;
                                 and.b32 w7, $4, 0xffff;
-                                shr.u32 w6, $4, 4;   and.b32 w6, w6, 0xffff;
-                                prmt.b32 w5, $4, 0, 0x4421;
-                                shr.u32 w4, $4, 12;  and.b32 w4, w4, 0xffff;
                                 shr.u32 w3, $4, 16;
-                                shr.u32 w2, wb, 4;   and.b32 w2, w2, 0xffff;
-                                prmt.b32 w1, wb, 0, 0x4421;
-                                shr.u32 w0, wb, 12;  and.b32 w0, w0, 0xffff;
+                                shf.r.wrap.b32 w6, $4, $5, 4;   shr.u32 w2, w6, 16;  and.b32 w6, w6, 0xffff;
+                                shf.r.wrap.b32 w5, $4, $5, 8;   shr.u32 w1, w5, 16;  and.b32 w5, w5, 0xffff;
+                                shf.r.wrap.b32 w4, $4, $5, 12;  shr.u32 w0, w4, 16;  and.b32 w4, w4, 0xffff;
                             """ + dq_tail,
                             "=r,=r,=r,=r,r,r",
                             has_side_effects=False, is_align_stack=False,
@@ -2278,22 +2282,22 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         res = llvm.inline_asm(
                             dq_ret_ty,
                             [Uint32(b).ir_value(), Uint32(a).ir_value(),
-                             Int32(sel_a).ir_value(), Int32(sel_b8).ir_value()],
+                             Int32(shift0).ir_value(), Int32(shift_b5).ir_value()],
                             """
                             {
-                                .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, wa, wb8, lo, hi, M;
+                                .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, wa, wb5, lo, hi, M;
                                 .reg .b16 e0, e1, e2, e3;
                                 mov.b32 M, 0xCBAC1FED;
-                                prmt.b32 wa, $4, $5, $6;
-                                prmt.b32 wb8, $4, $5, $7;
+                                shf.r.wrap.b32 wa, $4, $5, $6;
+                                shf.r.wrap.b32 wb5, $4, $5, $7;
                                 and.b32 w7, wa, 0xffff;
                                 shr.u32 w6, wa, 3;   and.b32 w6, w6, 0xffff;
                                 shr.u32 w5, wa, 6;   and.b32 w5, w5, 0xffff;
                                 shr.u32 w4, wa, 9;   and.b32 w4, w4, 0xffff;
-                                shr.u32 w3, wb8, 4;  and.b32 w3, w3, 0xffff;
-                                shr.u32 w2, wb8, 7;  and.b32 w2, w2, 0xffff;
-                                shr.u32 w1, wb8, 10; and.b32 w1, w1, 0xffff;
-                                shr.u32 w0, wb8, 13; and.b32 w0, w0, 0xffff;
+                                shr.u32 w3, wa, 12;  and.b32 w3, w3, 0xffff;
+                                shr.u32 w2, wa, 15;  and.b32 w2, w2, 0xffff;
+                                shr.u32 w1, wb5, 13; and.b32 w1, w1, 0xffff;
+                                shr.u32 w0, wb5, 16;
                             """ + dq_tail,
                             "=r,=r,=r,=r,r,r,r,r",
                             has_side_effects=False, is_align_stack=False,
@@ -2302,18 +2306,18 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         res = llvm.inline_asm(
                             dq_ret_ty,
                             [Uint32(b).ir_value(), Uint32(a).ir_value(),
-                             Int32(sel_a).ir_value()],
+                             Int32(shift0).ir_value()],
                             """
                             {
                                 .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, wa, lo, hi, M;
                                 .reg .b16 e0, e1, e2, e3;
                                 mov.b32 M, 0xCBAC1FED;
-                                prmt.b32 wa, $4, $5, $6;
+                                shf.r.wrap.b32 wa, $4, $5, $6;
                                 and.b32 w7, wa, 0xffff;
                                 shr.u32 w6, wa, 2;   and.b32 w6, w6, 0xffff;
                                 shr.u32 w5, wa, 4;   and.b32 w5, w5, 0xffff;
                                 shr.u32 w4, wa, 6;   and.b32 w4, w4, 0xffff;
-                                prmt.b32 w3, wa, 0, 0x4421;
+                                shr.u32 w3, wa, 8;   and.b32 w3, w3, 0xffff;
                                 shr.u32 w2, wa, 10;  and.b32 w2, w2, 0xffff;
                                 shr.u32 w1, wa, 12;  and.b32 w1, w1, 0xffff;
                                 shr.u32 w0, wa, 14;  and.b32 w0, w0, 0xffff;
@@ -2466,9 +2470,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 total.fill(Float32(0.0))
                 for block in cutlass.range(8):
                     kb = split * Int32(8) + block
-                    if kb < Int32(self.blocks):
-                        slot = seq % Int32(stages)
-                        _mbar_wait(bar_full + slot * Int32(8), (seq // Int32(stages)) & Int32(1))
+                    if cutlass.const_expr(self.blocks % 8 == 0) or kb < Int32(self.blocks):
+                        slot = (Uint32(seq) % Uint32(stages)).to(Int32)
+                        _mbar_wait(bar_full + slot * Int32(8), ((Uint32(seq) // Uint32(stages)) & Uint32(1)).to(Int32))
                         stage = ring + slot * Int32(self.fc1_stage_bytes)
                         self.fc1_ws_block(total, stage,
                                           stage + Int32(self.fc1_a_bytes) + proj * Int32(8192),
@@ -2487,9 +2491,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 total.fill(Float32(0.0))
                 for block in cutlass.range(8):
                     kb = split * Int32(8) + block
-                    if kb < Int32(self.blocks):
-                        slot = seq % Int32(stages)
-                        _mbar_wait(bar_full + slot * Int32(8), (seq // Int32(stages)) & Int32(1))
+                    if cutlass.const_expr(self.blocks % 8 == 0) or kb < Int32(self.blocks):
+                        slot = (Uint32(seq) % Uint32(stages)).to(Int32)
+                        _mbar_wait(bar_full + slot * Int32(8), ((Uint32(seq) // Uint32(stages)) & Uint32(1)).to(Int32))
                         stage = ring + slot * Int32(self.fc1_stage_bytes)
                         self.fc1_ws_block(total, stage,
                                           stage + Int32(self.fc1_a_bytes) + proj * Int32(8192),
@@ -2508,9 +2512,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     total.fill(Float32(0.0))
                 for block in cutlass.range(8):
                     kb = split * Int32(8) + block
-                    if kb < Int32(self.blocks):
-                        slot = seq % Int32(stages)
-                        _mbar_wait(bar_full + slot * Int32(8), (seq // Int32(stages)) & Int32(1))
+                    if cutlass.const_expr(self.blocks % 8 == 0) or kb < Int32(self.blocks):
+                        slot = (Uint32(seq) % Uint32(stages)).to(Int32)
+                        _mbar_wait(bar_full + slot * Int32(8), ((Uint32(seq) // Uint32(stages)) & Uint32(1)).to(Int32))
                         if cutlass.const_expr(width != 0):
                             stage = ring + slot * Int32(self.fc1_stage_bytes)
                             self.fc1_ws_block(total, stage,
