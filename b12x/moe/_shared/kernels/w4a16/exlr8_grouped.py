@@ -53,6 +53,11 @@ _FC1_PRODUCER_THREADS = 128
 _FC1_PRODUCER_REGS = 88
 _FC1_CONSUMER_REGS = 208
 _FC1_CTA_MAX_REGS = 3 * 168
+# Full FP32 accumulators trade producer registers for two larger consumers.
+_FC1_FULL_GRAND_PRODUCER_REGS = 40
+_FC1_FULL_GRAND_CONSUMER_REGS = 232
+assert (_FC1_FULL_GRAND_PRODUCER_REGS + 2 * _FC1_FULL_GRAND_CONSUMER_REGS
+        == _FC1_CTA_MAX_REGS), "FC1 full-grand register split must equal CTAPOOL (504)"
 assert _FC1_PRODUCER_REGS + 2 * _FC1_CONSUMER_REGS == _FC1_CTA_MAX_REGS, (
     f"FC1 warpgroup register split {_FC1_PRODUCER_REGS} + 2*{_FC1_CONSUMER_REGS} "
     f"must equal CTAPOOL {_FC1_CTA_MAX_REGS}"
@@ -2561,8 +2566,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             _fence_mbar_init()
         cute.arch.sync_threads()
         use_full_grand = not (self.a8 and not self.quantize_pass)
-        prod_regs = 40 if use_full_grand else _FC1_PRODUCER_REGS
-        cons_regs = 232 if use_full_grand else _FC1_CONSUMER_REGS
+        prod_regs = _FC1_FULL_GRAND_PRODUCER_REGS if use_full_grand else _FC1_PRODUCER_REGS
+        cons_regs = _FC1_FULL_GRAND_CONSUMER_REGS if use_full_grand else _FC1_CONSUMER_REGS
         if tid >= Int32(_FC1_CONSUMER_THREADS):
             cute.arch.warpgroup_reg_dealloc(prod_regs)
             self.fc1_ws_producer(tid - Int32(_FC1_CONSUMER_THREADS), ring, cta, grid, x,
