@@ -424,3 +424,17 @@ def test_audit_manifest_rotated_world_partitions(world, layer):
             assert sum(bool(r[expert][unit][0]) for r in ranks) == 1
     if world == 6:
         assert max(sum(bool(u[0]) for u in e) for r in ranks for e in r) == 3
+
+
+def test_spark_duel_checks_multiple_live_counts_under_frozen_resolution():
+    source = SOURCE.with_name("bench_exlr8_grouped_prefill.py").read_text()
+    tree = ast.parse(source)
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "audit_main")
+    frozen = next(n for n in ast.walk(main) if isinstance(n, ast.With)
+                  and "kernel_resolution_guard" in ast.unparse(n.items[0]))
+    text = ast.unparse(frozen)
+    assert "arm['launch'](live)" in text
+    assert "activation[live:].fill_(float('nan'))" in text
+    assert "weights[live:].fill_(float('nan'))" in text
+    assert "reference[:live].view(torch.int16)" in text
+    assert "state['output'][live:]" in text

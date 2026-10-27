@@ -471,6 +471,32 @@ def audit_main(args):
                     if not bool(torch.isnan(state["output"][rows:]).all()):
                         raise AssertionError(f"{label}: wrote output tail")
                     audit_pack(ids, state, arm["group_rows"])
+                if args.engine_aot:
+                    live_counts = sorted({min(rows, n) for n in (1, 17, 63, 64, 65, 127,
+                                                               1024, 2752, 4095, 4096)})
+                    for live in live_counts:
+                        activation.copy_(original_activation)
+                        weights.copy_(original_weights)
+                        activation[live:].fill_(float("nan"))
+                        weights[live:].fill_(float("nan"))
+                        for label, arm in arms.items():
+                            state = arm["state"]
+                            for key in ("fc1", "intermediate", "fc2", "output"):
+                                state[key].fill_(float("nan"))
+                            audit_pack(ids[:live], state, arm["group_rows"], reverse=bool(live % 2))
+                            arm["launch"](live)
+                            torch.cuda.synchronize()
+                            if not torch.equal(state["output"][:live].view(torch.int16),
+                                               reference[:live].view(torch.int16)):
+                                raise AssertionError(f"{label}: frozen live={live} differs from oracle")
+                            if not bool(torch.isnan(state["output"][live:]).all()):
+                                raise AssertionError(f"{label}: frozen live={live} wrote tail")
+                    activation.copy_(original_activation)
+                    weights.copy_(original_weights)
+                    activation[rows:].fill_(float("nan"))
+                    weights[rows:].fill_(float("nan"))
+                    for arm in arms.values():
+                        audit_pack(ids, arm["state"], arm["group_rows"])
                 if args.exhaustive and rows == 4096:
                     for live in range(1, 4097):
                         for label, arm in arms.items():
