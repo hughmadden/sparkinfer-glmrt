@@ -1181,18 +1181,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 if (slice_shift >= Int32(0) and slice_shift <= Int32(4)
                         and (Int32(48) % slice_blocks) == Int32(0)
                         and fc2_cta_limit > Int32(0)):
-                    slice_fc2_bytes = block_fc2_bytes * slice_blocks
-                    rem_l2_bytes = max(Int32(0), l2_budget - slice_fc2_bytes)
-                    keep_a_groups = (
-                        Int32(self.max_groups) if inter_bytes <= rem_l2_bytes
-                        else (rem_l2_bytes // (unit_limit * Int32(self.group_rows * 256)))
-                    )
                     slice_base = Int32(0)
                     while slice_base < Int32(48):
                         self.launch_fc2(
                             pointers, bits, unit_count, unit_map,
                             group_expert, route_slots, intermediate, fc2,
-                            rows, group_count, unit_limit, slice_base, slice_blocks, slice_shift, fc2_cta_limit, stream, True, keep_a_groups)
+                            rows, group_count, unit_limit, slice_base, slice_blocks, slice_shift, fc2_cta_limit, stream, True)
                         self.reduce_kernel(
                             route_group_lane, route_weights, fc2, signs_out, output,
                             rows, group_count, slice_base, slice_blocks, slice_shift
@@ -1204,7 +1198,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 self.launch_fc2(
                     pointers, bits, unit_count, unit_map,
                     group_expert, route_slots, intermediate, fc2,
-                    rows, group_count, unit_limit, Int32(0), Int32(self.blocks), Int32(0), cta_limit, stream, False, Int32(self.max_groups))
+                    rows, group_count, unit_limit, Int32(0), Int32(self.blocks), Int32(0), cta_limit, stream)
                 self.reduce_kernel(
                     route_group_lane, route_weights, fc2, signs_out, output,
                     rows, group_count, Int32(0), Int32(self.blocks), Int32(0)
@@ -2704,13 +2698,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                    rows: Int32, group_count: cute.Tensor, unit_limit: Int32,
                    slice_base: Int32, slice_blocks: Int32, slice_shift: Int32,
                    grid_limit: Int32, stream: cuda.CUstream,
-                   evict_first: cutlass.Constexpr = False,
-                   keep_a_groups: Int32 = Int32(512)):
+                   evict_first: cutlass.Constexpr = False):
         if cutlass.const_expr(self.FC2_WS):
             self.grouped_fc2_ws_kernel(
                 pointers, bits, unit_count, unit_map, group_expert, route_slots,
                 intermediate, fc2, rows, group_count, unit_limit,
-                slice_base, slice_blocks, slice_shift, evict_first, keep_a_groups).launch(
+                slice_base, slice_blocks, slice_shift, evict_first).launch(
                     grid=(min(Int32(self.max_groups * self.blocks), grid_limit), 1, 1),
                     block=(384, 1, 1), min_blocks_per_mp=1, stream=stream)
         else:
@@ -2728,11 +2721,30 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                            intermediate: cute.Tensor, fc2: cute.Tensor,
                            rows: Int32, group_count: cute.Tensor, unit_limit: Int32,
                            slice_base: Int32, slice_blocks: Int32, slice_shift: Int32,
-                           evict_first: cutlass.Constexpr = False,
-                           keep_a_groups: Int32 = Int32(512)):
+                           evict_first: cutlass.Constexpr = False):
         @dsl_user_op
-        def _st_global_cs_v4_u32(
-            addr: Int64, v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, *, loc=None, ip=None
+        def _fc2_out_store_policy(is_sliced: Int32, *, loc=None, ip=None) -> Int64:
+            return Int64(
+                llvm.inline_asm(
+                    T.i64(),
+                    [Int32(is_sliced).ir_value(loc=loc, ip=ip)],
+                    "{ .reg .pred p; .reg .b64 el, ef; "
+                    "createpolicy.fractional.L2::evict_last.b64 el, 1.0; "
+                    "createpolicy.fractional.L2::evict_first.b64 ef, 1.0; "
+                    "setp.ne.b32 p, $1, 0; "
+                    "selp.b64 $0, el, ef, p; }",
+                    "=l,r",
+                    has_side_effects=False,
+                    is_align_stack=False,
+                    asm_dialect=llvm.AsmDialect.AD_ATT,
+                    loc=loc,
+                    ip=ip,
+                )
+            )
+
+        @dsl_user_op
+        def _st_global_l2hint_v4_u32(
+            addr: Int64, v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, pol: Int64, *, loc=None, ip=None
         ):
             llvm.inline_asm(
                 None,
@@ -2742,29 +2754,16 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     Uint32(v1).ir_value(loc=loc, ip=ip),
                     Uint32(v2).ir_value(loc=loc, ip=ip),
                     Uint32(v3).ir_value(loc=loc, ip=ip),
+                    Int64(pol).ir_value(loc=loc, ip=ip),
                 ],
-                "st.global.cs.v4.b32 [$0], {$1, $2, $3, $4};",
-                "l,r,r,r,r",
+                "st.global.L2::cache_hint.v4.b32 [$0], {$1, $2, $3, $4}, $5;",
+                "l,r,r,r,r,l",
                 has_side_effects=True,
                 is_align_stack=False,
                 asm_dialect=llvm.AsmDialect.AD_ATT,
                 loc=loc,
                 ip=ip,
             )
-
-        @dsl_user_op
-        def cp_async4_shared_global_cg_zfill_evict_first(
-            smem_addr: Int32, gmem_addr: Int64, valid_copy: Int32, *, loc=None, ip=None
-        ):
-            llvm.inline_asm(
-                None,
-                [Int32(smem_addr).ir_value(loc=loc, ip=ip),
-                 Int64(gmem_addr).ir_value(loc=loc, ip=ip),
-                 Int32(valid_copy).ir_value(loc=loc, ip=ip)],
-                "{ .reg .pred q; .reg .b32 sz; .reg .b64 pol; setp.ne.b32 q, $2, 0; selp.b32 sz, 16, 0, q; createpolicy.fractional.L2::evict_first.b64 pol, 1.0; cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, sz, pol; }",
-                "r,l,r",
-                has_side_effects=True, is_align_stack=False,
-                asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
         groups = group_count[0]
         if groups < Int32(0) or groups > Int32(self.max_groups):
@@ -2829,6 +2828,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             if use_chunks else Int32(1)
         )
         max_slot = rows * Int32(self.top_k)
+        rev_groups = sliced & (((slice_base // slice_blocks) & Int32(1)) != Int32(0))
 
         if tid >= Int32(256):
             cute.arch.warpgroup_reg_dealloc(_FC1_PRODUCER_REGS)
@@ -2873,6 +2873,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         group = (t_task // Int32(chunks_per_group)) if use_chunks else (t_task // pair_slices)
                         b_local_base = ((t_task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((t_task - group * pair_slices) << Int32(1))
                     group += bulk_groups
+                if rev_groups:
+                    group = groups - Int32(1) - group
                 block_base = slice_base + b_local_base
 
                 expert = group_expert[group]
@@ -2913,14 +2915,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                     valid_mask = valid_mask | Int32(1 << (idx * 2 + 1))
                         if cutlass.const_expr(evict_first):
                             last_reader = Int32(1)
-                            if slice_blocks > Int32(6):
-                                if group + Int32(1) < groups:
-                                    if group_expert[group + Int32(1)] == expert:
-                                        last_reader = Int32(0)
-                                if group > Int32(0):
-                                    if group_expert[group - Int32(1)] == expert:
-                                        last_reader = Int32(0)
-                        evict_a = sliced & (group >= keep_a_groups)
+                            next_g = (group - Int32(1)) if rev_groups else (group + Int32(1))
+                            if next_g >= Int32(0) and next_g < groups:
+                                if group_expert[next_g] == expert:
+                                    last_reader = Int32(0)
                         my_w = Int32(0)
                         my_pay = Int64(0)
                         my_sc = Int64(0)
@@ -3019,34 +3017,19 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                                     m_src + r_prod1.to(Int64) * Int64(256), v1)
                                     else:
                                         c_byte_off = c_prod.to(Int64) * Int64(16)
-                                        if evict_a:
-                                            for idx in cutlass.range_constexpr(self.mtiles):
-                                                if Int32(idx) < num_live_m:
-                                                    m = (out_meta >> Int32(idx * 2)) & Int32(3)
-                                                    tile_stage = stage_a + Int32(idx * 4096)
-                                                    m_src = source_a + m.to(Int64) * Int64(4096) + c_byte_off
-                                                    v0 = (valid_mask >> Int32(idx * 2)) & Int32(1)
-                                                    v1 = (valid_mask >> Int32(idx * 2 + 1)) & Int32(1)
-                                                    cp_async4_shared_global_cg_zfill_evict_first(
-                                                        tile_stage + off_prod0,
-                                                        m_src + r_prod0.to(Int64) * Int64(256), v0)
-                                                    cp_async4_shared_global_cg_zfill_evict_first(
-                                                        tile_stage + off_prod1,
-                                                        m_src + r_prod1.to(Int64) * Int64(256), v1)
-                                        else:
-                                            for idx in cutlass.range_constexpr(self.mtiles):
-                                                if Int32(idx) < num_live_m:
-                                                    m = (out_meta >> Int32(idx * 2)) & Int32(3)
-                                                    tile_stage = stage_a + Int32(idx * 4096)
-                                                    m_src = source_a + m.to(Int64) * Int64(4096) + c_byte_off
-                                                    v0 = (valid_mask >> Int32(idx * 2)) & Int32(1)
-                                                    v1 = (valid_mask >> Int32(idx * 2 + 1)) & Int32(1)
-                                                    cp_async4_shared_global_cg_zfill(
-                                                        tile_stage + off_prod0,
-                                                        m_src + r_prod0.to(Int64) * Int64(256), v0, Int32(1))
-                                                    cp_async4_shared_global_cg_zfill(
-                                                        tile_stage + off_prod1,
-                                                        m_src + r_prod1.to(Int64) * Int64(256), v1, Int32(1))
+                                        for idx in cutlass.range_constexpr(self.mtiles):
+                                            if Int32(idx) < num_live_m:
+                                                m = (out_meta >> Int32(idx * 2)) & Int32(3)
+                                                tile_stage = stage_a + Int32(idx * 4096)
+                                                m_src = source_a + m.to(Int64) * Int64(4096) + c_byte_off
+                                                v0 = (valid_mask >> Int32(idx * 2)) & Int32(1)
+                                                v1 = (valid_mask >> Int32(idx * 2 + 1)) & Int32(1)
+                                                cp_async4_shared_global_cg_zfill(
+                                                    tile_stage + off_prod0,
+                                                    m_src + r_prod0.to(Int64) * Int64(256), v0, Int32(1))
+                                                cp_async4_shared_global_cg_zfill(
+                                                    tile_stage + off_prod1,
+                                                    m_src + r_prod1.to(Int64) * Int64(256), v1, Int32(1))
                                     if cutlass.const_expr(self.a8 and not self.quantize_pass):
                                         _mbar_arrive(bar_full + slot * Int32(8))
                                     else:
@@ -3059,6 +3042,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             cute.arch.warpgroup_reg_alloc(_FC1_CONSUMER_REGS)
             total = cute.make_rmem_tensor((self.mtiles, 2, 8), Float32)
             r_out = cute.make_rmem_tensor((self.mtiles, 2), Int32)
+            out_pol = _fc2_out_store_policy(Int32(1) if sliced else Int32(0))
 
             while task < limit_tasks:
                 group = Int32(0)
@@ -3094,6 +3078,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         group = (t_task // Int32(chunks_per_group)) if use_chunks else (t_task // pair_slices)
                         b_local_base = ((t_task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((t_task - group * pair_slices) << Int32(1))
                     group += bulk_groups
+                if rev_groups:
+                    group = groups - Int32(1) - group
 
                 expert = group_expert[group]
                 group_base = group.to(Int64) * Int64(self.group_rows)
@@ -3262,10 +3248,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                             w2 = h2 if is_hi else l2
                                             w3 = h3 if is_hi else l3
                                             if row_valid and (lane & Int32(2)) == Int32(0):
-                                                if sliced:
-                                                    st_global_v4_u32(row_addr, w0, w1, w2, w3)
-                                                else:
-                                                    _st_global_cs_v4_u32(row_addr, w0, w1, w2, w3)
+                                                _st_global_l2hint_v4_u32(row_addr, w0, w1, w2, w3, out_pol)
                                         else:
                                             if row_valid:
                                                 st_global_v2_f32(row_addr, total[idx, j, 2 * v], total[idx, j, 2 * v + 1])
