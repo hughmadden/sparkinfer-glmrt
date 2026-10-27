@@ -2160,6 +2160,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             rec_b0 = b_base + (n16_0 * Int32(8 * width) + ib) * Int32(4)
             if cutlass.const_expr(width == 3):
                 src_lane = (lane + Int32(31) - ((lane & Int32(3)) == Int32(3)).to(Int32)) & Int32(31)
+        packed_scale = ld_shared_i32_relaxed(scale_addr).to(Uint32)
         if cutlass.const_expr(self.a8):
             sa_base = a_base + Int32(2048) + (lane >> Int32(2)) * Int32(16)
             for k32 in cutlass.range_constexpr(4):
@@ -2215,25 +2216,120 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         acc[idx, j, 6] = fma_rn_f32(d6, sa1, acc[idx, j, 6])
                         acc[idx, j, 7] = fma_rn_f32(d7, sa1, acc[idx, j, 7])
         else:
+            sel_a = Int32(0)
+            sel_b8 = Int32(0)
+            if cutlass.const_expr(width == 2):
+                sel_a = Int32(0x3210) + ((lane & Int32(1)) ^ Int32(1)) * Int32(0x2222)
+            elif cutlass.const_expr(width == 3):
+                sel_a = Int32(0x3210) + ((lane + Int32(1)) & Int32(3)) * Int32(0x1111)
+                sel_b8 = sel_a + Int32(0x1111)
+            b_next0 = ld_ring_u32_offset(rec_b0, 0)
+            b_next1 = ld_ring_u32_offset(rec_b0, 32 * width)
+            dq_ret_ty = llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()])
+            dq_tail = """
+                mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, 0x8fff8fff, 0x3b603b60, 0x6a;
+                mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, 0x8fff8fff, 0x3b603b60, 0x6a;
+                mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, 0x8fff8fff, 0x3b603b60, 0x6a;
+                mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, 0x8fff8fff, 0x3b603b60, 0x6a;
+                mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, 0x8fff8fff, 0x3b603b60, 0x6a;
+                mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, 0x8fff8fff, 0x3b603b60, 0x6a;
+                mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, 0x8fff8fff, 0x3b603b60, 0x6a;
+                mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, 0x8fff8fff, 0x3b603b60, 0x6a;
+                prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 $0, lo, hi;
+                prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 $1, lo, hi;
+                prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 $2, lo, hi;
+                prmt.b32 lo, w6, w7, 0x5410;  prmt.b32 hi, w6, w7, 0x7632;  add.rn.f16x2 $3, lo, hi;
+                cvt.rn.satfinite.e4m3x2.f16x2 e0, $0;  cvt.rn.f16x2.e4m3x2 $0, e0;
+                cvt.rn.satfinite.e4m3x2.f16x2 e1, $1;  cvt.rn.f16x2.e4m3x2 $1, e1;
+                cvt.rn.satfinite.e4m3x2.f16x2 e2, $2;  cvt.rn.f16x2.e4m3x2 $2, e2;
+                cvt.rn.satfinite.e4m3x2.f16x2 e3, $3;  cvt.rn.f16x2.e4m3x2 $3, e3;
+            }
+            """
             for k16 in cutlass.range_constexpr(8):
+                b_cur0 = b_next0
+                b_cur1 = b_next1
                 frags = []
                 for j in cutlass.range_constexpr(2):
-                    wa = Uint32(0)
-                    wb = Uint32(0)
+                    b = b_cur0 if j == 0 else b_cur1
+                    a = cute.arch.shuffle_sync(b, src_lane)
                     if cutlass.const_expr(width == 4):
-                        b = ld_ring_u32_offset(rec_b0, k16 * 1024 + j * 128)
-                        a = cute.arch.shuffle_sync(b, src_lane)
-                        wa = b
-                        wb = (a << Uint32(16)) | (b >> Uint32(16))
+                        res = llvm.inline_asm(
+                            dq_ret_ty,
+                            [Uint32(b).ir_value(), Uint32(a).ir_value()],
+                            """
+                            {
+                                .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, wb, lo, hi, M;
+                                .reg .b16 e0, e1, e2, e3;
+                                mov.b32 M, 0xCBAC1FED;
+                                shf.r.wrap.b32 wb, $4, $5, 16;
+                                and.b32 w7, $4, 0xffff;
+                                shr.u32 w6, $4, 4;   and.b32 w6, w6, 0xffff;
+                                prmt.b32 w5, $4, 0, 0x4421;
+                                shr.u32 w4, $4, 12;  and.b32 w4, w4, 0xffff;
+                                shr.u32 w3, $4, 16;
+                                shr.u32 w2, wb, 4;   and.b32 w2, w2, 0xffff;
+                                prmt.b32 w1, wb, 0, 0x4421;
+                                shr.u32 w0, wb, 12;  and.b32 w0, w0, 0xffff;
+                            """ + dq_tail,
+                            "=r,=r,=r,=r,r,r",
+                            has_side_effects=False, is_align_stack=False,
+                            asm_dialect=llvm.AsmDialect.AD_ATT)
+                    elif cutlass.const_expr(width == 3):
+                        res = llvm.inline_asm(
+                            dq_ret_ty,
+                            [Uint32(b).ir_value(), Uint32(a).ir_value(),
+                             Int32(sel_a).ir_value(), Int32(sel_b8).ir_value()],
+                            """
+                            {
+                                .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, wa, wb8, lo, hi, M;
+                                .reg .b16 e0, e1, e2, e3;
+                                mov.b32 M, 0xCBAC1FED;
+                                prmt.b32 wa, $4, $5, $6;
+                                prmt.b32 wb8, $4, $5, $7;
+                                and.b32 w7, wa, 0xffff;
+                                shr.u32 w6, wa, 3;   and.b32 w6, w6, 0xffff;
+                                shr.u32 w5, wa, 6;   and.b32 w5, w5, 0xffff;
+                                shr.u32 w4, wa, 9;   and.b32 w4, w4, 0xffff;
+                                shr.u32 w3, wb8, 4;  and.b32 w3, w3, 0xffff;
+                                shr.u32 w2, wb8, 7;  and.b32 w2, w2, 0xffff;
+                                shr.u32 w1, wb8, 10; and.b32 w1, w1, 0xffff;
+                                shr.u32 w0, wb8, 13; and.b32 w0, w0, 0xffff;
+                            """ + dq_tail,
+                            "=r,=r,=r,=r,r,r,r,r",
+                            has_side_effects=False, is_align_stack=False,
+                            asm_dialect=llvm.AsmDialect.AD_ATT)
                     else:
-                        b = ld_ring_u32_offset(rec_b0, k16 * 256 * width + j * 32 * width)
-                        a = cute.arch.shuffle_sync(b, src_lane)
-                        w_sh = ((a.to(Int64) << Int64(32)) | b.to(Int64)) >> shift0.to(Int64)
-                        wa = w_sh.to(Uint32)
-                        wb = (w_sh >> Int64(4 * width)).to(Uint32)
-                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
-                    frags.append((_e4m3_round_half2(b0), _e4m3_round_half2(b1),
-                                  _e4m3_round_half2(b2), _e4m3_round_half2(b3)))
+                        res = llvm.inline_asm(
+                            dq_ret_ty,
+                            [Uint32(b).ir_value(), Uint32(a).ir_value(),
+                             Int32(sel_a).ir_value()],
+                            """
+                            {
+                                .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, wa, lo, hi, M;
+                                .reg .b16 e0, e1, e2, e3;
+                                mov.b32 M, 0xCBAC1FED;
+                                prmt.b32 wa, $4, $5, $6;
+                                and.b32 w7, wa, 0xffff;
+                                shr.u32 w6, wa, 2;   and.b32 w6, w6, 0xffff;
+                                shr.u32 w5, wa, 4;   and.b32 w5, w5, 0xffff;
+                                shr.u32 w4, wa, 6;   and.b32 w4, w4, 0xffff;
+                                prmt.b32 w3, wa, 0, 0x4421;
+                                shr.u32 w2, wa, 10;  and.b32 w2, w2, 0xffff;
+                                shr.u32 w1, wa, 12;  and.b32 w1, w1, 0xffff;
+                                shr.u32 w0, wa, 14;  and.b32 w0, w0, 0xffff;
+                            """ + dq_tail,
+                            "=r,=r,=r,=r,r,r,r",
+                            has_side_effects=False, is_align_stack=False,
+                            asm_dialect=llvm.AsmDialect.AD_ATT)
+                    frags.append((
+                        Uint32(llvm.extractvalue(T.i32(), res, [0])),
+                        Uint32(llvm.extractvalue(T.i32(), res, [1])),
+                        Uint32(llvm.extractvalue(T.i32(), res, [2])),
+                        Uint32(llvm.extractvalue(T.i32(), res, [3])),
+                    ))
+                if cutlass.const_expr(k16 < 7):
+                    b_next0 = ld_ring_u32_offset(rec_b0, (k16 + 1) * 256 * width)
+                    b_next1 = ld_ring_u32_offset(rec_b0, (k16 + 1) * 256 * width + 32 * width)
                 col = Int32((k16 & 3) * 2) + c_half
                 addr_k16 = a_base + (r_m * Int32(16) + (col ^ (r_m & Int32(7)))) * Int32(16)
                 for idx in cutlass.range_constexpr(active):
@@ -2248,7 +2344,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             acc[idx, j, 4], acc[idx, j, 5], acc[idx, j, 6], acc[idx, j, 7],
                             a0, a1, a2, a3, f[2], f[3])
                         acc[idx, j, 4], acc[idx, j, 5], acc[idx, j, 6], acc[idx, j, 7] = d4, d5, d6, d7
-        packed_scale = ld_shared_i32_relaxed(scale_addr).to(Uint32)
         scale, _ = half2_to_float2_scaled(packed_scale, Float32(1.0))
         for idx in cutlass.range_constexpr(active):
             for j in cutlass.range_constexpr(2):
@@ -2463,8 +2558,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             _fence_mbar_init()
         cute.arch.sync_threads()
         use_full_grand = not (self.a8 and not self.quantize_pass)
-        prod_regs = 56 if use_full_grand else _FC1_PRODUCER_REGS
-        cons_regs = 224 if use_full_grand else _FC1_CONSUMER_REGS
+        prod_regs = 40 if use_full_grand else _FC1_PRODUCER_REGS
+        cons_regs = 232 if use_full_grand else _FC1_CONSUMER_REGS
         if tid >= Int32(_FC1_CONSUMER_THREADS):
             cute.arch.warpgroup_reg_dealloc(prod_regs)
             self.fc1_ws_producer(tid - Int32(_FC1_CONSUMER_THREADS), ring, cta, grid, x,
