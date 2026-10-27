@@ -204,10 +204,10 @@ def audit_specs(decode):
             ("cta4", 64, {"CTAS_PER_SM": 4})]
 
 
-def manifest_widths(manifest, layer, rank, experts=256, units=16):
-    """Retain global slots and ascending sparse TP2 ownership."""
-    if rank not in (0, 1):
-        raise ValueError("audit rank must be 0 or 1")
+def manifest_widths(manifest, layer, rank, experts=256, units=16, world=2):
+    """Retain global slots and the engine's rotated sparse TP ownership."""
+    if not 1 <= world <= 8 or not 0 <= rank < world:
+        raise ValueError("audit rank must be in 0..world-1, world in 1..8")
     entry = manifest["layers"][str(layer)]
     result = []
     for expert in range(experts):
@@ -217,7 +217,7 @@ def manifest_widths(manifest, layer, rank, experts=256, units=16):
                       entry["down"][expert]]
             if any(type(w) is not int or w not in (2, 3, 4) for w in widths):
                 raise ValueError("manifest requires K2/K3/K4 integer widths")
-            row.append(widths if (units * expert + unit + layer) % 2 == rank else [0, 0, 0])
+            row.append(widths if (units * expert + unit + layer) % world == rank else [0, 0, 0])
         result.append(row)
     return result
 
@@ -267,7 +267,7 @@ def load_reference_core(spec):
     return module.Exlr8GroupedKernel, (str(path), actual, hashlib.sha256(source).hexdigest())
 
 
-def audit_compile(label, group_rows, knobs, capacity, decode, reference=None):
+def audit_compile(label, group_rows, knobs, capacity, decode, reference=None, engine_aot=False):
     """Keep benchmark knob sweeps out of the production AOT cache namespace."""
     from b12x.integration.cuteafd import _common, exlr8
     from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
@@ -286,12 +286,12 @@ def audit_compile(label, group_rows, knobs, capacity, decode, reference=None):
             reference_type, identity = reference
             if not grouped or knobs:
                 raise ValueError("frozen reference requires an unmodified grouped arm")
-            wrapper.runtime_l2 = False
+            wrapper.runtime_l2 = engine_aot
             wrapper.core = reference_type(6144, 16, 8, capacity, group_rows,
                                           fc2_f32=decode)
             arm_source = (identity,)
             kwargs["name"] = "exlr8_audit_frozen_reference"
-        kwargs["key"] = (arm_source, tuple(sorted(knobs.items())), kwargs["key"])
+        kwargs["key"] = (arm_source, engine_aot, tuple(sorted(knobs.items())), kwargs["key"])
         return _common.compile_program(wrapper, **kwargs)
     exlr8.compile_program = keyed
     try:
@@ -361,6 +361,18 @@ def audit_main(args):
     if args.exhaustive and (max(rows_list) != 4096 or min(rows_list) <= 64):
         raise ValueError("exhaustive mode requires prefill only, including rows4096")
     reference_core = load_reference_core(args.reference_core) if args.reference_core else None
+    if args.phase_profile and not args.json_output:
+        raise ValueError("--phase-profile requires --json-output")
+    if args.engine_aot:
+        if not args.source_commit or args.world != 6 or args.rank != 0:
+            raise ValueError("Spark duel requires --source-commit and frozen TP6 rank0 geometry")
+        if reference_core is None or args.arms != "current,current_control,candidate":
+            raise ValueError("--engine-aot requires a frozen reference and current,current_control,candidate arms")
+        if torch.cuda.get_device_capability() != (12, 1):
+            raise ValueError("Spark duel requires SM121")
+        if not {2752, 4096} <= set(rows_list):
+            raise ValueError("Spark duel requires shipped rows 2752 and 4096")
+        torch.cuda.set_per_process_memory_fraction(0.25)
     if reference_core and min(rows_list) <= 64:
         raise ValueError("frozen grouped reference is prefill-only")
     waves = load_route_waves(args.routes or "realistic")
@@ -373,7 +385,8 @@ def audit_main(args):
     l2_bytes = runtime_l2_bytes(args.l2_cap_mib)
     report = dict(manifest=str(manifest_path), manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
                   routes=str(route_path), routes_sha256=hashlib.sha256(route_path.read_bytes()).hexdigest(),
-                  gpu=str(props), rank=args.rank, seed=args.seed,
+                  gpu=str(props), rank=args.rank, world=args.world, seed=args.seed,
+                  engine_aot=args.engine_aot, source_commit=args.source_commit,
                   l2_bytes=l2_bytes, l2_cap_mib=args.l2_cap_mib,
                   reference_core=reference_core[1] if reference_core else None,
                   payload="independent random trellis bytes, real manifest tiers and global expert IDs",
@@ -382,9 +395,10 @@ def audit_main(args):
     for index in indices:
         wave = waves[index]
         layer = wave["layer"]
-        pointers, bits, owners = audit_weights(manifest_widths(manifest, layer, args.rank), 6144, args.seed + layer)
+        widths = manifest_widths(manifest, layer, args.rank, world=args.world)
+        pointers, bits, owners = audit_weights(widths, 6144, args.seed + layer)
         compact = compact_unit_descriptors(bits)
-        assert compact[2] == 8
+        unit_limit = compact[2]
         planned = 4096 if max(rows_list) > 64 else 64
         gen = torch.Generator(device="cuda").manual_seed(args.seed)
         activation = torch.randn((planned, 6144), generator=gen, device="cuda").half() * 0.02
@@ -395,7 +409,13 @@ def audit_main(args):
         scratch = dict(fc1=torch.empty(slots * 16 * 2 * 6 * 128, device="cuda"),
                        intermediate=torch.empty(slots * 16 * 128, dtype=torch.float16, device="cuda"),
                        fc2=torch.empty(slots * 6144, device="cuda"))
+        original_activation, original_weights = activation.clone(), weights.clone()
         for rows in rows_list:
+            activation.copy_(original_activation)
+            weights.copy_(original_weights)
+            if args.engine_aot:
+                activation[rows:].fill_(float("nan"))
+                weights[rows:].fill_(float("nan"))
             decode = rows <= 64
             arm_capacity = 64 if decode else 4096
             ids = real_route_ids(rows, wave, torch.Generator().manual_seed(args.seed + rows))
@@ -414,11 +434,12 @@ def audit_main(args):
                 state = audit_state(planned, capacity, group_rows, scratch)
                 audit_pack(ids, state, group_rows)
                 program, source = audit_compile(actual_label, group_rows, knobs, capacity, decode,
-                    reference=reference_core if label in ("current", "current_control") else None)
+                    reference=reference_core if label in ("current", "current_control") else None,
+                    engine_aot=args.engine_aot)
                 limit = args.cta_limit or props.multi_processor_count * int(program.geometry["ctas_per_sm"])
                 extra = compact[:2] if any(o.name == "unit_count" for o in program.operands) else ()
                 def launch(live=rows, program=program, state=state, extra=extra, limit=limit):
-                    scalars = launch_scalars(program, live, limit, 8, l2_bytes)
+                    scalars = launch_scalars(program, live, limit, unit_limit, l2_bytes)
                     program.launch(activation, pointers, bits, state["group_expert"], state["route_slots"],
                         state["inverse"], weights, state["fc1"], state["intermediate"], state["fc2"],
                         signs, state["output"], state["count"], *extra, scalars=scalars)
@@ -450,6 +471,32 @@ def audit_main(args):
                     if not bool(torch.isnan(state["output"][rows:]).all()):
                         raise AssertionError(f"{label}: wrote output tail")
                     audit_pack(ids, state, arm["group_rows"])
+                if args.engine_aot:
+                    live_counts = sorted({min(rows, n) for n in (1, 17, 63, 64, 65, 127,
+                                                               1024, 2752, 4095, 4096)})
+                    for live in live_counts:
+                        activation.copy_(original_activation)
+                        weights.copy_(original_weights)
+                        activation[live:].fill_(float("nan"))
+                        weights[live:].fill_(float("nan"))
+                        for label, arm in arms.items():
+                            state = arm["state"]
+                            for key in ("fc1", "intermediate", "fc2", "output"):
+                                state[key].fill_(float("nan"))
+                            audit_pack(ids[:live], state, arm["group_rows"], reverse=bool(live % 2))
+                            arm["launch"](live)
+                            torch.cuda.synchronize()
+                            if not torch.equal(state["output"][:live].view(torch.int16),
+                                               reference[:live].view(torch.int16)):
+                                raise AssertionError(f"{label}: frozen live={live} differs from oracle")
+                            if not bool(torch.isnan(state["output"][live:]).all()):
+                                raise AssertionError(f"{label}: frozen live={live} wrote tail")
+                    activation.copy_(original_activation)
+                    weights.copy_(original_weights)
+                    activation[rows:].fill_(float("nan"))
+                    weights[rows:].fill_(float("nan"))
+                    for arm in arms.values():
+                        audit_pack(ids, arm["state"], arm["group_rows"])
                 if args.exhaustive and rows == 4096:
                     for live in range(1, 4097):
                         for label, arm in arms.items():
@@ -466,6 +513,8 @@ def audit_main(args):
                                 raise AssertionError(f"{label}: exhaustive live={live} wrote tail")
                     for arm in arms.values():
                         audit_pack(ids, arm["state"], arm["group_rows"])
+            if args.engine_aot and not all(exact.values()):
+                raise AssertionError("exact-track candidate differs from the frozen oracle")
             samples = {label: [] for label in arms if exact[label]}
             for label in samples:
                 for _ in range(args.warmup):
@@ -477,8 +526,20 @@ def audit_main(args):
             case = dict(rows=rows, wave_index=index, layer=layer, content=wave.get("content"),
                         bitwise=exact, samples_ms=samples,
                         median_ms={label: statistics.median(s) for label, s in samples.items()},
-                        source=arms["current"]["source"], packing_poison=True,
-                        exhaustive=args.exhaustive and rows == 4096, unit_limit=8)
+                        source=arms["candidate" if "candidate" in arms else "current"]["source"],
+                        packing_poison=True,
+                        exhaustive=args.exhaustive and rows == 4096, unit_limit=unit_limit,
+                        useful_flops=sum(len([u for u in widths[e] if u[0]]) * 128 * 6144 * 6
+                                         for e in ids.flatten().tolist()),
+                        unique_weight_bytes=sum(6144 * 16 * sum(sum(u) for u in widths[e])
+                                                for e in set(ids.flatten().tolist())))
+            if args.phase_profile:
+                from benchmarks.benchmark_exlr8_a16 import stage_profile
+                stages = dict(fc1=("grouped_fc1",), fc2=("grouped_fc2",),
+                              activation=("activation_kernel",), reduce=("reduce_kernel",))
+                case["profile_only"] = {label: stage_profile(arm["graph"],
+                    str(Path(args.json_output).resolve().parent), stages)
+                    for label, arm in arms.items()}
             print(json.dumps(case), flush=True)
             report["cases"].append(case)
             if args.json_output:
@@ -510,7 +571,13 @@ def main():
     ap.add_argument("--audit", action="store_true", help="graph-first real-manifest TP2 existing-kernel audit")
     ap.add_argument("--manifest", help="actual EXLR8 width manifest, never synthetic cyclic tiers")
     ap.add_argument("--reference-core", help="frozen grouped source PATH@git-blob-SHA; current/current_control use it")
-    ap.add_argument("--rank", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--rank", type=int, default=0)
+    ap.add_argument("--world", type=int, default=2)
+    ap.add_argument("--engine-aot", action="store_true",
+                    help="exact SM121 duel using the engine AOT ABI and runtime L2 oracle")
+    ap.add_argument("--source-commit", help="committed candidate revision recorded in the receipt")
+    ap.add_argument("--phase-profile", action="store_true",
+                    help="separate perturbed phase attribution, never the timing verdict")
     ap.add_argument("--wave-indices", default="0,12,24,36,48,60")
     ap.add_argument("--arms", help="comma-separated audit arms; current is always included")
     ap.add_argument("--exhaustive", action="store_true", help="check frozen prefill kernels at every live row 1..4096")
@@ -520,7 +587,7 @@ def main():
     args.iters = args.iters if args.iters is not None else (20 if args.audit else 10)
     args.repeats = args.repeats if args.repeats is not None else (7 if args.audit else 3)
 
-    if args.audit:
+    if args.audit or args.engine_aot:
         return audit_main(args)
 
     wave = load_wave(args.routes)

@@ -399,11 +399,42 @@ def test_grouped_launch_scalars_preserve_non_grouped_abi():
         assert launch(program, 17, 376, 8, 96 * 2**20) == expected
 
 
-def test_grouped_frozen_audit_disables_l2_forwarding():
+def test_grouped_frozen_audit_selects_l2_abi():
     source = SOURCE.with_name("bench_exlr8_grouped_prefill.py").read_text()
     tree = ast.parse(source)
     compile_arm = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "audit_compile")
     keyed = next(n for n in compile_arm.body if isinstance(n, ast.FunctionDef) and n.name == "keyed")
     branch = next(n for n in keyed.body if isinstance(n, ast.If))
-    assert "wrapper.runtime_l2 = False" in ast.unparse(branch)
+    assert "wrapper.runtime_l2 = engine_aot" in ast.unparse(branch)
     assert "wrapper.core = reference_type" in ast.unparse(branch)
+
+
+@pytest.mark.parametrize("world", [1, 2, 4, 6, 8])
+@pytest.mark.parametrize("layer", [7, 47])
+def test_audit_manifest_rotated_world_partitions(world, layer):
+    entry = dict(gate=[[2] * 16 for _ in range(3)],
+                 up=[[3] * 16 for _ in range(3)], down=[4] * 3)
+    build = audit_helpers("manifest_widths")["manifest_widths"]
+    ranks = [build({"layers": {str(layer): entry}}, layer, rank,
+                   experts=3, world=world) for rank in range(world)]
+    for expert in range(3):
+        for unit in range(16):
+            owner = (16 * expert + unit + layer) % world
+            assert ranks[owner][expert][unit] == [2, 3, 4]
+            assert sum(bool(r[expert][unit][0]) for r in ranks) == 1
+    if world == 6:
+        assert max(sum(bool(u[0]) for u in e) for r in ranks for e in r) == 3
+
+
+def test_spark_duel_checks_multiple_live_counts_under_frozen_resolution():
+    source = SOURCE.with_name("bench_exlr8_grouped_prefill.py").read_text()
+    tree = ast.parse(source)
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "audit_main")
+    frozen = next(n for n in ast.walk(main) if isinstance(n, ast.With)
+                  and "kernel_resolution_guard" in ast.unparse(n.items[0]))
+    text = ast.unparse(frozen)
+    assert "arm['launch'](live)" in text
+    assert "activation[live:].fill_(float('nan'))" in text
+    assert "weights[live:].fill_(float('nan'))" in text
+    assert "reference[:live].view(torch.int16)" in text
+    assert "state['output'][live:]" in text
