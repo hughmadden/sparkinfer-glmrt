@@ -593,8 +593,9 @@ def fc2_ws_slice_task_mapping(
     slice_shift: int,
     *,
     blocks: int = 48,
-) -> tuple[int, int, bool, list[tuple[int, int]]]:
-    """Host mirror of ``grouped_fc2_ws_kernel``'s task-to-(group, b_local_base) loop."""
+    slice_base: int = 0,
+) -> tuple[int, bool, list[tuple[int, int, int]]]:
+    """Mirror FC2 WS tasks as (group, b_local_base, b_pairs), including bulk/tail waves."""
     if step <= 0:
         raise ValueError(f"grouped_fc2_ws_kernel step must be positive, got {step}")
     if slice_blocks <= 0 or (slice_blocks % 2) != 0 or (blocks % slice_blocks) != 0:
@@ -606,44 +607,59 @@ def fc2_ws_slice_task_mapping(
     sliced = slice_blocks < blocks
     two_chunks = (slice_shift == 2) or (slice_shift == 4)
     slice_chunks = 1 if slice_shift == 0 else (2 if two_chunks else 3)
-    group_tasks = groups * (slice_chunks if sliced else chunks_per_group)
-    use_chunks = group_tasks >= step
     pair_slices = slice_blocks >> 1
-    limit_tasks = group_tasks if use_chunks else (groups * pair_slices)
+    tail_waves = 2 if slice_blocks > 24 else (1 if slice_blocks == 24 else 0)
+    min_for_bulk = (tail_waves + 1) * step
+    avail_bulk = groups - tail_waves * step if groups >= min_for_bulk else 0
+    bulk_groups = (avail_bulk // step) * step
+    tail_groups = groups - bulk_groups
+    tail_group_tasks = tail_groups * (slice_chunks if sliced else chunks_per_group)
+    use_chunks = tail_group_tasks >= step
+    tail_limit_tasks = tail_group_tasks if use_chunks else (tail_groups * pair_slices)
+    limit_tasks = bulk_groups + tail_limit_tasks
     b_pairs_sliced = (
         1 if slice_shift == 0
         else ((slice_blocks >> 2) if two_chunks else (1 << (slice_shift - 1)))
     )
-    b_pairs = (b_pairs_sliced if sliced else (b_chunk_const // 2)) if use_chunks else 1
-    tasks: list[tuple[int, int]] = []
+    tail_b_pairs = (b_pairs_sliced if sliced else (b_chunk_const // 2)) if use_chunks else 1
+    rev_groups = sliced and ((slice_base // slice_blocks) & 1) != 0
+    tasks: list[tuple[int, int, int]] = []
     for cta in range(step):
         task = cta
         while task < limit_tasks:
-            if blocks == 48:
-                if sliced:
-                    if slice_shift == 0:
-                        group = task
-                        b_local_base = 0
-                    elif two_chunks:
-                        if use_chunks:
-                            group = task >> 1
-                            b_local_base = (task & 1) * (b_pairs_sliced << 1)
-                        else:
-                            group = (task >> 3) if slice_shift == 4 else ((task >> 1) // 3)
-                            b_local_base = (task - group * pair_slices) << 1
-                    else:
-                        q = task if use_chunks else (task >> (slice_shift - 1))
-                        group = q // 3
-                        b_local_base = ((q - group * 3) << slice_shift) if use_chunks else ((task - group * pair_slices) << 1)
-                else:
-                    group = (task // chunks_per_group) if use_chunks else (task // (blocks // 2))
-                    b_local_base = ((task % chunks_per_group) * b_chunk_const) if use_chunks else ((task % (blocks // 2)) * 2)
+            if task < bulk_groups:
+                group, b_local_base, b_pairs = task, 0, pair_slices
             else:
-                group = (task // chunks_per_group) if use_chunks else (task // pair_slices)
-                b_local_base = ((task % chunks_per_group) * b_chunk_const) if use_chunks else ((task - group * pair_slices) << 1)
-            tasks.append((group, b_local_base))
+                t_task = task - bulk_groups
+                b_pairs = tail_b_pairs
+                if blocks == 48:
+                    if sliced:
+                        if slice_shift == 0:
+                            group = t_task
+                            b_local_base = 0
+                        elif two_chunks:
+                            if use_chunks:
+                                group = t_task >> 1
+                                b_local_base = (t_task & 1) * (b_pairs_sliced << 1)
+                            else:
+                                group = (t_task >> 3) if slice_shift == 4 else ((t_task >> 1) // 3)
+                                b_local_base = (t_task - group * pair_slices) << 1
+                        else:
+                            q = t_task if use_chunks else (t_task >> (slice_shift - 1))
+                            group = q // 3
+                            b_local_base = ((q - group * 3) << slice_shift) if use_chunks else ((t_task - group * pair_slices) << 1)
+                    else:
+                        group = (t_task // chunks_per_group) if use_chunks else (t_task // (blocks // 2))
+                        b_local_base = ((t_task % chunks_per_group) * b_chunk_const) if use_chunks else ((t_task % (blocks // 2)) * 2)
+                else:
+                    group = (t_task // chunks_per_group) if use_chunks else (t_task // pair_slices)
+                    b_local_base = ((t_task % chunks_per_group) * b_chunk_const) if use_chunks else ((t_task - group * pair_slices) << 1)
+                group += bulk_groups
+            if rev_groups:
+                group = groups - 1 - group
+            tasks.append((group, b_local_base, b_pairs))
             task += step
-    return limit_tasks, b_pairs, use_chunks, tasks
+    return limit_tasks, use_chunks, tasks
 
 
 def fc2_slice_task_mapping(
@@ -808,7 +824,7 @@ def validate_fc2_slice_geometry(
             continue
         expected_fc2 = {(g, b) for g in range(groups) for b in range(slice_blocks)}
 
-        limit_ws, b_pairs, _, ws_tasks = fc2_ws_slice_task_mapping(
+        limit_ws, _, ws_tasks = fc2_ws_slice_task_mapping(
             groups, fc2_grid, slice_blocks, slice_shift, blocks=blocks
         )
         if len(ws_tasks) != limit_ws:
@@ -817,7 +833,7 @@ def validate_fc2_slice_geometry(
             )
         covered_ws = [
             (g, b_local_base + 2 * pair_idx + j)
-            for g, b_local_base in ws_tasks
+            for g, b_local_base, b_pairs in ws_tasks
             for pair_idx in range(b_pairs)
             for j in range(2)
         ]

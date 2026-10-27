@@ -186,13 +186,13 @@ def test_every_slice_shift_fc2_task_mapping_bijective_and_terminating(
     expected_domain = {(g, b) for g in range(groups) for b in range(slice_blocks)}
 
     # 1. Warp-specialized paired-N256 FC2 kernel (grouped_fc2_ws_kernel)
-    limit_ws, b_pairs, use_chunks_ws, ws_tasks = fc2_ws_slice_task_mapping(
+    limit_ws, use_chunks_ws, ws_tasks = fc2_ws_slice_task_mapping(
         groups, step, slice_blocks, slice_shift, blocks=48
     )
     assert len(ws_tasks) == limit_ws
     covered_ws = [
         (g, b_local_base + 2 * pair_idx + j)
-        for g, b_local_base in ws_tasks
+        for g, b_local_base, b_pairs in ws_tasks
         for pair_idx in range(b_pairs)
         for j in range(2)
     ]
@@ -212,6 +212,32 @@ def test_every_slice_shift_fc2_task_mapping_bijective_and_terminating(
     ]
     assert len(covered_f) == groups * slice_blocks
     assert set(covered_f) == expected_domain
+
+
+@pytest.mark.parametrize("step", [48, 170, 188])
+@pytest.mark.parametrize("slice_shift,slice_blocks", [(0, 48), (0, 2), (1, 6), (2, 12), (3, 24), (4, 16)])
+def test_fc2_ws_bulk_tail_boundaries_and_snake_order(step, slice_shift, slice_blocks):
+    tail_waves = 2 if slice_blocks > 24 else (1 if slice_blocks == 24 else 0)
+    threshold = (tail_waves + 1) * step
+    samples = {0, 1, step - 1, step, step + 1, threshold - 1, threshold,
+               threshold + 1, threshold + step - 1, threshold + step, 512, 768}
+    for groups in sorted(samples):
+        limit, use_chunks, tasks = fc2_ws_slice_task_mapping(
+            groups, step, slice_blocks, slice_shift
+        )
+        expected_bulk = ((groups - tail_waves * step) // step) * step if groups >= threshold else 0
+        assert len(tasks) == limit
+        bulk_tasks = [(g, b, n) for g, b, n in tasks if g < expected_bulk]
+        assert set(bulk_tasks) == {(g, 0, slice_blocks // 2) for g in range(expected_bulk)}
+        coverage = [(g, b + 2 * p + j) for g, b, n in tasks for p in range(n) for j in range(2)]
+        assert len(coverage) == groups * slice_blocks
+        assert set(coverage) == {(g, b) for g in range(groups) for b in range(slice_blocks)}
+        reverse_limit, reverse_chunks, reversed_tasks = fc2_ws_slice_task_mapping(
+            groups, step, slice_blocks, slice_shift, slice_base=slice_blocks
+        )
+        assert (reverse_limit, reverse_chunks) == (limit, use_chunks)
+        assert reversed_tasks == ([(groups - 1 - g, b, n) for g, b, n in tasks]
+                                  if slice_blocks < 48 else tasks)
 
 
 @pytest.mark.parametrize("slice_shift", [0, 1, 2, 3, 4])
