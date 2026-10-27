@@ -15,6 +15,8 @@ _CONST_NAMES = {
     "_FC1_PRODUCER_REGS",
     "_FC1_CONSUMER_REGS",
     "_FC1_CTA_MAX_REGS",
+    "_FC1_FULL_GRAND_PRODUCER_REGS",
+    "_FC1_FULL_GRAND_CONSUMER_REGS",
 }
 _FUNC_NAMES = {
     "slice_blocks_for_shift",
@@ -59,6 +61,11 @@ def test_fc1_ws_register_budget_within_ctapool():
     assert consumer_regs == 208
     assert cta_max_regs == 3 * 168 == 504
     assert producer_regs + 2 * consumer_regs == cta_max_regs
+    full_producer_regs = HELPERS["_FC1_FULL_GRAND_PRODUCER_REGS"]
+    full_consumer_regs = HELPERS["_FC1_FULL_GRAND_CONSUMER_REGS"]
+    assert full_producer_regs == 40
+    assert full_consumer_regs == 232
+    assert full_producer_regs + 2 * full_consumer_regs == cta_max_regs
 
 
 @pytest.mark.parametrize(
