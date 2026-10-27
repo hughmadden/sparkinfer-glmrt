@@ -291,7 +291,7 @@ def audit_compile(label, group_rows, knobs, capacity, decode, reference=None, en
                                           fc2_f32=decode)
             arm_source = (identity,)
             kwargs["name"] = "exlr8_audit_frozen_reference"
-        kwargs["key"] = (arm_source, tuple(sorted(knobs.items())), kwargs["key"])
+        kwargs["key"] = (arm_source, engine_aot, tuple(sorted(knobs.items())), kwargs["key"])
         return _common.compile_program(wrapper, **kwargs)
     exlr8.compile_program = keyed
     try:
@@ -361,7 +361,11 @@ def audit_main(args):
     if args.exhaustive and (max(rows_list) != 4096 or min(rows_list) <= 64):
         raise ValueError("exhaustive mode requires prefill only, including rows4096")
     reference_core = load_reference_core(args.reference_core) if args.reference_core else None
+    if args.phase_profile and not args.json_output:
+        raise ValueError("--phase-profile requires --json-output")
     if args.engine_aot:
+        if not args.source_commit or args.world != 6 or args.rank != 0:
+            raise ValueError("Spark duel requires --source-commit and frozen TP6 rank0 geometry")
         if reference_core is None or args.arms != "current,current_control,candidate":
             raise ValueError("--engine-aot requires a frozen reference and current,current_control,candidate arms")
         if torch.cuda.get_device_capability() != (12, 1):
