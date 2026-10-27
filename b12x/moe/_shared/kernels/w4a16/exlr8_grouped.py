@@ -2057,6 +2057,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         token[i] = tok
                     bytes_tx = (w0 + w1) * Int32(2048)
                     last_reader = Int32(1)
+                    if group > Int32(0):
+                        if group_expert[group - Int32(1)] == expert:
+                            last_reader = Int32(0)
                     if group + Int32(1) < groups:
                         if group_expert[group + Int32(1)] == expert:
                             last_reader = Int32(0)
@@ -2147,17 +2150,16 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         acc.fill(Float32(0.0))
         r_m = lane & Int32(15)
         c_half = lane >> Int32(4)
-        rec_a0 = Int32(0)
         rec_b0 = Int32(0)
+        src_lane = (lane + Int32(31)) & Int32(31)
         shift0 = Int32(0)
-        shift1 = Int32(0)
         if cutlass.const_expr(width == 4):
             rec_b0 = b_base + (n16_0 * Int32(32) + lane) * Int32(4)
         else:
-            ia, ib, shift0, _ = trellis256_lane_geom_bits(lane, 0, 8, width)
-            rec_a0 = b_base + (n16_0 * Int32(8 * width) + ia) * Int32(4)
+            _, ib, shift0, _ = trellis256_lane_geom_bits(lane, 0, 8, width)
             rec_b0 = b_base + (n16_0 * Int32(8 * width) + ib) * Int32(4)
-            shift1 = shift0 + Int32(4 * width)
+            if cutlass.const_expr(width == 3):
+                src_lane = (lane + Int32(31) - ((lane & Int32(3)) == Int32(3)).to(Int32)) & Int32(31)
         if cutlass.const_expr(self.a8):
             sa_base = a_base + Int32(2048) + (lane >> Int32(2)) * Int32(16)
             for k32 in cutlass.range_constexpr(4):
@@ -2173,15 +2175,15 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         wb = Uint32(0)
                         if cutlass.const_expr(width == 4):
                             b = ld_ring_u32_offset(rec_b0, k16 * 1024 + j * 128)
-                            a = cute.arch.shuffle_sync(b, (lane + Int32(31)) & Int32(31))
+                            a = cute.arch.shuffle_sync(b, src_lane)
                             wa = b
                             wb = (a << Uint32(16)) | (b >> Uint32(16))
                         else:
-                            a = ld_ring_u32_offset(rec_a0, k16 * 256 * width + j * 32 * width)
                             b = ld_ring_u32_offset(rec_b0, k16 * 256 * width + j * 32 * width)
-                            window = (a.to(Int64) << Int64(32)) | b.to(Int64)
-                            wa = (window >> shift0.to(Int64)).to(Uint32)
-                            wb = (window >> shift1.to(Int64)).to(Uint32)
+                            a = cute.arch.shuffle_sync(b, src_lane)
+                            w_sh = ((a.to(Int64) << Int64(32)) | b.to(Int64)) >> shift0.to(Int64)
+                            wa = w_sh.to(Uint32)
+                            wb = (w_sh >> Int64(4 * width)).to(Uint32)
                         b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
                         e_lo = _e4m3x4_from_half2x2(b0, b1)
                         e_hi = _e4m3x4_from_half2x2(b2, b3)
@@ -2220,22 +2222,22 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     wb = Uint32(0)
                     if cutlass.const_expr(width == 4):
                         b = ld_ring_u32_offset(rec_b0, k16 * 1024 + j * 128)
-                        a = cute.arch.shuffle_sync(b, (lane + Int32(31)) & Int32(31))
+                        a = cute.arch.shuffle_sync(b, src_lane)
                         wa = b
                         wb = (a << Uint32(16)) | (b >> Uint32(16))
                     else:
-                        a = ld_ring_u32_offset(rec_a0, k16 * 256 * width + j * 32 * width)
                         b = ld_ring_u32_offset(rec_b0, k16 * 256 * width + j * 32 * width)
-                        window = (a.to(Int64) << Int64(32)) | b.to(Int64)
-                        wa = (window >> shift0.to(Int64)).to(Uint32)
-                        wb = (window >> shift1.to(Int64)).to(Uint32)
+                        a = cute.arch.shuffle_sync(b, src_lane)
+                        w_sh = ((a.to(Int64) << Int64(32)) | b.to(Int64)) >> shift0.to(Int64)
+                        wa = w_sh.to(Uint32)
+                        wb = (w_sh >> Int64(4 * width)).to(Uint32)
                     b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
                     frags.append((_e4m3_round_half2(b0), _e4m3_round_half2(b1),
                                   _e4m3_round_half2(b2), _e4m3_round_half2(b3)))
-                col = Int32(k16 * 2) + c_half
+                col = Int32((k16 & 3) * 2) + c_half
                 addr_k16 = a_base + (r_m * Int32(16) + (col ^ (r_m & Int32(7)))) * Int32(16)
                 for idx in cutlass.range_constexpr(active):
-                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(addr_k16, idx * 4096)
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(addr_k16, idx * 4096 + (k16 >> 2) * 128)
                     for j in cutlass.range_constexpr(2):
                         f = frags[j]
                         d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
@@ -2263,15 +2265,17 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         v_lo = ld_shared_i32_relaxed(hdr_s + Int32(8))
         v_hi = ld_shared_i32_relaxed(hdr_s + Int32(12))
         task = ld_shared_i32_relaxed(hdr_s + Int32(16))
-        proj = cw >> Int32(2)
-        col = (cw & Int32(3)) * Int32(32) + (lane & Int32(3)) * Int32(2)
+        cw_s = bind_loop_i32(cw, task)
+        lane_s = bind_loop_i32(lane, task)
+        proj = cw_s >> Int32(2)
+        col = (cw_s & Int32(3)) * Int32(32) + (lane_s & Int32(3)) * Int32(2)
         out_base = fc1_addr + (
             (task * Int32(2) + proj).to(Int64) * Int64(self.group_rows * 128)
             + col.to(Int64)) * Int64(4)
         for idx in cutlass.range_constexpr(active):
             m = (live >> Int32(idx * 2)) & Int32(3)
             for v in cutlass.range_constexpr(2):
-                local = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
+                local = m * Int32(16) + Int32(v * 8) + (lane_s >> Int32(2))
                 word = v_lo if local < Int32(32) else v_hi
                 if ((word >> (local & Int32(31))) & Int32(1)) != Int32(0):
                     row_addr = out_base + local.to(Int64) * Int64(128 * 4)
@@ -2359,7 +2363,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         proj = cw >> Int32(2)
         n16_0 = (cw & Int32(3)) * Int32(2)
         scale_base = hdr + Int32(4 * _FC1_HEADER_WORDS) + proj * Int32(4 * self.blocks)
-        if cutlass.const_expr(active <= 3 and width != 0):
+        full_grand = not (self.a8 and not self.quantize_pass)
+        if cutlass.const_expr((active <= 3 or full_grand) and width != 0):
             grand = cute.make_rmem_tensor((active, 2, 8), Float32)
             grand.fill(Float32(0.0))
             for split in cutlass.range(self.splits):
@@ -2393,7 +2398,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         stage = ring + slot * Int32(self.fc1_stage_bytes)
                         self.fc1_ws_block(total, stage,
                                           stage + Int32(self.fc1_a_bytes) + proj * Int32(8192),
-                                          lane, n16_0, width, scale_base + kb * Int32(4), 4)
+                                          lane, n16_0, width, scale_base + kb * Int32(4), active)
                         _mbar_arrive(bar_empty + slot * Int32(8))
                         seq += Int32(1)
                 for idx in cutlass.range_constexpr(2):
@@ -2457,13 +2462,16 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 _mbar_init(bar_tempty + Int32(8 * s), Int32(_FC1_CONSUMER_THREADS))
             _fence_mbar_init()
         cute.arch.sync_threads()
+        use_full_grand = not (self.a8 and not self.quantize_pass)
+        prod_regs = 56 if use_full_grand else _FC1_PRODUCER_REGS
+        cons_regs = 224 if use_full_grand else _FC1_CONSUMER_REGS
         if tid >= Int32(_FC1_CONSUMER_THREADS):
-            cute.arch.warpgroup_reg_dealloc(_FC1_PRODUCER_REGS)
+            cute.arch.warpgroup_reg_dealloc(prod_regs)
             self.fc1_ws_producer(tid - Int32(_FC1_CONSUMER_THREADS), ring, cta, grid, x,
                                  pointers, bits, unit_count, unit_map, group_expert,
                                  route_slots, rows, groups, unit_limit)
         else:
-            cute.arch.warpgroup_reg_alloc(_FC1_CONSUMER_REGS)
+            cute.arch.warpgroup_reg_alloc(cons_regs)
             lane, cw = tid & Int32(31), tid >> Int32(5)
             fc1_addr = fc1.iterator.toint()
             hdr_base = ring + Int32(self.fc1_hdr_off)
