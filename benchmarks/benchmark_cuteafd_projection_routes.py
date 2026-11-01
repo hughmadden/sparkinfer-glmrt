@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 from pathlib import Path
 import statistics
+import subprocess
 import sys
+import threading
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -15,8 +20,14 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shapes", default="4096x4096", help="comma-separated output N x input K")
     parser.add_argument("--rows", default="1,8,9,10,16,32,64")
-    parser.add_argument("--recipes", choices=("routes", "compensation"), default="routes",
-                        help="skinny vs MMA, or identical-tile uncompensated vs compensated TMA")
+    parser.add_argument("--recipes", choices=("routes", "compensation", "trellis"), default="routes",
+                        help="BF16 route comparisons, or the unchanged native K6 prefill baseline")
+    parser.add_argument("--trellis-config", type=Path,
+                        help="JSON list of {n,k,side,groups} K6 geometries; trellis recipe only")
+    parser.add_argument("--trellis-paired", action="store_true",
+                        help="retain exactly two K6 geometries and interleave their timed replays")
+    parser.add_argument("--trellis-steady-ms", type=float, default=0,
+                        help="continuous L2-cold duration; equal session_id configs interleave")
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -27,9 +38,11 @@ def parse_args(argv=None):
         parser.error("shapes must be NxK and rows must be comma-separated integers")
     if any(len(shape) != 2 or any(v <= 0 or v % 8 for v in shape) for shape in args.shapes):
         parser.error("projection dimensions must be positive multiples of eight")
-    row_limit = 4096 if args.recipes == "compensation" else 128
+    row_limit = 4096 if args.recipes in ("compensation", "trellis") else 128
     if args.samples < 1 or any(v < 1 or v > row_limit for v in args.rows):
         parser.error(f"positive samples and live rows in 1..{row_limit} required")
+    if args.trellis_steady_ms and (not math.isfinite(args.trellis_steady_ms) or args.trellis_steady_ms < 200):
+        parser.error("steady sessions must be finite and at least 200 ms")
     return args
 
 
@@ -68,8 +81,260 @@ def _accuracy(actual, baseline, oracle):
             "rows_exceeding_bar": int((candidate > reference * 1.01 ** 2).sum().item())}
 
 
+def _gpu_telemetry():
+    fields = "power.draw,clocks.sm,clocks.max.sm,clocks.mem,utilization.gpu,temperature.gpu"
+    def query(arguments):
+        result = subprocess.run(["nvidia-smi", *arguments, "--format=csv,noheader,nounits"],
+                                capture_output=True, text=True, timeout=15)
+        return {"returncode": result.returncode, "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip()}
+    return {"time_ns": time.time_ns(), "pid": os.getpid(), "fields": fields,
+            "gpu": query([f"--query-gpu={fields}"]),
+            "compute_apps": query(["--query-compute-apps=pid,process_name,used_memory"])}
+
+
+def _alternating_order_audit(samples):
+    median = statistics.median(samples)
+    mad = statistics.median(abs(value-median) for value in samples)
+    delta = (abs(statistics.median(samples[::2])-statistics.median(samples[1::2]))
+             if len(samples) > 1 else None)
+    return dict(mad_us=mad, delta_us=delta, flagged=delta is None or delta > 3*mad)
+
+
+def _steady_trellis(args, pending, flush):
+    import pynvml
+    import torch
+
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+    results = []
+    for rows, pair in pending.items():
+        for entry, graph in pair:
+            entry["telemetry_before"] = _gpu_telemetry()
+        # Queue a continuous host loop; nested graph capture is unsupported.
+        def run_session(measured):
+            events = [[] for _ in pair]
+            begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+            begin.record()
+            deadline, repeat = time.monotonic() + args.trellis_steady_ms/1000, 0
+            while time.monotonic() < deadline or repeat < args.samples:
+                order = range(len(pair)) if repeat % 2 == 0 else reversed(range(len(pair)))
+                for index in order:
+                    flush()
+                    if measured:
+                        start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+                        start.record()
+                    pair[index][1].replay()
+                    if measured:
+                        stop.record()
+                        events[index].append((start, stop))
+                repeat += 1
+                if repeat % 4 == 0:
+                    torch.cuda.current_stream().synchronize()
+            end.record()
+            end.synchronize()
+            return events, begin.elapsed_time(end)
+
+        run_session(False)
+        readings, errors, stop_sampling = [], [], threading.Event()
+        def sample():
+            while not stop_sampling.wait(.01):
+                try:
+                    readings.append(dict(time_ns=time.time_ns(),
+                        power_w=pynvml.nvmlDeviceGetPowerUsage(handle)/1000,
+                        sm_mhz=pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM),
+                        memory_mhz=pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM),
+                        utilization=pynvml.nvmlDeviceGetUtilizationRates(handle).gpu,
+                        temperature=pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)))
+                except Exception as error:
+                    errors.append(str(error))
+        sampler = threading.Thread(target=sample)
+        sampler.start()
+        launch_ns = time.time_ns()
+        events, duration_ms = run_session(True)
+        finish_ns = time.time_ns()
+        stop_sampling.set()
+        sampler.join()
+        active = [v for v in readings if launch_ns <= v["time_ns"] <= finish_ns]
+        accepted = bool(active) and not errors and duration_ms >= args.trellis_steady_ms
+        for index, (entry, graph) in enumerate(pair):
+            entry["samples_us"] = [start.elapsed_time(stop)*1000 for start, stop in events[index]]
+            entry["median_us"] = statistics.median(entry["samples_us"])
+            entry["session_ms"] = duration_ms
+            entry["in_run_telemetry"] = active
+            entry["telemetry_errors"] = errors
+            audit = _alternating_order_audit(entry["samples_us"])
+            entry["alternating_order_audit"] = audit
+            entry["accepted"] = accepted and not audit["flagged"]
+            entry["telemetry_after"] = _gpu_telemetry()
+            results.append(entry)
+            print(json.dumps({key: value for key, value in entry.items()
+                              if key not in ("samples_us", "in_run_telemetry")}), flush=True)
+    return results
+
+
+def _trellis_baseline(args):
+    import numpy as np
+    import torch
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from benchmarks.common import make_l2_flush_fn
+    from tests._reference.native_trellis import Reference
+
+    configs = (json.loads(args.trellis_config.read_text()) if args.trellis_config else
+               [dict(n=n, k=k, side=1, groups=1) for n, k in args.shapes])
+    flush = make_l2_flush_fn(True)
+    torch.manual_seed(174)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    results = []
+    properties = torch.cuda.get_device_properties(0)
+    if args.trellis_paired and len(configs) != 2:
+        raise ValueError("paired K6 timing requires exactly two configurations")
+    pending, retained = {}, []
+    def save():
+        if args.output:
+            args.output.write_text(json.dumps(dict(device=torch.cuda.get_device_name(),
+                sms=properties.multi_processor_count, torch_version=torch.__version__,
+                cuda_version=torch.version.cuda, argv=sys.argv, kind="native_k6_baseline",
+                conditions="unchanged production core; F16 rotated inputs; random K128 scales; L2 eviction per replay; bounded group0/N128/all-K F32/FP64 oracle with up to8 rows; row invariance vs maximum M, eager/graph and repeated replay byte checks cover all live outputs/groups; steady mode uses >=200ms warm/timed host loops, in-run NVML and an alternating-order MAD audit, no power/clock rejection; cross-device absolute timing extrapolation is not valid",
+                results=results), indent=2)+"\n")
+    for config_index, config in enumerate(configs):
+        n, k, side, groups = (config[key] for key in ("n", "k", "side", "groups"))
+        if n % 128 or k % 128 or side not in (1, 2) or groups not in (1, 4):
+            raise ValueError(f"invalid trellis geometry: {config}")
+        x = torch.randn(groups, max(args.rows), k, device="cuda", dtype=torch.float16) * .1
+        inputs = torch.tensor([row.data_ptr() for row in x], device="cuda", dtype=torch.int64)
+        payloads = [torch.randint(0, 256, (n*k*6//8,), device="cuda", dtype=torch.uint8)
+                    for _ in range(groups)]
+        scales = [(torch.rand(k//128, device="cuda", dtype=torch.float16) + .5)
+                  for _ in range(groups)]
+        partial_elements = (groups*max(args.rows)*((k+1023)//1024)*n
+                            if min(args.rows) < 130 else 1)
+        partial = torch.empty(partial_elements, device="cuda", dtype=torch.float32)
+        outputs = [torch.empty(max(args.rows), n, device="cuda", dtype=torch.float32)
+                   for _ in range(groups)]
+        program = compile_trellis_linear_aot(input_features=k, output_features=n, bits=6,
+            codebook="mcg", sharded_side=side, rotation_count=groups, groups=groups,
+            max_rows=max(args.rows))
+        operands = ((inputs, payloads[0], scales[0], partial, outputs[0]) if groups == 1 else
+                    (inputs, *payloads, *scales, partial, *outputs))
+
+        # Independently reconstruct one N128 output block, bounded in K128 chunks.
+        weight = np.empty((k, 128), dtype=np.float32)
+        reference = Reference("mcg")
+        tile_bytes = 128*128*6//8
+        for kb in range(k//128):
+            offset = kb*tile_bytes if side == 1 else kb*(n//128)*tile_bytes
+            raw = payloads[0][offset:offset+tile_bytes].cpu().numpy().tobytes()
+            tiles = reference.decode_tiles(raw, 6)
+            if side == 1:
+                block = tiles.reshape(8, 8, 16, 16).transpose(0, 2, 1, 3).reshape(128, 128)
+            else:
+                block = tiles.reshape(1, 8, 8, 16, 16).transpose(1, 3, 0, 2, 4).reshape(128, 128)
+            weight[kb*128:(kb+1)*128] = block
+        sample_rows = min(8, min(args.rows))
+        w = torch.tensor(weight, device="cuda")
+        scaled_w = w * scales[0].float().repeat_interleave(128)[:, None]
+        oracle = x[0, :sample_rows].double() @ scaled_w.double()
+        f32_oracle = x[0, :sample_rows].float() @ scaled_w
+        baseline = x[0, :sample_rows] @ scaled_w.half()
+        max_outputs = None
+        for rows in sorted(args.rows, reverse=True):
+            scalars = (rows, 0, properties.multi_processor_count*4)
+            for output in outputs:
+                output.fill_(float("nan"))
+            program.launch(*operands, scalars=scalars)
+            torch.cuda.synchronize()
+            expected = [output[:rows].clone() for output in outputs]
+            if any(not bool(torch.isfinite(value).all()) for value in expected):
+                raise RuntimeError(f"{config} M{rows}: nonfinite output")
+            if max_outputs is None:
+                max_outputs = expected
+            elif any(not torch.equal(value.view(torch.int32), want[:rows].view(torch.int32))
+                     for value, want in zip(expected, max_outputs)):
+                raise RuntimeError(f"{config} M{rows}: row invariance failed")
+            accuracy = _accuracy(outputs[0][:sample_rows, :128], baseline, oracle)
+            if not accuracy["pass"]:
+                raise RuntimeError(f"{config} M{rows}: bounded independent oracle failed: {accuracy}")
+            error = outputs[0][:sample_rows, :128].float() - f32_oracle
+            accuracy.update(f32_oracle=dict(max_abs=float(error.abs().max()),
+                            rms=float(error.square().mean().sqrt())),
+                fp64_oracle_rms=float((outputs[0][:sample_rows, :128].double()-oracle).square().mean().sqrt()),
+                sample_rows=sample_rows, sample_columns=128,
+                oracle_scope="group0, bounded rows/N, all K; not checkpoint fidelity")
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                program.launch(*operands, scalars=scalars)
+            for output in outputs:
+                output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            if any(not torch.equal(value[:rows].view(torch.int32), want.view(torch.int32))
+                   for value, want in zip(outputs, expected)):
+                raise RuntimeError("trellis graph replay differs from eager output")
+            # A second replay also checks deterministic overwrite of every live output.
+            graph.replay()
+            torch.cuda.synchronize()
+            if any(not torch.equal(value[:rows].view(torch.int32), want.view(torch.int32))
+                   for value, want in zip(outputs, expected)):
+                raise RuntimeError("trellis repeated replay is not deterministic")
+            entry = dict(config, rows=rows, bits=6, codebook="mcg", input_dtype="f16",
+                         samples_us=[], accuracy=accuracy, row_invariant=True, graph_exact=True)
+            if args.trellis_paired or args.trellis_steady_ms:
+                pending.setdefault(rows, []).append((entry, graph))
+            else:
+                entry["telemetry_before"] = _gpu_telemetry()
+                for _ in range(args.samples):
+                    flush()
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    graph.replay()
+                    end.record()
+                    end.synchronize()
+                    entry["samples_us"].append(start.elapsed_time(end)*1000)
+                entry["telemetry_after"] = _gpu_telemetry()
+                entry["median_us"] = statistics.median(entry["samples_us"])
+                results.append(entry)
+                print(json.dumps({key: value for key, value in entry.items() if key != "samples_us"}), flush=True)
+                save()
+            del graph, expected
+        del max_outputs
+        if args.trellis_paired or args.trellis_steady_ms:
+            retained.append((program, operands, x, inputs, payloads, scales, partial, outputs))
+        del program, operands, x, inputs, payloads, scales, partial, outputs, w, scaled_w, oracle, f32_oracle, baseline
+        if args.trellis_steady_ms and (config_index+1 == len(configs) or
+                config.get("session_id", config_index) != configs[config_index+1].get("session_id", config_index+1)):
+            results.extend(_steady_trellis(args, pending, flush))
+            pending.clear()
+            retained.clear()
+            save()
+        torch.cuda.empty_cache()
+    for rows, pair in pending.items():
+        for entry, graph in pair:
+            graph.replay()
+        torch.cuda.synchronize()
+        for entry, graph in pair:
+            entry["telemetry_before"] = _gpu_telemetry()
+        for sample in range(args.samples):
+            for entry, graph in pair if sample % 2 == 0 else pair[::-1]:
+                flush()
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                graph.replay()
+                end.record()
+                end.synchronize()
+                entry["samples_us"].append(start.elapsed_time(end)*1000)
+        for entry, graph in pair:
+            entry["telemetry_after"] = _gpu_telemetry()
+            entry["median_us"] = statistics.median(entry["samples_us"])
+            results.append(entry)
+            print(json.dumps({key: value for key, value in entry.items() if key != "samples_us"}), flush=True)
+        save()
+
+
 def main():
     args = parse_args()
+    if args.recipes == "trellis":
+        return _trellis_baseline(args)
     import torch
     from benchmarks.common import make_l2_flush_fn
 
