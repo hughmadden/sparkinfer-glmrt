@@ -4,6 +4,7 @@ Weights and scales retain their decode residency. Original-slot FP32 route
 planes use the native engine's existing ordered fold and BF16 compactor.
 """
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
@@ -93,7 +94,7 @@ class V4StreamPipeline:
                  w2: cute.Pointer, s2: cute.Pointer, ids: cute.Pointer, routing: cute.Pointer,
                  meta: cute.Pointer, pair_row: cute.Pointer, pair_pos: cute.Pointer,
                  act: cute.Pointer, grouped_routing: cute.Pointer, grouped_route: cute.Pointer,
-                 output: cute.Pointer, rows: Int32, stream):
+                 output: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         pairs = rows * self.topk
         tiles = (pairs + 127) // 128 + min(pairs, self.experts)
         self.prep(ids, meta, pair_row, pair_pos, rows, pairs, stream)

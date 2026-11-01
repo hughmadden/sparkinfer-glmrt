@@ -444,6 +444,46 @@ def test_native_stream_scratch_matches_every_static_tensor(capacity, width):
     assert layout[-2]["shape"] == (capacity * 6,)
 
 
+def test_native_stream_export_to_c_signature_is_supported_without_cuda():
+    import inspect
+
+    import cuda.bindings.driver as cuda
+    import cutlass
+    from cutlass.base_dsl.common import DSLRuntimeError
+    from cutlass.base_dsl.jit_executor import ExecutionArgs
+    from cutlass.cute.export.c_header_generator import CuteCHeaderGenerator
+    from cutlass.cute.runtime import make_ptr
+
+    from b12x.moe._shared.kernels.v4_stream_pipeline import V4StreamPipeline
+
+    signature = inspect.signature(V4StreamPipeline.__call__)
+    signature = signature.replace(parameters=list(signature.parameters.values())[1:])
+    pointer_names = [name for name in signature.parameters if name not in ("rows", "stream")]
+    pointer_types = (cutlass.Uint8, cutlass.Uint32, cutlass.Uint8, cutlass.Uint32,
+                     cutlass.Uint8, cutlass.Int32, cutlass.Float32, cutlass.Int32,
+                     cutlass.Int32, cutlass.Int32, cutlass.Uint8, cutlass.Float32,
+                     cutlass.Int32, cutlass.Float32)
+    assert len(pointer_names) == len(pointer_types) == 14
+    args = tuple(make_ptr(dtype, 0, assumed_align=16) for dtype in pointer_types)
+    args += (cutlass.Int32(256), cuda.CUstream(0))
+    generator = CuteCHeaderGenerator()
+    # This is the checker called by export_to_c, not a static annotation check.
+    arguments, packed, declarations = generator._generate_arguments(
+        "v4_stream", ExecutionArgs(signature, "V4StreamPipeline"), args, {})
+    assert arguments == [*(f"void *{name}" for name in pointer_names),
+                         "int32_t rows", "cudaStream_t stream"]
+    assert packed == [f"&{name}" for name in signature.parameters]
+    assert declarations == []
+
+    untyped = signature.replace(parameters=[
+        param.replace(annotation=inspect.Parameter.empty) if name == "stream" else param
+        for name, param in signature.parameters.items()])
+    with pytest.raises(DSLRuntimeError, match="Unsupported argument.*stream"):
+        generator._generate_arguments(
+            "v4_stream", ExecutionArgs(untyped, "V4StreamPipeline"), args, {})
+    assert not torch.cuda.is_initialized()
+
+
 def test_native_stream_has_ordered_float_output_and_no_atomic_reduction():
     path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v4_stream_pipeline.py"
     source = path.read_text()
