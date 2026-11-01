@@ -35,6 +35,19 @@ def test_v41_fc1_split_recipe_is_hardware_scoped():
         assert recipe(*shape) == 1
 
 
+def test_seed_oracle_control_does_not_inherit_default_split():
+    path = _PATH.parents[1] / "tests/moe/test_v41_exact_slices.py"
+    tree = ast.parse(path.read_text())
+    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "_synthetic_oracle_seeds")
+    arms = [node for node in ast.walk(helper) if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id == "native_pair_arm"]
+    control, candidate = arms
+    assert isinstance(control.args[2], ast.Name) and control.args[2].id == "exact_control"
+    assert next(kw.value.value for kw in control.keywords if kw.arg == "fc1_k_splits") == 1
+    assert next(kw.value.id for kw in candidate.keywords if kw.arg == "fc1_k_splits") == "k_split"
+
+
 def test_mxfp4_pair_widths_cover_all_worlds_without_padding(monkeypatch):
     monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
         ownership_unit=lambda intermediate, world: 64 if (intermediate, world) == (2304, 5) else 32))

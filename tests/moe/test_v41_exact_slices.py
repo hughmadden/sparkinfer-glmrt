@@ -294,7 +294,7 @@ def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker
         for capacity in (1, 16, 80):
             operands = (x[:capacity], ids[:capacity], routing[:capacity], weights, scales)
             control, control_output, control_owned = native_pair_arm(
-                *operands, control_tile, False, False, coded, qualify=True)
+                *operands, control_tile, exact_control, False, coded, qualify=True, fc1_k_splits=1)
             candidate, output, owned = native_pair_arm(
                 *operands, tile, True, False, coded, qualify=True, fc1_k_splits=k_split)
             control()
@@ -305,6 +305,9 @@ def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker
             print(marker + " " + json.dumps(dict(
                 weight_seed=weight_seed, activation_seed=activation_seed, capacity=capacity,
                 hidden=h, logical=n, coded=coded, tile=tile, control_tile=control_tile, k_split=k_split,
+                control_arm=dict(tile=control_tile, split=1, exact_storage=exact_control),
+                candidate_arm=dict(tile=tile, split=k_split, exact_storage=True),
+                bitwise_equal=torch.equal(control_output, output),
                 control=f32_errors(control_output, oracle), candidate=f32_errors(output, oracle),
                 synthetic=True, timed=False)), flush=True)
 
