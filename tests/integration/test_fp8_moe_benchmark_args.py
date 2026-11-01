@@ -289,3 +289,92 @@ def test_legacy_glm_fixture_is_not_relabelled_for_other_families():
     assert bench.recorded_waves(path, SimpleNamespace(name="glm", experts=256, top_k=8))
     with pytest.raises(ValueError, match="family"):
         bench.recorded_waves(path, SimpleNamespace(name="mimo", experts=256, top_k=8))
+
+
+def test_explicit_rank_extents_and_identical_controls():
+    args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings",
+                             "--mxfp4-arm", "compact:288:288:128",
+                             "--mxfp4-arm", "pad64:288:320:64", "--control-repeats", "3"])
+    specs, controls = bench.tiling_specs(args, 288, 192, (64, 128, 192))
+    assert controls == ["padded", "padded-control-1", "padded-control-2"]
+    assert specs == [(name, False, 192, None) for name in controls] + [
+        ("compact", True, 128, 288), ("pad64", True, 64, 320)]
+    samples = {name: [1., 2., 3.] for name in controls}
+    samples.update(compact=[2., 4., 6.], pad64=[4., 8., 12.])
+    result = bench.tiling_timing_summary(samples, {name: True for name in samples}, controls)
+    assert result["winner"] == "compact" and result["speedup"] == .5
+    assert result["identical_control_speedups"] == {name: [1., 1., 1.] for name in controls[1:]}
+    assert bench.tiling_timing_summary(samples, {name: False for name in samples}, controls)["winner"] is None
+
+
+@pytest.mark.parametrize("value", ["bad", "a:0:128:64", "a:33:128:64", "a:128:96:64",
+                                   "a:96:97:64", "a:96:96:32", "padded-x:96:96:64",
+                                   "exact-64:96:96:64", "aligned-w2-x:96:96:64", "a/b:96:96:64"])
+def test_invalid_explicit_extents_fail_before_cuda(value):
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings", "--mxfp4-arm", value])
+
+
+def test_explicit_names_and_mode_are_unambiguous():
+    with pytest.raises(ValueError, match="duplicate"):
+        bench.native_screen_arms(["a:96:96:64", "a:128:128:64"])
+    for argv in (["--mxfp4-arm", "a:96:96:64"], ["--control-repeats", "1"],
+                 ["--mxfp4-pair", "--native-slices", "--mxfp4-tilings", "--widths", "96",
+                  "--mxfp4-arm", "a:96:96:64"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(argv)
+
+
+@pytest.mark.parametrize("stored", [96, 128, 160])
+def test_explicit_padding_preserves_real_payload_and_scale_blocks(stored):
+    logical, hidden, experts = 96, 128, 2
+    shapes = {"w1": (experts, logical, hidden // 2), "w3": (experts, logical, hidden // 2),
+              "w2": (experts, hidden, logical // 2)}
+    weights = {name: torch.full(shape, 0x32, dtype=torch.uint8) for name, shape in shapes.items()}
+    scales = {name: torch.full((*shape[:-1], shape[-1] // 16), 122, dtype=torch.uint8)
+              for name, shape in shapes.items()}
+    resident, factors = bench.extend_native_weights(weights, scales, stored)
+    assert resident["w1"].shape == (experts, stored, hidden // 2)
+    assert resident["w2"].shape == (experts, hidden, stored // 2)
+    for name in ("w1", "w3"):
+        assert torch.equal(resident[name][:, :logical], weights[name])
+        assert torch.equal(factors[name][:, :logical], scales[name])
+        assert not bool(resident[name][:, logical:].count_nonzero())
+    assert torch.equal(resident["w2"][..., :logical // 2], weights["w2"])
+    assert not bool(resident["w2"][..., logical // 2:].count_nonzero())
+    assert torch.equal(factors["w2"][..., :logical // 32], scales["w2"])
+    assert bool((factors["w2"] == 122).all())
+
+
+def jsonl_routes(tmp_path, records):
+    path = tmp_path / "routes.jsonl"
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    return path
+
+
+def test_existing_jsonl_replays_exact_narrow_rows_and_wide_histograms(tmp_path):
+    narrow = dict(event="expert_routes", layer=7, lane=0, rows=3, topk=[[3, 0], [0, 1], [3, 0]])
+    wide = dict(event="expert_routes", layer=8, lane=1, rows=80, expert_rows=[[0, 80], [1, 40], [3, 40]])
+    waves = bench.recorded_waves(jsonl_routes(tmp_path, [narrow, wide]),
+                                 SimpleNamespace(name="mimo", experts=4, top_k=2))
+    assert waves[0]["expert_rows"] == [(0, 3), (1, 1), (3, 2)]
+    assert bench.screen_route_wave(waves, 3, 0) is waves[0]
+    assert bench.screen_route_wave(waves + [waves[0]], 3, 1) is waves[0]
+    assert bench.screen_route_ids(waves[0], 4, 2, 1).tolist() == narrow["topk"]
+    ids = bench.screen_route_ids(waves[1], 4, 2, 5)
+    assert torch.bincount(ids.flatten().long(), minlength=4).tolist() == [80, 40, 0, 40]
+    assert bool((ids[:, 0] != ids[:, 1]).all())
+    assert torch.equal(ids, bench.screen_route_ids(waves[1], 4, 2, 5))
+    with pytest.raises(ValueError, match="exactly 16"):
+        bench.screen_route_wave(waves, 16, 0)
+
+
+@pytest.mark.parametrize("record", [dict(event="other", rows=1, topk=[[0, 1]]),
+    dict(event="expert_routes", rows=1, topk=[[0, 0]]),
+    dict(event="expert_routes", rows=1, topk=[[0, 4]]),
+    dict(event="expert_routes", rows=1, topk=[[0]]),
+    dict(event="expert_routes", rows=2, topk=[[0, 1]]),
+    dict(event="expert_routes", rows=1, expert_rows=[[0, 1]])])
+def test_malformed_jsonl_routes_fail_closed(tmp_path, record):
+    with pytest.raises(ValueError):
+        bench.recorded_waves(jsonl_routes(tmp_path, [record]), SimpleNamespace(name="v41", experts=4, top_k=2))
