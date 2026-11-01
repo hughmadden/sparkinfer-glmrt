@@ -12,6 +12,7 @@ old A16 ceiling; it is not a serving arithmetic override.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from collections import Counter
 from dataclasses import replace
 import hashlib
@@ -181,6 +182,9 @@ def parse_args(argv=None):
     parser.add_argument("--mxfp4-pair", action="store_true",
                         help="interleave identical logical weights in padded and exact K32 storage")
     parser.add_argument("--widths", help="paired-screen rank widths; defaults to every T2..8 adjacent width")
+    parser.add_argument("--engine-policy-root", type=Path)
+    parser.add_argument("--shipped-prefill", action="store_true",
+                        help="qualify ordered native STREAM against shipped prefill recipes")
     parser.add_argument("--native-slices", action="store_true",
                         help="paired native V4.1/V4 slice pipelines instead of grouped programs")
     parser.add_argument("--mxfp4-tilings", action="store_true",
@@ -192,6 +196,11 @@ def parse_args(argv=None):
     parser.add_argument("--control-repeats", type=int, default=2,
                         help="identical padded controls in the tiling screen, including its reference")
     args = parser.parse_args(argv)
+    if args.shipped_prefill and (not args.native_slices or not args.mxfp4_pair
+            or args.geometry not in ("v41", "dsv4f") or args.engine_policy_root is None
+            or args.capacity is not None or args.mxfp4_tilings or args.routes
+            or any(int(row) not in (256, 1024, 4096) for row in args.rows.split(","))):
+        parser.error("shipped prefill requires native V4/V4.1 pairs, policy root and prefill capacities")
     if args.iters <= 0:
         parser.error("iters must be positive")
     if args.continue_on_fail and (not args.check or args.exact_sweep):
@@ -458,14 +467,39 @@ def compiled_case(g, args, rows, route, cache):
     return cache[key]
 
 
-def paired_widths(intermediate, requested=None):
-    widths = ({int(width) for width in requested.split(",")} if requested else
-              {32 * (intermediate // 32 // world + extra)
-               for world in range(2, 9)
-               for extra in (0, int(intermediate // 32 % world != 0))})
+def engine_layout_policy(root):
+    if root is None:
+        raise ValueError("implicit widths require --engine-policy-root; otherwise pass --widths")
+    path = Path(root) / "python/tools/lib/mxfp4_layouts.py"
+    spec = importlib.util.spec_from_file_location("benchmark_engine_mxfp4_layouts", path)
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    return policy
+
+
+def paired_widths(intermediate, requested=None, policy_root=None):
+    if requested:
+        widths = {int(width) for width in requested.split(",")}
+    else:
+        policy = engine_layout_policy(policy_root)
+        widths = set()
+        for world in range(2, 9):
+            unit = policy.ownership_unit(intermediate, world)
+            units = intermediate // unit
+            widths.update((unit * (units // world), unit * -(-units // world)))
     if any(width <= 0 or width % 32 or width > intermediate for width in widths):
         raise ValueError("paired widths must be whole K32 within the checkpoint intermediate")
     return sorted(widths)
+
+
+def shipped_prefill_recipe(family, hidden, rank_width, capacity, policy_root):
+    policy = engine_layout_policy(policy_root)
+    matching = 128 if family == "dsv4f" else native_slice_width(family, rank_width)
+    # Equal Flash roles pass atomic-min-capacity; unequal width exports do not.
+    return dict(tile=policy.native_slice_width(hidden, rank_width, 121, capacity, matching),
+                exact=policy.stored_width(hidden, rank_width) == rank_width,
+                atomic=family == "dsv4f" and rank_width in (256, 512, 1024),
+                coded=family == "v41")
 
 
 def native_slice_width(family, rank_width):
@@ -474,7 +508,7 @@ def native_slice_width(family, rank_width):
 
 
 def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
-                    aligned_w2=False, aligned_w2_scales=False, stored_width=None):
+                    aligned_w2=False, aligned_w2_scales=False, stored_width=None, combine_output=False):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -546,16 +580,28 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
         if aligned_w2_scales:
             pipeline.fc2.w2_scale_columns = w2_pitch // 32
     launch = cute.compile(pipeline, *args, cutlass.Int32(rows), current_cuda_stream())
+    token_output = torch.empty_like(x) if combine_output else output
+    combine = None
+    if combine_output:
+        from b12x.moe._shared.kernels.v4_stream_pipeline import NativeTokenCombine
+        source_tensor = from_dlpack(output.view(rows, hidden) if atomic else output,
+                                    assumed_align=16)
+        token_tensor = from_dlpack(token_output, assumed_align=16)
+        combine = cute.compile(NativeTokenCombine(hidden, 1 if atomic else topk),
+            source_tensor.iterator, token_tensor.iterator, cutlass.Int32(rows), current_cuda_stream())
     def execute(live):
         launch(*args, cutlass.Int32(live), current_cuda_stream())
+        if combine is not None:
+            combine(source_tensor.iterator, token_tensor.iterator, cutlass.Int32(live), current_cuda_stream())
     if qualify:
-        if atomic:
-            raise ValueError("tiling qualification requires ordered deterministic route output")
-        qualify_pair_replay(execute, ids, output, [partial, *scratch], tensors,
-                            lambda live: output[:live * topk])
+        if atomic and not combine_output:
+            raise ValueError("atomic qualification requires combined token output")
+        qualifier = qualify_atomic_pair_replay if atomic else qualify_pair_replay
+        qualifier(execute, ids, token_output, [partial, *scratch, output] if combine_output else [partial, *scratch],
+                  [*tensors, token_output], lambda live: token_output[:live if combine_output else live * topk])
     def run():
         execute(rows)
-    return run, output, (tensors, args, launch)
+    return run, token_output, (tensors, args, launch, combine, execute)
 
 
 def mxfp4_decode_partitions(width):
@@ -624,12 +670,42 @@ def f32_errors(output, reference):
     return {"max_abs": difference.abs().max().item(), "rms": difference.square().mean().sqrt().item()}
 
 
+def qualify_atomic_pair_replay(run, ids, output, scratch, buffers, prefix):
+    """Atomic controls may reorder FP32 additions; do not claim byte determinism."""
+    rows = ids.shape[0]
+    run(rows)
+    expected = output.clone()
+    original = ids.clone()
+    for live in sorted({1, min(17, rows), rows}):
+        output.fill_(float("nan"))
+        for tensor in scratch:
+            tensor.fill_(255)
+        run(live)
+        torch.testing.assert_close(prefix(live), expected[:live], rtol=.02, atol=.03125)
+    if rows > 1:
+        ids[1:] = ids[:1].expand_as(ids[1:])
+        run(rows)
+        torch.testing.assert_close(prefix(1), expected[:1], rtol=.02, atol=.03125)
+        ids.copy_(original)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(rows)
+    for _ in range(3):
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(output, expected, rtol=.02, atol=.03125)
+    return dict(deterministic=False, graph_reuse=True, comparison="tolerance-only")
+
+
 def qualify_pair_replay(run, ids, output, scratch, buffers, prefix):
     """Poison, prefix/wave-mix invariance and fixed-address graph replay."""
     rows = ids.shape[0]
     addresses = tuple(t.data_ptr() for t in buffers)
     run(rows)
     expected = output.clone()
+    for _ in range(3):
+        run(rows)
+        assert torch.equal(output, expected), "repeat determinism"
     for live in sorted({1, min(17, rows), rows}):
         output.fill_(float("nan"))
         for tensor in scratch:
@@ -658,7 +734,125 @@ def qualify_pair_replay(run, ids, output, scratch, buffers, prefix):
     return {"deterministic": True, "row_invariant": True, "graph_reuse": True}
 
 
+def production_stream_arm(x, ids, routing, weights, scales, coded):
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from b12x._lib.utils import current_cuda_stream
+    from b12x.moe._shared.kernels.v4_stream_pipeline import V4StreamPipeline, NativeTokenCombine
+    from b12x.moe._shared.scale_codes import pack_scale_codes
+    from tests.moe.test_v41_exact_slices import pack
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+
+    rows, hidden = x.shape
+    experts, width = weights["w1"].shape[:2]
+    topk = ids.shape[1]
+    packed = pack(weights, scales, width % 128 != 0)
+    if coded:
+        packed[1] = pack_scale_codes(torch.cat((scales["w3"], scales["w1"]), 1),
+            tensor_name="w13.scale", gated_half_rows=width).cuda().flatten()
+        packed[3] = pack_scale_codes(scales["w2"], tensor_name="w2.scale").cuda().flatten()
+    wire, _ = wire_rows(x)
+    pipeline = V4StreamPipeline(rows, hidden=hidden, intermediate=width,
+                               experts=experts, topk=topk, scale_codes=coded)
+    arena = torch.empty(pipeline.scratch_bytes, dtype=torch.uint8, device="cuda")
+    dtype = {"u8": torch.uint8, "i32": torch.int32, "f32": torch.float32}
+    scratch = [arena[spec["offset"]:spec["offset"] + spec["nbytes"]]
+               .view(dtype[spec["dtype"]]).reshape(spec["shape"]) for spec in pipeline.layout]
+    output = torch.empty_like(x)
+    tensors = [wire, *packed, ids.flatten(), routing.flatten(), *scratch]
+    views = [from_dlpack(t, assumed_align=16) for t in tensors]
+    pointers = [view.iterator for view in views]
+    launch = cute.compile(pipeline, *pointers, cutlass.Int32(rows), current_cuda_stream())
+    token_view = from_dlpack(output, assumed_align=16)
+    combine = cute.compile(NativeTokenCombine(hidden, 1), pointers[-1], token_view.iterator,
+                           cutlass.Int32(rows), current_cuda_stream())
+    def execute(live):
+        launch(*pointers, cutlass.Int32(live), current_cuda_stream())
+        combine(pointers[-1], token_view.iterator, cutlass.Int32(live), current_cuda_stream())
+    qualification = qualify_pair_replay(execute, ids, output, [arena], [*tensors, output],
+                                         lambda live: output[:live])
+    return lambda: execute(rows), output, (arena, tensors, views, launch, combine, token_view), qualification
+
+
+def shipped_stream_screen(g, args):
+    properties = torch.cuda.get_device_properties(0)
+    sm = properties.major * 10 + properties.minor
+    l2_bytes = int(properties.L2_cache_size)
+    flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
+    records = []
+    for width in paired_widths(g.intermediate, args.widths, args.engine_policy_root):
+        expert_bytes = 3 * width * g.hidden // 2
+        experts = max(16, (2 * l2_bytes // (16 * expert_bytes) + 1) * 16)
+        generator = torch.Generator().manual_seed(args.seed + width)
+        weights, scales = {}, {}
+        for name, shape in (("w1", (experts, width, g.hidden // 2)),
+                            ("w3", (experts, width, g.hidden // 2)),
+                            ("w2", (experts, g.hidden, width // 2))):
+            weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+            scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
+                                        dtype=torch.uint8, generator=generator)
+        for rows in map(int, args.rows.split(",")):
+            torch.manual_seed(args.seed + rows)
+            x = (torch.randn(rows, g.hidden, device="cuda") * .5).bfloat16()
+            ids = torch.rand(rows, experts, device="cuda").topk(g.top_k, -1).indices.int()
+            if args.routing == "hot":
+                ids.copy_(ids[:1].expand_as(ids))
+            routing = torch.rand(rows, g.top_k, device="cuda")
+            routing /= routing.sum(-1, keepdim=True)
+            if sm == 120:
+                recipe = dict(tile=192 if g.name == "v41" else 128, exact=True,
+                              atomic=g.name == "dsv4f", coded=g.name == "v41")
+            else:
+                recipe = shipped_prefill_recipe(g.name, g.hidden, width, rows, args.engine_policy_root)
+            runs, outputs, keepalive, qualifications = {}, {}, [], {}
+            controls = ("current", "current-2", "current-3")
+            for label in controls:
+                runs[label], outputs[label], keep = native_pair_arm(x, ids, routing, weights, scales,
+                    recipe["tile"], recipe["exact"], recipe["atomic"], recipe["coded"],
+                    qualify=True, combine_output=True)
+                keepalive.append(keep)
+            runs["native-stream"], outputs["native-stream"], keep, qualifications["native-stream"] = (
+                production_stream_arm(x, ids, routing, weights, scales, recipe["coded"]))
+            keepalive.append(keep)
+            oracle_routes = mxfp4_f32_reference(x, ids, routing, weights, scales, limit=10., native=True)
+            oracle = torch.zeros_like(x, dtype=torch.float32)
+            for slot in range(g.top_k):
+                oracle += oracle_routes.reshape(rows, g.top_k, g.hidden)[:, slot]
+            errors = {}
+            for label, output in outputs.items():
+                error = f32_errors(output, oracle)
+                error["normalized_rms"] = error["rms"] / max(oracle.square().mean().sqrt().item(), 1e-8)
+                assert error["normalized_rms"] < .02, (label, error)
+                errors[label] = error
+            if args.graph:
+                for label, run in list(runs.items()):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run()
+                    keepalive.append(graph)
+                    runs[label] = graph.replay
+            samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
+            medians = {label: statistics.median(values) for label, values in samples.items()}
+            control = [medians[label] for label in controls]
+            record = dict(geometry=g.name, sm=sm, width=width, rows=rows, shipped_recipe=recipe,
+                controls=controls, samples_us=samples, median_us=medians,
+                speedup=min(control) / medians["native-stream"],
+                control_spread=max(control) / min(control) - 1,
+                regression_beyond_spread=medians["native-stream"] > max(control),
+                qualifications=qualifications, matched_f32_errors=errors,
+                scratch_bytes=keep[0].numel(), stream_scale_representation="codes" if recipe["coded"] else "raw")
+            records.append(record)
+            print(json.dumps(record), flush=True)
+            del keepalive, runs, outputs, keep
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(dict(device=str(properties), results=records), indent=2) + "\n")
+
+
 def mxfp4_pair_screen(g, args):
+    if args.shipped_prefill:
+        return shipped_stream_screen(g, args)
     """One warmed L2-cold interleaved session with identical rank weights."""
     from dataclasses import dataclass
     from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_scratch_bytes
@@ -681,7 +875,7 @@ def mxfp4_pair_screen(g, args):
     l2_bytes = int(properties.L2_cache_size)
     flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
     topk = 6 if args.native_slices else 8
-    for width in paired_widths(g.intermediate, args.widths):
+    for width in paired_widths(g.intermediate, args.widths, args.engine_policy_root):
         # Keep both arms' resident payloads beyond L2 on the actual card.
         expert_payload_bytes = 3 * width * g.hidden // 2
         experts = max(16, (2 * l2_bytes // (16 * expert_payload_bytes) + 1) * 16)
@@ -777,7 +971,7 @@ def mxfp4_tiling_screen(g, args, geometry_type):
     l2_bytes = int(properties.L2_cache_size)
     flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
     explicit = native_screen_arms(args.mxfp4_arm)
-    widths = sorted({arm[1] for arm in explicit}) if explicit else paired_widths(g.intermediate, args.widths)
+    widths = sorted({arm[1] for arm in explicit}) if explicit else paired_widths(g.intermediate, args.widths, args.engine_policy_root)
     if any(width > g.intermediate for width in widths):
         raise ValueError("logical rank width exceeds the model intermediate")
     waves = recorded_waves(args.routes, g) if args.routes else None
@@ -919,7 +1113,7 @@ def main() -> None:
 
     if args.native_slices:
         intermediate, hidden = {"v41": (2304, 5120), "dsv4f": (2048, 4096), "dsv4p": (3072, 7168)}[args.geometry]
-        g = Fp8MoeGeometry(args.geometry, hidden, 384, 6, intermediate, weights="mxfp4")
+        g = Fp8MoeGeometry(args.geometry, hidden, 256 if args.geometry == "dsv4f" else 384, 6, intermediate, weights="mxfp4")
     else:
         g = GEOMETRIES[args.geometry].with_tp(args.tp)
     if args.mxfp4_pair:

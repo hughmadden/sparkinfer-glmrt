@@ -15,17 +15,26 @@ from b12x._lib.intrinsics import (
 from ._fp8_moe_kernels import _i32_at
 from ._fp8_moe_stream import STREAM_TILE_M, _chunk
 from ._mxfp4_down_a8_plan import Mxfp4DownA8Plan, mxfp4_scale_row_bytes
+from b12x.moe._shared.kernels.w4a8_staging import scale_code_word
 
 
 class StreamMxfp4DownA8:
-    def __init__(self, *, hidden: int, inter: int, experts: int):
+    def __init__(self, *, hidden: int, inter: int, experts: int, round_output_bf16: bool = True,
+                 native_resident: bool = False, native_exact: bool = False, scale_codes: bool = False):
+        self.native_resident, self.native_exact = bool(native_resident), bool(native_exact)
+        self.scale_codes = bool(scale_codes)
+        if self.scale_codes and not self.native_resident:
+            raise ValueError("compact scale codes require native resident weights")
+        self.round_output_bf16 = bool(round_output_bf16)
         self.plan = Mxfp4DownA8Plan(int(hidden), int(inter), int(experts))
         self.hidden, self.inter, self.experts = self.plan.hidden, self.plan.inter, self.plan.experts
         self.blocks = (self.inter + self.plan.k_block - 1) // self.plan.k_block
         self.scale_row_bytes = mxfp4_scale_row_bytes(self.inter)
 
     def key(self) -> tuple:
-        return ("stream_down_mxfp4_a8", 2, self.hidden, self.inter, self.experts)
+        key = ("stream_down_mxfp4_a8", 2, self.hidden, self.inter, self.experts,
+               self.native_resident, self.native_exact, self.scale_codes)
+        return key if self.round_output_bf16 else key + (("f32_output",),)
 
     def _storage(self):
         class Storage:
@@ -43,7 +52,7 @@ class StreamMxfp4DownA8:
             block=(self.plan.threads, 1, 1), stream=stream, min_blocks_per_mp=1)
 
     @cute.jit
-    def _load(self, block, ring, a_rows: Int64, w_rows: Int64, s_rows: Int64, tidx):
+    def _load(self, block, ring, a_rows: Int64, w_rows: Int64, s_rows: Int64, tidx, expert, n0):
         p = self.plan
         stage = ring + (Int32(block) % Int32(2)) * Int32(p.stage_bytes)
         for q in cutlass.range_constexpr(STREAM_TILE_M * (p.k_block // 16) // p.threads):
@@ -58,25 +67,76 @@ class StreamMxfp4DownA8:
                 cp_async4_shared_global_pred(dest, source, live.to(Int32))
             else:
                 cp_async4_shared_global(dest, source)
-        for q in cutlass.range_constexpr(p.tile_n * (p.k_block // 32) // p.threads):
-            c = tidx + Int32(q * p.threads)
-            row = c // Int32(p.k_block // 32)
-            piece = c % Int32(p.k_block // 32)
-            dest = stage + Int32(p.a_bytes) + row * Int32(p.w_stride) + piece * Int32(16)
-            source = (w_rows + Int64(row) * Int64(self.inter // 2) + Int64(block) * Int64(p.k_block // 2)
-                      + Int64(piece) * Int64(16))
-            if const_expr(self.inter % p.k_block):
-                live = Int32(block) * Int32(p.k_block) + piece * Int32(32) < Int32(self.inter)
-                cp_async4_shared_global_pred(dest, source, live.to(Int32))
-            else:
-                cp_async4_shared_global(dest, source)
+        if const_expr(self.native_resident):
+            stored = self.inter if const_expr(self.native_exact) else (self.inter + 127) // 128 * 128
+            base = w_rows - (Int64(expert) * self.hidden + n0) * (self.inter // 2)
+            for q in cutlass.range_constexpr(p.tile_n * (p.k_block // 32) // p.threads):
+                index = tidx + Int32(q * p.threads)
+                kb = index // 128
+                nc = (index // 32) % 4
+                lane = index % 32
+                k = Int32(block) * 4 + kb
+                dest = stage + Int32(p.a_bytes) + index * 16
+                if k < self.inter // 32:
+                    if const_expr(self.native_exact):
+                        word = Int64(expert) * (self.hidden * stored // 8) + Int64(n0 * (stored // 8) + k * 512 + nc * 128 + lane * 4)
+                    else:
+                        n = n0 + nc * 32
+                        word = Int64(expert) * (self.hidden * stored // 8) + Int64(((n // 256) * (stored // 128) + k // 4) * 4096 + (k % 4) * 1024 + (n % 256 // 32) * 128 + lane * 4)
+                    cp_async4_shared_global(dest, base + word * 4)
+                else:
+                    for j in cutlass.range_constexpr(4):
+                        st_shared_u32(dest + Int32(j * 4), Uint32(0))
+        else:
+            for q in cutlass.range_constexpr(p.tile_n * (p.k_block // 32) // p.threads):
+                c = tidx + Int32(q * p.threads)
+                row = c // Int32(p.k_block // 32)
+                piece = c % Int32(p.k_block // 32)
+                dest = stage + Int32(p.a_bytes) + row * Int32(p.w_stride) + piece * Int32(16)
+                source = (w_rows + Int64(row) * Int64(self.inter // 2) + Int64(block) * Int64(p.k_block // 2)
+                          + Int64(piece) * Int64(16))
+                if const_expr(self.inter % p.k_block):
+                    live = Int32(block) * Int32(p.k_block) + piece * Int32(32) < Int32(self.inter)
+                    cp_async4_shared_global_pred(dest, source, live.to(Int32))
+                else:
+                    cp_async4_shared_global(dest, source)
         # Four K32 scales per 128-K block; rows are padded to keep each word aligned.
         if tidx < Int32(STREAM_TILE_M):
             at = stage + Int32(p.a_bytes + p.w_bytes) + tidx * Int32(p.s_stride)
             cp_async_u32_shared_global(at, a_rows + Int64(tidx) * Int64(p.row_bytes) + Int64(self.inter)
                                        + Int64(block) * Int64(4))
-            cp_async_u32_shared_global(at + Int32(p.s_bytes),
-                                       s_rows + Int64(tidx) * Int64(self.scale_row_bytes) + Int64(block) * Int64(4))
+            if const_expr(self.native_resident):
+                stored = self.inter if const_expr(self.native_exact) else (self.inter + 127) // 128 * 128
+                base = s_rows - (Int64(expert) * self.hidden + n0) * self.scale_row_bytes
+                row = n0 + tidx
+                if const_expr(self.scale_codes):
+                    tiles = (self.inter // 32 + 3) // 4
+                    scale_ptr = cute.make_ptr(cutlass.Uint8, base, cute.AddressSpace.gmem, assumed_align=1)
+                    scales = cute.make_tensor(scale_ptr, cute.make_layout(
+                        (self.experts * self.hidden * (2 * tiles + 1),)))
+                    packed = scale_code_word(scales, Int64(expert), Int64(row), Int64(block),
+                                             self.hidden, self.inter // 32)
+                else:
+                    packed = Uint32(0)
+                    for j in cutlass.range_constexpr(4):
+                        k = Int32(block) * 4 + Int32(j)
+                        if k < self.inter // 32:
+                            if const_expr(self.native_exact):
+                                columns = self.inter // 32
+                                count = Int32(4)
+                                if const_expr(self.inter % 128 != 0):
+                                    if k // 4 == self.inter // 128:
+                                        count = Int32(columns % 4)
+                                offset = Int64(expert * self.hidden * columns + (row // 128) * 128 * columns + (k // 4) * 512 + (row % 128) * count + k % 4)
+                            else:
+                                columns = stored // 32
+                                offset = Int64(expert * self.hidden * columns + ((row // 256) * (columns // 4) + k // 4) * 1024 + (row % 256) * 4 + k % 4)
+                            ptr = cute.make_ptr(cutlass.Uint8, base + offset, cute.AddressSpace.gmem, assumed_align=1)
+                            packed |= Uint32(ptr[0]) << Uint32(j * 8)
+                st_shared_u32(at + Int32(p.s_bytes), packed)
+            else:
+                cp_async_u32_shared_global(at + Int32(p.s_bytes),
+                                           s_rows + Int64(tidx) * Int64(self.scale_row_bytes) + Int64(block) * Int64(4))
         cute.arch.cp_async_commit_group()
 
     @cute.jit
@@ -108,7 +168,14 @@ class StreamMxfp4DownA8:
                     asc[mt] = ld_shared_u32(ssa + srow * Int32(p.s_stride))
                 for nt in cutlass.range_constexpr(8):
                     col = warp_n * Int32(64) + Int32(8 * nt) + g
-                    v0, v1, v2, v3 = ld_shared_v4_u32(sw + col * Int32(p.w_stride) + Int32(16 * ks))
+                    if const_expr(self.native_resident):
+                        index = Int32(ks * 512) + col // 32 * 128 + col % 8 * 16 + col % 32 // 8
+                        v0 = ld_shared_u32(sw + index * 4)
+                        v1 = ld_shared_u32(sw + (index + 4) * 4)
+                        v2 = ld_shared_u32(sw + (index + 8) * 4)
+                        v3 = ld_shared_u32(sw + (index + 12) * 4)
+                    else:
+                        v0, v1, v2, v3 = ld_shared_v4_u32(sw + col * Int32(p.w_stride) + Int32(16 * ks))
                     lo, hi = v0, v2
                     if j >= Int32(2):
                         lo, hi = v1, v3
@@ -143,9 +210,9 @@ class StreamMxfp4DownA8:
             a_rows = Int64(act.toint()) + Int64(tile) * Int64(STREAM_TILE_M) * Int64(p.row_bytes)
             w_rows = Int64(w.toint()) + (Int64(e) * Int64(self.hidden) + Int64(n0)) * Int64(self.inter // 2)
             s_rows = Int64(s.toint()) + (Int64(e) * Int64(self.hidden) + Int64(n0)) * Int64(self.scale_row_bytes)
-            self._load(0, ring, a_rows, w_rows, s_rows, tidx)
+            self._load(0, ring, a_rows, w_rows, s_rows, tidx, e, n0)
             if const_expr(self.blocks > 1):
-                self._load(1, ring, a_rows, w_rows, s_rows, tidx)
+                self._load(1, ring, a_rows, w_rows, s_rows, tidx, e, n0)
             warp_m, warp_n = warp_id // Int32(2), warp_id % Int32(2)
             active = warp_m * Int32(32) < live
             g, j = lane // Int32(4), lane % Int32(4)
@@ -162,25 +229,38 @@ class StreamMxfp4DownA8:
                     self._mma_stage(block, ring + (block % Int32(2)) * Int32(p.stage_bytes), acc, warp_m, warp_n, lane)
                 cute.arch.sync_threads()
                 if block + Int32(2) < Int32(self.blocks):
-                    self._load(block + Int32(2), ring, a_rows, w_rows, s_rows, tidx)
-            if active:
-                for mt in cutlass.range_constexpr(2):
-                    for half in cutlass.range_constexpr(2):
-                        row = warp_m * Int32(32) + Int32(16 * mt + 8 * half) + g
-                        for nt in cutlass.range_constexpr(8):
-                            f = 4 * (8 * mt + nt) + 2 * half
-                            col = warp_n * Int32(64) + Int32(8 * nt) + Int32(2) * j
-                            # Reuse the drained ring for the baseline's coalesced
-                            # BF16 epilogue; its output fits within two stages.
-                            st_shared_u32(ring + row * Int32(p.out_stride) + col * Int32(2),
-                                          pack_f32x2_to_bfloat2(acc[f], acc[f + 1]))
-            cute.arch.sync_threads()
-            segments = p.tile_n * 2 // 16
-            for q in cutlass.range_constexpr(STREAM_TILE_M * segments // p.threads):
-                c = tidx + Int32(p.threads * q)
-                row, seg = c // Int32(segments), c % Int32(segments)
-                if row < live:
-                    v0, v1, v2, v3 = ld_shared_v4_u32(ring + row * Int32(p.out_stride) + seg * Int32(16))
-                    st_global_v4_u32(Int64(y.toint()) + ((Int64(first) + Int64(row)) * Int64(self.hidden)
-                                                        + Int64(n0)) * Int64(2) + Int64(seg) * Int64(16),
-                                     v0, v1, v2, v3)
+                    self._load(block + Int32(2), ring, a_rows, w_rows, s_rows, tidx, e, n0)
+            if const_expr(not self.round_output_bf16):
+                if active:
+                    output = cute.make_ptr(Float32, Int64(y.toint()), cute.AddressSpace.gmem, assumed_align=4)
+                    for mt in cutlass.range_constexpr(2):
+                        for half in cutlass.range_constexpr(2):
+                            row = warp_m * Int32(32) + Int32(16 * mt + 8 * half) + g
+                            if row < live:
+                                for nt in cutlass.range_constexpr(8):
+                                    f = 4 * (8 * mt + nt) + 2 * half
+                                    col = n0 + warp_n * Int32(64) + Int32(8 * nt) + Int32(2) * j
+                                    offset = (Int64(first) + Int64(row)) * self.hidden + Int64(col)
+                                    output[offset] = acc[f]
+                                    output[offset + 1] = acc[f + 1]
+            else:
+                if active:
+                    for mt in cutlass.range_constexpr(2):
+                        for half in cutlass.range_constexpr(2):
+                            row = warp_m * Int32(32) + Int32(16 * mt + 8 * half) + g
+                            for nt in cutlass.range_constexpr(8):
+                                f = 4 * (8 * mt + nt) + 2 * half
+                                col = warp_n * Int32(64) + Int32(8 * nt) + Int32(2) * j
+                                # Reuse the drained ring for the coalesced BF16 epilogue.
+                                st_shared_u32(ring + row * Int32(p.out_stride) + col * Int32(2),
+                                              pack_f32x2_to_bfloat2(acc[f], acc[f + 1]))
+                cute.arch.sync_threads()
+                segments = p.tile_n * 2 // 16
+                for q in cutlass.range_constexpr(STREAM_TILE_M * segments // p.threads):
+                    c = tidx + Int32(p.threads * q)
+                    row, seg = c // Int32(segments), c % Int32(segments)
+                    if row < live:
+                        v0, v1, v2, v3 = ld_shared_v4_u32(ring + row * Int32(p.out_stride) + seg * Int32(16))
+                        st_global_v4_u32(Int64(y.toint()) + ((Int64(first) + Int64(row)) * Int64(self.hidden)
+                                                            + Int64(n0)) * Int64(2) + Int64(seg) * Int64(16),
+                                         v0, v1, v2, v3)
