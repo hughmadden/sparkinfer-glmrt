@@ -407,10 +407,14 @@ def mxfp4_pair_screen(g, args):
     if g.weights != "mxfp4":
         raise ValueError("paired screen requires an MXFP4 geometry")
     results = []
-    flush = torch.zeros(256 << 20, dtype=torch.uint8, device="cuda")
-    # Sixteen experts exceed L2 even at the narrowest production width.
-    experts, topk = 16, 6 if args.native_slices else 8
+    properties = torch.cuda.get_device_properties(0)
+    l2_bytes = int(properties.L2_cache_size)
+    flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
+    topk = 6 if args.native_slices else 8
     for width in paired_widths(g.intermediate, args.widths):
+        # Keep both arms' resident payloads beyond L2 on the actual card.
+        expert_payload_bytes = 3 * width * g.hidden // 2
+        experts = max(16, (2 * l2_bytes // (16 * expert_payload_bytes) + 1) * 16)
         padded = (width + 127) // 128 * 128
         gen = torch.Generator().manual_seed(args.seed + width)
         weights, scales = {}, {}
@@ -480,6 +484,8 @@ def mxfp4_pair_screen(g, args):
                 record = dict(geometry=g.name, hidden=g.hidden, experts=experts, topk=topk,
                               width=width, padded_width=padded, rows=rows, route=route,
                               weight_sha256=weight_hash, graph=args.graph, routing=args.routing,
+                              l2_bytes=l2_bytes, resident_payload_bytes=experts * expert_payload_bytes,
+                              slice_width=native_slice_width(g.name, width) if args.native_slices else None,
                               padded_us=old, exact_us=new, speedup=old/new,
                               comparison=comparisons[route], samples_us={arm: samples[route + "-" + arm]
                               for arm in ("padded", "exact")})
