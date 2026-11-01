@@ -610,6 +610,9 @@ class NativeTrellisLinear:
         self.input_units = g["sharded_side"] == 2
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
         self.splits = g["splits"]
+        self.prefill_stages = _PREFILL_STAGES
+        self.prefill_pipeline = False
+        self.prefill_prefetch = False
         self.decode_cta_warps = 2
         self.ws_b_stage_bytes = 4096 if self.e4m3 else 8192
         self.ws_stage_bytes = _WS_A_STAGE_BYTES + self.ws_b_stage_bytes
@@ -657,7 +660,7 @@ class NativeTrellisLinear:
     def _prefill_storage(self):
         w_tile_bytes = 256 if self.e4m3 else 512
         stage_bytes = _PREFILL_BM * 64 * 2 + 16 * w_tile_bytes
-        total_bytes = _PREFILL_STAGES * stage_bytes + 128
+        total_bytes = self.prefill_stages * stage_bytes + 128
         class Storage:
             pass
         Storage.__annotations__ = {
@@ -1505,7 +1508,9 @@ class NativeTrellisLinear:
 
     @cute.jit
     def _prefill_produce_tile(self, p_tid: Int32, base: Int32, x_ptr: Int64, payload_ptr: Int64, rows: Int32, m0: Int32, nb64: Int32, stage_cnt: Int32) -> Int32:
-        if cutlass.const_expr(self.bits == 6):
+        if cutlass.const_expr(self.bits == 6 and self.prefill_pipeline):
+            return self._prefill_produce_tile_k6_pipeline(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, stage_cnt)
+        elif cutlass.const_expr(self.bits == 6):
             return self._prefill_produce_tile_k6(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, stage_cnt)
         else:
             return self._prefill_produce_tile_generic(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, stage_cnt)
@@ -1518,8 +1523,8 @@ class NativeTrellisLinear:
         w_tile_bytes = 256 if self.e4m3 else 512
         a_stage_bytes = _PREFILL_BM * 64 * 2
         stage_bytes = a_stage_bytes + 16 * w_tile_bytes
-        bar_full = base + Int32(_PREFILL_STAGES * stage_bytes)
-        bar_empty = bar_full + Int32(8 * _PREFILL_STAGES)
+        bar_full = base + Int32(self.prefill_stages * stage_bytes)
+        bar_empty = bar_full + Int32(8 * self.prefill_stages)
         lane, pw = p_tid & Int32(31), p_tid >> Int32(5)
         r0, c = p_tid >> Int32(3), p_tid & Int32(7)
         sa_lane_off = r0 * Int32(128) + ((c ^ (r0 & Int32(7))) << Int32(4))
@@ -1646,7 +1651,9 @@ class NativeTrellisLinear:
 
     @cute.jit
     def _prefill_consume_tile(self, tid: Int32, base: Int32, scales_ptr: Int64, output_ptr: Int64, rows: Int32, m0: Int32, nb64: Int32, stage_cnt: Int32) -> Int32:
-        if cutlass.const_expr(self.bits == 6):
+        if cutlass.const_expr(self.bits == 6 and self.prefill_pipeline):
+            return self._prefill_consume_tile_k6_pipeline(tid, base, scales_ptr, output_ptr, rows, m0, nb64, stage_cnt)
+        elif cutlass.const_expr(self.bits == 6):
             return self._prefill_consume_tile_k6(tid, base, scales_ptr, output_ptr, rows, m0, nb64, stage_cnt)
         else:
             return self._prefill_consume_tile_generic(tid, base, scales_ptr, output_ptr, rows, m0, nb64, stage_cnt)
@@ -1659,8 +1666,8 @@ class NativeTrellisLinear:
         w_tile_bytes = 256 if self.e4m3 else 512
         a_stage_bytes = _PREFILL_BM * 64 * 2
         stage_bytes = a_stage_bytes + 16 * w_tile_bytes
-        bar_full = base + Int32(_PREFILL_STAGES * stage_bytes)
-        bar_empty = bar_full + Int32(8 * _PREFILL_STAGES)
+        bar_full = base + Int32(self.prefill_stages * stage_bytes)
+        bar_empty = bar_full + Int32(8 * self.prefill_stages)
         lane, cw = tid & Int32(31), tid >> Int32(5)
         cw_m, cw_n = cw >> Int32(1), cw & Int32(1)
         l7, l15, l_sh4 = lane & Int32(7), lane & Int32(15), lane >> Int32(4)
@@ -1751,10 +1758,10 @@ class NativeTrellisLinear:
         base = shared_ptr_to_u32(storage.buf.data_ptr())
         w_tile_bytes = 256 if self.e4m3 else 512
         stage_bytes = _PREFILL_BM * 64 * 2 + 16 * w_tile_bytes
-        bar_full = base + Int32(_PREFILL_STAGES * stage_bytes)
-        bar_empty = bar_full + Int32(8 * _PREFILL_STAGES)
+        bar_full = base + Int32(self.prefill_stages * stage_bytes)
+        bar_empty = bar_full + Int32(8 * self.prefill_stages)
         if tid == Int32(0):
-            for s in cutlass.range_constexpr(_PREFILL_STAGES):
+            for s in cutlass.range_constexpr(self.prefill_stages):
                 _mbar_init(bar_full + Int32(8 * s), Int32(2 * _PREFILL_PRODUCER_THREADS))
                 _mbar_init(bar_empty + Int32(8 * s), Int32(_PREFILL_CONSUMER_THREADS))
             _fence_mbar_init()
@@ -1797,10 +1804,10 @@ class NativeTrellisLinear:
         base = shared_ptr_to_u32(storage.buf.data_ptr())
         w_tile_bytes = 256 if self.e4m3 else 512
         stage_bytes = _PREFILL_BM * 64 * 2 + 16 * w_tile_bytes
-        bar_full = base + Int32(_PREFILL_STAGES * stage_bytes)
-        bar_empty = bar_full + Int32(8 * _PREFILL_STAGES)
+        bar_full = base + Int32(self.prefill_stages * stage_bytes)
+        bar_empty = bar_full + Int32(8 * self.prefill_stages)
         if tid == Int32(0):
-            for s in cutlass.range_constexpr(_PREFILL_STAGES):
+            for s in cutlass.range_constexpr(self.prefill_stages):
                 _mbar_init(bar_full + Int32(8 * s), Int32(2 * _PREFILL_PRODUCER_THREADS))
                 _mbar_init(bar_empty + Int32(8 * s), Int32(_PREFILL_CONSUMER_THREADS))
             _fence_mbar_init()
@@ -3183,8 +3190,8 @@ class NativeTrellisLinear:
         w_tile_bytes = 256 if self.e4m3 else 512
         a_stage_bytes = _PREFILL_BM * 64 * 2
         stage_bytes = a_stage_bytes + 16 * w_tile_bytes
-        bar_full = base + Int32(_PREFILL_STAGES * stage_bytes)
-        bar_empty = bar_full + Int32(8 * _PREFILL_STAGES)
+        bar_full = base + Int32(self.prefill_stages * stage_bytes)
+        bar_empty = bar_full + Int32(8 * self.prefill_stages)
         lane, pw = p_tid & Int32(31), p_tid >> Int32(5)
         r0, c = p_tid >> Int32(3), p_tid & Int32(7)
         sa_lane_off = r0 * Int32(128) + ((c ^ (r0 & Int32(7))) << Int32(4))
@@ -3274,6 +3281,120 @@ class NativeTrellisLinear:
         return stage_cnt
 
     @cute.jit
+    def _prefill_k6_load(self, ptr: Int64, offset: cutlass.Constexpr, policy: Int64) -> Uint32:
+        if cutlass.const_expr(self.prefill_prefetch):
+            return _ld_l2_off_pure(ptr, offset, policy)
+        else:
+            return _ld_global_nc_u32_offset(ptr, offset)
+
+    @cute.jit
+    def _prefill_produce_tile_k6_pipeline(self, p_tid: Int32, base: Int32,
+                              x_ptr: Int64, payload_ptr: Int64,
+                              rows: Int32, m0: Int32, nb64: Int32,
+                              stage_cnt: Int32) -> Int32:
+        w_tile_bytes = 256 if self.e4m3 else 512
+        a_stage_bytes = _PREFILL_BM * 64 * 2
+        stage_bytes = a_stage_bytes + 16 * w_tile_bytes
+        bar_full = base + Int32(self.prefill_stages * stage_bytes)
+        bar_empty = bar_full + Int32(8 * self.prefill_stages)
+        lane, pw = p_tid & Int32(31), p_tid >> Int32(5)
+        r0, c = p_tid >> Int32(3), p_tid & Int32(7)
+        sa_lane_off = r0 * Int32(128) + ((c ^ (r0 & Int32(7))) << Int32(4))
+        sw_pw_off = Int32(a_stage_bytes) + pw * Int32(w_tile_bytes) + lane * Int32(8 if self.e4m3 else 16)
+        nb128 = nb64 >> Int32(1)
+        n16_in_128 = (nb64 & Int32(1)) * Int32(4) + pw
+        tile_init = nb128 * Int32(64 if self.input_units else (self.k // 16 * 8)) + n16_in_128
+        kb_w_stride = Int64((self.n // 2 if self.input_units else 64) * 32 * 6)
+        w_tile_base = payload_ptr + tile_init.to(Int64) * Int64(192)
+        prev_lane = (lane + Int32(31)) & Int32(31)
+        shift = ((lane & Int32(1)) ^ Int32(1)) << Int32(4)
+        idx0 = (lane >> Int32(1)) * Int32(3) + (lane & Int32(1))
+        p0_cur = w_tile_base + idx0.to(Int64) * Int64(4)
+        rem_rows = rows - (m0 + r0)
+        x_cur = x_ptr + (m0 + r0).to(Int64) * Int64(self.k * 2) + (c * Int32(8)).to(Int64) * Int64(2)
+        policy = _prefill_k6_policy()
+        w_s0 = cute.make_rmem_tensor((4, 2), Uint32)
+        w_s1 = cute.make_rmem_tensor((4, 2), Uint32)
+        for k16_in_64 in cutlass.range_constexpr(4):
+            off0 = k16_in_64 * 1536
+            off1 = (4 + k16_in_64) * 1536
+            w_s0[k16_in_64, 0] = self._prefill_k6_load(p0_cur, off0, policy)
+            w_s0[k16_in_64, 1] = self._prefill_k6_load(p0_cur, off0 + 4, policy)
+            w_s1[k16_in_64, 0] = self._prefill_k6_load(p0_cur, off1, policy)
+            w_s1[k16_in_64, 1] = self._prefill_k6_load(p0_cur, off1 + 4, policy)
+        sa_base0 = base + sa_lane_off
+        sw_base0 = base + sw_pw_off
+        num_kb = Int32(self.k // 128)
+        for kb in cutlass.range(self.k // 128, unroll=1):
+            slot = stage_cnt % Int32(self.prefill_stages)
+            stage_off = slot * Int32(stage_bytes)
+            phase = ((stage_cnt // Int32(self.prefill_stages)) & Int32(1)) ^ Int32(1)
+            full = bar_full + slot * Int32(8)
+            _mbar_wait(bar_empty + slot * Int32(8), phase)
+            for i in cutlass.range_constexpr(8):
+                _cp_async4_zfill_offset(
+                    sa_base0 + stage_off, i * 2048,
+                    x_cur, i * 32 * self.k, rem_rows, i * 16)
+            _cp_async_mbar_arrive_noinc(full)
+            for k16_in_64 in cutlass.range_constexpr(4):
+                wa, wb = _k6_align_shfl(w_s0[k16_in_64, 0], w_s0[k16_in_64, 1], prev_lane, shift)
+                if cutlass.const_expr(self.mul1):
+                    b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, 6)
+                else:
+                    b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, 6)
+                if cutlass.const_expr(self.e4m3):
+                    e01 = _f16x2x2_to_e4m3x4(b0, b1)
+                    e23 = _f16x2x2_to_e4m3x4(b2, b3)
+                    _st_shared_v2_u32_offset(sw_base0 + stage_off, k16_in_64 * 4 * w_tile_bytes, e01, e23)
+                else:
+                    if cutlass.const_expr(self.input_bf16):
+                        b0, b1 = _f16x2_to_bf16x2(b0), _f16x2_to_bf16x2(b1)
+                        b2, b3 = _f16x2_to_bf16x2(b2), _f16x2_to_bf16x2(b3)
+                    _st_shared_v4_u32_offset(sw_base0 + stage_off, k16_in_64 * 4 * w_tile_bytes, b0, b1, b2, b3)
+            _mbar_arrive(full)
+            stage_cnt = stage_cnt + Int32(1)
+            if kb + Int32(1) < num_kb:
+                p0_cur = p0_cur + kb_w_stride
+            for k16_in_64 in cutlass.range_constexpr(4):
+                off0 = k16_in_64 * 1536
+                w_s0[k16_in_64, 0] = self._prefill_k6_load(p0_cur, off0, policy)
+                w_s0[k16_in_64, 1] = self._prefill_k6_load(p0_cur, off0 + 4, policy)
+
+            slot = stage_cnt % Int32(self.prefill_stages)
+            stage_off = slot * Int32(stage_bytes)
+            phase = ((stage_cnt // Int32(self.prefill_stages)) & Int32(1)) ^ Int32(1)
+            full = bar_full + slot * Int32(8)
+            _mbar_wait(bar_empty + slot * Int32(8), phase)
+            for i in cutlass.range_constexpr(8):
+                _cp_async4_zfill_offset(
+                    sa_base0 + stage_off, i * 2048,
+                    x_cur, 128 + i * 32 * self.k, rem_rows, i * 16)
+            _cp_async_mbar_arrive_noinc(full)
+            x_cur = x_cur + Int64(256)
+            for k16_in_64 in cutlass.range_constexpr(4):
+                wa, wb = _k6_align_shfl(w_s1[k16_in_64, 0], w_s1[k16_in_64, 1], prev_lane, shift)
+                if cutlass.const_expr(self.mul1):
+                    b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, 6)
+                else:
+                    b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, 6)
+                if cutlass.const_expr(self.e4m3):
+                    e01 = _f16x2x2_to_e4m3x4(b0, b1)
+                    e23 = _f16x2x2_to_e4m3x4(b2, b3)
+                    _st_shared_v2_u32_offset(sw_base0 + stage_off, k16_in_64 * 4 * w_tile_bytes, e01, e23)
+                else:
+                    if cutlass.const_expr(self.input_bf16):
+                        b0, b1 = _f16x2_to_bf16x2(b0), _f16x2_to_bf16x2(b1)
+                        b2, b3 = _f16x2_to_bf16x2(b2), _f16x2_to_bf16x2(b3)
+                    _st_shared_v4_u32_offset(sw_base0 + stage_off, k16_in_64 * 4 * w_tile_bytes, b0, b1, b2, b3)
+            _mbar_arrive(full)
+            for k16_in_64 in cutlass.range_constexpr(4):
+                off1 = (4 + k16_in_64) * 1536
+                w_s1[k16_in_64, 0] = self._prefill_k6_load(p0_cur, off1, policy)
+                w_s1[k16_in_64, 1] = self._prefill_k6_load(p0_cur, off1 + 4, policy)
+            stage_cnt = stage_cnt + Int32(1)
+        return stage_cnt
+
+    @cute.jit
     def _prefill_consume_tile_k6(self, tid: Int32, base: Int32,
                               scales_ptr: Int64, output_ptr: Int64,
                               rows: Int32, m0: Int32, nb64: Int32,
@@ -3343,6 +3464,105 @@ class NativeTrellisLinear:
                         for v in cutlass.range_constexpr(4):
                             split_total[n8, v] = split_total[n8, v] + acc[n8, v] * scale
                     stage_cnt = stage_cnt + Int32(1)
+            for n8 in cutlass.range_constexpr(8):
+                for v in cutlass.range_constexpr(4):
+                    grand_total[n8, v] = grand_total[n8, v] + split_total[n8, v]
+        col_base = nb64 * Int32(64) + cw_n * Int32(32) + (lane & Int32(3)) * Int32(2)
+        for m_sub in cutlass.range_constexpr(2):
+            row0 = m0 + cw_m * Int32(32) + Int32(m_sub * 16) + (lane >> Int32(2))
+            row1 = row0 + Int32(8)
+            if row0 < rows:
+                addr0 = output_ptr + (row0.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
+                for n8 in cutlass.range_constexpr(4):
+                    idx = m_sub * 4 + n8
+                    _st_global_cs_v2_f32_offset(addr0, n8 * 32, grand_total[idx, 0], grand_total[idx, 1])
+            if row1 < rows:
+                addr1 = output_ptr + (row1.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
+                for n8 in cutlass.range_constexpr(4):
+                    idx = m_sub * 4 + n8
+                    _st_global_cs_v2_f32_offset(addr1, n8 * 32, grand_total[idx, 2], grand_total[idx, 3])
+        return stage_cnt
+
+
+    @cute.jit
+    def _prefill_consume_tile_k6_pipeline(self, tid: Int32, base: Int32,
+                              scales_ptr: Int64, output_ptr: Int64,
+                              rows: Int32, m0: Int32, nb64: Int32,
+                              stage_cnt: Int32) -> Int32:
+        w_tile_bytes = 256 if self.e4m3 else 512
+        a_stage_bytes = _PREFILL_BM * 64 * 2
+        stage_bytes = a_stage_bytes + 16 * w_tile_bytes
+        bar_full = base + Int32(self.prefill_stages * stage_bytes)
+        bar_empty = bar_full + Int32(8 * self.prefill_stages)
+        lane, cw = tid & Int32(31), tid >> Int32(5)
+        cw_m, cw_n = cw >> Int32(1), cw & Int32(1)
+        l7, l15, l_sh4 = lane & Int32(7), lane & Int32(15), lane >> Int32(4)
+        a_lane_off = (cw_m * Int32(32) + l15) * Int32(128) + ((l_sh4 ^ l7) << Int32(4))
+        sw0 = base + Int32(a_stage_bytes) + cw_n * Int32(2 * w_tile_bytes) + lane * Int32(8 if self.e4m3 else 16)
+        grand_total = cute.make_rmem_tensor((8, 4), Float32)
+        grand_total.fill(Float32(0.0))
+        for split in cutlass.range(self.splits, unroll=1):
+            split_total = cute.make_rmem_tensor((8, 4), Float32)
+            split_total.fill(Float32(0.0))
+            for block in cutlass.range(8, unroll=1):
+                kb = split * Int32(8) + block
+                if kb < Int32(self.k // 128):
+                    scale = _side_value(scales_ptr, kb)
+                    acc = cute.make_rmem_tensor((8, 4), Float32)
+                    acc.fill(Float32(0.0))
+                    phase = stage_cnt & Int32(1)
+                    for s in cutlass.range_constexpr(2):
+                        if cutlass.const_expr(self.prefill_pipeline):
+                            # Ring progress counts K64 halves, not arithmetic K128 blocks.
+                            slot = stage_cnt % Int32(self.prefill_stages)
+                            phase = (stage_cnt // Int32(self.prefill_stages)) & Int32(1)
+                        else:
+                            slot = Int32(s)
+                        s_off = slot * Int32(stage_bytes)
+                        _mbar_wait(bar_full + slot * Int32(8), phase)
+                        for k16_in_64 in cutlass.range_constexpr(4):
+                            a_addr = base + (a_lane_off ^ Int32(k16_in_64 * 32))
+                            a0_0, a1_0, a2_0, a3_0 = _ldmatrix_m8n8x4_b16_offset(a_addr + s_off, 0)
+                            a0_1, a1_1, a2_1, a3_1 = _ldmatrix_m8n8x4_b16_offset(a_addr + s_off, 2048)
+                            for n_local in cutlass.range_constexpr(2):
+                                w_off = (k16_in_64 * 4 + n_local) * w_tile_bytes
+                                if cutlass.const_expr(self.e4m3):
+                                    e01, e23 = _ld_ring_v2_u32_offset(sw0 + s_off, w_off)
+                                    b0, b1 = _e4m3x4_to_f16x2x2(e01)
+                                    b2, b3 = _e4m3x4_to_f16x2x2(e23)
+                                    if cutlass.const_expr(self.input_bf16):
+                                        b0, b1 = _f16x2_to_bf16x2(b0), _f16x2_to_bf16x2(b1)
+                                        b2, b3 = _f16x2_to_bf16x2(b2), _f16x2_to_bf16x2(b3)
+                                else:
+                                    b0, b1, b2, b3 = _ld_ring_v4_u32_offset(sw0 + s_off, w_off)
+                                i0 = 2 * n_local
+                                i1 = 2 * n_local + 1
+                                d0, d1, d2, d3 = self.mma_ready(
+                                    acc[i0, 0], acc[i0, 1], acc[i0, 2], acc[i0, 3],
+                                    a0_0, a1_0, a2_0, a3_0, b0, b1)
+                                acc[i0, 0], acc[i0, 1], acc[i0, 2], acc[i0, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = self.mma_ready(
+                                    acc[i1, 0], acc[i1, 1], acc[i1, 2], acc[i1, 3],
+                                    a0_0, a1_0, a2_0, a3_0, b2, b3)
+                                acc[i1, 0], acc[i1, 1], acc[i1, 2], acc[i1, 3] = d0, d1, d2, d3
+                                j0 = 4 + 2 * n_local
+                                j1 = 4 + 2 * n_local + 1
+                                d0, d1, d2, d3 = self.mma_ready(
+                                    acc[j0, 0], acc[j0, 1], acc[j0, 2], acc[j0, 3],
+                                    a0_1, a1_1, a2_1, a3_1, b0, b1)
+                                acc[j0, 0], acc[j0, 1], acc[j0, 2], acc[j0, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = self.mma_ready(
+                                    acc[j1, 0], acc[j1, 1], acc[j1, 2], acc[j1, 3],
+                                    a0_1, a1_1, a2_1, a3_1, b2, b3)
+                                acc[j1, 0], acc[j1, 1], acc[j1, 2], acc[j1, 3] = d0, d1, d2, d3
+                        _mbar_arrive(bar_empty + slot * Int32(8))
+                        if cutlass.const_expr(self.prefill_pipeline):
+                            stage_cnt = stage_cnt + Int32(1)
+                    for n8 in cutlass.range_constexpr(8):
+                        for v in cutlass.range_constexpr(4):
+                            split_total[n8, v] = split_total[n8, v] + acc[n8, v] * scale
+                    if cutlass.const_expr(not self.prefill_pipeline):
+                        stage_cnt = stage_cnt + Int32(1)
             for n8 in cutlass.range_constexpr(8):
                 for v in cutlass.range_constexpr(4):
                     grand_total[n8, v] = grand_total[n8, v] + split_total[n8, v]
@@ -3928,6 +4148,14 @@ def select4(index: Int32, v0: Int64, v1: Int64, v2: Int64, v3: Int64) -> Int64:
     elif index == Int32(2):
         out = v2
     return out
+
+
+@dsl_user_op
+def _prefill_k6_policy(*, loc=None, ip=None) -> Int64:
+    return Int64(llvm.inline_asm(
+        T.i64(), [], "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;", "=l",
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
 
 
 @dsl_user_op
