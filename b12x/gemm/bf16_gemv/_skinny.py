@@ -545,7 +545,8 @@ class RoutedBf16Projection:
             self.skinny = RowTiledSkinnyBf16Gemv(self.n, self.k, skinny_tiles_by_rows, out_dtype=out_dtype)
             self.skinny_tiles_by_rows = self.skinny.tiles_by_rows
         else:
-            self.skinny = SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, **skinny_config(n, k, out_dtype))
+            self.skinny = SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, **skinny_config(n, k, out_dtype)) \
+                if self.max_skinny_rows > 0 else None
             self.skinny_tiles_by_rows = ()
         if not tiles_by_rows and self.max_skinny_rows == 0:
             tiles_by_rows = DECODE_TMA_TILES.get((self.n, self.k), ())
@@ -567,9 +568,11 @@ class RoutedBf16Projection:
 
     def key(self) -> tuple:
         s = self.skinny
-        # tiles_by_rows extends the key; projections without it keep theirs.
-        return (self.n, self.k, str(self.out_dtype), self.max_skinny_rows, s.cols, s.rows_per_tile,
-                s.threads, tuple(sorted(self.large.config.items())), self.wide is not None) \
+        config = skinny_config(self.n, self.k, self.out_dtype) if s is None else dict(
+            cols=s.cols, rows_per_tile=s.rows_per_tile, threads=s.threads)
+        # Keep existing keys even when the disabled skinny route is not built.
+        return (self.n, self.k, str(self.out_dtype), self.max_skinny_rows, config["cols"], config["rows_per_tile"],
+                config["threads"], tuple(sorted(self.large.config.items())), self.wide is not None) \
             + ((("tiles_by_rows", self.tiles_by_rows),) if self.tiles_by_rows else ()) \
             + ((("skinny_tiles_by_rows", self.skinny_tiles_by_rows),) if self.skinny_tiles_by_rows else ())
 
@@ -577,7 +580,8 @@ class RoutedBf16Projection:
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
                  stream: cuda.CUstream):
         if rows <= Int32(self.max_skinny_rows):
-            self.skinny(x, w, out, rows, stream)
+            if cutlass.const_expr(self.skinny is not None):
+                self.skinny(x, w, out, rows, stream)
         else:
             if cutlass.const_expr(self.wide is not None):
                 if rows >= Int32(WIDE_PREFILL_MIN_ROWS):

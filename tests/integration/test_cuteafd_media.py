@@ -214,6 +214,16 @@ def test_existing_biased_projection_tower_shapes(width, outputs):
     assert (out == 1 + 1 / 128).all()
 
 
+def test_disabled_skinny_projection_does_not_construct_gemv(monkeypatch):
+    from b12x.gemm.bf16_gemv import _skinny
+    def forbidden(*args, **kwargs):
+        raise AssertionError("disabled skinny route constructed")
+    monkeypatch.setattr(_skinny, "SkinnyBf16Gemv", forbidden)
+    projection = _skinny.RoutedBf16Projection(1536, 1176, max_skinny_rows=0)
+    assert projection.skinny is None
+    assert projection.key()[3:7] == (0, 1, 8, 128)
+
+
 @pytest.mark.parametrize("height,width", [(2, 2), (4, 6), (6, 4), (2, 128), (128, 2), (128, 128)])
 def test_spatial_merge_adapter_matches_official_channel_major_pixel_shuffle(height, width):
     require_b12x()
