@@ -125,7 +125,36 @@ def test_compensated_route_selects_its_measured_row_tiles(monkeypatch):
     assert "tiles_by_rows" not in plain["geometry"]
 
 
+def test_trellis_accepts_config_and_continuous_pairing_without_cuda():
+    args = _BENCH.parse_args(["--recipes", "trellis", "--shapes", "6144x16384",
+                              "--rows", "2752,4096", "--trellis-config", "shapes.json",
+                              "--trellis-paired", "--trellis-steady-ms", "200"])
+    assert args.shapes == [(6144, 16384)]
+    assert args.rows == [2752, 4096]
+    assert args.trellis_config == Path("shapes.json")
+    assert args.trellis_paired
+    assert args.trellis_steady_ms == 200
+
+
+@pytest.mark.parametrize("samples,flagged", [
+    ([100, 100, 100, 100], False),
+    ([100, 101, 100, 101], False),
+    ([100, 120, 100, 120, 100], True),
+    ([100], True),
+])
+def test_trellis_order_audit_flags_bias_or_missing_reverse_order(samples, flagged):
+    audit = _BENCH._alternating_order_audit(samples)
+    assert audit["flagged"] is flagged
+    assert audit["mad_us"] >= 0
+    assert (audit["delta_us"] is None) == (len(samples) == 1)
+
+
 @pytest.mark.parametrize("argv", [
+    ["--recipes", "trellis", "--rows", "4097"],
+    ["--recipes", "trellis", "--trellis-steady-ms", "199"],
+    ["--recipes", "trellis", "--trellis-steady-ms", "nan"],
+    ["--recipes", "trellis", "--trellis-steady-ms", "inf"],
+    ["--recipes", "trellis", "--trellis-arms", "ring3"],
     ["--rows", "4096"],
     ["--recipes", "compensation", "--rows", "4097"],
     ["--recipes", "compensation", "--rows", "0"],

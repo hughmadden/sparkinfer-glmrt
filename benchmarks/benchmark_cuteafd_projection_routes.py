@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -27,8 +28,6 @@ def parse_args(argv=None):
                         help="retain exactly two K6 geometries and interleave their timed replays")
     parser.add_argument("--trellis-steady-ms", type=float, default=0,
                         help="continuous L2-cold duration; equal session_id configs interleave")
-    parser.add_argument("--trellis-arms", default="baseline",
-                        help="baseline,ring2,ring3,ring4,sched2,sched3,sched4,wide2,wide3,wide_sched2,wide_sched3; paired with baseline on identical data")
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -42,16 +41,8 @@ def parse_args(argv=None):
     row_limit = 4096 if args.recipes in ("compensation", "trellis") else 128
     if args.samples < 1 or any(v < 1 or v > row_limit for v in args.rows):
         parser.error(f"positive samples and live rows in 1..{row_limit} required")
-    args.trellis_arms = args.trellis_arms.split(",")
-    if (not args.trellis_arms or args.trellis_arms[0] != "baseline" or
-            len(set(args.trellis_arms)) != len(args.trellis_arms) or
-            any(arm not in ("baseline", "ring2", "ring3", "ring4", "sched2", "sched3", "sched4", "wide2", "wide3", "wide_sched2", "wide_sched3")
-                for arm in args.trellis_arms)):
-        parser.error("trellis arms must be unique, start with baseline, and name supported rings")
-    if len(args.trellis_arms) > 1 and not args.trellis_steady_ms:
-        parser.error("candidate arms require steady interleaved timing")
-    if args.trellis_steady_ms and args.trellis_steady_ms < 200:
-        parser.error("steady sessions must be at least 200 ms")
+    if args.trellis_steady_ms and (not math.isfinite(args.trellis_steady_ms) or args.trellis_steady_ms < 200):
+        parser.error("steady sessions must be finite and at least 200 ms")
     return args
 
 
@@ -100,6 +91,14 @@ def _gpu_telemetry():
     return {"time_ns": time.time_ns(), "pid": os.getpid(), "fields": fields,
             "gpu": query([f"--query-gpu={fields}"]),
             "compute_apps": query(["--query-compute-apps=pid,process_name,used_memory"])}
+
+
+def _alternating_order_audit(samples):
+    median = statistics.median(samples)
+    mad = statistics.median(abs(value-median) for value in samples)
+    delta = (abs(statistics.median(samples[::2])-statistics.median(samples[1::2]))
+             if len(samples) > 1 else None)
+    return dict(mad_us=mad, delta_us=delta, flagged=delta is None or delta > 3*mad)
 
 
 def _steady_trellis(args, pending, flush):
@@ -164,34 +163,14 @@ def _steady_trellis(args, pending, flush):
             entry["session_ms"] = duration_ms
             entry["in_run_telemetry"] = active
             entry["telemetry_errors"] = errors
-            samples = entry["samples_us"]
-            mad = statistics.median(abs(v-entry["median_us"]) for v in samples)
-            delta = abs(statistics.median(samples[::2])-statistics.median(samples[1::2]))
-            entry["alternating_order_audit"] = dict(mad_us=mad, delta_us=delta, flagged=delta > 3*mad)
-            entry["accepted"] = accepted and delta <= 3*mad
+            audit = _alternating_order_audit(entry["samples_us"])
+            entry["alternating_order_audit"] = audit
+            entry["accepted"] = accepted and not audit["flagged"]
             entry["telemetry_after"] = _gpu_telemetry()
             results.append(entry)
             print(json.dumps({key: value for key, value in entry.items()
                               if key not in ("samples_us", "in_run_telemetry")}), flush=True)
     return results
-
-
-def _trellis_arm_program(template, arm):
-    from b12x.integration.cuteafd._common import compile_program
-    from b12x.integration.cuteafd.trellis_linear import _GroupedPointers, _Pointers
-
-    if arm == "baseline":
-        return template
-    g = template.geometry
-    pointers = (_GroupedPointers if g.get("groups", 1) == 4 else _Pointers)(g)
-    pointers.core.prefill_pipeline = True
-    pointers.core.prefill_stages = int(arm[-1])
-    pointers.core.prefill_prefetch = "sched" in arm
-    if arm.startswith("wide"):
-        pointers.core.prefill_bm = 64
-        pointers.core.prefill_bn = 128
-    return compile_program(pointers, name="trellis_prefill_screen", operands=template.operands,
-        scalars=template.scalars, key=(tuple(g.items()), arm), geometry=g, version=1)
 
 
 def _trellis_baseline(args):
@@ -215,8 +194,8 @@ def _trellis_baseline(args):
         if args.output:
             args.output.write_text(json.dumps(dict(device=torch.cuda.get_device_name(),
                 sms=properties.multi_processor_count, torch_version=torch.__version__,
-                cuda_version=torch.version.cuda, argv=sys.argv, kind="native_k6_prefill_screen",
-                conditions="Max-Q power-limited, relative ranking only; F16 rotated inputs; random K128 scales; L2 eviction per replay; bounded group0/N128/all-K oracle with up to8 rows; candidate vs frozen production output byte checks cover all live outputs/groups; row invariant vs maximum M; eager/graph deterministic; >=200ms warm/timed host loops, in-run NVML; alternating-order MAD audit, no power/clock rejection",
+                cuda_version=torch.version.cuda, argv=sys.argv, kind="native_k6_baseline",
+                conditions="unchanged production core; F16 rotated inputs; random K128 scales; L2 eviction per replay; bounded group0/N128/all-K F32/FP64 oracle with up to8 rows; row invariance vs maximum M, eager/graph and repeated replay byte checks cover all live outputs/groups; steady mode uses >=200ms warm/timed host loops, in-run NVML and an alternating-order MAD audit, no power/clock rejection; cross-device absolute timing extrapolation is not valid",
                 results=results), indent=2)+"\n")
     for config_index, config in enumerate(configs):
         n, k, side, groups = (config[key] for key in ("n", "k", "side", "groups"))
@@ -238,7 +217,6 @@ def _trellis_baseline(args):
             max_rows=max(args.rows))
         operands = ((inputs, payloads[0], scales[0], partial, outputs[0]) if groups == 1 else
                     (inputs, *payloads, *scales, partial, *outputs))
-        programs = {arm: _trellis_arm_program(program, arm) for arm in args.trellis_arms}
 
         # Independently reconstruct one N128 output block, bounded in K128 chunks.
         weight = np.empty((k, 128), dtype=np.float32)
@@ -258,88 +236,74 @@ def _trellis_baseline(args):
         scaled_w = w * scales[0].float().repeat_interleave(128)[:, None]
         oracle = x[0, :sample_rows].double() @ scaled_w.double()
         f32_oracle = x[0, :sample_rows].float() @ scaled_w
-        max_outputs = {}
+        baseline = x[0, :sample_rows] @ scaled_w.half()
+        max_outputs = None
         for rows in sorted(args.rows, reverse=True):
             scalars = (rows, 0, properties.multi_processor_count*4)
-            expected = None
-            for arm, arm_program in programs.items():
-                for output in outputs:
-                    output.fill_(float("nan"))
-                arm_program.launch(*operands, scalars=scalars)
-                torch.cuda.synchronize()
-                actual = [output[:rows].clone() for output in outputs]
-                if arm == "baseline":
-                    expected = actual
-                different = sum(int((value.view(torch.int32) != want.view(torch.int32)).sum())
-                                for value, want in zip(actual, expected))
-                if different:
-                    raise RuntimeError(f"{config} {arm} M{rows}: {different} output bit mismatches vs current kernel")
-                if rows == max(args.rows):
-                    max_outputs[arm] = actual
-                elif any(not torch.equal(value.view(torch.int32), want[:rows].view(torch.int32))
-                         for value, want in zip(actual, max_outputs[arm])):
-                    raise RuntimeError(f"{config} {arm} M{rows}: row invariance failed")
-                error = outputs[0][:sample_rows, :128].float() - f32_oracle
-                f32_error = dict(max_abs=float(error.abs().max()), rms=float(error.square().mean().sqrt()))
-                if arm == "baseline":
-                    baseline_error = f32_error
-                if any(f32_error[metric] > baseline_error[metric] for metric in ("max_abs", "rms")):
-                    raise RuntimeError(f"{config} {arm}: F32-oracle error regressed")
-                accuracy = dict(pass_bit_exact=True, differing_elements=different,
-                    f32_oracle=f32_error, baseline_f32_oracle=baseline_error,
-                    fp64_oracle_rms=float((outputs[0][:sample_rows, :128].double()-oracle).square().mean().sqrt()), sample_rows=sample_rows, sample_columns=128,
-                    oracle_scope="group0, bounded rows/N, all K; full-output exactness implies unchanged oracle error everywhere")
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    arm_program.launch(*operands, scalars=scalars)
-                for output in outputs:
-                    output.fill_(float("nan"))
-                graph.replay()
-                torch.cuda.synchronize()
-                if any(not torch.equal(value[:rows].view(torch.int32), want.view(torch.int32))
-                       for value, want in zip(outputs, actual)):
-                    raise RuntimeError(f"{arm}: graph replay differs from eager output")
-                # A second replay also checks deterministic overwrite of every live output.
-                graph.replay()
-                torch.cuda.synchronize()
-                if any(not torch.equal(value[:rows].view(torch.int32), want.view(torch.int32))
-                       for value, want in zip(outputs, actual)):
-                    raise RuntimeError(f"{arm}: repeated replay is not deterministic")
-                entry = dict(config, arm=arm, rows=rows, bits=6, codebook="mcg", input_dtype="f16",
-                             samples_us=[], accuracy=accuracy, row_invariant=True, graph_exact=True)
-                if args.trellis_paired or args.trellis_steady_ms:
-                    pending.setdefault(rows, []).append((entry, graph))
-                else:
-                    entry["telemetry_before"] = _gpu_telemetry()
-                    for _ in range(args.samples):
-                        flush()
-                        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                        start.record()
-                        graph.replay()
-                        end.record()
-                        end.synchronize()
-                        entry["samples_us"].append(start.elapsed_time(end)*1000)
-                    entry["telemetry_after"] = _gpu_telemetry()
-                    entry["median_us"] = statistics.median(entry["samples_us"])
-                    results.append(entry)
-                    print(json.dumps({key: value for key, value in entry.items() if key != "samples_us"}), flush=True)
-                    save()
-                del graph, actual
-        del max_outputs, expected
+            for output in outputs:
+                output.fill_(float("nan"))
+            program.launch(*operands, scalars=scalars)
+            torch.cuda.synchronize()
+            expected = [output[:rows].clone() for output in outputs]
+            if any(not bool(torch.isfinite(value).all()) for value in expected):
+                raise RuntimeError(f"{config} M{rows}: nonfinite output")
+            if max_outputs is None:
+                max_outputs = expected
+            elif any(not torch.equal(value.view(torch.int32), want[:rows].view(torch.int32))
+                     for value, want in zip(expected, max_outputs)):
+                raise RuntimeError(f"{config} M{rows}: row invariance failed")
+            accuracy = _accuracy(outputs[0][:sample_rows, :128], baseline, oracle)
+            if not accuracy["pass"]:
+                raise RuntimeError(f"{config} M{rows}: bounded independent oracle failed: {accuracy}")
+            error = outputs[0][:sample_rows, :128].float() - f32_oracle
+            accuracy.update(f32_oracle=dict(max_abs=float(error.abs().max()),
+                            rms=float(error.square().mean().sqrt())),
+                fp64_oracle_rms=float((outputs[0][:sample_rows, :128].double()-oracle).square().mean().sqrt()),
+                sample_rows=sample_rows, sample_columns=128,
+                oracle_scope="group0, bounded rows/N, all K; not checkpoint fidelity")
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                program.launch(*operands, scalars=scalars)
+            for output in outputs:
+                output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            if any(not torch.equal(value[:rows].view(torch.int32), want.view(torch.int32))
+                   for value, want in zip(outputs, expected)):
+                raise RuntimeError("trellis graph replay differs from eager output")
+            # A second replay also checks deterministic overwrite of every live output.
+            graph.replay()
+            torch.cuda.synchronize()
+            if any(not torch.equal(value[:rows].view(torch.int32), want.view(torch.int32))
+                   for value, want in zip(outputs, expected)):
+                raise RuntimeError("trellis repeated replay is not deterministic")
+            entry = dict(config, rows=rows, bits=6, codebook="mcg", input_dtype="f16",
+                         samples_us=[], accuracy=accuracy, row_invariant=True, graph_exact=True)
+            if args.trellis_paired or args.trellis_steady_ms:
+                pending.setdefault(rows, []).append((entry, graph))
+            else:
+                entry["telemetry_before"] = _gpu_telemetry()
+                for _ in range(args.samples):
+                    flush()
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    graph.replay()
+                    end.record()
+                    end.synchronize()
+                    entry["samples_us"].append(start.elapsed_time(end)*1000)
+                entry["telemetry_after"] = _gpu_telemetry()
+                entry["median_us"] = statistics.median(entry["samples_us"])
+                results.append(entry)
+                print(json.dumps({key: value for key, value in entry.items() if key != "samples_us"}), flush=True)
+                save()
+            del graph, expected
+        del max_outputs
         if args.trellis_paired or args.trellis_steady_ms:
-            retained.append((programs, operands, x, inputs, payloads, scales, partial, outputs))
-        del program, programs, arm_program, operands, x, inputs, payloads, scales, partial, outputs, w, scaled_w, oracle, f32_oracle
+            retained.append((program, operands, x, inputs, payloads, scales, partial, outputs))
+        del program, operands, x, inputs, payloads, scales, partial, outputs, w, scaled_w, oracle, f32_oracle, baseline
         if args.trellis_steady_ms and (config_index+1 == len(configs) or
                 config.get("session_id", config_index) != configs[config_index+1].get("session_id", config_index+1)):
-            if len(args.trellis_arms) > 1:
-                for arm in args.trellis_arms[1:]:
-                    paired = {}
-                    for rows, entries in pending.items():
-                        paired[rows] = [(dict(entry, comparison_arm=arm), graph)
-                            for entry, graph in entries if entry["arm"] in ("baseline", arm)]
-                    results.extend(_steady_trellis(args, paired, flush))
-            else:
-                results.extend(_steady_trellis(args, pending, flush))
+            results.extend(_steady_trellis(args, pending, flush))
             pending.clear()
             retained.clear()
             save()
