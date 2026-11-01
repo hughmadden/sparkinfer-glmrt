@@ -20,8 +20,12 @@ WIDTH_CASES += [(2048, 6144, width) for width in (32, 64, 96)]
 
 
 @pytest.mark.parametrize("intermediate,hidden,width", WIDTH_CASES)
-def test_exact_decode_retains_padded_warp_partition(intermediate, hidden, width):
+def test_exact_decode_retains_padded_warp_partition(intermediate, hidden, width, monkeypatch):
+    from b12x.integration.cuteafd import fp8_moe
     from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, _Route
+
+    # The GB10 four-warp exceptions have a separate real-dispatch numerical gate.
+    monkeypatch.setattr(fp8_moe, "_sm121", lambda: False)
 
     @dataclass(frozen=True)
     class Exact(Fp8MoeGeometry):
@@ -39,9 +43,15 @@ def test_exact_decode_retains_padded_warp_partition(intermediate, hidden, width)
     assert exact.down.row_bytes == width // 2
 
 
-@pytest.mark.parametrize("intermediate,hidden,width", WIDTH_CASES)
-@pytest.mark.parametrize("route,a8", [("decode", False), ("stream", False), ("stream", True)])
-def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, hidden, width, route, a8):
+TAIL_CASES = [(intermediate, hidden, width, route, a8, 4096)
+              for intermediate, hidden, width in WIDTH_CASES
+              for route, a8 in (("decode", False), ("stream", False), ("stream", True))]
+TAIL_CASES += [(2048, 6144, width, "decode", False, capacity)
+               for width in (672, 704) for capacity in (1, 16, 80)]
+
+
+@pytest.mark.parametrize("intermediate,hidden,width,route,a8,capacity", TAIL_CASES)
+def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, hidden, width, route, a8, capacity):
     require_b12x()
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_scratch_bytes
@@ -61,8 +71,15 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, h
     padded = Exact("tail", hidden=hidden, experts=16, top_k=8, intermediate=intermediate,
                    weights="mxfp4", width=padded_width)
     gen = torch.Generator(device="cuda").manual_seed(97)
-    capacity = 4096
-    source, _ = wire_rows(torch.randn(capacity, g.hidden, device="cuda", generator=gen).bfloat16())
+    x = torch.randn(capacity, g.hidden, device="cuda", generator=gen).bfloat16()
+    source, _ = wire_rows(x)
+    changed_fold = (torch.cuda.get_device_capability() == (12, 1) and hidden == 6144
+                    and width in (672, 704) and route == "decode")
+    if changed_fold:
+        from b12x.integration.cuteafd.fp8_moe import _Route
+        assert _Route(g, route, capacity, True).down.warps == 4
+        assert _Route(padded, route, capacity, True).down.warps == 6
+        torch.backends.cuda.matmul.allow_tf32 = False
     ids = torch.rand(capacity, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int().contiguous()
     weights = torch.rand(capacity, g.top_k, device="cuda", generator=gen).contiguous()
     codes = lambda shape: torch.randint(0, 256, shape, device="cuda", generator=gen).byte()
@@ -86,11 +103,19 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, h
     old_scratch = torch.empty(fp8_moe_scratch_bytes(padded, route, capacity, mxfp4_down_a8=a8), device="cuda", dtype=torch.uint8)
     buffers = (source, ids, weights, *packed, out, scratch)
     addresses = tuple(t.data_ptr() for t in buffers)
-    candidate.launch(*buffers, scalars=(17,))
-    baseline.launch(source, ids, weights, *old, ref, old_scratch, scalars=(17,))
+    warm_rows = min(17, capacity)
+    candidate.launch(*buffers, scalars=(warm_rows,))
+    baseline.launch(source, ids, weights, *old, ref, old_scratch, scalars=(warm_rows,))
     torch.cuda.synchronize()
+    oracle = None
+    if changed_fold:
+        from benchmarks.bench_cuteafd_fp8_moe import f32_errors, mxfp4_f32_reference
+        oracle = mxfp4_f32_reference(x, ids, weights,
+            {"w1": w1, "w3": w3, "w2": w2},
+            {"w1": s1, "w3": s3, "w2": s2[..., :width // 32]})
+    live_rows = sorted({min(rows, capacity) for rows in (1, 16, 17, 80, 127, 128, 129, 641, capacity)})
     with kernel_resolution_guard("exact K32 tails across live rows and graph replay"):
-        for rows in (1, 17, 127, 128, 129, 641, 4096):
+        for rows in live_rows:
             scratch.fill_(0xFF)
             out.fill_(float("nan"))
             candidate.launch(*buffers, scalars=(rows,))
@@ -111,7 +136,18 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, h
                 "histogram": {str(bound): int((ulps == bound).sum()) for bound in (0, 1, 2, 3, 4)},
                 "over4": int((ulps > 4).sum()), "cosine": float(cosine),
             }), flush=True)
-            assert torch.equal(out[:rows], ref[:rows]), (hidden, width, route, a8, rows, int(ulps.max()))
+            if changed_fold:
+                actual_error = f32_errors(out[:rows], oracle[:rows])
+                padded_error = f32_errors(ref[:rows], oracle[:rows])
+                print("mxfp4_dispatch_oracle " + json.dumps({
+                    "hidden": hidden, "width": width, "capacity": capacity, "rows": rows,
+                    "down_warps": 4, "padded_down_warps": 6,
+                    "candidate": actual_error, "padded": padded_error,
+                }), flush=True)
+                assert all(actual_error[key] <= padded_error[key] for key in ("max_abs", "rms")), (
+                    width, capacity, rows, actual_error, padded_error)
+            else:
+                assert torch.equal(out[:rows], ref[:rows]), (hidden, width, route, a8, rows, int(ulps.max()))
             result = out[:rows].clone()
             scratch.zero_()
             # Padding bytes must be ignored by all three down kernels.
