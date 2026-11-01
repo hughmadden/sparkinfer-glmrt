@@ -268,8 +268,14 @@ def test_v41_k_split_synthetic_oracle_seeds(weight_seed, n):
                             "mxfp4_k_split_synthetic_oracle", k_split=2, exact_control=True)
 
 
+@pytest.mark.parametrize("weight_seed", [92800, 92801, 92802, 92803])
+def test_v41_s384_shipped_k_split_oracle_seeds(weight_seed):
+    _synthetic_oracle_seeds(weight_seed, 5120, 384, True, 128, 192,
+                            "mxfp4_shipped_k_split_oracle", k_split=2, candidate_exact=False)
+
+
 def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker,
-                            k_split=1, exact_control=False):
+                            k_split=1, exact_control=False, candidate_exact=True):
     require_b12x()
     import json
     from benchmarks.bench_cuteafd_fp8_moe import (
@@ -296,7 +302,7 @@ def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker
             control, control_output, control_owned = native_pair_arm(
                 *operands, control_tile, exact_control, False, coded, qualify=True, fc1_k_splits=1)
             candidate, output, owned = native_pair_arm(
-                *operands, tile, True, False, coded, qualify=True, fc1_k_splits=k_split)
+                *operands, tile, candidate_exact, False, coded, qualify=True, fc1_k_splits=k_split)
             control()
             candidate()
             torch.cuda.synchronize()
@@ -305,8 +311,11 @@ def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker
             print(marker + " " + json.dumps(dict(
                 weight_seed=weight_seed, activation_seed=activation_seed, capacity=capacity,
                 hidden=h, logical=n, coded=coded, tile=tile, control_tile=control_tile, k_split=k_split,
-                control_arm=dict(tile=control_tile, split=1, exact_storage=exact_control),
-                candidate_arm=dict(tile=tile, split=k_split, exact_storage=True),
+                control_arm=dict(tile=control_tile, split=1, exact_storage=exact_control and
+                    (n % 128 != 0 or (n + control_tile - 1) // control_tile * control_tile > n)),
+                candidate_arm=dict(tile=tile, split=k_split, exact_storage=candidate_exact and
+                    (n % 128 != 0 or (n + tile - 1) // tile * tile > n)),
+                reference_rms=oracle.square().mean().sqrt().item(),
                 bitwise_equal=torch.equal(control_output, output),
                 control=f32_errors(control_output, oracle), candidate=f32_errors(output, oracle),
                 synthetic=True, timed=False)), flush=True)
