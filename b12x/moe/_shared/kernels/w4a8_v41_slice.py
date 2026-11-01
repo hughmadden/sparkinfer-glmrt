@@ -88,14 +88,10 @@ class V41FusedSliceKernel:
         self.intermediate = intermediate
         self.exact_storage = bool(exact_storage)
         self.scale_codes = bool(scale_codes)
-        assert not (self.scale_codes and self.exact_storage), "scale codes use the N256 resident layout"
-        if self.exact_storage:
-            assert intermediate == 576 and hidden == 5120, "exact tail layout is the V4.1 TP4 contract"
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.slices = (intermediate + width - 1) // width
-        assert self.slices * width <= (intermediate + 127) // 128 * 128, (
-            "slice exceeds packed storage"
-        )
+        if not self.exact_storage:
+            assert self.slices * width <= self.kernel_intermediate, "slice exceeds packed storage"
 
     @cute.jit
     def __call__(
@@ -239,7 +235,8 @@ class V41FusedSliceKernel:
                 if cutlass.const_expr(self.scale_codes):
                     stage_scale_codes_slice(s13, sb, expert, kt, start, tid,
                                             self.width, 2 * self.kernel_intermediate,
-                                            self.hidden // 32)
+                                            self.hidden // 32,
+                                            self.intermediate if self.exact_storage else 0)
                 elif cutlass.const_expr(self.exact_storage):
                     stage_v41_exact_sfb(
                         s13,
@@ -269,7 +266,8 @@ class V41FusedSliceKernel:
                     stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
                                             start + self.kernel_intermediate, tid,
                                             self.width, 2 * self.kernel_intermediate,
-                                            self.hidden // 32)
+                                            self.hidden // 32,
+                                            self.intermediate if self.exact_storage else 0)
                 elif cutlass.const_expr(self.exact_storage):
                     stage_v41_exact_sfb(
                         s13,
@@ -524,14 +522,10 @@ class V41SliceFc1Kernel:
         self.intermediate = intermediate
         self.exact_storage = bool(exact_storage)
         self.scale_codes = bool(scale_codes)
-        assert not (self.scale_codes and self.exact_storage), "scale codes use the N256 resident layout"
-        if self.exact_storage:
-            assert intermediate == 576 and hidden == 5120, "exact tail layout is the V4.1 TP4 contract"
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.slices = (intermediate + width - 1) // width
-        assert self.slices * width <= (intermediate + 127) // 128 * 128, (
-            "slice exceeds packed storage"
-        )
+        if not self.exact_storage:
+            assert self.slices * width <= self.kernel_intermediate, "slice exceeds packed storage"
 
     @cute.jit
     def __call__(
@@ -655,7 +649,8 @@ class V41SliceFc1Kernel:
                 if cutlass.const_expr(self.scale_codes):
                     stage_scale_codes_slice(s13, sb, expert, kt, start, tid,
                                             self.width, 2 * self.kernel_intermediate,
-                                            self.hidden // 32)
+                                            self.hidden // 32,
+                                            self.intermediate if self.exact_storage else 0)
                 elif cutlass.const_expr(self.exact_storage):
                     stage_v41_exact_sfb(
                         s13,
@@ -685,7 +680,8 @@ class V41SliceFc1Kernel:
                     stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
                                             start + self.kernel_intermediate, tid,
                                             self.width, 2 * self.kernel_intermediate,
-                                            self.hidden // 32)
+                                            self.hidden // 32,
+                                            self.intermediate if self.exact_storage else 0)
                 elif cutlass.const_expr(self.exact_storage):
                     stage_v41_exact_sfb(
                         s13,
@@ -836,14 +832,10 @@ class V41SliceFc2Kernel:
         self.intermediate = intermediate
         self.exact_storage = bool(exact_storage)
         self.scale_codes = bool(scale_codes)
-        assert not (self.scale_codes and self.exact_storage), "scale codes use the N256 resident layout"
-        if self.exact_storage:
-            assert intermediate == 576 and hidden == 5120, "exact tail layout is the V4.1 TP4 contract"
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.slices = (intermediate + width - 1) // width
-        assert self.slices * width <= (intermediate + 127) // 128 * 128, (
-            "slice exceeds packed storage"
-        )
+        if not self.exact_storage:
+            assert self.slices * width <= self.kernel_intermediate, "slice exceeds packed storage"
 
     @cute.jit
     def __call__(

@@ -1,4 +1,4 @@
-"""Exact V4.1 TP4 resident tails against padded slices and the FP32 oracle."""
+"""Exact K32 resident tails against identical padded slices and the FP32 oracle."""
 import pytest
 import torch
 from tests.conftest import require_b12x
@@ -46,13 +46,13 @@ def pack(weights, scales, exact):
     return result
 
 
-def run_pipeline(x, ids, routing, packed, width, exact, atomic=False):
+def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, coded=False):
     import cutlass
     import cutlass.cute as cute
     from b12x._lib.utils import current_cuda_stream
     from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
     m, h = x.shape
-    e, topk, n = 8, ids.shape[1], 576
+    e, topk = 8, ids.shape[1]
     wire = torch.zeros(m, h+h//32, dtype=torch.uint8, device='cuda')
     blocks = x.float().reshape(m,-1,32)
     scale = torch.exp2(torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-4)/448)))
@@ -69,7 +69,7 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False):
         from cutlass.cute.runtime import from_dlpack
         return from_dlpack(t,assumed_align=16)
     args=[tensor(t) for t in tensors]
-    fn=cute.compile(V41SlicePipeline(m,width,experts=e,topk=topk,exact_storage=exact,atomic_tokens=atomic),*args,cutlass.Int32(m),current_cuda_stream())
+    fn=cute.compile(V41SlicePipeline(m,width,experts=e,topk=topk,intermediate=n,hidden=h,exact_storage=exact,atomic_tokens=atomic,scale_codes=coded),*args,cutlass.Int32(m),current_cuda_stream())
     fn(*args,cutlass.Int32(m),current_cuda_stream())
     # Resolve once, exercise multiple live counts, then replay with fixed storage.
     fn(*args,cutlass.Int32(1),current_cuda_stream())
@@ -108,3 +108,45 @@ def test_exact_slices(m,width,atomic):
     oracle=reference(x,ids,routing,{k:v.cuda() for k,v in weights.items()},{k:v.cuda() for k,v in scales.items()})
     cos=torch.nn.functional.cosine_similarity(new.flatten(),oracle.flatten(),dim=0).item()
     assert cos>.9999,cos
+
+
+# Every adjacent width at its production hidden geometry, including shipped
+# equal splits and native V4 Flash TP3/TP6.
+WIDTHS = [(hidden, width)
+          for intermediate, hidden in ((2048, 4096), (2304, 5120), (3072, 7168))
+          for width in sorted({32 * (intermediate // 32 // world + extra)
+                               for world in range(2, 9)
+                               for extra in (0, int(intermediate // 32 % world != 0))})]
+
+
+@pytest.mark.parametrize("h,n", WIDTHS)
+@pytest.mark.parametrize("coded", [False, True])
+@pytest.mark.parametrize("atomic", [False, True])
+def test_all_k32_widths_exact_storage(h, n, coded, atomic):
+    require_b12x()
+    from b12x.moe._shared.scale_codes import pack_scale_codes
+    torch.manual_seed(928 + n)
+    # Eight experts exercise nonzero expert strides and both projection halves.
+    m, e, k = 17, 8, 6
+    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing = (routing / routing.sum(-1, keepdim=True) * 1.5).float()
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+    padded = pack(weights, scales, False)
+    exact = pack(weights, scales, True) if n % 128 else list(padded)
+    if coded:
+        exact[1] = pack_scale_codes(torch.cat((scales["w3"], scales["w1"]), 1),
+                                   tensor_name="w13.scale", gated_half_rows=n).view(torch.uint32).flatten().cuda()
+        exact[3] = pack_scale_codes(scales["w2"], tensor_name="w2.scale").view(torch.uint32).flatten().cuda()
+    reference_output = run_pipeline(x, ids, routing, padded, 192 if n % 192 == 0 else 128,
+                                    False, atomic, n=n)
+    result = run_pipeline(x, ids, routing, exact, 192 if n % 192 == 0 else 128,
+                          bool(n % 128), atomic, n=n, coded=coded)
+    if atomic:
+        torch.testing.assert_close(result, reference_output, atol=.002, rtol=.002)
+    else:
+        assert torch.equal(result, reference_output), (n, coded, (result - reference_output).abs().max().item())

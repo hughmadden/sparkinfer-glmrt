@@ -31,30 +31,19 @@ def pack_scale_codes(scales, *, tensor_name, gated_half_rows=None):
             f"{tensor_name}: expert {expert} row {row} UE8M0 span {span} exceeds 15; "
             "unsupported V4.1 scale codes"
         )
-    if gated_half_rows is not None:
-        if rows != 2 * gated_half_rows:
-            raise ValueError(f"{tensor_name}: invalid gate/up row geometry")
-        half = (gated_half_rows + 127) // 128 * 128
-        stored_rows = 2 * half
-    else:
-        half = 0
-        stored_rows = (rows + 255) // 256 * 256
-    if stored_rows % 256:
-        raise ValueError(f"{tensor_name}: resident rows must align to N256 tiles")
+    if rows <= 0 or rows % 32 or (gated_half_rows is not None and rows != 2 * gated_half_rows):
+        raise ValueError(f"{tensor_name}: invalid exact K32 scale rows")
+    stored_rows = rows
     tiles = (columns + 3) // 4
     offsets = torch.zeros((experts, stored_rows, tiles * 4), dtype=torch.uint8, device=scales.device)
     bases = torch.zeros((experts, stored_rows), dtype=torch.uint8, device=scales.device)
     delta = scales - low[..., None]
-    if half:
-        for source, destination in ((0, 0), (gated_half_rows, half)):
-            offsets[:, destination:destination + gated_half_rows, :columns] = delta[:, source:source + gated_half_rows]
-            bases[:, destination:destination + gated_half_rows] = low[:, source:source + gated_half_rows]
-    else:
-        offsets[:, :rows, :columns] = delta
-        bases[:, :rows] = low
+    offsets[:, :, :columns] = delta
+    bases[:] = low
     nibble = offsets.reshape(experts, stored_rows, tiles, 4).to(torch.int32)
     codes = nibble[..., 0] | nibble[..., 1] << 4 | nibble[..., 2] << 8 | nibble[..., 3] << 12
-    codes = codes.reshape(experts, stored_rows // 256, 256, tiles).permute(0, 1, 3, 2).contiguous()
+    codes = torch.cat(tuple(codes[:, start:start + 256].transpose(1, 2).contiguous().flatten(1)
+                            for start in range(0, rows, 256)), 1)
     return torch.cat((codes.to(torch.uint16).view(torch.uint8).reshape(experts, -1), bases), -1).contiguous()
 
 
@@ -63,10 +52,12 @@ def unpack_scale_codes(packed, *, rows, columns):
     experts = packed.shape[0]
     tiles = (columns + 3) // 4
     code_bytes = rows * tiles * 2
-    if rows % 256 or packed.dtype != torch.uint8 or packed.shape[1] != code_bytes + rows:
+    if rows <= 0 or rows % 32 or columns <= 0 or packed.dtype != torch.uint8 or packed.shape[1] != code_bytes + rows:
         raise ValueError("invalid V4.1 scale-code resident extent")
     codes = packed[:, :code_bytes].contiguous().view(torch.uint16).to(torch.int32)
-    codes = codes.reshape(experts, rows // 256, tiles, 256).permute(0, 1, 3, 2).reshape(experts, rows, tiles)
+    codes = torch.cat(tuple(codes[:, start * tiles:(start + min(256, rows - start)) * tiles]
+                            .reshape(experts, tiles, min(256, rows - start)).transpose(1, 2)
+                            for start in range(0, rows, 256)), 1)
     bases = packed[:, code_bytes:].to(torch.int32)
     values = torch.stack(tuple((codes >> (4 * i)) & 15 for i in range(4)), -1)
     values = (values + bases[..., None, None]).to(torch.uint8).reshape(experts, rows, tiles * 4)
