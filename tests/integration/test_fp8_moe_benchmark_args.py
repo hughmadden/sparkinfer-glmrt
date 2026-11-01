@@ -1,6 +1,7 @@
 """CPU-only controls for fixed-export row sweeps and recorded route replay."""
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -14,6 +15,113 @@ _PATH = Path(__file__).resolve().parents[2] / "benchmarks/bench_cuteafd_fp8_moe.
 _SPEC = importlib.util.spec_from_file_location("fp8_moe_benchmark", _PATH)
 bench = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(bench)
+
+
+def test_mxfp4_pair_widths_cover_all_worlds_without_padding():
+    assert bench.paired_widths(2304) == [288, 320, 352, 384, 448, 480, 576, 768, 1152]
+    assert bench.paired_widths(2048) == [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024]
+    assert bench.paired_widths(3072) == [384, 416, 448, 512, 608, 640, 768, 1024, 1536]
+    args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--geometry", "v41", "--widths", "448,480"])
+    assert args.native_slices and args.widths == "448,480"
+    with pytest.raises(ValueError):
+        bench.paired_widths(2048, "2080")
+
+
+@pytest.mark.parametrize("family,rank_width,expected", [
+    ("v41", 288, 192), ("v41", 576, 192), ("v41", 768, 192),
+    ("v41", 448, 128), ("dsv4f", 384, 128), ("dsv4p", 768, 128),
+])
+def test_native_pair_retains_shipped_slice_recipe(family, rank_width, expected):
+    assert bench.native_slice_width(family, rank_width) == expected
+
+
+@pytest.mark.parametrize("argv", [["--native-slices"], ["--widths", "448"],
+    ["--mxfp4-pair", "--widths", "33"], ["--mxfp4-pair", "--widths", "oops"],
+    ["--mxfp4-pair", "--input", "bf16"], ["--mxfp4-pair", "--profile-dir", "out"]])
+def test_invalid_pair_modes_fail_before_cuda(argv):
+    with pytest.raises(SystemExit):
+        bench.parse_args(argv)
+
+
+@pytest.mark.parametrize("width,expected", [(288, [1, 2, 3, 4, 8]), (576, [1, 2, 4, 5, 8]),
+                                          (672, [1, 2, 4, 6, 8]), (608, [1, 2, 4, 5, 8])])
+def test_tiling_screen_includes_old_four_warps_and_matching_partition(width, expected):
+    assert bench.mxfp4_decode_partitions(width) == expected
+
+
+def test_tiling_controls_are_development_pair_only():
+    assert bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings"]).mxfp4_tilings
+    for argv in (["--mxfp4-tilings"], ["--mxfp4-pair", "--mxfp4-tilings", "--capacity", "4096"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(argv)
+
+
+@pytest.mark.parametrize("width", [288, 576])
+def test_aligned_w2_changes_only_payload_tile_pitch(monkeypatch, width):
+    from tests.moe.test_v41_exact_slices import pack
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    experts, hidden = 2, 256
+    weights, scales = {}, {}
+    for name, shape in (("w1", (experts, width, hidden // 2)),
+                        ("w3", (experts, width, hidden // 2)),
+                        ("w2", (experts, hidden, width // 2))):
+        weights[name] = (torch.arange(shape[0] * shape[1] * shape[2]) % 251 + 1).byte().reshape(shape)
+        scales[name] = torch.full((*shape[:-1], shape[-1] // 16), 122, dtype=torch.uint8)
+    pitch = (width + 127) // 128 * 128
+    exact = pack(weights, scales, True)
+    aligned = pack(weights, scales, True, w2_pitch=pitch)
+    for plane in (0, 1, 3):
+        assert torch.equal(exact[plane], aligned[plane])
+    expected = exact[2].reshape(experts, hidden // 128, width // 32, 512)
+    actual = aligned[2].reshape(experts, hidden // 128, pitch // 32, 512)
+    assert torch.equal(actual[:, :, :width // 32], expected)
+    assert torch.count_nonzero(actual[:, :, width // 32:].view(torch.int32)) == 0
+
+
+@pytest.mark.parametrize("width", [288, 576])
+def test_w2_coded_pitch_is_already_aligned_and_extension_preserves_bytes(width):
+    from b12x.moe._shared.scale_codes import pack_scale_codes
+    columns = width // 32
+    source = (torch.arange(256 * columns).reshape(1, 256, columns) % 3 + 121).byte()
+    aligned_columns = (columns + 3) // 4 * 4
+    extension = source.amin(-1, keepdim=True).expand(1, 256, aligned_columns - columns)
+    exact = pack_scale_codes(source, tensor_name="w2.scale")
+    aligned = pack_scale_codes(torch.cat((source, extension), -1), tensor_name="w2.scale")
+    assert exact.shape == (1, 256 * (2 * ((columns + 3) // 4) + 1))
+    assert torch.equal(exact, aligned)
+
+
+def test_w2_pitch_arm_is_native_development_only():
+    assert bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings", "--native-slices",
+                             "--mxfp4-w2-pitch"]).mxfp4_w2_pitch
+    for argv in (["--mxfp4-w2-pitch"], ["--mxfp4-pair", "--mxfp4-tilings", "--mxfp4-w2-pitch"],
+                 ["--mxfp4-pair", "--native-slices", "--mxfp4-w2-pitch"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(argv)
+
+
+def test_f32_errors_measure_unrounded_reference():
+    error = bench.f32_errors(torch.tensor([1., 3.]), torch.tensor([2., 5.]))
+    assert error == pytest.approx(dict(max_abs=2., rms=(2.5 ** .5)))
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_mxfp4_f32_oracle_has_explicit_quantization_boundaries(native):
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+    x = torch.full((1, 32), .25, dtype=torch.bfloat16)
+    ids, routing = torch.zeros((1, 1), dtype=torch.int32), torch.full((1, 1), .5)
+    weights = {name: torch.full((1, 32, 16), 0x22, dtype=torch.uint8) for name in ("w1", "w3", "w2")}
+    scales = {name: torch.full((1, 32, 1), 126, dtype=torch.uint8) for name in weights}
+    output = bench.mxfp4_f32_reference(x, ids, routing, weights, scales, 10. if native else 0., native=native)
+    gate = torch.full((1, 32), 4.)
+    if native:
+        act = (torch.nn.functional.silu(gate) * gate * .5).bfloat16()
+        _, act = wire_rows(act)
+        expected = act.float().sum() * .5
+    else:
+        act = (torch.nn.functional.silu(gate).bfloat16().float() * gate).bfloat16()
+        expected = act.float().sum() * .5 * .5
+    assert torch.equal(output, torch.full((1, 32), expected.item()))
 
 
 def test_capacity_is_independent_of_live_rows():
@@ -182,3 +290,116 @@ def test_legacy_glm_fixture_is_not_relabelled_for_other_families():
     assert bench.recorded_waves(path, SimpleNamespace(name="glm", experts=256, top_k=8))
     with pytest.raises(ValueError, match="family"):
         bench.recorded_waves(path, SimpleNamespace(name="mimo", experts=256, top_k=8))
+
+
+@pytest.mark.parametrize("tile", [32, 64, 128, 192])
+@pytest.mark.parametrize("logical", [288, 416, 576, 608])
+@pytest.mark.parametrize("atomic", [False, True])
+def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical, atomic):
+    function = next(node for node in ast.parse(_PATH.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "native_pair_arm")
+    assignment, = [node for node in ast.walk(function) if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "partial" for target in node.targets)]
+    expression = compile(ast.Expression(assignment.value), str(_PATH), "eval")
+    # Run the real allocation expression on CPU; CUDA dataflow is GPU-qualified separately.
+    allocator = SimpleNamespace(empty=lambda shape, **kwargs: torch.empty(shape))
+    partial = eval(expression, {"__builtins__": {}, "torch": allocator},
+                   dict(logical=logical, width=tile, routes=96, atomic=atomic))
+    assert partial.numel() * 4 == (4 if atomic else
+        ((logical + tile - 1) // tile) * 96 * (tile + tile // 8))
+
+
+def test_explicit_rank_extents_and_identical_controls():
+    args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings",
+                             "--mxfp4-arm", "compact:288:288:128",
+                             "--mxfp4-arm", "pad64:288:320:64", "--control-repeats", "3"])
+    specs, controls = bench.tiling_specs(args, 288, 192, (64, 128, 192))
+    assert controls == ["padded", "padded-control-1", "padded-control-2"]
+    assert specs == [(name, False, 192, None) for name in controls] + [
+        ("compact", True, 128, 288), ("pad64", True, 64, 320)]
+    samples = {name: [1., 2., 3.] for name in controls}
+    samples.update(compact=[2., 4., 6.], pad64=[4., 8., 12.])
+    result = bench.tiling_timing_summary(samples, {name: True for name in samples}, controls)
+    assert result["winner"] == "compact" and result["speedup"] == .5
+    assert result["identical_control_speedups"] == {name: [1., 1., 1.] for name in controls[1:]}
+    assert bench.tiling_timing_summary(samples, {name: False for name in samples}, controls)["winner"] is None
+
+
+@pytest.mark.parametrize("value", ["bad", "a:0:128:64", "a:33:128:64", "a:128:96:64",
+                                   "a:96:97:64", "a:96:96:16", "padded-x:96:96:64",
+                                   "exact-64:96:96:64", "aligned-w2-x:96:96:64", "a/b:96:96:64"])
+def test_invalid_explicit_extents_fail_before_cuda(value):
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings", "--mxfp4-arm", value])
+
+
+def test_explicit_tile32_is_benchmark_only():
+    args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings",
+                             "--mxfp4-arm", "tile32:288:288:32"])
+    specs, _ = bench.tiling_specs(args, 288, 192, (64, 128, 192))
+    assert specs[-1] == ("tile32", True, 32, 288)
+
+
+def test_explicit_names_and_mode_are_unambiguous():
+    with pytest.raises(ValueError, match="duplicate"):
+        bench.native_screen_arms(["a:96:96:64", "a:128:128:64"])
+    for argv in (["--mxfp4-arm", "a:96:96:64"], ["--control-repeats", "1"],
+                 ["--mxfp4-pair", "--native-slices", "--mxfp4-tilings", "--widths", "96",
+                  "--mxfp4-arm", "a:96:96:64"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(argv)
+
+
+@pytest.mark.parametrize("stored", [96, 128, 160])
+def test_explicit_padding_preserves_real_payload_and_scale_blocks(stored):
+    logical, hidden, experts = 96, 128, 2
+    shapes = {"w1": (experts, logical, hidden // 2), "w3": (experts, logical, hidden // 2),
+              "w2": (experts, hidden, logical // 2)}
+    weights = {name: torch.full(shape, 0x32, dtype=torch.uint8) for name, shape in shapes.items()}
+    scales = {name: torch.full((*shape[:-1], shape[-1] // 16), 122, dtype=torch.uint8)
+              for name, shape in shapes.items()}
+    resident, factors = bench.extend_native_weights(weights, scales, stored)
+    assert resident["w1"].shape == (experts, stored, hidden // 2)
+    assert resident["w2"].shape == (experts, hidden, stored // 2)
+    for name in ("w1", "w3"):
+        assert torch.equal(resident[name][:, :logical], weights[name])
+        assert torch.equal(factors[name][:, :logical], scales[name])
+        assert not bool(resident[name][:, logical:].count_nonzero())
+    assert torch.equal(resident["w2"][..., :logical // 2], weights["w2"])
+    assert not bool(resident["w2"][..., logical // 2:].count_nonzero())
+    assert torch.equal(factors["w2"][..., :logical // 32], scales["w2"])
+    assert bool((factors["w2"] == 122).all())
+
+
+def jsonl_routes(tmp_path, records):
+    path = tmp_path / "routes.jsonl"
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    return path
+
+
+def test_existing_jsonl_replays_exact_narrow_rows_and_wide_histograms(tmp_path):
+    narrow = dict(event="expert_routes", layer=7, lane=0, rows=3, topk=[[3, 0], [0, 1], [3, 0]])
+    wide = dict(event="expert_routes", layer=8, lane=1, rows=80, expert_rows=[[0, 80], [1, 40], [3, 40]])
+    waves = bench.recorded_waves(jsonl_routes(tmp_path, [narrow, wide]),
+                                 SimpleNamespace(name="mimo", experts=4, top_k=2))
+    assert waves[0]["expert_rows"] == [(0, 3), (1, 1), (3, 2)]
+    assert bench.screen_route_wave(waves, 3, 0) is waves[0]
+    assert bench.screen_route_wave(waves + [waves[0]], 3, 1) is waves[0]
+    assert bench.screen_route_ids(waves[0], 4, 2, 1).tolist() == narrow["topk"]
+    ids = bench.screen_route_ids(waves[1], 4, 2, 5)
+    assert torch.bincount(ids.flatten().long(), minlength=4).tolist() == [80, 40, 0, 40]
+    assert bool((ids[:, 0] != ids[:, 1]).all())
+    assert torch.equal(ids, bench.screen_route_ids(waves[1], 4, 2, 5))
+    with pytest.raises(ValueError, match="exactly 16"):
+        bench.screen_route_wave(waves, 16, 0)
+
+
+@pytest.mark.parametrize("record", [dict(event="other", rows=1, topk=[[0, 1]]),
+    dict(event="expert_routes", rows=1, topk=[[0, 0]]),
+    dict(event="expert_routes", rows=1, topk=[[0, 4]]),
+    dict(event="expert_routes", rows=1, topk=[[0]]),
+    dict(event="expert_routes", rows=2, topk=[[0, 1]]),
+    dict(event="expert_routes", rows=1, expert_rows=[[0, 1]])])
+def test_malformed_jsonl_routes_fail_closed(tmp_path, record):
+    with pytest.raises(ValueError):
+        bench.recorded_waves(jsonl_routes(tmp_path, [record]), SimpleNamespace(name="v41", experts=4, top_k=2))

@@ -226,7 +226,7 @@ class V41SliceReduce:
     """Ordered FP32 slice sum into original route order; invalid routes are zero."""
 
     def __init__(self, width, capacity, topk=6, *, intermediate=576, hidden=5120):
-        assert width in (64, 128, 192) and capacity > 0 and topk > 0
+        assert width in (32, 64, 128, 192) and capacity > 0 and topk > 0
         self.hidden = hidden
         self.capacity = capacity
         assert intermediate > 0 and intermediate % 32 == 0

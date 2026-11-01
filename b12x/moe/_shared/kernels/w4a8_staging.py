@@ -22,13 +22,13 @@ def stage_repacked_b_slice(
     threads: cutlass.Constexpr,
     width: cutlass.Constexpr,
 ):
-    """Copy N64/N128/N192 weights into compact lane-major shared storage.
+    """Copy N32/N64/N128/N192 weights into compact lane-major shared storage.
 
     The compact destination has shape [4,width/32,32,4] in u32 words.
     A slice may cross an N256 boundary, including independently padded W13
     projection halves. All source offsets and products use 64-bit arithmetic.
     """
-    assert width in (64, 128, 192)
+    assert width in (32, 64, 128, 192)
     chunks = width // 32
     transfers = 4 * chunks * 32
     for iteration in cutlass.range_constexpr((transfers + threads - 1) // threads):
@@ -60,7 +60,7 @@ def stage_repacked_sfb_slice(
     width: cutlass.Constexpr,
 ):
     """Copy the corresponding N rows of four packed K32 UE8M0 scales."""
-    assert width in (64, 128, 192)
+    assert width in (32, 64, 128, 192)
     transfers = width // 4
     for iteration in cutlass.range_constexpr((transfers + threads - 1) // threads):
         index = thread + Int32(iteration * threads)
@@ -84,12 +84,12 @@ def stage_repacked_b_k_slice(
     threads: cutlass.Constexpr,
     depth: cutlass.Constexpr,
 ):
-    """Copy N128 by K64/K128/K192 into [depth/32,4,32,4] u32.
+    """Copy N128 by K32/K64/K128/K192 into [depth/32,4,32,4] u32.
 
     Both starts must be aligned to 32. Handles crossings of both packed tile
     axes; the caller owns bounds and completion just as for N-slice staging.
     """
-    assert depth in (64, 128, 192)
+    assert depth in (32, 64, 128, 192)
     transfers = (depth // 32) * 4 * 32
     for iteration in cutlass.range_constexpr((transfers + threads - 1) // threads):
         index = thread + Int32(iteration * threads)
@@ -126,7 +126,7 @@ def stage_repacked_sfb_k_slice(
     selection. Weight payload has no padding. Stores are synchronous; callers
     synchronize threads as well as completing the weight cp.async group.
     """
-    assert depth in (64, 128, 192)
+    assert depth in (32, 64, 128, 192)
     groups = (depth + 127) // 128
     for iteration in cutlass.range_constexpr((128 * groups + threads - 1) // threads):
         index = thread + Int32(iteration * threads)
@@ -154,7 +154,12 @@ def scale_code_word(source: cute.Tensor, expert: Int64, row: Int64,
     stride = rows * (tiles * 2 + 1)
     codes = cute.recast_tensor(source, cutlass.Uint16)
     bases = cute.recast_tensor(source, cutlass.Uint8)
-    index = expert * Int64(stride // 2) + (row // Int64(256) * Int64(tiles) + tile) * Int64(256) + row % Int64(256)
+    tile_rows = Int64(256)
+    if cutlass.const_expr(rows % 256):
+        if row // Int64(256) == Int64(rows // 256):
+            tile_rows = Int64(rows % 256)
+    index = (expert * Int64(stride // 2) + row // Int64(256) * Int64(256 * tiles)
+             + tile * tile_rows + row % Int64(256))
     code = cutlass.Uint32(codes[index])
     base = cutlass.Uint32(bases[expert * Int64(stride) + Int64(rows * tiles * 2) + row])
     word = ((code & cutlass.Uint32(15))
@@ -172,12 +177,22 @@ def scale_code_word(source: cute.Tensor, expert: Int64, row: Int64,
 def stage_scale_codes_slice(source: cute.Tensor, shared_base: Int32,
                             expert: Int64, k_tile: Int32, n_start: Int32,
                             thread: Int32, width: cutlass.Constexpr,
-                            rows: cutlass.Constexpr, columns: cutlass.Constexpr):
+                            rows: cutlass.Constexpr, columns: cutlass.Constexpr,
+                            half_rows: cutlass.Constexpr = 0):
     for iteration in cutlass.range_constexpr((width + 127) // 128):
         index = thread + Int32(iteration * 128)
         if index < Int32(width):
-            word = scale_code_word(source, expert, Int64(n_start) + Int64(index),
-                                   Int64(k_tile), rows, columns)
+            word = cutlass.Uint32(0)
+            if cutlass.const_expr(half_rows > 0):
+                # Ragged FC1 halves are adjacent; a masked up tail must not
+                # read the gate half, even when the whole plane still contains it.
+                row = n_start + index
+                limit = Int32(half_rows) if n_start < Int32(rows // 2) else Int32(rows // 2 + half_rows)
+                if row < limit:
+                    word = scale_code_word(source, expert, Int64(row), Int64(k_tile), rows, columns)
+            else:
+                word = scale_code_word(source, expert, Int64(n_start) + Int64(index),
+                                       Int64(k_tile), rows, columns)
             st_shared_u32(shared_base + index * Int32(4), word)
 
 
@@ -209,8 +224,9 @@ def stage_v41_exact_b(source: cute.Tensor, shared_base: Int32,
                       expert_word_base: Int64, n_start: Int32, k_start: Int32,
                       thread: Int32, width: cutlass.Constexpr,
                       intermediate: cutlass.Constexpr, hidden: cutlass.Constexpr,
-                      gated: cutlass.Constexpr, projection: cutlass.Constexpr = 0):
-    """Exact TP4 payload: FC1 N128 tiles (last N64), FC2 K128 tiles (last K64).
+                      gated: cutlass.Constexpr, projection: cutlass.Constexpr = 0,
+                      stored_intermediate: cutlass.Constexpr = 0):
+    """Exact K32 payload: FC1 N128 tiles and FC2 K128 tiles with compact tails.
 
     Shared payload remains the existing compact MMA layout. Out-of-range tails
     are zeroed only in shared MMA scratch, never in resident weights.
@@ -238,7 +254,8 @@ def stage_v41_exact_b(source: cute.Tensor, shared_base: Int32,
                 # FC2 callers supply an N128-aligned start. A chunk stays
                 # inside that tile, so no per-thread N quotient is needed.
                 k = k_start // Int32(32) + kb
-                word = (expert_word_base + Int64(n_start) * Int64(intermediate // 8)
+                pitch = stored_intermediate if cutlass.const_expr(stored_intermediate > 0) else intermediate
+                word = (expert_word_base + Int64(n_start) * Int64(pitch // 8)
                         + Int64(k * 512 + chunk * 128 + lane * 4))
             valid = n < Int32(intermediate) if cutlass.const_expr(gated) else k < Int32(intermediate // 32)
             address = shared_base + index * Int32(16)
@@ -273,35 +290,21 @@ def stage_v41_exact_sfb(source: cute.Tensor, destination,
                 for element in cutlass.range_constexpr(4):
                     st_shared_u32(address + Int32(element * 4), cutlass.Uint32(0))
     else:
-        source_halves = cute.recast_tensor(source, cutlass.Uint16)
+        source_bytes = cute.recast_tensor(source, cutlass.Uint8)
         row = thread
-        tile_base = expert_word_base + Int64(n_start // 128) * Int64(intermediate)
+        columns = intermediate // 32
+        tile_base = expert_word_base * Int64(4) + Int64(n_start // 128) * Int64(128 * columns)
         groups = (width + 127) // 128
         for group in cutlass.range_constexpr(groups):
-            k = k_start // Int32(32) + Int32(group * 4)
-            tile = k // Int32(4)
-            phase = k % Int32(4)
             packed = cutlass.Uint32(0)
-            if k < Int32(intermediate // 32):
-                # One aligned scale word, or the exact two-byte K64 tail.
-                word = cutlass.Uint32(0)
-                if tile == Int32(intermediate // 128):
-                    word = cutlass.Uint32(source_halves[tile_base * Int64(2)
-                        + Int64(tile * 256 + row)])
-                else:
-                    word = cutlass.Uint32(source[tile_base + Int64(tile * 128 + row)])
-                packed = word >> cutlass.Uint32(phase * 8)
-                # Only a four-byte group crossing a K128 tile needs a second
-                # load. N64/N192 final groups consume two bytes, not four.
-                if cutlass.const_expr(min(4, width // 32 - group * 4) == 4):
-                    if phase > Int32(0) and k + Int32(4) - phase < Int32(intermediate // 32):
-                        next_word = cutlass.Uint32(0)
-                        if tile + Int32(1) == Int32(intermediate // 128):
-                            next_word = cutlass.Uint32(source_halves[tile_base * Int64(2)
-                                + Int64((tile + 1) * 256 + row)])
-                        else:
-                            next_word = cutlass.Uint32(source[tile_base + Int64((tile + 1) * 128 + row)])
-                        packed |= next_word << cutlass.Uint32((4 - phase) * 8)
-                else:
-                    packed &= cutlass.Uint32(65535)
+            for byte in cutlass.range_constexpr(min(4, width // 32 - group * 4)):
+                k = k_start // Int32(32) + Int32(group * 4 + byte)
+                if k < Int32(columns):
+                    tile = k // Int32(4)
+                    count = Int32(4)
+                    if cutlass.const_expr(columns % 4):
+                        if tile == Int32(columns // 4):
+                            count = Int32(columns % 4)
+                    offset = tile_base + Int64(tile * 512 + row * count + k % 4)
+                    packed |= cutlass.Uint32(source_bytes[offset]) << cutlass.Uint32(byte * 8)
             destination[thread + Int32(group * 128)] = packed.to(destination.element_type)

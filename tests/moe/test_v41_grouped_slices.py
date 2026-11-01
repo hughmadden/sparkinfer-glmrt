@@ -69,15 +69,15 @@ def test_grouped_exact_slices(routing_case):
 def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
                           capacity=80, row_counts=None, experts=None,
                           exact_storage=False, routing_case="shared"):
-    if -(-n // width) * width > (n + 127) // 128 * 128:
-        pytest.skip("slice width does not tile this intermediate within its packed storage")
+    if not exact_storage and -(-n // width) * width > (n + 127) // 128 * 128:
+        pytest.skip("padded slice exceeds its packed storage; use the exact-tail kernel")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("Blackwell GPU required")
     torch.manual_seed(4164)
     experts = (128 if n == 2304 else 32) if experts is None else experts
     assert capacity > 0 and 0 < topk <= experts
     assert routing_case in ("shared", "unique")
-    assert not exact_storage or (h, n) == (5120, 576)
+    assert h % 256 == 0 and n > 0 and n % 32 == 0
     weights = {}
     scales = {}
     for name, shape in [
@@ -218,6 +218,8 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
             after_case(
                 case=case,
                 native_inputs=(packed, wire, ids, route_weights),
+                weights=weights,
+                scales=scales,
                 args=args,
                 meta_view=meta_view,
                 out=out,

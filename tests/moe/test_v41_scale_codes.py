@@ -14,7 +14,8 @@ from b12x.moe._shared.scale_codes import (
 )
 
 
-@pytest.mark.parametrize("rows,columns,half", [(768, 160, 384), (1280, 160, 640), (5120, 18, None), (5120, 12, None)])
+@pytest.mark.parametrize("rows,columns,half", [(768, 160, 384), (1280, 160, 640), (1152, 160, 576),
+    (576, 160, 288), (832, 128, 416), (1344, 224, 672), (5120, 18, None), (5120, 12, None)])
 def test_scale_code_roundtrip(rows, columns, half):
     torch.manual_seed(444)
     scales = torch.randint(0, 16, (2, rows, columns), dtype=torch.uint8)
@@ -121,7 +122,9 @@ def test_real_weights_scale_code_gemm_bitwise(prefix, intermediate, compact):
     hidden, capacity, width = 5120, 96, 192
     stored = (intermediate + 127) // 128 * 128
     s13 = torch.cat((scales["w3"], scales["w1"]), 1)
-    compressed = [pack_scale_codes(s13, tensor_name=prefix + ".w13.scale", gated_half_rows=intermediate),
+    padded_s13 = torch.cat(tuple(torch.nn.functional.pad(scales[name], (0, 0, 0, stored - intermediate))
+                                for name in ("w3", "w1")), 1)
+    compressed = [pack_scale_codes(padded_s13, tensor_name=prefix + ".w13.scale", gated_half_rows=stored),
                   pack_scale_codes(scales["w2"], tensor_name=prefix + ".w2.scale")]
     raw = [pack_scale(s13.clone(), weight_E=1, rows=2*intermediate, k_dim=hidden, gated_half_rows=intermediate),
            pack_scale(scales["w2"].clone(), weight_E=1, rows=hidden, k_dim=intermediate)]
