@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import statistics
+import subprocess
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -19,6 +22,8 @@ def parse_args(argv=None):
                         help="BF16 route comparisons, or the unchanged native K6 prefill baseline")
     parser.add_argument("--trellis-config", type=Path,
                         help="JSON list of {n,k,side,groups} K6 geometries; trellis recipe only")
+    parser.add_argument("--trellis-paired", action="store_true",
+                        help="retain exactly two K6 geometries and interleave their timed replays")
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -70,6 +75,18 @@ def _accuracy(actual, baseline, oracle):
             "rows_exceeding_bar": int((candidate > reference * 1.01 ** 2).sum().item())}
 
 
+def _gpu_telemetry():
+    fields = "power.draw,clocks.sm,clocks.max.sm,clocks.mem,utilization.gpu,temperature.gpu"
+    def query(arguments):
+        result = subprocess.run(["nvidia-smi", *arguments, "--format=csv,noheader,nounits"],
+                                capture_output=True, text=True, timeout=15)
+        return {"returncode": result.returncode, "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip()}
+    return {"time_ns": time.time_ns(), "pid": os.getpid(), "fields": fields,
+            "gpu": query([f"--query-gpu={fields}"]),
+            "compute_apps": query(["--query-compute-apps=pid,process_name,used_memory"])}
+
+
 def _trellis_baseline(args):
     import numpy as np
     import torch
@@ -83,6 +100,16 @@ def _trellis_baseline(args):
     torch.manual_seed(174)
     results = []
     properties = torch.cuda.get_device_properties(0)
+    if args.trellis_paired and len(configs) != 2:
+        raise ValueError("paired K6 timing requires exactly two configurations")
+    pending, retained = {}, []
+    def save():
+        if args.output:
+            args.output.write_text(json.dumps(dict(device=torch.cuda.get_device_name(),
+                sms=properties.multi_processor_count, torch_version=torch.__version__,
+                cuda_version=torch.version.cuda, argv=sys.argv, kind="native_k6_baseline",
+                conditions="unchanged production core; F16 rotated inputs; eager and graph warmup per M; L2 eviction per sample; independent N128/K-all/8-row FP64 oracle; byte-exact graph replay; per-cell GPU telemetry; paired mode alternates arm order",
+                results=results), indent=2)+"\n")
     for config in configs:
         n, k, side, groups = (config[key] for key in ("n", "k", "side", "groups"))
         if n % 128 or k % 128 or side not in (1, 2) or groups not in (1, 4):
@@ -139,28 +166,51 @@ def _trellis_baseline(args):
             if any(not torch.equal(actual[:rows].view(torch.int32), want.view(torch.int32))
                    for actual, want in zip(outputs, expected)):
                 raise RuntimeError("trellis graph replay differs from eager output")
-            times = []
-            for _ in range(args.samples):
+            entry = dict(config, rows=rows, bits=6, codebook="mcg", input_dtype="f16",
+                         samples_us=[], accuracy=accuracy)
+            if args.trellis_paired:
+                pending.setdefault(rows, []).append((entry, graph))
+            else:
+                entry["telemetry_before"] = _gpu_telemetry()
+                for _ in range(args.samples):
+                    flush()
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    graph.replay()
+                    end.record()
+                    end.synchronize()
+                    entry["samples_us"].append(start.elapsed_time(end)*1000)
+                entry["telemetry_after"] = _gpu_telemetry()
+                entry["median_us"] = statistics.median(entry["samples_us"])
+                results.append(entry)
+                print(json.dumps({key: value for key, value in entry.items() if key != "samples_us"}), flush=True)
+                save()
+            del graph, expected
+        if args.trellis_paired:
+            retained.append((program, operands, x, inputs, payloads, scales, partial, outputs))
+        del program, operands, x, inputs, payloads, scales, partial, outputs, w, oracle, baseline
+        torch.cuda.empty_cache()
+    for rows, pair in pending.items():
+        for entry, graph in pair:
+            graph.replay()
+        torch.cuda.synchronize()
+        for entry, graph in pair:
+            entry["telemetry_before"] = _gpu_telemetry()
+        for sample in range(args.samples):
+            for entry, graph in pair if sample % 2 == 0 else pair[::-1]:
                 flush()
                 start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 start.record()
                 graph.replay()
                 end.record()
                 end.synchronize()
-                times.append(start.elapsed_time(end)*1000)
-            entry = dict(config, rows=rows, bits=6, codebook="mcg", input_dtype="f16",
-                         median_us=statistics.median(times), samples_us=times, accuracy=accuracy)
+                entry["samples_us"].append(start.elapsed_time(end)*1000)
+        for entry, graph in pair:
+            entry["telemetry_after"] = _gpu_telemetry()
+            entry["median_us"] = statistics.median(entry["samples_us"])
             results.append(entry)
             print(json.dumps({key: value for key, value in entry.items() if key != "samples_us"}), flush=True)
-            if args.output:
-                args.output.write_text(json.dumps(dict(device=torch.cuda.get_device_name(),
-                    sms=properties.multi_processor_count, torch_version=torch.__version__,
-                    cuda_version=torch.version.cuda, argv=sys.argv, kind="native_k6_baseline",
-                    conditions="unchanged production core; F16 rotated inputs; one eager and graph warmup per M; L2 eviction per sample; independent N128/K-all/8-row FP64 oracle; byte-exact graph replay",
-                    results=results), indent=2)+"\n")
-            del graph, expected
-        del program, operands, x, inputs, payloads, scales, partial, outputs, w, oracle, baseline
-        torch.cuda.empty_cache()
+        save()
 
 
 def main():
