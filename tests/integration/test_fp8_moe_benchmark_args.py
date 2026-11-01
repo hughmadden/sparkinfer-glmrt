@@ -429,8 +429,8 @@ def test_native_stream_scratch_matches_every_static_tensor(capacity, width):
     exec(compile(ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])),
                  str(path), "exec"), namespace)
     layout, size = namespace["stream_scratch_layout"](capacity, 5120, width, 384, 6)
-    assert [row["name"] for row in layout] == ["meta", "pair_row", "pair_pos", "act", "down",
-                                               "grouped_routing", "output"]
+    assert [row["name"] for row in layout] == ["meta", "pair_row", "pair_pos", "act",
+                                               "grouped_routing", "grouped_route", "output"]
     end = 0
     for row in layout:
         assert row["offset"] == (end + 15) // 16 * 16
@@ -440,7 +440,7 @@ def test_native_stream_scratch_matches_every_static_tensor(capacity, width):
         assert row["nbytes"] == expected
         end = row["offset"] + expected
     assert size == end
-    assert layout[-1]["shape"] == (capacity, 5120)
+    assert layout[-1]["shape"] == (capacity * 6, 5120)
     assert layout[-2]["shape"] == (capacity * 6,)
 
 
@@ -448,7 +448,13 @@ def test_native_stream_has_ordered_float_output_and_no_atomic_reduction():
     path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v4_stream_pipeline.py"
     source = path.read_text()
     assert "red_add" not in source and "atomic" not in source.split('"""', 2)[-1]
-    assert "value = fadd_rn_f32" in source and "output[index] = value\n" in source
+    assert "value = fadd_rn_f32" in source
+    assert "ordered_combine" not in source
+    assert "grouped_route[position] = index" in source
+    assert "original_routes=True" in source
+    down = (_PATH.parents[1] / "b12x/integration/cuteafd/_mxfp4_moe_a8.py").read_text()
+    assert "route = Int64(grouped_route[route])" in down
+    assert '"f32_original_routes"' in down
     assert "scale_codes=scale_codes" in source
     qualifier = ast.unparse(next(node for node in ast.parse(_PATH.read_text()).body
                                 if isinstance(node, ast.FunctionDef) and node.name == "qualify_pair_replay"))

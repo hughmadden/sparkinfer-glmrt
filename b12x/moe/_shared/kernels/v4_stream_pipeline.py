@@ -1,8 +1,7 @@
 """Ordered native MXFP4 V4/V4.1 prefill over caller-owned scratch.
 
-Weights and scales retain their decode residency. FP32 token output is consumed
-by the native engine's existing BF16 token compactor; no floating-point atomics
-or resident repacking are used.
+Weights and scales retain their decode residency. Original-slot FP32 route
+planes use the native engine's existing ordered fold and BF16 compactor.
 """
 
 import cutlass
@@ -27,8 +26,8 @@ def stream_scratch_specs(capacity, hidden, intermediate, experts, topk):
     return (("meta", "i32", (meta_words(experts, tiles),)),
             ("pair_row", "i32", (pairs,)), ("pair_pos", "i32", (pairs,)),
             ("act", "u8", (tiles * 128 * mxfp8_down_row_bytes(intermediate),)),
-            ("down", "f32", (pairs, hidden)), ("grouped_routing", "f32", (pairs,)),
-            ("output", "f32", (capacity, hidden)))
+            ("grouped_routing", "f32", (pairs,)), ("grouped_route", "i32", (pairs,)),
+            ("output", "f32", (pairs, hidden)))
 
 
 def stream_scratch_layout(capacity, hidden, intermediate, experts, topk):
@@ -44,7 +43,7 @@ def stream_scratch_layout(capacity, hidden, intermediate, experts, topk):
 
 
 class NativeTokenCombine:
-    """Native FP32 routes/tokens to BF16, with an explicit ordered slot fold."""
+    """Benchmark equivalent of native compact_routes<Hidden, Routes>."""
 
     def __init__(self, hidden, topk):
         self.hidden, self.topk = hidden, topk
@@ -60,8 +59,8 @@ class NativeTokenCombine:
         index = Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
         if index < Int64(rows) * self.hidden:
             row, col = index // self.hidden, index % self.hidden
-            value = Float32(0)
-            for slot in cutlass.range_constexpr(self.topk):
+            value = Float32(source[row * self.topk * self.hidden + col])
+            for slot in cutlass.range_constexpr(1, self.topk):
                 value = fadd_rn_f32(value, Float32(source[(row * self.topk + slot) * self.hidden + col]))
             output[index] = value.to(cutlass.BFloat16)
 
@@ -82,48 +81,38 @@ class V4StreamPipeline:
             route_weight_before_fc2=True, native_resident=True,
             native_exact=intermediate % 128 != 0, scale_codes=scale_codes)
         self.down = StreamMxfp4DownA8(hidden=hidden, inter=intermediate, experts=experts,
-            round_output_bf16=False, native_resident=True,
+            round_output_bf16=False, native_resident=True, original_routes=True,
             native_exact=intermediate % 128 != 0, scale_codes=scale_codes)
 
     def key(self):
-        return ("v4_native_stream", 1, self.capacity, self.hidden, self.intermediate,
+        return ("v4_native_stream", 2, self.capacity, self.hidden, self.intermediate,
                 self.experts, self.topk, self.scale_codes, self.gate_up.key(), self.down.key())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w13: cute.Pointer, s13: cute.Pointer,
                  w2: cute.Pointer, s2: cute.Pointer, ids: cute.Pointer, routing: cute.Pointer,
                  meta: cute.Pointer, pair_row: cute.Pointer, pair_pos: cute.Pointer,
-                 act: cute.Pointer, down: cute.Pointer, grouped_routing: cute.Pointer,
+                 act: cute.Pointer, grouped_routing: cute.Pointer, grouped_route: cute.Pointer,
                  output: cute.Pointer, rows: Int32, stream):
         pairs = rows * self.topk
         tiles = (pairs + 127) // 128 + min(pairs, self.experts)
         self.prep(ids, meta, pair_row, pair_pos, rows, pairs, stream)
-        self.group_weights(routing, pair_pos, grouped_routing, pairs).launch(
+        self.group_weights(routing, pair_pos, grouped_routing, grouped_route, output, pairs).launch(
             grid=(max(1, (pairs + 255) // 256), 1, 1), block=(256, 1, 1), stream=stream)
         self.gate_up(x, pair_row, meta, w13, s13, w13, s13, act, tiles, stream, grouped_routing)
-        self.down(act, meta, w2, s2, down, tiles, stream)
-        self.ordered_combine(down, pair_pos, output, rows).launch(
-            grid=(max(1, (rows * self.hidden + 255) // 256), 1, 1),
-            block=(256, 1, 1), stream=stream)
+        self.down(act, meta, w2, s2, output, tiles, stream, grouped_route)
 
     @cute.kernel
     def group_weights(self, routing: cute.Pointer, positions: cute.Pointer,
-                      grouped: cute.Pointer, pairs: Int32):
+                      grouped: cute.Pointer, grouped_route: cute.Pointer,
+                      output: cute.Pointer, pairs: Int32):
         index = cute.arch.block_idx()[0] * 256 + cute.arch.thread_idx()[0]
         if index < pairs:
             position = positions[index]
             if position >= 0:
                 grouped[position] = routing[index]
-
-    @cute.kernel
-    def ordered_combine(self, down: cute.Pointer, positions: cute.Pointer,
-                        output: cute.Pointer, rows: Int32):
-        index = Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
-        if index < Int64(rows) * self.hidden:
-            row, col = index // self.hidden, index % self.hidden
-            value = Float32(0)
-            for slot in cutlass.range_constexpr(self.topk):
-                position = positions[row * self.topk + slot]
-                if position >= 0:
-                    value = fadd_rn_f32(value, Float32(down[Int64(position) * self.hidden + col]))
-            output[index] = value
+                grouped_route[position] = index
+            else:
+                # Invalid routes have no DownA8 CTA, so publish their zero plane here.
+                for col in cutlass.range(self.hidden, unroll=1):
+                    output[Int64(index) * self.hidden + col] = Float32(0)

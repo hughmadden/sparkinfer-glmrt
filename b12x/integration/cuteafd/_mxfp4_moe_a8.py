@@ -20,12 +20,16 @@ from b12x.moe._shared.kernels.w4a8_staging import scale_code_word
 
 class StreamMxfp4DownA8:
     def __init__(self, *, hidden: int, inter: int, experts: int, round_output_bf16: bool = True,
-                 native_resident: bool = False, native_exact: bool = False, scale_codes: bool = False):
+                 native_resident: bool = False, native_exact: bool = False, scale_codes: bool = False,
+                 original_routes: bool = False):
         self.native_resident, self.native_exact = bool(native_resident), bool(native_exact)
         self.scale_codes = bool(scale_codes)
         if self.scale_codes and not self.native_resident:
             raise ValueError("compact scale codes require native resident weights")
         self.round_output_bf16 = bool(round_output_bf16)
+        self.original_routes = bool(original_routes)
+        if self.original_routes and self.round_output_bf16:
+            raise ValueError("original route planes require FP32 output")
         self.plan = Mxfp4DownA8Plan(int(hidden), int(inter), int(experts))
         self.hidden, self.inter, self.experts = self.plan.hidden, self.plan.inter, self.plan.experts
         self.blocks = (self.inter + self.plan.k_block - 1) // self.plan.k_block
@@ -34,6 +38,8 @@ class StreamMxfp4DownA8:
     def key(self) -> tuple:
         key = ("stream_down_mxfp4_a8", 2, self.hidden, self.inter, self.experts,
                self.native_resident, self.native_exact, self.scale_codes)
+        if self.original_routes:
+            return key + (("f32_original_routes",),)
         return key if self.round_output_bf16 else key + (("f32_output",),)
 
     def _storage(self):
@@ -46,8 +52,11 @@ class StreamMxfp4DownA8:
 
     @cute.jit
     def __call__(self, act: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer,
-                 y: cute.Pointer, max_tiles: Int32, stream: cuda.CUstream):
-        self.kernel(act, meta, w, s, y, self._storage()).launch(
+                 y: cute.Pointer, max_tiles: Int32, stream: cuda.CUstream,
+                 grouped_route: cute.Pointer = None):
+        if const_expr(self.original_routes and grouped_route is None):
+            raise ValueError("original route output requires a grouped route map")
+        self.kernel(act, meta, w, s, y, self._storage(), grouped_route).launch(
             grid=(self.hidden // self.plan.tile_n, max_tiles, 1),
             block=(self.plan.threads, 1, 1), stream=stream, min_blocks_per_mp=1)
 
@@ -195,7 +204,7 @@ class StreamMxfp4DownA8:
 
     @cute.kernel
     def kernel(self, act: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer, y: cute.Pointer,
-               Storage: cutlass.Constexpr):
+               Storage: cutlass.Constexpr, grouped_route: cute.Pointer = None):
         p = self.plan
         n_blk = Int32(cute.arch.block_idx()[0])
         tile = Int32(cute.arch.block_idx()[1])
@@ -240,7 +249,10 @@ class StreamMxfp4DownA8:
                                 for nt in cutlass.range_constexpr(8):
                                     f = 4 * (8 * mt + nt) + 2 * half
                                     col = n0 + warp_n * Int32(64) + Int32(8 * nt) + Int32(2) * j
-                                    offset = (Int64(first) + Int64(row)) * self.hidden + Int64(col)
+                                    route = Int64(first) + Int64(row)
+                                    if const_expr(self.original_routes):
+                                        route = Int64(grouped_route[route])
+                                    offset = route * self.hidden + Int64(col)
                                     output[offset] = acc[f]
                                     output[offset + 1] = acc[f + 1]
             else:

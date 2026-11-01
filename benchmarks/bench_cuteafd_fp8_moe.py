@@ -765,13 +765,27 @@ def production_stream_arm(x, ids, routing, weights, scales, coded):
     pointers = [view.iterator for view in views]
     launch = cute.compile(pipeline, *pointers, cutlass.Int32(rows), current_cuda_stream())
     token_view = from_dlpack(output, assumed_align=16)
-    combine = cute.compile(NativeTokenCombine(hidden, 1), pointers[-1], token_view.iterator,
+    combine = cute.compile(NativeTokenCombine(hidden, topk), pointers[-1], token_view.iterator,
                            cutlass.Int32(rows), current_cuda_stream())
     def execute(live):
         launch(*pointers, cutlass.Int32(live), current_cuda_stream())
         combine(pointers[-1], token_view.iterator, cutlass.Int32(live), current_cuda_stream())
     qualification = qualify_pair_replay(execute, ids, output, [arena], [*tensors, output],
                                          lambda live: output[:live])
+    original_ids = ids.clone()
+    ids[0].fill_(-1)
+    ids[-1, -1] = experts
+    execute(rows)
+    invalid_expected = output.clone()
+    assert torch.count_nonzero(output[0]) == 0, "invalid route row must be zero"
+    arena.fill_(255)
+    output.fill_(float("nan"))
+    execute(rows)
+    assert torch.equal(output, invalid_expected), "invalid route poison/repeat"
+    assert torch.isfinite(output).all(), "invalid route output"
+    ids.copy_(original_ids)
+    execute(rows)
+    qualification["invalid_routes"] = True
     return lambda: execute(rows), output, (arena, tensors, views, launch, combine, token_view), qualification
 
 
