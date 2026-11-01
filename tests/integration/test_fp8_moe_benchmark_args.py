@@ -17,8 +17,10 @@ bench = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(bench)
 
 
-def test_mxfp4_pair_widths_cover_all_worlds_without_padding():
-    assert bench.paired_widths(2304) == [288, 320, 352, 384, 448, 480, 576, 768, 1152]
+def test_mxfp4_pair_widths_cover_all_worlds_without_padding(monkeypatch):
+    monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
+        ownership_unit=lambda intermediate, world: 64 if (intermediate, world) == (2304, 5) else 32))
+    assert bench.paired_widths(2304) == [288, 320, 352, 384, 448, 512, 576, 768, 1152]
     assert bench.paired_widths(2048) == [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024]
     assert bench.paired_widths(3072) == [384, 416, 448, 512, 608, 640, 768, 1024, 1536]
     args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--geometry", "v41", "--widths", "448,480"])
@@ -403,3 +405,57 @@ def test_existing_jsonl_replays_exact_narrow_rows_and_wide_histograms(tmp_path):
 def test_malformed_jsonl_routes_fail_closed(tmp_path, record):
     with pytest.raises(ValueError):
         bench.recorded_waves(jsonl_routes(tmp_path, [record]), SimpleNamespace(name="v41", experts=4, top_k=2))
+
+
+@pytest.mark.parametrize("family", ["v41", "dsv4f"])
+def test_native_stream_screen_requires_shared_policy_and_prefill(family):
+    args = ["--geometry", family, "--mxfp4-pair", "--native-slices", "--shipped-prefill",
+            "--engine-policy-root", "engine", "--rows", "256,1024,4096"]
+    assert bench.parse_args(args).shipped_prefill
+    for extra in (["--rows", "80"], ["--capacity", "4096"], ["--mxfp4-tilings"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(args + extra)
+
+
+@pytest.mark.parametrize("capacity", [256, 1024, 4096])
+@pytest.mark.parametrize("width", [288, 352, 512, 576, 1152, 2304])
+def test_native_stream_scratch_matches_every_static_tensor(capacity, width):
+    path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v4_stream_pipeline.py"
+    tree = ast.parse(path.read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    namespace = dict(stream_max_tiles=lambda e, p: (p + 127) // 128 + min(e, p),
+                     meta_words=lambda e, t: 4 + 3 * e + t,
+                     mxfp8_down_row_bytes=lambda i: (i + i // 32 + 15) // 16 * 16)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])),
+                 str(path), "exec"), namespace)
+    layout, size = namespace["stream_scratch_layout"](capacity, 5120, width, 384, 6)
+    assert [row["name"] for row in layout] == ["meta", "pair_row", "pair_pos", "act",
+                                               "grouped_routing", "grouped_route", "output"]
+    end = 0
+    for row in layout:
+        assert row["offset"] == (end + 15) // 16 * 16
+        expected = 1 if row["dtype"] == "u8" else 4
+        for extent in row["shape"]:
+            expected *= extent
+        assert row["nbytes"] == expected
+        end = row["offset"] + expected
+    assert size == end
+    assert layout[-1]["shape"] == (capacity * 6, 5120)
+    assert layout[-2]["shape"] == (capacity * 6,)
+
+
+def test_native_stream_has_ordered_float_output_and_no_atomic_reduction():
+    path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v4_stream_pipeline.py"
+    source = path.read_text()
+    assert "red_add" not in source and "atomic" not in source.split('"""', 2)[-1]
+    assert "value = fadd_rn_f32" in source
+    assert "ordered_combine" not in source
+    assert "grouped_route[position] = index" in source
+    assert "original_routes=True" in source
+    down = (_PATH.parents[1] / "b12x/integration/cuteafd/_mxfp4_moe_a8.py").read_text()
+    assert "route = Int64(grouped_route[route])" in down
+    assert '"f32_original_routes"' in down
+    assert "scale_codes=scale_codes" in source
+    qualifier = ast.unparse(next(node for node in ast.parse(_PATH.read_text()).body
+                                if isinstance(node, ast.FunctionDef) and node.name == "qualify_pair_replay"))
+    assert "repeat determinism" in qualifier and "torch.equal(output, expected)" in qualifier
