@@ -61,6 +61,8 @@ def test_projection_compensation_is_opt_in_and_default_key_is_unchanged(monkeypa
     calls = []
 
     class Projection:
+        exact_row_cap = 2**31 - 1
+
         def __init__(self, n, k, **kwargs):
             calls.append((n, k, kwargs))
             self.kwargs = kwargs
@@ -81,7 +83,8 @@ def test_projection_compensation_is_opt_in_and_default_key_is_unchanged(monkeypa
     assert default == explicit
     assert calls[:2] == [(7168, 6144, {"out_dtype": "bf16", "max_skinny_rows": 0})] * 2
     assert calls[2] == (7168, 6144, {"out_dtype": "bf16", "tiles_by_rows": (), "compensated": True})
-    assert default["geometry"] == dict(width=6144, outputs=7168, output_dtype="bf16", skinny_rows=0)
+    assert default["geometry"] == dict(width=6144, outputs=7168, output_dtype="bf16", skinny_rows=0,
+                                       exact_row_cap=2**31 - 1)
     assert compensated["geometry"]["compensated"] is True
     assert default["key"] != compensated["key"]
     with pytest.raises(ValueError, match="boolean"):
@@ -96,6 +99,8 @@ def _compensated_build(monkeypatch, table):
     calls = []
 
     class Projection:
+        exact_row_cap = 2**31 - 1
+
         def __init__(self, n, k, **kwargs):
             calls.append((n, k, kwargs))
             self.kwargs = kwargs
