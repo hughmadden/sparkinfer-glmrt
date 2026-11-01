@@ -17,10 +17,29 @@ bench = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(bench)
 
 
+def test_v41_fc1_split_recipe_is_hardware_scoped():
+    path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v41_slice_pipeline.py"
+    tree = ast.parse(path.read_text())
+    nodes = [node for node in tree.body if isinstance(node, ast.Assign)
+             and any(isinstance(target, ast.Name) and target.id == "FC1_DECODE_K_SPLITS"
+                     for target in node.targets)]
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "fc1_decode_k_splits")
+    module = ast.Module(body=[*nodes, function], type_ignores=[])
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    recipe = namespace["fc1_decode_k_splits"]
+    assert recipe(121, 5120, 384, 128, False, True) == 2
+    for shape in [(120, 5120, 384, 128, False, True), (121, 5120, 576, 128, True, True),
+                  (121, 5120, 384, 192, False, True), (121, 5120, 384, 128, False, False)]:
+        assert recipe(*shape) == 1
+
+
 def test_mxfp4_pair_widths_cover_all_worlds_without_padding(monkeypatch):
     monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
         ownership_unit=lambda intermediate, world: 64 if (intermediate, world) == (2304, 5) else 32))
     assert bench.paired_widths(2304) == [288, 320, 352, 384, 448, 512, 576, 768, 1152]
+
     assert bench.paired_widths(2048) == [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024]
     assert bench.paired_widths(3072) == [384, 416, 448, 512, 608, 640, 768, 1024, 1536]
     args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--geometry", "v41", "--widths", "448,480"])
