@@ -69,3 +69,30 @@ def test_unrepresentable_geometry_fails_before_allocating(hidden, inter, experts
 def test_weight_scale_rows_are_u32_aligned(k, stride):
     assert PLAN["mxfp4_scale_row_bytes"](k) == stride
     assert stride >= k // 32 and stride % 4 == 0
+
+
+@pytest.mark.parametrize("rows", [1, 16, 80])
+@pytest.mark.parametrize("spark", [False, True])
+@pytest.mark.parametrize("hidden,width,matching", [(6144, 672, 6), (6144, 704, 6),
+    (4096, 672, 6), (6144, 320, 3), (6144, 352, 3), (6144, 384, 3), (6144, 512, 4)])
+def test_measured_decode_partition_is_fixed_across_capacities_and_hardware(rows, spark, hidden, width, matching):
+    import ast
+    from types import SimpleNamespace
+
+    source = Path(__file__).resolve().parents[2] / "b12x/integration/cuteafd/fp8_moe.py"
+    tree = ast.parse(source.read_text())
+    route = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_Route")
+    init = next(node for node in route.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    primitive = lambda **kw: SimpleNamespace(**kw)
+    env = dict(Fp8MoeGeometry=SimpleNamespace, DECODE_MAX_ROWS=80, MoePrep=primitive,
+        GatherRows=primitive, GroupedMxfp4Gemv=primitive, GroupedFp8Gemv=primitive,
+        MoeSwiGLU=primitive, MoeCombine=primitive, _gate_up_groups=lambda _: 4,
+        _sm121=lambda: spark)
+    exec(compile(ast.Module(body=[init], type_ignores=[]), str(source), "exec"), env)
+    geometry = SimpleNamespace(hidden=hidden, slice=width, experts=16, top_k=8,
+        weights="mxfp4", swiglu_limit=0., activation="silu_bf16_product")
+    selected = SimpleNamespace()
+    env["__init__"](selected, geometry, "decode", rows, True)
+    expected = 4 if spark and hidden == 6144 and width in (672, 704) else matching
+    assert selected.down.warps == expected
+    assert selected.down.max_rows == rows
