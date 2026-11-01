@@ -55,6 +55,50 @@ def test_tiling_controls_are_development_pair_only():
             bench.parse_args(argv)
 
 
+@pytest.mark.parametrize("width", [288, 576])
+def test_aligned_w2_changes_only_payload_tile_pitch(monkeypatch, width):
+    from tests.moe.test_v41_exact_slices import pack
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    experts, hidden = 2, 256
+    weights, scales = {}, {}
+    for name, shape in (("w1", (experts, width, hidden // 2)),
+                        ("w3", (experts, width, hidden // 2)),
+                        ("w2", (experts, hidden, width // 2))):
+        weights[name] = (torch.arange(shape[0] * shape[1] * shape[2]) % 251 + 1).byte().reshape(shape)
+        scales[name] = torch.full((*shape[:-1], shape[-1] // 16), 122, dtype=torch.uint8)
+    pitch = (width + 127) // 128 * 128
+    exact = pack(weights, scales, True)
+    aligned = pack(weights, scales, True, w2_pitch=pitch)
+    for plane in (0, 1, 3):
+        assert torch.equal(exact[plane], aligned[plane])
+    expected = exact[2].reshape(experts, hidden // 128, width // 32, 512)
+    actual = aligned[2].reshape(experts, hidden // 128, pitch // 32, 512)
+    assert torch.equal(actual[:, :, :width // 32], expected)
+    assert torch.count_nonzero(actual[:, :, width // 32:].view(torch.int32)) == 0
+
+
+@pytest.mark.parametrize("width", [288, 576])
+def test_w2_coded_pitch_is_already_aligned_and_extension_preserves_bytes(width):
+    from b12x.moe._shared.scale_codes import pack_scale_codes
+    columns = width // 32
+    source = (torch.arange(256 * columns).reshape(1, 256, columns) % 3 + 121).byte()
+    aligned_columns = (columns + 3) // 4 * 4
+    extension = source.amin(-1, keepdim=True).expand(1, 256, aligned_columns - columns)
+    exact = pack_scale_codes(source, tensor_name="w2.scale")
+    aligned = pack_scale_codes(torch.cat((source, extension), -1), tensor_name="w2.scale")
+    assert exact.shape == (1, 256 * (2 * ((columns + 3) // 4) + 1))
+    assert torch.equal(exact, aligned)
+
+
+def test_w2_pitch_arm_is_native_development_only():
+    assert bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings", "--native-slices",
+                             "--mxfp4-w2-pitch"]).mxfp4_w2_pitch
+    for argv in (["--mxfp4-w2-pitch"], ["--mxfp4-pair", "--mxfp4-tilings", "--mxfp4-w2-pitch"],
+                 ["--mxfp4-pair", "--native-slices", "--mxfp4-w2-pitch"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(argv)
+
+
 def test_f32_errors_measure_unrounded_reference():
     error = bench.f32_errors(torch.tensor([1., 3.]), torch.tensor([2., 5.]))
     assert error == pytest.approx(dict(max_abs=2., rms=(2.5 ** .5)))

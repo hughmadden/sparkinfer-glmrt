@@ -5,10 +5,12 @@ from tests.conftest import require_b12x
 from tests.moe.test_v41_expert_numerics import reference
 
 
-def pack(weights, scales, exact):
+def pack(weights, scales, exact, *, w2_pitch=None):
     """Independent tensor-layout reference, including both FC1 projection halves."""
     n, h = weights['w1'].shape[1], weights['w1'].shape[2] * 2
     padded = n if exact else (n + 127) // 128 * 128
+    if w2_pitch is not None:
+        assert exact and w2_pitch >= n and w2_pitch % 128 == 0
     result = []
     for gated, scale in [(True, False), (True, True), (False, False), (False, True)]:
         names = ['w3', 'w1'] if gated else ['w2']
@@ -18,7 +20,8 @@ def pack(weights, scales, exact):
             if gated:
                 source = torch.nn.functional.pad(source, (0, 0, 0, padded - n))
             else:
-                source = torch.nn.functional.pad(source, (0, (padded-n)//(32 if scale else 8)))
+                stored = w2_pitch if w2_pitch is not None and not scale else padded
+                source = torch.nn.functional.pad(source, (0, (stored-n)//(32 if scale else 8)))
             planes.append(source)
         source = torch.cat(planes, 1) if gated and not exact else None
         tiles = []

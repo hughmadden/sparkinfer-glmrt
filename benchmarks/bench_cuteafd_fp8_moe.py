@@ -184,6 +184,8 @@ def parse_args(argv=None):
                         help="paired native V4.1/V4 slice pipelines instead of grouped programs")
     parser.add_argument("--mxfp4-tilings", action="store_true",
                         help="screen exact native widths 64/128/192 or grouped decode warp partitions with F32 gates")
+    parser.add_argument("--mxfp4-w2-pitch", action="store_true",
+                        help="development native arm: exact W13 rows with only W2 payload pitch aligned to 128 columns")
     args = parser.parse_args(argv)
     if args.iters <= 0:
         parser.error("iters must be positive")
@@ -214,6 +216,8 @@ def parse_args(argv=None):
         parser.error("--native-slices requires --mxfp4-pair")
     if args.mxfp4_tilings and (not args.mxfp4_pair or args.capacity is not None):
         parser.error("--mxfp4-tilings requires --mxfp4-pair without fixed capacity")
+    if args.mxfp4_w2_pitch and not (args.mxfp4_tilings and args.native_slices):
+        parser.error("--mxfp4-w2-pitch requires --mxfp4-tilings and --native-slices")
     if args.widths:
         try:
             widths = [int(width) for width in args.widths.split(",")]
@@ -350,7 +354,8 @@ def native_slice_width(family, rank_width):
     return 192 if family == "v41" and (rank_width % 192 == 0 or rank_width == 288) else 128
 
 
-def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False):
+def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
+                    aligned_w2=False, aligned_w2_scales=False):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -365,13 +370,23 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     topk = ids.shape[1]
     # Padded is a benchmark oracle, never an installed alternate role.
     tail = exact and intermediate % 128 != 0
-    packed = pack(weights, scales, tail)
+    if aligned_w2 and (not tail or atomic or not coded):
+        raise ValueError("aligned W2 screen requires ordered coded-scale exact native tails")
+    if aligned_w2_scales and not aligned_w2:
+        raise ValueError("aligned W2 scales require the aligned W2 payload arm")
+    w2_pitch = (intermediate + 127) // 128 * 128 if aligned_w2 else None
+    packed = pack(weights, scales, tail, w2_pitch=w2_pitch)
     if coded:
         stored = intermediate if exact else (intermediate + 127) // 128 * 128
         s13 = torch.cat(tuple(torch.nn.functional.pad(scales[name], (0, 0, 0, stored - intermediate))
                              for name in ("w3", "w1")), 1)
         packed[1] = pack_scale_codes(s13, tensor_name="w13.scale", gated_half_rows=stored).view(torch.uint32).flatten().cuda()
-        packed[3] = pack_scale_codes(scales["w2"], tensor_name="w2.scale").view(torch.uint32).flatten().cuda()
+        down_scales = scales["w2"]
+        if aligned_w2_scales:
+            extra = w2_pitch // 32 - intermediate // 32
+            down_scales = torch.cat((down_scales, down_scales.amin(-1, keepdim=True)
+                                     .expand(*down_scales.shape[:-1], extra)), -1)
+        packed[3] = pack_scale_codes(down_scales, tensor_name="w2.scale").view(torch.uint32).flatten().cuda()
     groups = x.float().reshape(rows, -1, 32)
     exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448))
     wire = torch.cat(((groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
@@ -386,10 +401,15 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     tensors = [wire[:, :hidden].view(torch.uint32), wire[:, hidden:], *packed,
                ids.flatten(), routing.flatten(), *scratch, partial, output]
     args = [from_dlpack(tensor, assumed_align=16) for tensor in tensors]
-    launch = cute.compile(V41SlicePipeline(rows, width, experts=experts, topk=topk,
-                          intermediate=intermediate, hidden=hidden, exact_storage=tail,
-                          atomic_tokens=atomic, scale_codes=coded), *args,
-                          cutlass.Int32(rows), current_cuda_stream())
+    pipeline = V41SlicePipeline(rows, width, experts=experts, topk=topk,
+                                intermediate=intermediate, hidden=hidden, exact_storage=tail,
+                                atomic_tokens=atomic, scale_codes=coded)
+    if aligned_w2:
+        # Isolate W2 payload pitch; W13 and both coded scale planes stay exact.
+        pipeline.fc2.w2_intermediate = w2_pitch
+        if aligned_w2_scales:
+            pipeline.fc2.w2_scale_columns = w2_pitch // 32
+    launch = cute.compile(pipeline, *args, cutlass.Int32(rows), current_cuda_stream())
     def execute(live):
         launch(*args, cutlass.Int32(live), current_cuda_stream())
     if qualify:
@@ -654,12 +674,18 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                 tiles = (64, 128, 192) if args.native_slices else (mxfp4_decode_partitions(width) if route == "decode" else (None,))
                 specs = [("padded", False, baseline_tile), ("matching", True, baseline_tile)]
                 specs += [(f"exact-{tile}", True, tile) for tile in tiles if tile != baseline_tile]
+                if args.mxfp4_w2_pitch:
+                    specs = [("padded", False, baseline_tile), ("matching", True, baseline_tile),
+                             ("aligned-w2", True, baseline_tile),
+                             ("aligned-w2-scales", True, baseline_tile)]
                 runs, outputs, keepalive, invariants = {}, {}, [], {}
                 for label, exact, tile in specs:
                     try:
                         if args.native_slices:
                             run, output, owned = native_pair_arm(x, ids, routing, weights, scales, tile,
-                                                                exact, False, g.name == "v41", qualify=True)
+                                                                exact, False, g.name == "v41", qualify=True,
+                                                                aligned_w2=label.startswith("aligned-w2"),
+                                                                aligned_w2_scales=label == "aligned-w2-scales")
                         else:
                             stored = width if exact else padded
                             geometry = geometry_type(g.name, g.hidden, experts, topk, g.intermediate,
@@ -713,16 +739,23 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                     assert torch.isfinite(output).all() and torch.count_nonzero(output), "invalid tiling output"
                 samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
                 medians = {label: statistics.median(value) for label, value in samples.items()}
+                paired_speedups = {label: statistics.median(base / candidate for base, candidate in
+                                    zip(samples["padded"], value)) for label, value in samples.items()}
                 candidates = [label for label in runs if label != "padded" and eligible[label]]
-                winner = min(candidates, key=medians.get) if candidates else None
+                winner = max(candidates, key=paired_speedups.get) if candidates else None
                 comparisons = compare_route_outputs(outputs)
                 record = dict(geometry=g.name, hidden=g.hidden, width=width, padded_width=padded,
                               rows=rows, route=route, experts=experts, topk=topk, graph=args.graph,
                               routing=args.routing, weight_sha256=weight_hash, l2_bytes=l2_bytes,
                               resident_payload_bytes=experts * expert_bytes, samples_us=samples,
+                              resident_payload_bytes_by_arm={label: experts * g.hidden *
+                                  (3 * padded if label == "padded" else
+                                   2 * width + padded if label.startswith("aligned-w2") else 3 * width) // 2
+                                  for label in runs},
                               medians_us=medians, f32_errors=errors, quality_eligible=eligible,
                               within_version_invariants=invariants, comparisons=comparisons,
-                              winner=winner, speedup=medians["padded"] / medians[winner] if winner else None)
+                              paired_speedups=paired_speedups, winner=winner,
+                              speedup=paired_speedups[winner] if winner else None)
                 results.append(record)
                 print(json.dumps(record), flush=True)
                 del runs, outputs, keepalive

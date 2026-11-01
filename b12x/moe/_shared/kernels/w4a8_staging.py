@@ -224,7 +224,8 @@ def stage_v41_exact_b(source: cute.Tensor, shared_base: Int32,
                       expert_word_base: Int64, n_start: Int32, k_start: Int32,
                       thread: Int32, width: cutlass.Constexpr,
                       intermediate: cutlass.Constexpr, hidden: cutlass.Constexpr,
-                      gated: cutlass.Constexpr, projection: cutlass.Constexpr = 0):
+                      gated: cutlass.Constexpr, projection: cutlass.Constexpr = 0,
+                      stored_intermediate: cutlass.Constexpr = 0):
     """Exact K32 payload: FC1 N128 tiles and FC2 K128 tiles with compact tails.
 
     Shared payload remains the existing compact MMA layout. Out-of-range tails
@@ -253,7 +254,8 @@ def stage_v41_exact_b(source: cute.Tensor, shared_base: Int32,
                 # FC2 callers supply an N128-aligned start. A chunk stays
                 # inside that tile, so no per-thread N quotient is needed.
                 k = k_start // Int32(32) + kb
-                word = (expert_word_base + Int64(n_start) * Int64(intermediate // 8)
+                pitch = stored_intermediate if cutlass.const_expr(stored_intermediate > 0) else intermediate
+                word = (expert_word_base + Int64(n_start) * Int64(pitch // 8)
                         + Int64(k * 512 + chunk * 128 + lane * 4))
             valid = n < Int32(intermediate) if cutlass.const_expr(gated) else k < Int32(intermediate // 32)
             address = shared_base + index * Int32(16)
