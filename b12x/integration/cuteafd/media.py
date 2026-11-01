@@ -218,6 +218,31 @@ def compile_biased_projection_aot(*, width, outputs):
         geometry=dict(width=width, outputs=outputs, bias_before_cast=True))
 
 
+class PatchProjection:
+    def __init__(self, width, outputs):
+        from b12x.gemm.bf16_gemv._kernel import Bf16GemmKernel
+        self.width, self.outputs = width, outputs
+        self.projection = Bf16GemmKernel(outputs, width, False)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        self.projection(x, weight, out, out, rows, Int64(self.width), Int64(self.width),
+                        Int64(self.outputs), Int64(1), Int64(1), Int32(0), stream)
+
+
+def compile_patch_projection_aot(*, width, outputs):
+    """Existing BF16 warp-MMA with a masked K tail and no bias or intermediate cast."""
+    if min(width, outputs) <= 0:
+        raise ValueError("patch projection dimensions must be positive")
+    return compile_program(PatchProjection(width, outputs), name="media_patch_projection",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{width}]"),
+                  Operand("weight", torch.bfloat16, f"[{outputs},{width}]"),
+                  Operand("out", torch.bfloat16, f"[rows,{outputs}]", "out")),
+        scalars=(Scalar("rows"),), key=(width, outputs),
+        geometry=dict(width=width, outputs=outputs, bias=False, accumulator="float32"))
+
+
 class Gelu:
     def __init__(self, width):
         from b12x.norm.vision import _Vision
@@ -303,8 +328,9 @@ def vision_transformer_programs(*, hidden, intermediate, patch_width, merge,
             lambda w=width, o=outputs: compile_biased_projection_aot(width=w, outputs=o))
     for width, outputs in ((patch_width, hidden), (hidden * merge * merge, adapter_width),
                            (adapter_width, adapter_width), (adapter_width, output_width)):
+        builder = compile_patch_projection_aot if width % 64 else compile_bf16_projection_aot
         result[f"projection_h{width}_o{outputs}"] = (
-            lambda w=width, o=outputs: compile_bf16_projection_aot(width=w, outputs=o))
+            lambda w=width, o=outputs, build=builder: build(width=w, outputs=o))
     for width in dict.fromkeys((intermediate, adapter_width)):
         result[f"gelu_h{width}"] = lambda w=width: compile_gelu_aot(width=w)
     return result

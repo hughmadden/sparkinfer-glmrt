@@ -214,14 +214,51 @@ def test_existing_biased_projection_tower_shapes(width, outputs):
     assert (out == 1 + 1 / 128).all()
 
 
-def test_disabled_skinny_projection_does_not_construct_gemv(monkeypatch):
-    from b12x.gemm.bf16_gemv import _skinny
-    def forbidden(*args, **kwargs):
-        raise AssertionError("disabled skinny route constructed")
-    monkeypatch.setattr(_skinny, "SkinnyBf16Gemv", forbidden)
-    projection = _skinny.RoutedBf16Projection(1536, 1176, max_skinny_rows=0)
-    assert projection.skinny is None
-    assert projection.key()[3:7] == (0, 1, 8, 128)
+@pytest.mark.parametrize("rows", (1, 16, 80))
+def test_patch_projection_matches_single_bf16_store_and_live_rows(rows):
+    require_b12x()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.media import compile_patch_projection_aot
+    width, outputs = 1176, 1536
+    g = torch.Generator().manual_seed(132)
+    x = (torch.randint(-4, 5, (rows, width), generator=g).float() / 16).bfloat16().cuda()
+    weight = (torch.randint(-4, 5, (outputs, width), generator=g).float() / 16).bfloat16().cuda()
+    # The K-tail term moves this midpoint up; an intermediate BF16 cast loses it.
+    x[:, 0], x[:, 1], x[:, -1] = 1, 1 / 256, 1 / 256
+    weight[0] = 0
+    weight[0, 0], weight[0, 1], weight[0, -1] = 1, 1, 1
+    expected = (x.float() @ weight.float().T).bfloat16()
+    assert (expected[:, 0] == 1 + 1 / 128).all()
+    program = compile_patch_projection_aot(width=width, outputs=outputs)
+    out = torch.full((rows + 1, outputs), 42, device="cuda", dtype=torch.bfloat16)
+    program.launch(x, weight, out, scalars=[rows])
+    assert torch.equal(out[:rows], expected)
+    assert (out[rows:] == 42).all()
+    with kernel_resolution_guard("vision patch projection live extents"):
+        for live in dict.fromkeys((1, min(rows, 16), rows)):
+            program.launch(x, weight, out, scalars=[live])
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                program.launch(x, weight, out, scalars=[live])
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out[:live], expected[:live])
+
+
+def test_patch_projection_random_reference():
+    require_b12x()
+    from b12x.integration.cuteafd.media import compile_patch_projection_aot
+    g = torch.Generator().manual_seed(133)
+    x = torch.randn(16, 1176, generator=g).bfloat16().cuda()
+    weight = torch.randn(1536, 1176, generator=g).bfloat16().cuda()
+    out = torch.empty(16, 1536, device="cuda", dtype=torch.bfloat16)
+    program = compile_patch_projection_aot(width=1176, outputs=1536)
+    program.launch(x, weight, out, scalars=[16])
+    ref64 = x.double() @ weight.double().T
+    terms = x.double().abs() @ weight.double().abs().T
+    ulp = torch.exp2(torch.floor(torch.log2(ref64.abs().clamp_min(2.0 ** -126))) - 7)
+    error = terms * (1176 * 2.0 ** -24 / (1 - 1176 * 2.0 ** -24)) + ulp
+    assert ((out.double() - ref64).abs() <= error).all()
 
 
 @pytest.mark.parametrize("height,width", [(2, 2), (4, 6), (6, 4), (2, 128), (128, 2), (128, 128)])
