@@ -214,6 +214,38 @@ def test_existing_biased_projection_tower_shapes(width, outputs):
     assert (out == 1 + 1 / 128).all()
 
 
+@pytest.mark.parametrize("height,width", [(2, 2), (4, 6), (6, 4), (2, 128), (128, 2), (128, 128)])
+def test_spatial_merge_adapter_matches_official_channel_major_pixel_shuffle(height, width):
+    require_b12x()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.media import compile_spatial_merge_aot
+    hidden, ratio = 1536, 2
+    g = torch.Generator().manual_seed(131)
+    x = torch.randn(height * width, hidden, generator=g).bfloat16().cuda()
+    # Official Muse get_vision_pixel_shuffle_index followed by pixel_shuffle:
+    # group raster spatial blocks first, then transpose C ahead of their 4 rows.
+    index = torch.arange(height * width, device="cuda")
+    index = index.view(height // ratio, ratio, width // ratio, ratio)
+    index = index.permute(0, 2, 1, 3).reshape(-1)
+    expected = x[index].view(-1, ratio * ratio, hidden).permute(0, 2, 1)
+    expected = expected.reshape(-1, hidden * ratio * ratio)
+    rows = expected.shape[0]
+    out = torch.full((rows + 1, hidden * ratio * ratio), 42, device="cuda", dtype=torch.bfloat16)
+    program = compile_spatial_merge_aot(width=hidden, ratio=ratio)
+    program.launch(x, out, scalars=[rows, height, width])
+    assert torch.equal(out[:rows], expected)
+    assert (out[rows:] == 42).all()
+    with kernel_resolution_guard("vision spatial merge live extents"):
+        for live in dict.fromkeys((1, min(rows, 16), rows)):
+            program.launch(x, out, scalars=[live, height, width])
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                program.launch(x, out, scalars=[live, height, width])
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out[:live], expected[:live])
+
+
 @pytest.mark.parametrize("dim,windowed", [(96, False), (96, True), (128, False)])
 def test_vision_attention_segments(dim, windowed):
     require_b12x()
