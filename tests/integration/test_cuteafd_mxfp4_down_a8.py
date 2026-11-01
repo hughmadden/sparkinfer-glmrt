@@ -39,7 +39,7 @@ def test_quantized_oracle_padding_poison_and_fixed_resolution(real):
     out = torch.empty(capacity, g.hidden, dtype=torch.bfloat16, device="cuda")
     scratch = torch.empty(size, dtype=torch.uint8, device="cuda")
     base_out = torch.empty_like(out)
-    base_scratch = torch.empty(fp8_moe_scratch_bytes(g, "stream", capacity), dtype=torch.uint8, device="cuda")
+    base_scratch = torch.empty(fp8_moe_scratch_bytes(g, "stream", capacity, mxfp4_down_a8=False), dtype=torch.uint8, device="cuda")
     buffers = (source, ids, weights, *w, out, scratch)
     addresses = tuple(t.data_ptr() for t in buffers)
     program.launch(*buffers, scalars=(641,))
