@@ -62,7 +62,9 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, 
     wire[:,:h] = (blocks/scale[...,None]).to(torch.float8_e4m3fn).view(torch.uint8).reshape(m,h)
     wire[:,h:] = scale.to(torch.float8_e8m0fnu).view(torch.uint8)
     routes=m*topk
-    partial=torch.empty(((n+width-1)//width,routes,h),device='cuda',dtype=torch.float32)
+    partial_words = 1 if atomic else ((n+width-1)//width)*routes*(width//4+width//32)
+    partial_storage = torch.full((partial_words+16,), 12345., device='cuda')
+    partial = partial_storage[:partial_words]
     output=torch.empty(m*h if atomic else (routes,h),device='cuda',dtype=torch.float32)
     scratch=[torch.empty(shape,device='cuda',dtype=dtype) for shape,dtype in [
         ((1,),torch.int32),((e*routes,),torch.int32),((e,),torch.int32),((e,2),torch.int32),
@@ -87,6 +89,8 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, 
     graph.replay()
     assert torch.cuda.memory_allocated() == allocated
     torch.cuda.synchronize()
+    # The exporter exposes exactly the compact activation arena, not hidden-wide planes.
+    assert bool((partial_storage[partial_words:] == 12345.).all())
     if not atomic: assert torch.equal(output, expected)
     else: torch.testing.assert_close(output, expected, atol=.002, rtol=.002)
     if return_routes:

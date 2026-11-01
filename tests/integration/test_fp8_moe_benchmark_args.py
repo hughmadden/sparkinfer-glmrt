@@ -1,6 +1,7 @@
 """CPU-only controls for fixed-export row sweeps and recorded route replay."""
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -289,6 +290,23 @@ def test_legacy_glm_fixture_is_not_relabelled_for_other_families():
     assert bench.recorded_waves(path, SimpleNamespace(name="glm", experts=256, top_k=8))
     with pytest.raises(ValueError, match="family"):
         bench.recorded_waves(path, SimpleNamespace(name="mimo", experts=256, top_k=8))
+
+
+@pytest.mark.parametrize("tile", [64, 128, 192])
+@pytest.mark.parametrize("logical", [288, 416, 576, 608])
+@pytest.mark.parametrize("atomic", [False, True])
+def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical, atomic):
+    function = next(node for node in ast.parse(_PATH.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "native_pair_arm")
+    assignment, = [node for node in ast.walk(function) if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "partial" for target in node.targets)]
+    expression = compile(ast.Expression(assignment.value), str(_PATH), "eval")
+    # Run the real allocation expression on CPU; CUDA dataflow is GPU-qualified separately.
+    allocator = SimpleNamespace(empty=lambda shape, **kwargs: torch.empty(shape))
+    partial = eval(expression, {"__builtins__": {}, "torch": allocator},
+                   dict(logical=logical, width=tile, routes=96, atomic=atomic))
+    assert partial.numel() * 4 == (4 if atomic else
+        ((logical + tile - 1) // tile) * 96 * (tile + tile // 8))
 
 
 def test_explicit_rank_extents_and_identical_controls():

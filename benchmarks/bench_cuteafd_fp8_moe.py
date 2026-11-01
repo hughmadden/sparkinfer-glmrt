@@ -520,7 +520,8 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     wire = torch.cat(((groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
                       .view(torch.uint8).reshape(rows, hidden), (exponent + 127).to(torch.uint8)), 1)
     routes = rows * topk
-    partial = torch.empty(((logical + width - 1) // width, routes, hidden), device="cuda")
+    partial = torch.empty((1,) if atomic else
+                          ((logical + width - 1) // width, routes, width // 4 + width // 32), device="cuda")
     output = torch.empty(rows * hidden if atomic else (routes, hidden), device="cuda")
     scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
         ((1,), torch.int32), ((experts * routes,), torch.int32), ((experts,), torch.int32),
