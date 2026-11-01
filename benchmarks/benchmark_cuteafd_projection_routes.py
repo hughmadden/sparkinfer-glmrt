@@ -28,7 +28,7 @@ def parse_args(argv=None):
     parser.add_argument("--trellis-steady-ms", type=float, default=0,
                         help="continuous L2-cold duration; equal session_id configs interleave")
     parser.add_argument("--trellis-arms", default="baseline",
-                        help="baseline,ring2,ring3,ring4,sched2,sched3,sched4; paired with baseline on identical data")
+                        help="baseline,ring2,ring3,ring4,sched2,sched3,sched4,wide2,wide3,wide_sched2,wide_sched3; paired with baseline on identical data")
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -45,7 +45,7 @@ def parse_args(argv=None):
     args.trellis_arms = args.trellis_arms.split(",")
     if (not args.trellis_arms or args.trellis_arms[0] != "baseline" or
             len(set(args.trellis_arms)) != len(args.trellis_arms) or
-            any(arm not in ("baseline", "ring2", "ring3", "ring4", "sched2", "sched3", "sched4")
+            any(arm not in ("baseline", "ring2", "ring3", "ring4", "sched2", "sched3", "sched4", "wide2", "wide3", "wide_sched2", "wide_sched3")
                 for arm in args.trellis_arms)):
         parser.error("trellis arms must be unique, start with baseline, and name supported rings")
     if len(args.trellis_arms) > 1 and not args.trellis_steady_ms:
@@ -186,7 +186,10 @@ def _trellis_arm_program(template, arm):
     pointers = (_GroupedPointers if g.get("groups", 1) == 4 else _Pointers)(g)
     pointers.core.prefill_pipeline = True
     pointers.core.prefill_stages = int(arm[-1])
-    pointers.core.prefill_prefetch = arm.startswith("sched")
+    pointers.core.prefill_prefetch = "sched" in arm
+    if arm.startswith("wide"):
+        pointers.core.prefill_bm = 64
+        pointers.core.prefill_bn = 128
     return compile_program(pointers, name="trellis_prefill_screen", operands=template.operands,
         scalars=template.scalars, key=(tuple(g.items()), arm), geometry=g, version=1)
 
