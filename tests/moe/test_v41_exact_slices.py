@@ -215,6 +215,21 @@ def test_ordered_tile32_decode_qualification(h, n, coded):
 
 @pytest.mark.parametrize("weight_seed", [92800, 92801, 92802, 92803])
 def test_v41_s576_tile128_synthetic_oracle_seeds(weight_seed):
+    _synthetic_oracle_seeds(weight_seed, 5120, 576, True, 128, 192,
+                            "mxfp4_s576_synthetic_oracle")
+
+
+@pytest.mark.parametrize("h,n,coded", [(4096, 288, False), (5120, 256, False),
+                                     (7168, 288, False), (5120, 256, True),
+                                     (5120, 288, True)])
+@pytest.mark.parametrize("weight_seed", [92800, 92801, 92802, 92803])
+def test_ordered_tile32_synthetic_oracle_seeds(weight_seed, h, n, coded):
+    control_tile = 192 if coded and n == 288 else 128
+    _synthetic_oracle_seeds(weight_seed, h, n, coded, 32, control_tile,
+                            "mxfp4_tile32_synthetic_oracle")
+
+
+def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker):
     require_b12x()
     import json
     from benchmarks.bench_cuteafd_fp8_moe import (
@@ -222,7 +237,7 @@ def test_v41_s576_tile128_synthetic_oracle_seeds(weight_seed):
     )
 
     torch.backends.cuda.matmul.allow_tf32 = False
-    m, e, n, h, k = 80, 8, 576, 5120, 6
+    m, e, k = 80, 8, 6
     generator = torch.Generator().manual_seed(weight_seed)
     weights, scales = {}, {}
     for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
@@ -239,16 +254,17 @@ def test_v41_s576_tile128_synthetic_oracle_seeds(weight_seed):
         for capacity in (1, 16, 80):
             operands = (x[:capacity], ids[:capacity], routing[:capacity], weights, scales)
             control, control_output, control_owned = native_pair_arm(
-                *operands, 192, False, False, True, qualify=True)
+                *operands, control_tile, False, False, coded, qualify=True)
             candidate, output, owned = native_pair_arm(
-                *operands, 128, True, False, True, qualify=True)
+                *operands, tile, True, False, coded, qualify=True)
             control()
             candidate()
             torch.cuda.synchronize()
             assert torch.isfinite(output).all() and torch.count_nonzero(output)
             oracle = reference[:capacity * k]
-            print("mxfp4_s576_synthetic_oracle " + json.dumps(dict(
+            print(marker + " " + json.dumps(dict(
                 weight_seed=weight_seed, activation_seed=activation_seed, capacity=capacity,
+                hidden=h, logical=n, coded=coded, tile=tile, control_tile=control_tile,
                 control=f32_errors(control_output, oracle), candidate=f32_errors(output, oracle),
                 synthetic=True, timed=False)), flush=True)
 
