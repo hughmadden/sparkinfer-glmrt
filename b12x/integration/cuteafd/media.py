@@ -218,6 +218,31 @@ def compile_biased_projection_aot(*, width, outputs):
         geometry=dict(width=width, outputs=outputs, bias_before_cast=True))
 
 
+class PatchProjection:
+    def __init__(self, width, outputs):
+        from b12x.gemm.bf16_gemv._kernel import Bf16GemmKernel
+        self.width, self.outputs = width, outputs
+        self.projection = Bf16GemmKernel(outputs, width, False)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        self.projection(x, weight, out, out, rows, Int64(self.width), Int64(self.width),
+                        Int64(self.outputs), Int64(1), Int64(1), Int32(0), stream)
+
+
+def compile_patch_projection_aot(*, width, outputs):
+    """Existing BF16 warp-MMA with a masked K tail and no bias or intermediate cast."""
+    if min(width, outputs) <= 0:
+        raise ValueError("patch projection dimensions must be positive")
+    return compile_program(PatchProjection(width, outputs), name="media_patch_projection",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{width}]"),
+                  Operand("weight", torch.bfloat16, f"[{outputs},{width}]"),
+                  Operand("out", torch.bfloat16, f"[rows,{outputs}]", "out")),
+        scalars=(Scalar("rows"),), key=(width, outputs),
+        geometry=dict(width=width, outputs=outputs, bias=False, accumulator="float32"))
+
+
 class Gelu:
     def __init__(self, width):
         from b12x.norm.vision import _Vision
@@ -249,6 +274,66 @@ def compile_bf16_residual_add_aot(*, width):
         Operand("b", torch.bfloat16, f"[rows,{width}]"),
         Operand("out", torch.bfloat16, f"[rows,{width}]", "out")),
         scalars=(Scalar("rows"),), key=(width,), geometry=dict(width=width))
+
+
+class SpatialMerge:
+    def __init__(self, width, ratio):
+        from b12x.norm.vision import _Vision
+        self.launch = _Vision("merge", width, 1, ratio)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, out: cute.Pointer, rows: Int32,
+                 height: Int32, width: Int32, stream: cuda.CUstream):
+        self.launch(x, out, out, out, out, out, rows, height, width, stream)
+
+
+def compile_spatial_merge_aot(*, width, ratio):
+    """Existing channel-major spatial gather; rows is the merged output count.
+
+    Input raster is [height,width,channels], output [ceil(H/r),ceil(W/r),C,r,r].
+    Input and output must be disjoint. Edge padding retains the library zeros.
+    """
+    if min(width, ratio) <= 0:
+        raise ValueError("spatial merge requires positive channel width and ratio")
+    return compile_program(SpatialMerge(width, ratio), name="media_spatial_merge",
+        operands=(Operand("x", torch.bfloat16, f"[height,width,{width}]"),
+                  Operand("out", torch.bfloat16, f"[rows,{width * ratio * ratio}]", "out")),
+        scalars=(Scalar("rows"), Scalar("height"), Scalar("width")), key=(width, ratio),
+        geometry=dict(width=width, ratio=ratio, layout="channel_spatial"))
+
+
+def vision_transformer_programs(*, hidden, intermediate, patch_width, merge,
+                                adapter_width, output_width):
+    """Native BF16 affine/GELU vision stack, expressed by checkpoint geometry.
+
+    Reuses existing arithmetic kernels and byte-copy gather. Live image rows,
+    permutation indices and attention/window tables remain launch inputs.
+    """
+    from .pointwise import compile_affine_norm_aot, compile_bf16_projection_aot
+    from .context_split import compile_paged_staging_gather_aot
+    if min(hidden, intermediate, patch_width, merge, adapter_width, output_width) <= 0:
+        raise ValueError("vision transformer geometry must be positive")
+    result = {
+        f"layer_norm_h{hidden}": lambda: compile_affine_norm_aot(width=hidden,
+            subtract_mean=True, bias=True, input_dtype=torch.bfloat16,
+            parameter_dtype=torch.bfloat16),
+        f"residual_h{hidden}": lambda: compile_bf16_residual_add_aot(width=hidden),
+        f"row_gather_h{hidden}": lambda: compile_paged_staging_gather_aot(
+            row_bytes=hidden * 2, page_rows=1),
+        f"spatial_merge_h{hidden}_r{merge}": lambda: compile_spatial_merge_aot(width=hidden, ratio=merge),
+    }
+    for width, outputs in ((hidden, 3 * hidden), (hidden, hidden),
+                           (hidden, intermediate), (intermediate, hidden)):
+        result[f"biased_projection_h{width}_o{outputs}"] = (
+            lambda w=width, o=outputs: compile_biased_projection_aot(width=w, outputs=o))
+    for width, outputs in ((patch_width, hidden), (hidden * merge * merge, adapter_width),
+                           (adapter_width, adapter_width), (adapter_width, output_width)):
+        builder = compile_patch_projection_aot if width % 64 else compile_bf16_projection_aot
+        result[f"projection_h{width}_o{outputs}"] = (
+            lambda w=width, o=outputs, build=builder: build(width=w, outputs=o))
+    for width in dict.fromkeys((intermediate, adapter_width)):
+        result[f"gelu_h{width}"] = lambda w=width: compile_gelu_aot(width=w)
+    return result
 
 
 def vision_programs(*, dim, hidden, bf16_products=False,
