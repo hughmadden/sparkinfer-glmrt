@@ -26,6 +26,14 @@ def test_mxfp4_pair_widths_cover_all_worlds_without_padding():
         bench.paired_widths(2048, "2080")
 
 
+@pytest.mark.parametrize("family,rank_width,expected", [
+    ("v41", 288, 192), ("v41", 576, 192), ("v41", 768, 192),
+    ("v41", 448, 128), ("dsv4f", 384, 128), ("dsv4p", 768, 128),
+])
+def test_native_pair_retains_shipped_slice_recipe(family, rank_width, expected):
+    assert bench.native_slice_width(family, rank_width) == expected
+
+
 @pytest.mark.parametrize("argv", [["--native-slices"], ["--widths", "448"],
     ["--mxfp4-pair", "--widths", "33"], ["--mxfp4-pair", "--widths", "oops"],
     ["--mxfp4-pair", "--input", "bf16"], ["--mxfp4-pair", "--profile-dir", "out"]])

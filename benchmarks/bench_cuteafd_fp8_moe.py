@@ -341,6 +341,11 @@ def paired_widths(intermediate, requested=None):
     return sorted(widths)
 
 
+def native_slice_width(family, rank_width):
+    # Preserve V4.1 TP8's shipped width-192 fold across its masked final plane.
+    return 192 if family == "v41" and (rank_width % 192 == 0 or rank_width == 288) else 128
+
+
 def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
@@ -430,7 +435,7 @@ def mxfp4_pair_screen(g, args):
                 for exact in (False, True):
                     label = route + ("-exact" if exact else "-padded")
                     if args.native_slices:
-                        slice_width = 192 if width % 192 == 0 else 128
+                        slice_width = native_slice_width(g.name, width)
                         run, output, owned = native_pair_arm(x, ids, routing, weights, scales,
                                                             slice_width, exact, g.name != "v41" and rows >= 256,
                                                             g.name == "v41")
