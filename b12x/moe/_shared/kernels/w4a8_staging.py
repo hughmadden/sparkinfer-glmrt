@@ -22,13 +22,13 @@ def stage_repacked_b_slice(
     threads: cutlass.Constexpr,
     width: cutlass.Constexpr,
 ):
-    """Copy N64/N128/N192 weights into compact lane-major shared storage.
+    """Copy N32/N64/N128/N192 weights into compact lane-major shared storage.
 
     The compact destination has shape [4,width/32,32,4] in u32 words.
     A slice may cross an N256 boundary, including independently padded W13
     projection halves. All source offsets and products use 64-bit arithmetic.
     """
-    assert width in (64, 128, 192)
+    assert width in (32, 64, 128, 192)
     chunks = width // 32
     transfers = 4 * chunks * 32
     for iteration in cutlass.range_constexpr((transfers + threads - 1) // threads):
@@ -60,7 +60,7 @@ def stage_repacked_sfb_slice(
     width: cutlass.Constexpr,
 ):
     """Copy the corresponding N rows of four packed K32 UE8M0 scales."""
-    assert width in (64, 128, 192)
+    assert width in (32, 64, 128, 192)
     transfers = width // 4
     for iteration in cutlass.range_constexpr((transfers + threads - 1) // threads):
         index = thread + Int32(iteration * threads)
@@ -84,12 +84,12 @@ def stage_repacked_b_k_slice(
     threads: cutlass.Constexpr,
     depth: cutlass.Constexpr,
 ):
-    """Copy N128 by K64/K128/K192 into [depth/32,4,32,4] u32.
+    """Copy N128 by K32/K64/K128/K192 into [depth/32,4,32,4] u32.
 
     Both starts must be aligned to 32. Handles crossings of both packed tile
     axes; the caller owns bounds and completion just as for N-slice staging.
     """
-    assert depth in (64, 128, 192)
+    assert depth in (32, 64, 128, 192)
     transfers = (depth // 32) * 4 * 32
     for iteration in cutlass.range_constexpr((transfers + threads - 1) // threads):
         index = thread + Int32(iteration * threads)
@@ -126,7 +126,7 @@ def stage_repacked_sfb_k_slice(
     selection. Weight payload has no padding. Stores are synchronous; callers
     synchronize threads as well as completing the weight cp.async group.
     """
-    assert depth in (64, 128, 192)
+    assert depth in (32, 64, 128, 192)
     groups = (depth + 127) // 128
     for iteration in cutlass.range_constexpr((128 * groups + threads - 1) // threads):
         index = thread + Int32(iteration * threads)

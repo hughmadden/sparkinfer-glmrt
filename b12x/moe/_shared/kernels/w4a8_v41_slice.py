@@ -509,7 +509,7 @@ class V41SliceFc1Kernel:
 
     def __init__(self, width, capacity, *, topk=6, intermediate=576, hidden=5120,
                  exact_storage=False, scale_codes=False):
-        assert width in (64, 128, 192)
+        assert width in (32, 64, 128, 192)
         assert capacity > 0 and topk > 0
         assert hidden > 0 and hidden % 128 == 0
         assert intermediate > 0 and intermediate % 32 == 0
@@ -817,7 +817,7 @@ class V41SliceFc2Kernel:
 
     def __init__(self, width, capacity, *, topk=6, intermediate=576, hidden=5120,
                  exact_storage=False, fc2_n_splits=1, scale_codes=False):
-        assert width in (64, 128, 192)
+        assert width in (32, 64, 128, 192)
         assert capacity > 0 and topk > 0
         assert hidden > 0 and hidden % 128 == 0
         assert intermediate > 0 and intermediate % 32 == 0

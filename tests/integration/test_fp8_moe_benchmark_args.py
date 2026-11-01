@@ -292,7 +292,7 @@ def test_legacy_glm_fixture_is_not_relabelled_for_other_families():
         bench.recorded_waves(path, SimpleNamespace(name="mimo", experts=256, top_k=8))
 
 
-@pytest.mark.parametrize("tile", [64, 128, 192])
+@pytest.mark.parametrize("tile", [32, 64, 128, 192])
 @pytest.mark.parametrize("logical", [288, 416, 576, 608])
 @pytest.mark.parametrize("atomic", [False, True])
 def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical, atomic):
@@ -326,11 +326,18 @@ def test_explicit_rank_extents_and_identical_controls():
 
 
 @pytest.mark.parametrize("value", ["bad", "a:0:128:64", "a:33:128:64", "a:128:96:64",
-                                   "a:96:97:64", "a:96:96:32", "padded-x:96:96:64",
+                                   "a:96:97:64", "a:96:96:16", "padded-x:96:96:64",
                                    "exact-64:96:96:64", "aligned-w2-x:96:96:64", "a/b:96:96:64"])
 def test_invalid_explicit_extents_fail_before_cuda(value):
     with pytest.raises(SystemExit):
         bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings", "--mxfp4-arm", value])
+
+
+def test_explicit_tile32_is_benchmark_only():
+    args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings",
+                             "--mxfp4-arm", "tile32:288:288:32"])
+    specs, _ = bench.tiling_specs(args, 288, 192, (64, 128, 192))
+    assert specs[-1] == ("tile32", True, 32, 288)
 
 
 def test_explicit_names_and_mode_are_unambiguous():

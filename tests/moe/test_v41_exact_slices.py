@@ -162,6 +162,97 @@ def test_all_k32_widths_exact_storage(h, n, coded, atomic):
         assert torch.equal(result, reference_output), (n, coded, (result - reference_output).abs().max().item())
 
 
+@pytest.mark.parametrize("h,n", [(h, n) for h in (4096, 5120, 7168) for n in (256, 288)])
+@pytest.mark.parametrize("coded", [False, True])
+def test_ordered_tile32_decode_qualification(h, n, coded):
+    require_b12x()
+    import json
+    from benchmarks.bench_cuteafd_fp8_moe import (
+        f32_errors, mxfp4_f32_reference, native_pair_arm,
+    )
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    m, e, k = 80, 8, 6
+    generator = torch.Generator().manual_seed(92832 + n)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
+                                     dtype=torch.uint8, generator=generator)
+    torch.manual_seed(92832 + h + n)
+    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    reference = mxfp4_f32_reference(x, ids, routing, weights, scales, 10., native=True)
+    expected, results = None, []
+    for capacity in (80, 16, 1):
+        operands = (x[:capacity], ids[:capacity], routing[:capacity], weights, scales)
+        control_tile = 192 if coded and n == 288 else 128
+        control, control_output, control_owned = native_pair_arm(
+            *operands, control_tile, False, False, coded, qualify=True)
+        candidate, output, owned = native_pair_arm(
+            *operands, 32, True, False, coded, qualify=True)
+        control()
+        candidate()
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all() and torch.count_nonzero(output)
+        if expected is None:
+            expected = output.clone()
+        assert torch.equal(output, expected[:capacity * k]), "decode-capacity row invariance"
+        oracle = reference[:capacity * k]
+        control_error = f32_errors(control_output, oracle)
+        candidate_error = f32_errors(output, oracle)
+        torch.testing.assert_close(output, control_output, atol=.01, rtol=.01)
+        results.append(dict(capacity=capacity, control=control_error, candidate=candidate_error,
+                            eligible=all(candidate_error[key] <= control_error[key]
+                                         for key in ("max_abs", "rms"))))
+    print("mxfp4_tile32_qualification " + json.dumps(dict(
+        hidden=h, logical=n, compact=bool(n % 128), coded=coded,
+        cached_slices=n // 32 <= 8, deterministic=True, poison_live_graph=True,
+        decode_capacity_row_invariance=True, results=results)), flush=True)
+
+
+@pytest.mark.parametrize("weight_seed", [92800, 92801, 92802, 92803])
+def test_v41_s576_tile128_synthetic_oracle_seeds(weight_seed):
+    require_b12x()
+    import json
+    from benchmarks.bench_cuteafd_fp8_moe import (
+        f32_errors, mxfp4_f32_reference, native_pair_arm,
+    )
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    m, e, n, h, k = 80, 8, 576, 5120, 6
+    generator = torch.Generator().manual_seed(weight_seed)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
+                                     dtype=torch.uint8, generator=generator)
+    for activation_seed in range(8):
+        torch.manual_seed(activation_seed)
+        x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+        ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+        routing = torch.rand(m, k, device="cuda")
+        routing /= routing.sum(-1, keepdim=True)
+        reference = mxfp4_f32_reference(x, ids, routing, weights, scales, 10., native=True)
+        for capacity in (1, 16, 80):
+            operands = (x[:capacity], ids[:capacity], routing[:capacity], weights, scales)
+            control, control_output, control_owned = native_pair_arm(
+                *operands, 192, False, False, True, qualify=True)
+            candidate, output, owned = native_pair_arm(
+                *operands, 128, True, False, True, qualify=True)
+            control()
+            candidate()
+            torch.cuda.synchronize()
+            assert torch.isfinite(output).all() and torch.count_nonzero(output)
+            oracle = reference[:capacity * k]
+            print("mxfp4_s576_synthetic_oracle " + json.dumps(dict(
+                weight_seed=weight_seed, activation_seed=activation_seed, capacity=capacity,
+                control=f32_errors(control_output, oracle), candidate=f32_errors(output, oracle),
+                synthetic=True, timed=False)), flush=True)
+
+
 @pytest.mark.parametrize("world,n", [(4, 576), (8, 288)])
 @pytest.mark.parametrize("m", [1, 16, 80, 256, 1024, 4096])
 def test_shipped_v41_width192_exact_route_bytes(world, n, m):

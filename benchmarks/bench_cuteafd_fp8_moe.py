@@ -184,7 +184,7 @@ def parse_args(argv=None):
     parser.add_argument("--native-slices", action="store_true",
                         help="paired native V4.1/V4 slice pipelines instead of grouped programs")
     parser.add_argument("--mxfp4-tilings", action="store_true",
-                        help="screen exact native widths 64/128/192 or grouped decode warp partitions with F32 gates")
+                        help="screen native tiles 64/128/192 (explicit arms also allow 32) or grouped decode warp partitions")
     parser.add_argument("--mxfp4-w2-pitch", action="store_true",
                         help="development native arm: exact W13 rows with only W2 payload pitch aligned to 128 columns")
     parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE",
@@ -374,8 +374,8 @@ def native_screen_arms(values):
         if (not name or name.startswith(("padded", "matching", "exact-", "aligned-w2"))
                 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in name)
                 or not 0 < logical <= stored or logical % 32 or stored % 32
-                or tile not in (64, 128, 192)):
-            raise ValueError("native arms need unique names, whole-K32 extents and tile64/128/192")
+                or tile not in (32, 64, 128, 192)):
+            raise ValueError("native arms need unique names, whole-K32 extents and tile32/64/128/192")
         if name in {arm[0] for arm in result}:
             raise ValueError("duplicate native arm name")
         result.append((name, logical, stored, tile))
