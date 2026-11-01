@@ -20,6 +20,26 @@ WIDTH_CASES += [(2048, 6144, width) for width in (32, 64, 96)]
 
 
 @pytest.mark.parametrize("intermediate,hidden,width", WIDTH_CASES)
+def test_exact_decode_retains_padded_warp_partition(intermediate, hidden, width):
+    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, _Route
+
+    @dataclass(frozen=True)
+    class Exact(Fp8MoeGeometry):
+        width: int = 32
+        @property
+        def slice(self):
+            return self.width
+
+    exact = _Route(Exact("tail", hidden, 16, 8, intermediate, weights="mxfp4", width=width), "decode", 17, True)
+    padded = _Route(Exact("tail", hidden, 16, 8, intermediate, weights="mxfp4",
+                          width=(width + 127) // 128 * 128), "decode", 17, True)
+    assert exact.down.warps == padded.down.warps
+    assert exact.down.k_per_warp == padded.down.k_per_warp
+    assert exact.down.blocks == padded.down.blocks
+    assert exact.down.row_bytes == width // 2
+
+
+@pytest.mark.parametrize("intermediate,hidden,width", WIDTH_CASES)
 @pytest.mark.parametrize("route,a8", [("decode", False), ("stream", False), ("stream", True)])
 def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, hidden, width, route, a8):
     require_b12x()
@@ -91,8 +111,7 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, h
                 "histogram": {str(bound): int((ulps == bound).sum()) for bound in (0, 1, 2, 3, 4)},
                 "over4": int((ulps > 4).sum()), "cosine": float(cosine),
             }), flush=True)
-            if width == padded_width:
-                assert torch.equal(out[:rows], ref[:rows])
+            assert torch.equal(out[:rows], ref[:rows]), (hidden, width, route, a8, rows, int(ulps.max()))
             result = out[:rows].clone()
             scratch.zero_()
             # Padding bytes must be ignored by all three down kernels.

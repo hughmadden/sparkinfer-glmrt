@@ -494,7 +494,10 @@ class _Route:
             # else the largest divisor <= 8 of the blocks (Qwen's 640: 5 warps).
             warps_i = 4 if i % 512 == 0 else max(d for d in range(1, 9) if (i // 128) % d == 0)
             if g.weights == "mxfp4" and i % 128:
-                warps_i = min(4, (i + 127) // 128)
+                # Match the padded kernel's K partition and warp fold exactly;
+                # only the final K32 lanes are masked, never moved to a new sum.
+                blocks_i = (i + 127) // 128
+                warps_i = 4 if blocks_i % 4 == 0 else max(d for d in range(1, 9) if blocks_i % d == 0)
             self.down = gemv(n=h, k=i, experts=e, max_rows=tile_rows, warps=warps_i, **native)
         else:
             self.gate_up = GroupedFp8Gemm(n=i, k=h, experts=e, halves=2, native_bf16=g.weights == "bf16")
