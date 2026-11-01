@@ -9,7 +9,6 @@ from pathlib import Path
 import statistics
 import subprocess
 import sys
-import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -25,8 +24,6 @@ def parse_args(argv=None):
                         help="JSON list of {n,k,side,groups} K6 geometries; trellis recipe only")
     parser.add_argument("--trellis-paired", action="store_true",
                         help="retain exactly two K6 geometries and interleave their timed replays")
-    parser.add_argument("--trellis-steady-ms", type=float, default=0,
-                        help="continuous L2-cold duration; equal session_id configs interleave")
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -40,8 +37,6 @@ def parse_args(argv=None):
     row_limit = 4096 if args.recipes in ("compensation", "trellis") else 128
     if args.samples < 1 or any(v < 1 or v > row_limit for v in args.rows):
         parser.error(f"positive samples and live rows in 1..{row_limit} required")
-    if args.trellis_steady_ms and args.trellis_steady_ms < 200:
-        parser.error("steady sessions must be at least 200 ms")
     return args
 
 
@@ -92,84 +87,6 @@ def _gpu_telemetry():
             "compute_apps": query(["--query-compute-apps=pid,process_name,used_memory"])}
 
 
-def _steady_trellis(args, pending, flush):
-    import math
-    import pynvml
-    import torch
-
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
-    results = []
-    for rows, pair in pending.items():
-        for entry, graph in pair:
-            entry["telemetry_before"] = _gpu_telemetry()
-        # Capture eviction and alternating arms together: host gaps must not
-        # downclock the GPU between the measured projection events.
-        def capture(rounds):
-            events = [[] for _ in pair]
-            session = torch.cuda.CUDAGraph()
-            begin, end = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
-            with torch.cuda.graph(session):
-                begin.record()
-                for repeat in range(rounds):
-                    order = range(len(pair)) if repeat % 2 == 0 else reversed(range(len(pair)))
-                    for index in order:
-                        flush()
-                        start, stop = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
-                        start.record()
-                        pair[index][1].replay()
-                        stop.record()
-                        events[index].append((start, stop))
-                end.record()
-            return session, events, begin, end
-
-        pilot, pilot_events, begin, end = capture(8)
-        pilot.replay()
-        torch.cuda.synchronize()
-        rounds = max(args.samples, math.ceil(args.trellis_steady_ms * 1.2 / (begin.elapsed_time(end)/8)))
-        del pilot, pilot_events, begin, end
-        session, events, begin, end = capture(rounds)
-        session.replay()
-        torch.cuda.synchronize()
-        readings, errors, stop_sampling = [], [], threading.Event()
-        def sample():
-            while not stop_sampling.wait(.01):
-                try:
-                    readings.append(dict(time_ns=time.time_ns(),
-                        power_w=pynvml.nvmlDeviceGetPowerUsage(handle)/1000,
-                        sm_mhz=pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM),
-                        memory_mhz=pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM),
-                        utilization=pynvml.nvmlDeviceGetUtilizationRates(handle).gpu,
-                        temperature=pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)))
-                except Exception as error:
-                    errors.append(str(error))
-        sampler = threading.Thread(target=sample)
-        sampler.start()
-        launch_ns = time.time_ns()
-        session.replay()
-        torch.cuda.synchronize()
-        finish_ns = time.time_ns()
-        stop_sampling.set()
-        sampler.join()
-        active = [v for v in readings if launch_ns <= v["time_ns"] <= finish_ns]
-        accepted = bool(active) and not errors and all(v["power_w"] <= 250 and v["sm_mhz"] >= 1800 for v in active)
-        duration_ms = begin.elapsed_time(end)
-        accepted = accepted and duration_ms >= args.trellis_steady_ms
-        for index, (entry, graph) in enumerate(pair):
-            entry["samples_us"] = [start.elapsed_time(stop)*1000 for start, stop in events[index]]
-            entry["median_us"] = statistics.median(entry["samples_us"])
-            entry["session_ms"] = duration_ms
-            entry["in_run_telemetry"] = active
-            entry["telemetry_errors"] = errors
-            entry["accepted"] = accepted
-            entry["telemetry_after"] = _gpu_telemetry()
-            results.append(entry)
-            print(json.dumps({key: value for key, value in entry.items()
-                              if key not in ("samples_us", "in_run_telemetry")}), flush=True)
-        del session, events, begin, end
-    return results
-
-
 def _trellis_baseline(args):
     import numpy as np
     import torch
@@ -191,9 +108,9 @@ def _trellis_baseline(args):
             args.output.write_text(json.dumps(dict(device=torch.cuda.get_device_name(),
                 sms=properties.multi_processor_count, torch_version=torch.__version__,
                 cuda_version=torch.version.cuda, argv=sys.argv, kind="native_k6_baseline",
-                conditions="unchanged production core; F16 rotated inputs; eager and graph warmup per M; L2 eviction per sample; independent N128/K-all/8-row FP64 oracle; byte-exact graph replay; steady mode uses continuous alternating replay, untimed steady warmup, in-run NVML telemetry, whole-session >250W/<1800MHz exclusion",
+                conditions="unchanged production core; F16 rotated inputs; eager and graph warmup per M; L2 eviction per sample; independent N128/K-all/8-row FP64 oracle; byte-exact graph replay; per-cell GPU telemetry; paired mode alternates arm order",
                 results=results), indent=2)+"\n")
-    for config_index, config in enumerate(configs):
+    for config in configs:
         n, k, side, groups = (config[key] for key in ("n", "k", "side", "groups"))
         if n % 128 or k % 128 or side not in (1, 2) or groups not in (1, 4):
             raise ValueError(f"invalid trellis geometry: {config}")
@@ -251,7 +168,7 @@ def _trellis_baseline(args):
                 raise RuntimeError("trellis graph replay differs from eager output")
             entry = dict(config, rows=rows, bits=6, codebook="mcg", input_dtype="f16",
                          samples_us=[], accuracy=accuracy)
-            if args.trellis_paired or args.trellis_steady_ms:
+            if args.trellis_paired:
                 pending.setdefault(rows, []).append((entry, graph))
             else:
                 entry["telemetry_before"] = _gpu_telemetry()
@@ -269,15 +186,9 @@ def _trellis_baseline(args):
                 print(json.dumps({key: value for key, value in entry.items() if key != "samples_us"}), flush=True)
                 save()
             del graph, expected
-        if args.trellis_paired or args.trellis_steady_ms:
+        if args.trellis_paired:
             retained.append((program, operands, x, inputs, payloads, scales, partial, outputs))
         del program, operands, x, inputs, payloads, scales, partial, outputs, w, oracle, baseline
-        if args.trellis_steady_ms and (config_index+1 == len(configs) or
-                config.get("session_id", config_index) != configs[config_index+1].get("session_id", config_index+1)):
-            results.extend(_steady_trellis(args, pending, flush))
-            pending.clear()
-            retained.clear()
-            save()
         torch.cuda.empty_cache()
     for rows, pair in pending.items():
         for entry, graph in pair:
