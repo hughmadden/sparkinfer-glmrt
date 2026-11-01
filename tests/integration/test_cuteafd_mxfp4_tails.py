@@ -1,6 +1,7 @@
 """Exact MXFP4 K32 tails against identical, zero-padded weights on SM12x."""
 from dataclasses import dataclass
 import json
+import statistics
 
 import pytest
 import torch
@@ -51,7 +52,63 @@ TAIL_CASES += [(2048, 6144, width, "decode", False, capacity)
 
 
 @pytest.mark.parametrize("intermediate,hidden,width,route,a8,capacity", TAIL_CASES)
-def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, hidden, width, route, a8, capacity):
+def test_exact_tail_matches_padding_with_poison_and_graph_replay(
+        intermediate, hidden, width, route, a8, capacity, monkeypatch):
+    require_b12x()
+    changed_fold = (torch.cuda.get_device_capability() == (12, 1) and hidden == 6144
+                    and width in (672, 704) and route == "decode")
+    if changed_fold:
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    observations = []
+    seeds = ((weight, activation) for weight in range(92800, 92804)
+             for activation in range(8)) if changed_fold and capacity <= 80 else [(97, 97)]
+    for weight_seed, activation_seed in seeds:
+        observations.extend(_exact_tail_case(
+            intermediate, hidden, width, route, a8, capacity, weight_seed, activation_seed))
+    # Large-capacity tail checks retain invariance coverage; the independent
+    # C1/C16/C80 cases adjudicate the changed fold across quantization boundaries.
+    if changed_fold and capacity <= 80:
+        for rows in sorted({item["rows"] for item in observations}):
+            samples = [item for item in observations if item["rows"] == rows]
+            assert len(samples) == 32
+            summary = _seed_oracle_summary(samples)
+            print("mxfp4_dispatch_seed_summary " + json.dumps({
+                "width": width, "capacity": capacity, "rows": rows,
+                "observations": len(samples), "metrics": summary,
+            }), flush=True)
+            assert all(item["candidate_mean"] <= item["padded_mean"] + item["padded_stdev"]
+                       for item in summary.values()), (width, capacity, rows, summary)
+
+
+def _seed_oracle_summary(samples):
+    summary = {}
+    for metric in ("max_abs", "rms"):
+        candidate = [item["candidate"][metric] for item in samples]
+        padded = [item["padded"][metric] for item in samples]
+        summary[metric] = {
+            "candidate_mean": statistics.fmean(candidate),
+            "padded_mean": statistics.fmean(padded),
+            "padded_stdev": statistics.stdev(padded),
+            "paired_mean_delta": statistics.fmean(a - b for a, b in zip(candidate, padded)),
+            "paired_median_delta": statistics.median(a - b for a, b in zip(candidate, padded)),
+            "worst_paired_delta": max(a - b for a, b in zip(candidate, padded)),
+            "candidate_higher_count": sum(a > b for a, b in zip(candidate, padded)),
+        }
+    return summary
+
+
+@pytest.mark.parametrize("delta,passes", [(0.01, True), (10.0, False)])
+def test_seed_oracle_mean_bound(delta, passes):
+    samples = [{"candidate": {metric: value + delta for metric in ("max_abs", "rms")},
+                "padded": {metric: value for metric in ("max_abs", "rms")}}
+               for value in range(1, 33)]
+    summary = _seed_oracle_summary(samples)
+    assert all(item["candidate_mean"] <= item["padded_mean"] + item["padded_stdev"]
+               for item in summary.values()) is passes
+    assert all(item["candidate_higher_count"] == 32 for item in summary.values())
+
+
+def _exact_tail_case(intermediate, hidden, width, route, a8, capacity, weight_seed, activation_seed):
     require_b12x()
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_scratch_bytes
@@ -70,7 +127,7 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, h
     padded_width = (width + 127) // 128 * 128
     padded = Exact("tail", hidden=hidden, experts=16, top_k=8, intermediate=intermediate,
                    weights="mxfp4", width=padded_width)
-    gen = torch.Generator(device="cuda").manual_seed(97)
+    gen = torch.Generator(device="cuda").manual_seed(activation_seed)
     x = torch.randn(capacity, g.hidden, device="cuda", generator=gen).bfloat16()
     source, _ = wire_rows(x)
     changed_fold = (torch.cuda.get_device_capability() == (12, 1) and hidden == 6144
@@ -79,9 +136,10 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, h
         from b12x.integration.cuteafd.fp8_moe import _Route
         assert _Route(g, route, capacity, True).down.warps == 4
         assert _Route(padded, route, capacity, True).down.warps == 6
-        torch.backends.cuda.matmul.allow_tf32 = False
     ids = torch.rand(capacity, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int().contiguous()
     weights = torch.rand(capacity, g.top_k, device="cuda", generator=gen).contiguous()
+    if changed_fold:
+        gen = torch.Generator(device="cuda").manual_seed(weight_seed)
     codes = lambda shape: torch.randint(0, 256, shape, device="cuda", generator=gen).byte()
     scales = lambda shape: torch.randint(118, 124, shape, device="cuda", generator=gen).byte()
     e, h = g.experts, g.hidden
@@ -113,6 +171,7 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, h
         oracle = mxfp4_f32_reference(x, ids, weights,
             {"w1": w1, "w3": w3, "w2": w2},
             {"w1": s1, "w3": s3, "w2": s2[..., :width // 32]})
+    observations = []
     live_rows = sorted({min(rows, capacity) for rows in (1, 16, 17, 80, 127, 128, 129, 641, capacity)})
     with kernel_resolution_guard("exact K32 tails across live rows and graph replay"):
         for rows in live_rows:
@@ -139,13 +198,14 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, h
             if changed_fold:
                 actual_error = f32_errors(out[:rows], oracle[:rows])
                 padded_error = f32_errors(ref[:rows], oracle[:rows])
-                print("mxfp4_dispatch_oracle " + json.dumps({
+                observation = {
                     "hidden": hidden, "width": width, "capacity": capacity, "rows": rows,
+                    "weight_seed": weight_seed, "activation_seed": activation_seed,
                     "down_warps": 4, "padded_down_warps": 6,
                     "candidate": actual_error, "padded": padded_error,
-                }), flush=True)
-                assert all(actual_error[key] <= padded_error[key] for key in ("max_abs", "rms")), (
-                    width, capacity, rows, actual_error, padded_error)
+                }
+                print("mxfp4_dispatch_oracle " + json.dumps(observation), flush=True)
+                observations.append(observation)
             else:
                 assert torch.equal(out[:rows], ref[:rows]), (hidden, width, route, a8, rows, int(ulps.max()))
             result = out[:rows].clone()
@@ -168,3 +228,4 @@ def test_exact_tail_matches_padding_with_poison_and_graph_replay(intermediate, h
             assert torch.cuda.memory_stats()["allocated_bytes.all.allocated"] == allocated
             assert torch.equal(out, expected)
             assert tuple(t.data_ptr() for t in buffers) == addresses
+    return observations
