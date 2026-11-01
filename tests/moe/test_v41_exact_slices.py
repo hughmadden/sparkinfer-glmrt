@@ -46,7 +46,7 @@ def pack(weights, scales, exact):
     return result
 
 
-def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, coded=False):
+def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, coded=False, return_routes=False):
     import cutlass
     import cutlass.cute as cute
     from b12x._lib.utils import current_cuda_stream
@@ -86,6 +86,9 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, 
     torch.cuda.synchronize()
     if not atomic: assert torch.equal(output, expected)
     else: torch.testing.assert_close(output, expected, atol=.002, rtol=.002)
+    if return_routes:
+        assert not atomic
+        return output.reshape(m, topk, h)
     return output.reshape(m,topk,h).sum(1) if not atomic else output.reshape(m,h)
 
 
@@ -150,3 +153,46 @@ def test_all_k32_widths_exact_storage(h, n, coded, atomic):
         torch.testing.assert_close(result, reference_output, atol=.002, rtol=.002)
     else:
         assert torch.equal(result, reference_output), (n, coded, (result - reference_output).abs().max().item())
+
+
+@pytest.mark.parametrize("world,n", [(4, 576), (8, 288)])
+@pytest.mark.parametrize("m", [1, 16, 80, 256, 1024, 4096])
+def test_shipped_v41_width192_exact_route_bytes(world, n, m):
+    require_b12x()
+    import json
+    from b12x.moe._shared.scale_codes import pack_scale_codes
+
+    h, e, k, width = 5120, 8, 6, 192
+    stored = (n + 127) // 128 * 128
+    torch.manual_seed(9280 + n + m)
+    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing = (routing / routing.sum(-1, keepdim=True)).float()
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+
+    def resident(exact):
+        packed = pack(weights, scales, exact)
+        half = n if exact else stored
+        s13 = torch.cat([torch.nn.functional.pad(scales[name], (0, 0, 0, half - n))
+                         for name in ("w3", "w1")], 1)
+        packed[1] = pack_scale_codes(s13, tensor_name="w13.scale", gated_half_rows=half).view(torch.uint32).flatten().cuda()
+        packed[3] = pack_scale_codes(scales["w2"], tensor_name="w2.scale").view(torch.uint32).flatten().cuda()
+        return packed
+
+    # Compare the ABI's ordered route planes, not a later sum that could hide
+    # different per-route values. Width 192 and its plane fold stay unchanged.
+    baseline = run_pipeline(x, ids, routing, resident(False), width, False,
+                            n=n, coded=True, return_routes=True)
+    candidate = run_pipeline(x, ids, routing, resident(True), width, True,
+                             n=n, coded=True, return_routes=True)
+    assert torch.isfinite(candidate).all() and torch.count_nonzero(candidate) > 0
+    assert torch.equal(candidate.view(torch.uint8), baseline.view(torch.uint8)), (world, n, m)
+    print("mxfp4_shipped_recipe " + json.dumps({
+        "world": world, "logical": n, "padded": stored, "width": width,
+        "planes": (n + width - 1) // width, "rows": m, "coded": True,
+        "route_bytes": candidate.numel() * candidate.element_size(), "bitwise_equal": True,
+    }), flush=True)
