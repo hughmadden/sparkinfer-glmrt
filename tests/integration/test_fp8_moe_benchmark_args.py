@@ -42,6 +42,43 @@ def test_invalid_pair_modes_fail_before_cuda(argv):
         bench.parse_args(argv)
 
 
+@pytest.mark.parametrize("width,expected", [(288, [1, 2, 3, 4, 8]), (576, [1, 2, 4, 5, 8]),
+                                          (672, [1, 2, 4, 6, 8]), (608, [1, 2, 4, 5, 8])])
+def test_tiling_screen_includes_old_four_warps_and_matching_partition(width, expected):
+    assert bench.mxfp4_decode_partitions(width) == expected
+
+
+def test_tiling_controls_are_development_pair_only():
+    assert bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings"]).mxfp4_tilings
+    for argv in (["--mxfp4-tilings"], ["--mxfp4-pair", "--mxfp4-tilings", "--capacity", "4096"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(argv)
+
+
+def test_f32_errors_measure_unrounded_reference():
+    error = bench.f32_errors(torch.tensor([1., 3.]), torch.tensor([2., 5.]))
+    assert error == pytest.approx(dict(max_abs=2., rms=(2.5 ** .5)))
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_mxfp4_f32_oracle_has_explicit_quantization_boundaries(native):
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+    x = torch.full((1, 32), .25, dtype=torch.bfloat16)
+    ids, routing = torch.zeros((1, 1), dtype=torch.int32), torch.full((1, 1), .5)
+    weights = {name: torch.full((1, 32, 16), 0x22, dtype=torch.uint8) for name in ("w1", "w3", "w2")}
+    scales = {name: torch.full((1, 32, 1), 126, dtype=torch.uint8) for name in weights}
+    output = bench.mxfp4_f32_reference(x, ids, routing, weights, scales, 10. if native else 0., native=native)
+    gate = torch.full((1, 32), 4.)
+    if native:
+        act = (torch.nn.functional.silu(gate) * gate * .5).bfloat16()
+        _, act = wire_rows(act)
+        expected = act.float().sum() * .5
+    else:
+        act = (torch.nn.functional.silu(gate).bfloat16().float() * gate).bfloat16()
+        expected = act.float().sum() * .5 * .5
+    assert torch.equal(output, torch.full((1, 32), expected.item()))
+
+
 def test_capacity_is_independent_of_live_rows():
     args = bench.parse_args(["--capacity", "4096", "--rows", "512,2048,2752,4096"])
     assert args.capacity == 4096
