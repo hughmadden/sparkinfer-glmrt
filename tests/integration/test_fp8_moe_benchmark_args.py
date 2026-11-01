@@ -17,22 +17,17 @@ bench = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(bench)
 
 
-def test_v41_fc1_split_recipe_is_hardware_scoped():
+def test_v41_fc1_split_is_explicit_and_defaults_to_one():
     path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v41_slice_pipeline.py"
     tree = ast.parse(path.read_text())
-    nodes = [node for node in tree.body if isinstance(node, ast.Assign)
-             and any(isinstance(target, ast.Name) and target.id == "FC1_DECODE_K_SPLITS"
-                     for target in node.targets)]
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "fc1_decode_k_splits")
-    module = ast.Module(body=[*nodes, function], type_ignores=[])
-    namespace = {}
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    recipe = namespace["fc1_decode_k_splits"]
-    assert recipe(121, 5120, 384, 128, False, True) == 2
-    for shape in [(120, 5120, 384, 128, False, True), (121, 5120, 576, 128, True, True),
-                  (121, 5120, 384, 192, False, True), (121, 5120, 384, 128, False, False)]:
-        assert recipe(*shape) == 1
+    pipeline = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                    and node.name == "V41SlicePipeline")
+    init = next(node for node in pipeline.body if isinstance(node, ast.FunctionDef)
+                and node.name == "__init__")
+    defaults = dict(zip((arg.arg for arg in init.args.kwonlyargs), init.args.kw_defaults))
+    assert ast.literal_eval(defaults["fc1_k_splits"]) == 1
+    assert "get_sm_version" not in path.read_text()
+    assert "FC1_DECODE_K_SPLITS" not in path.read_text()
 
 
 def test_seed_oracle_control_does_not_inherit_default_split():

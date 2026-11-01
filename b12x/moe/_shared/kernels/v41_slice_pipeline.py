@@ -18,29 +18,15 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import (
 )
 
 
-# GB10 ordered decode winner; keep every decode capacity on one accumulation order.
-FC1_DECODE_K_SPLITS = {(121, 5120, 384, 128, False, True): 2}
-
-
-def fc1_decode_k_splits(sm, hidden, intermediate, width, exact_storage, scale_codes):
-    return FC1_DECODE_K_SPLITS.get((sm, hidden, intermediate, width, exact_storage, scale_codes), 1)
-
-
 class V41SlicePipeline:
     def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576,
                  hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False,
-                 fc1_k_splits=None):
+                 fc1_k_splits=1):
         self.capacity = capacity
         self.hidden = hidden
         self.atomic_tokens = atomic_tokens
         self.experts = experts
         self.topk = topk
-        if fc1_k_splits is None:
-            fc1_k_splits = 1
-            if capacity <= 80 and not atomic_tokens:
-                from b12x._lib.intrinsics import get_sm_version
-                fc1_k_splits = fc1_decode_k_splits(get_sm_version(), hidden, intermediate,
-                                                  width, exact_storage, scale_codes)
         if atomic_tokens and fc1_k_splits != 1:
             raise ValueError("FC1 K splits require ordered route output")
         self.plan = V41RoutePlan(capacity, experts, topk, route_metadata=not atomic_tokens)
