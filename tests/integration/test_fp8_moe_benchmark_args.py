@@ -16,6 +16,24 @@ bench = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(bench)
 
 
+def test_mxfp4_pair_widths_cover_all_worlds_without_padding():
+    assert bench.paired_widths(2304) == [288, 320, 352, 384, 448, 480, 576, 768, 1152]
+    assert bench.paired_widths(2048) == [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024]
+    assert bench.paired_widths(3072) == [384, 416, 448, 512, 608, 640, 768, 1024, 1536]
+    args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--geometry", "v41", "--widths", "448,480"])
+    assert args.native_slices and args.widths == "448,480"
+    with pytest.raises(ValueError):
+        bench.paired_widths(2048, "2080")
+
+
+@pytest.mark.parametrize("argv", [["--native-slices"], ["--widths", "448"],
+    ["--mxfp4-pair", "--widths", "33"], ["--mxfp4-pair", "--widths", "oops"],
+    ["--mxfp4-pair", "--input", "bf16"], ["--mxfp4-pair", "--profile-dir", "out"]])
+def test_invalid_pair_modes_fail_before_cuda(argv):
+    with pytest.raises(SystemExit):
+        bench.parse_args(argv)
+
+
 def test_capacity_is_independent_of_live_rows():
     args = bench.parse_args(["--capacity", "4096", "--rows", "512,2048,2752,4096"])
     assert args.capacity == 4096
