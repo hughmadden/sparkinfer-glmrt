@@ -16,16 +16,21 @@ def ingress_buffers(rows, hidden, fmt, seed=408):
     return x.cuda(), x.double(), signs
 
 
-def test_grouping_stable_packing_and_graph():
+@pytest.mark.parametrize("experts,topk,max_rows,group_rows", [
+    (7, 3, 64, 16), (256, 8, 64, 16), (288, 8, 64, 16),
+    (288, 8, 4096, 64), (512, 8, 4096, 64)])
+def test_grouping_stable_packing_and_graph(experts, topk, max_rows, group_rows):
     from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
 
-    experts, topk, capacity, rows = 7, 3, 64, 64
-    program = compile_exlr8_group_aot(experts=experts, top_k=topk, max_groups=capacity, hidden=128)
+    rows = max_rows
+    capacity = (rows * topk + group_rows - 1) // group_rows + experts
+    program = compile_exlr8_group_aot(experts=experts, top_k=topk, max_groups=capacity,
+                                      hidden=128, max_rows=max_rows, group_rows=group_rows)
     x, _, signs = ingress_buffers(rows, 128, "fp8_k32")
     activation = torch.empty((rows, 128), dtype=torch.float16, device="cuda")
     ids = torch.empty((rows, topk), dtype=torch.int32, device="cuda")
     groups = torch.full((capacity,), -99, dtype=torch.int32, device="cuda")
-    slots = torch.full((capacity, 16), -99, dtype=torch.int32, device="cuda")
+    slots = torch.full((capacity, group_rows), -99, dtype=torch.int32, device="cuda")
     inverse = torch.full_like(ids, -99)
     count = torch.empty(1, dtype=torch.int32, device="cuda")
 
@@ -37,13 +42,13 @@ def test_grouping_stable_packing_and_graph():
         expected_inverse = torch.full((live * topk,), -1, dtype=torch.int32)
         for expert in range(experts):
             routes = (host[:live].flatten() == expert).nonzero().flatten().tolist()
-            for start in range(0, len(routes), 16):
-                chunk = routes[start:start + 16]
+            for start in range(0, len(routes), group_rows):
+                chunk = routes[start:start + group_rows]
                 group = len(expected_groups)
                 expected_groups.append(expert)
-                expected_slots.append(chunk + [-1] * (16 - len(chunk)))
+                expected_slots.append(chunk + [-1] * (group_rows - len(chunk)))
                 for lane, route in enumerate(chunk):
-                    expected_inverse[route] = group * 16 + lane
+                    expected_inverse[route] = group * group_rows + lane
         n = len(expected_groups)
         assert count.item() == n
         assert torch.equal(groups[:n].cpu(), torch.tensor(expected_groups, dtype=torch.int32))
@@ -52,7 +57,7 @@ def test_grouping_stable_packing_and_graph():
 
     host = torch.arange(rows * topk, dtype=torch.int32).reshape(rows, topk) % experts
     ids.copy_(host)
-    for live in (1, 2, 16, 63, 64):
+    for live in (1, 2, 16, 63, 64, rows):
         inverse.fill_(-99)
         launch(live)
         check(host, live)
@@ -62,7 +67,7 @@ def test_grouping_stable_packing_and_graph():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch()
-    for mode in range(3):
+    for mode in (0, 1, experts - 1):
         host = (torch.arange(rows * topk).reshape(rows, topk) * mode + mode).remainder(experts).int()
         ids.copy_(host)
         graph.replay()
@@ -143,7 +148,7 @@ def test_ingress_reference_rows_ctas_and_graph(hidden, fmt):
 
 
 @pytest.mark.parametrize("kind,kwargs", [
-    ("group", {"experts": 257}), ("group", {"top_k": 0}),
+    ("group", {"experts": 513}), ("group", {"top_k": 0}),
     ("group", {"max_groups": 2**31}), ("group", {"experts": True}),
     ("group", {"hidden": 129}), ("group", {"hidden": 2**30}),
     ("group", {"input_format": "e4m3"}), ("group", {"shared_expert": True}),

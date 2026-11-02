@@ -551,6 +551,93 @@ def audit_main(args):
         torch.cuda.empty_cache()
 
 
+def grouping_main(args):
+    """Qualify and time grouping/ingress without expert weight allocation."""
+    from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
+    from benchmark_exlr8_a16 import capture, make_wire
+
+    props = torch.cuda.get_device_properties(0)
+    report = dict(gpu=str(props), hidden=args.hidden, top_k=args.top_k,
+                  source_commit=args.source_commit, cases=[])
+    for rows in map(int, args.rows.split(",")):
+        if not 1 <= rows <= 4096:
+            raise ValueError("grouping rows must be in 1..4096")
+        planned, group_rows = (64, 16) if rows <= 64 else (4096, 64)
+        for distribution in ("uniform", "skewed"):
+            arms = {}
+            for experts in (256, 288):
+                generator = torch.Generator().manual_seed(args.seed + rows)
+                # Weighted sampling without replacement keeps top-k IDs distinct.
+                probability = torch.ones(experts)
+                if distribution == "skewed":
+                    probability[-32:] = 16
+                ids = torch.multinomial(probability.expand(rows, -1), args.top_k,
+                                        replacement=False, generator=generator).int()
+                # Always exercise the upper IDs, including expert287.
+                ids[0] = torch.arange(experts - args.top_k, experts)
+                capacity = (planned * args.top_k + group_rows - 1) // group_rows + experts
+                program = compile_exlr8_group_aot(experts=experts, hidden=args.hidden,
+                    top_k=args.top_k, max_groups=capacity, max_rows=planned, group_rows=group_rows)
+                x = make_wire(torch.randn((rows, args.hidden), device="cuda"))
+                signs = torch.ones(args.hidden, dtype=torch.int8, device="cuda")
+                tables = [torch.full((capacity,), -99, dtype=torch.int32, device="cuda"),
+                          torch.full((capacity, group_rows), -99, dtype=torch.int32, device="cuda"),
+                          torch.full_like(ids, -99, device="cuda"),
+                          torch.empty(1, dtype=torch.int32, device="cuda")]
+                activation = torch.full((rows + 1, args.hidden), float("nan"),
+                                        dtype=torch.float16, device="cuda")
+                device_ids = ids.cuda()
+                def launch(p=program, routes=device_ids, wire=x, sign=signs,
+                           metadata=tables, output=activation):
+                    p.launch(routes, wire, sign, *metadata, output,
+                             scalars=(rows, args.cta_limit or props.multi_processor_count * 4))
+                launch()
+                expected_experts, expected_slots = [], []
+                inverse = torch.full((rows * args.top_k,), -1, dtype=torch.int32)
+                for expert in range(experts):
+                    hits = (ids.flatten() == expert).nonzero().flatten().tolist()
+                    for first in range(0, len(hits), group_rows):
+                        chunk = hits[first:first + group_rows]
+                        base = len(expected_experts) * group_rows
+                        expected_experts.append(expert)
+                        expected_slots.append(chunk + [-1] * (group_rows - len(chunk)))
+                        inverse[chunk] = torch.arange(base, base + len(chunk), dtype=torch.int32)
+                count = len(expected_experts)
+                assert tables[-1].item() == count
+                assert torch.equal(tables[0][:count].cpu(), torch.tensor(expected_experts, dtype=torch.int32))
+                assert torch.equal(tables[1][:count].cpu(), torch.tensor(expected_slots, dtype=torch.int32))
+                assert torch.equal(tables[2].cpu().flatten(), inverse)
+                assert torch.isfinite(activation[:rows]).all() and torch.isnan(activation[rows:]).all()
+                frozen = [t.clone() for t in tables] + [activation[:rows].clone()]
+                graph = capture(launch)
+                graph.replay()
+                for actual, expected in zip(tables + [activation[:rows]], frozen):
+                    assert torch.equal(actual, expected)
+                arms[experts] = dict(graph=graph, owners=(program, device_ids, x, signs, tables, activation),
+                                     active_experts=int(ids.unique().numel()), groups=count, samples=[])
+            for repeat in range(args.repeats):
+                for experts in ((256, 288) if repeat % 2 == 0 else (288, 256)):
+                    graph = arms[experts]["graph"]
+                    for _ in range(args.warmup):
+                        graph.replay()
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    for _ in range(args.iters):
+                        graph.replay()
+                    end.record()
+                    end.synchronize()
+                    arms[experts]["samples"].append(start.elapsed_time(end) * 1000 / args.iters)
+            case = dict(rows=rows, distribution=distribution, correctness="stable packing + graph replay",
+                        arms={str(e): dict(samples_us=a["samples"], us=statistics.median(a["samples"]),
+                            us_per_expert=statistics.median(a["samples"]) / e,
+                            active_experts=a["active_experts"], groups=a["groups"]) for e, a in arms.items()})
+            case["normalized_288_over_256"] = case["arms"]["288"]["us_per_expert"] / case["arms"]["256"]["us_per_expert"]
+            report["cases"].append(case)
+            print(json.dumps(case), flush=True)
+    if args.json_output:
+        Path(args.json_output).write_text(json.dumps(report, indent=2) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hidden", type=int, default=6144)
@@ -569,6 +656,7 @@ def main():
     ap.add_argument("--cta-limit", type=int, default=0)
     ap.add_argument("--l2-cap-mib", type=float, help="cap the queried runtime L2 budget (MiB)")
     ap.add_argument("--dump", default=None, help="save the output rows here for a bitwise arm comparison")
+    ap.add_argument("--grouping-only", action="store_true", help="qualify/time 256 vs 288 expert grouping and ingress")
     ap.add_argument("--audit", action="store_true", help="graph-first real-manifest TP2 existing-kernel audit")
     ap.add_argument("--manifest", help="actual EXLR8 width manifest, never synthetic cyclic tiers")
     ap.add_argument("--reference-core", help="frozen grouped source PATH@git-blob-SHA; current/current_control use it")
@@ -588,6 +676,8 @@ def main():
     args.iters = args.iters if args.iters is not None else (20 if args.audit else 10)
     args.repeats = args.repeats if args.repeats is not None else (7 if args.audit else 3)
 
+    if args.grouping_only:
+        return grouping_main(args)
     if args.audit or args.engine_aot:
         return audit_main(args)
 
