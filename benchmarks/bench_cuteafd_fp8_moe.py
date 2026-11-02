@@ -499,9 +499,8 @@ def paired_widths(intermediate, requested=None, policy_root=None):
 def shipped_prefill_recipe(family, hidden, rank_width, capacity, policy_root):
     policy = engine_layout_policy(policy_root)
     matching = 128 if family == "dsv4f" else native_slice_width(family, rank_width)
-    # Equal V4 roles pass atomic-min-capacity; unequal width exports do not.
-    atomic_widths = {"dsv4f": (256, 512, 1024),
-                     "dsv4p": (384, 512, 768, 1024, 1536)}
+    # Only equal Pro roles pass atomic-min-capacity; Flash stays ordered.
+    atomic_widths = {"dsv4p": (384, 512, 768, 1024, 1536)}
     return dict(tile=policy.native_slice_width(hidden, rank_width, 121, capacity, matching),
                 exact=policy.stored_width(hidden, rank_width) == rank_width,
                 atomic=capacity >= 256 and rank_width in atomic_widths.get(family, ()),
@@ -859,7 +858,7 @@ def shipped_stream_screen(g, args):
             routing /= routing.sum(-1, keepdim=True)
             if sm == 120:
                 recipe = dict(tile=192 if g.name == "v41" else 128, exact=True,
-                              atomic=g.name == "dsv4f", coded=g.name == "v41")
+                              atomic=False, coded=g.name == "v41")
             else:
                 recipe = shipped_prefill_recipe(g.name, g.hidden, width, capacity, args.engine_policy_root)
             runs, outputs, keepalive, qualifications = {}, {}, [], {}
