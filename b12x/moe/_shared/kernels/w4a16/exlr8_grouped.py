@@ -64,7 +64,7 @@ assert _FC1_PRODUCER_REGS + 2 * _FC1_CONSUMER_REGS == _FC1_CTA_MAX_REGS, (
 )
 _FC1_TILE_STAGES = 4
 _FC1_HEADER_WORDS = 8
-from .exlr8 import Exlr8A16Kernel, _e4m3_round_half2, _side_value, signed_byte, store_bf16x4
+from .exlr8 import Exlr8A16Kernel, exlr8_clamp_swiglu, _e4m3_round_half2, _side_value, signed_byte, store_bf16x4
 
 
 @dsl_user_op
@@ -923,8 +923,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64,
-                 activations: str = "a16", quantize_pass: bool = True, fc2_f32: bool | None = None):
-        super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True)
+                 activations: str = "a16", quantize_pass: bool = True, fc2_f32: bool | None = None, swiglu_limit: float = 0):
+        super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True,
+                         swiglu_limit=swiglu_limit)
         if activations not in ("a16", "a8"):
             raise ValueError("EXLR8 grouped activations must be 'a16' or 'a8'")
         self.activations = activations
@@ -1031,11 +1032,13 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             return ("exlr8_a8_grouped", self.A8_CODE_VERSION, self.hidden_size, self.units,
                     self.top_k, self.max_groups, self.group_rows, self.CTAS_PER_SM,
                     self.FC2_WS, self.REDUCE_MLP, self.FC2_HALF, self.FC2_STAGES,
-                    self.fc1_ws, self.FC1_STAGES, self.quantize_pass)
+                    self.fc1_ws, self.FC1_STAGES, self.quantize_pass) + (
+                        ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
         return ("exlr8_a16_grouped", self.CODE_VERSION, self.hidden_size, self.units,
                 self.top_k, self.max_groups, self.group_rows, self.CTAS_PER_SM,
                 self.FC2_WS, self.REDUCE_MLP, self.FC2_HALF, self.FC2_STAGES,
-                self.fc1_ws, self.FC1_STAGES)
+                self.fc1_ws, self.FC1_STAGES) + (
+                    ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
 
     @cute.jit
     def quantize_a_k128_row(self, c: Int32, src_addr: Int64, valid: Int32):
@@ -2685,6 +2688,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 for v in cutlass.range_constexpr(4):
                                     gate = gh[v] * gs_val[v]
                                     up = uh[v] * us_val[v]
+                                    if cutlass.const_expr(self.swiglu_limit > 0):
+                                        gate, up = exlr8_clamp_swiglu(gate, up, self.swiglu_limit)
                                     sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math))
                                     g[v] = gate * sigmoid * up * ds_val[v]
                                 h0, h1, h2, h3 = _w4a8_had128_quad(g[0], g[1], g[2], g[3], lane)

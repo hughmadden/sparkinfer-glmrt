@@ -21,6 +21,8 @@ from cutlass._mlir.dialects import llvm
 
 from b12x._lib.intrinsics import (
     create_l2_evict_first_policy,
+    fmax_f32,
+    fmin_f32,
     f16_mma_m16n8k16_f32,
     half2_to_float2_scaled,
     ld_global_b16,
@@ -125,6 +127,15 @@ def _side_value(address: Int64, index: Int32):
     return lo
 
 
+@cute.jit
+def exlr8_clamp_swiglu(gate: Float32, up: Float32, limit: cutlass.Constexpr):
+    # Flash caps only the positive gate tail, but both tails of up.
+    if cutlass.const_expr(limit > 0):
+        gate = fmin_f32(gate, Float32(limit))
+        up = fmax_f32(fmin_f32(up, Float32(limit)), Float32(-limit))
+    return gate, up
+
+
 class Exlr8A16Kernel:
     ABI_VERSION = 3
     CODE_VERSION = 9
@@ -135,7 +146,8 @@ class Exlr8A16Kernel:
     CTAS_PER_SM = 4
 
     def __init__(self, hidden_size: int, units_per_expert: int, top_k: int,
-                 max_groups: int, fast_math: bool = True, device_count: bool = False):
+                 max_groups: int, fast_math: bool = True, device_count: bool = False,
+                 swiglu_limit: float = 0):
         if hidden_size <= 0 or hidden_size % 128:
             raise ValueError("EXLR8 hidden_size must be a positive multiple of 128")
         if min(units_per_expert, top_k, max_groups) < 1:
@@ -144,6 +156,9 @@ class Exlr8A16Kernel:
         self.units = int(units_per_expert)
         self.top_k = int(top_k)
         self.max_groups = int(max_groups)
+        if not 0 <= swiglu_limit < float("inf"):
+            raise ValueError("EXLR8 swiglu_limit must be finite and nonnegative")
+        self.swiglu_limit = float(swiglu_limit)
         self.fast_math = bool(fast_math)
         self.device_count = bool(device_count)
         self.group_rows = 16
@@ -153,7 +168,8 @@ class Exlr8A16Kernel:
     @property
     def __cache_key__(self):
         return ("exlr8_a16", self.ABI_VERSION, self.CODE_VERSION, self.hidden_size, self.units,
-                self.top_k, self.max_groups, self.fast_math, self.device_count)
+                self.top_k, self.max_groups, self.fast_math, self.device_count) + (
+                    ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
 
     @cute.jit
     def __call__(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -358,6 +374,8 @@ class Exlr8A16Kernel:
                         col = lane * Int32(4) + Int32(v)
                         gate = gh[v] * _side_value(gs, col)
                         up = uh[v] * _side_value(us, col)
+                        if cutlass.const_expr(self.swiglu_limit > 0):
+                            gate, up = exlr8_clamp_swiglu(gate, up, self.swiglu_limit)
                         sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math))
                         g[v] = gate * sigmoid * up * _side_value(ds, col)
                     g[0], g[1], g[2], g[3] = _w4a8_had128_quad(g[0], g[1], g[2], g[3], lane)
@@ -590,7 +608,8 @@ class Exlr8A16CompactKernel(Exlr8A16Kernel):
     @property
     def __cache_key__(self):
         return ("exlr8_a16_compact", self.ABI_VERSION, self.CODE_VERSION, self.hidden_size,
-                self.units, self.top_k, self.max_groups, self.fast_math, self.device_count)
+                self.units, self.top_k, self.max_groups, self.fast_math, self.device_count) + (
+                    ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
 
     @cute.jit
     def serving_compact(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -728,6 +747,8 @@ class Exlr8A16CompactKernel(Exlr8A16Kernel):
                             col = lane * Int32(4) + Int32(v)
                             gate = gh[v] * _side_value(gs, col)
                             up = uh[v] * _side_value(us, col)
+                            if cutlass.const_expr(self.swiglu_limit > 0):
+                                gate, up = exlr8_clamp_swiglu(gate, up, self.swiglu_limit)
                             sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math))
                             g[v] = gate * sigmoid * up * _side_value(ds, col)
                         g[0], g[1], g[2], g[3] = _w4a8_had128_quad(g[0], g[1], g[2], g[3], lane)
@@ -892,6 +913,7 @@ class Exlr8RoutedServingKernel:
         max_groups: int,
         fast_math: bool = True,
         variant: str = "k1_k23_coalesced",
+        swiglu_limit: float = 0,
     ):
         if hidden_size <= 0 or hidden_size % 128:
             raise ValueError("EXLR8 hidden_size must be a positive multiple of 128")
@@ -903,6 +925,9 @@ class Exlr8RoutedServingKernel:
         self.units = int(units_per_expert)
         self.top_k = int(top_k)
         self.max_groups = int(max_groups)
+        if not 0 <= swiglu_limit < float("inf"):
+            raise ValueError("EXLR8 swiglu_limit must be finite and nonnegative")
+        self.swiglu_limit = float(swiglu_limit)
         self.fast_math = bool(fast_math)
         self.variant = str(variant)
         self.k23_coalesced = variant == "k1_k23_coalesced"
@@ -923,7 +948,7 @@ class Exlr8RoutedServingKernel:
             self.max_groups,
             self.fast_math,
             self.variant,
-        )
+        ) + (("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
 
     @cute.jit
     def serving(
@@ -1469,6 +1494,8 @@ class Exlr8RoutedServingKernel:
                             for v in cutlass.range_constexpr(4):
                                 gate = gh[v] * gs_val[v]
                                 up = uh[v] * us_val[v]
+                                if cutlass.const_expr(self.swiglu_limit > 0):
+                                    gate, up = exlr8_clamp_swiglu(gate, up, self.swiglu_limit)
                                 sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math))
                                 g_acc[v] = gate * sigmoid * up * ds_val[v]
                             h0, h1, h2, h3 = _w4a8_had128_quad(g_acc[0], g_acc[1], g_acc[2], g_acc[3], lane)
