@@ -193,6 +193,55 @@ def test_glm_tp2_int4_native_slices(full_k, full_n, side):
         del graph
 
 
+@pytest.mark.parametrize("k,n,side", [
+    (4096, 32, 1), (4096, 64, 1),  # beta, TP2 and TP1
+    (4096, 128, 1), (4096, 128, 2),  # f_a/g_a
+    (128, 4096, 1), (128, 8192, 1),  # f_b/g_b, TP2 and TP1
+])
+def test_flash_mxfp8_a16_exact_shapes(k, n, side):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    capacity = 129
+    c = Case("mxfp8", side, k=k, n=n, rows=capacity)
+    # NativeTileLinear owns no padded resident weights or partial-result storage.
+    assert c.payload.numel() == k*n
+    assert c.scales.numel() == n*k//32
+    c.partial = torch.full((1,), float("nan"), device="cuda")
+    guarded = torch.full((capacity*n+64,), float("nan"), device="cuda")
+    c.output = guarded[32:-32].view(capacity, n)
+    immutable = [v.clone() for v in (c.x, c.payload, c.scales)]
+    pointers = [v.data_ptr() for v in (c.x, c.payload, c.scales, c.partial, c.output)]
+    limit = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count*4
+    c.launch(capacity, limit)
+    expected = c.output.clone()
+    ref = c.x.double() @ c.weight.double().T
+    baseline = (c.x @ c.weight.bfloat16().T).double()
+    assert torch.isfinite(expected).all() and torch.count_nonzero(expected) > 0
+    assert torch.linalg.vector_norm(expected.double()-ref) <= 1.01*torch.linalg.vector_norm(baseline-ref)
+    torch.cuda.synchronize()
+    with kernel_resolution_guard("Flash MXFP8 A16 shapes are precompiled"):
+        for rows in (1, 2, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129):
+            for ctas in (1, limit):
+                guarded.fill_(float("nan"))
+                c.launch(rows, ctas)
+                assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
+                assert torch.isnan(c.output[rows:]).all()
+                assert torch.isnan(guarded[:32]).all() and torch.isnan(guarded[-32:]).all()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            c.launch(17, limit)
+        for _ in range(3):
+            guarded.fill_(float("nan"))
+            graph.replay()
+            assert torch.equal(c.output[:17].view(torch.int32), expected[:17].view(torch.int32))
+            assert torch.isnan(c.output[17:]).all()
+            assert torch.isnan(guarded[:32]).all() and torch.isnan(guarded[-32:]).all()
+    assert torch.isnan(c.partial).all()
+    for value, before in zip((c.x, c.payload, c.scales), immutable):
+        assert torch.equal(value, before)
+    assert [v.data_ptr() for v in (c.x, c.payload, c.scales, c.partial, c.output)] == pointers
+
+
 def test_fp8_embedding_gather():
     from b12x.integration.cuteafd.fp8_row_embedding import compile_fp8_row_embedding_aot
     torch.manual_seed(408)

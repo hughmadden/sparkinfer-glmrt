@@ -16,15 +16,21 @@ def _cuda():
 
 @pytest.mark.parametrize("rows,decode", [(1, True), (16, True), (64, True), (129, False)])
 @pytest.mark.parametrize("heads", [32, 64])
-def test_flash_kda_core_bitwise(rows, decode, heads):
+@pytest.mark.parametrize("fully_projected", [False, True])
+def test_flash_kda_core_bitwise(rows, decode, heads, fully_projected):
     from b12x.integration.cuteafd._common import GLM53_FLASH
-    from b12x.integration.cuteafd.glmf import compile_glmf_kda_aot
-    from b12x.integration.cuteafd.glmf_split import compile_glmf_kda_core_aot
+    from b12x.integration.cuteafd.glmf import compile_glmf_kda_aot, compile_glmf_kda_commit_aot
+    from b12x.integration.cuteafd.glmf_split import (compile_glmf_kda_core_aot,
+                                                   compile_glmf_projected_kda_aot)
+    from b12x.integration.cuteafd._glm_kernels import BatchedBf16Gemm
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd._glmf_kernels import kda_replay_layout
     g = replace(GLM53_FLASH, kda_heads=heads)
     cap, d, h, p = max(64, rows), g.kda_width, g.hidden, g.kda_in_width
     fused = compile_glmf_kda_aot(g, max_rows=cap, decode=decode, output_kind="norm")
-    split = compile_glmf_kda_core_aot(g, max_rows=cap, decode=decode)
+    split = (compile_glmf_projected_kda_aot if fully_projected else
+             compile_glmf_kda_core_aot)(g, max_rows=cap, decode=decode)
     x, w = rand(rows, h), rand(p, h)
     wf, cw = rand(2, d, 128), rand(3*d, 4, dtype=torch.float32)
     al, dt, norm = rand(heads, dtype=torch.float32), rand(d, dtype=torch.float32), rand(128, scale=1)
@@ -32,6 +38,19 @@ def test_flash_kda_core_bitwise(rows, decode, heads):
     projection(p, h).launch(x, w, proj, scalars=(rows,))
     q, k, v = [proj[:, i*d:(i+1)*d].contiguous() for i in range(3)]
     fab = w[3*d:].contiguous()
+    if fully_projected:
+        # Use the identical BF16 second GEMMs, isolating the new pack/state seam.
+        aux = proj[:, 3*d:].contiguous()
+        fg = empty(rows, 2*d)
+        fg_program = compile_program(BatchedBf16Gemm(n=d, k=128, batch=2,
+            a_row=256+heads, a_batch=128, o_row=2*d, o_batch=d),
+            name="flash_projected_test_fg",
+            operands=tuple(Operand(name, torch.bfloat16, "[]", role)
+                for name, role in (("a", "in"), ("w", "in"), ("out", "out"))),
+            scalars=(Scalar("rows"),), key=(g,))
+        fg_program.launch(aux, wf, fg, scalars=(rows,))
+        decay, gate = fg[:, :d].contiguous(), fg[:, d:].contiguous()
+        beta = aux[:, 256:].contiguous()
     wo = empty(h, d)
     state0, conv0 = rand(2, heads, 128, 128, dtype=torch.float32), rand(2, 3, 3*d)
     slots = torch.zeros(rows, dtype=torch.int32, device="cuda")
@@ -53,18 +72,31 @@ def test_flash_kda_core_bitwise(rows, decode, heads):
             fused.launch(*args, rr, fs, scalars=(rows, spec))
         else:
             fused.launch(*args, fs, scalars=(rows,))
-        split.launch(x, q, k, v, q, fab, wf, cw, al, dt, norm, conv, state,
-            slots, first, out, replay, ss, scalars=(rows, spec))
+        if fully_projected:
+            split.launch(q, k, v, decay, gate, beta, cw, al, dt, norm, conv, state,
+                slots, first, out, replay, ss, scalars=(rows, spec))
+        else:
+            split.launch(x, q, k, v, q, fab, wf, cw, al, dt, norm, conv, state,
+                slots, first, out, replay, ss, scalars=(rows, spec))
     for spec in ((0, 1) if decode else (0,)):
         run(spec)
         same(out, ref); same(state, sr); same(conv, cr)
         if spec:
             same(replay, rr)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run(0)
-    graph.replay(); graph.replay()
+            same(state, state0); same(conv, conv0)
+            commit = compile_glmf_kda_commit_aot(g)
+            tables = torch.tensor([[0], [0], [max(1, rows//3)]], device="cuda", dtype=torch.int32)
+            commit.launch(state, conv, replay, tables, scalars=(1, 1, 1))
+            commit.launch(sr, cr, rr, tables, scalars=(1, 1, 1))
+            same(state, sr); same(conv, cr)
+    pointers = [t.data_ptr() for t in (state, conv, replay, out, ss)]
+    with kernel_resolution_guard("Flash KDA seams are precompiled"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(0)
+        graph.replay(); graph.replay()
     same(out, ref); same(state, sr); same(conv, cr)
+    assert [t.data_ptr() for t in (state, conv, replay, out, ss)] == pointers
     assert torch.isfinite(out).all() and torch.count_nonzero(out) > 0
 
 
@@ -112,6 +144,63 @@ def test_flash_mla_stages_bitwise(rows, heads):
         run()
     graph.replay(); graph.replay()
     same(cache, cref); same(query, ref); same(out, oref)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("stage", ["absorb", "values"])
+@pytest.mark.parametrize("mode,rows", [("decode", 1), ("decode", 17), ("decode", 64),
+                                       ("prefill", 129)])
+def test_flash_native_fp8_mla_oracle(heads, stage, mode, rows):
+    from b12x.integration.cuteafd._common import GLM53_FLASH
+    from b12x.integration.cuteafd.glmf_split import (compile_glmf_fp8_stage_aot,
+                                                   compile_glmf_stage_aot)
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    g = replace(GLM53_FLASH, heads=heads)
+    cap = max(64, rows)
+    n, k = (512, 256) if stage == "absorb" else (256, 512)
+    native = compile_glmf_fp8_stage_aot(g, stage=stage, mode=mode, max_rows=cap)
+    bf16 = compile_glmf_stage_aot(g, stage=stage, max_rows=cap)
+    a = rand(cap, heads, k, scale=.2)
+    packed = rand(heads, n, k, scale=.2).to(torch.float8_e4m3fn)
+    scales = torch.exp2(torch.randint(-3, 2, (heads, n, k//64), device="cuda").float())
+    weight = (packed.float()*scales.repeat_interleave(64, dim=-1)).bfloat16()
+    guarded = torch.full((cap*heads*n+64,), float("nan"), device="cuda", dtype=torch.bfloat16)
+    out = guarded[32:-32].view(cap, heads, n)
+    expected = empty(cap, heads, n)
+    immutable = [t.view(torch.uint8).clone() for t in (a, packed, scales)]
+    pointers = [t.data_ptr() for t in (a, packed, scales, out)]
+
+    def run(live):
+        native.launch(a, packed, scales, out, scalars=(live,))
+
+    bf16.launch(a, weight, expected, scalars=(rows,))
+    run(rows)
+    same(out[:rows], expected[:rows])
+    oracle = torch.einsum("rhk,hnk->rhn", a[:rows].double(), weight.double())
+    torch.testing.assert_close(out[:rows].double(), oracle, rtol=.005, atol=.005)
+    assert torch.isfinite(out[:rows]).all() and torch.count_nonzero(out[:rows]) > 0
+    saved = out[:rows].clone()
+    torch.cuda.synchronize()
+    with kernel_resolution_guard("Flash native FP8 MLA is precompiled"):
+        for live in sorted({1, min(rows, 16), min(rows, 17), rows}):
+            guarded.fill_(float("nan"))
+            run(live)
+            same(out[:live], saved[:live])
+            assert torch.isnan(out[live:]).all()
+            assert torch.isnan(guarded[:32]).all() and torch.isnan(guarded[-32:]).all()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(rows)
+        for _ in range(3):
+            guarded.fill_(float("nan"))
+            graph.replay()
+            same(out[:rows], saved)
+            assert torch.isnan(out[rows:]).all()
+            assert torch.isnan(guarded[:32]).all() and torch.isnan(guarded[-32:]).all()
+    for value, before in zip((a, packed, scales), immutable):
+        assert torch.equal(value.view(torch.uint8), before)
+    assert [t.data_ptr() for t in (a, packed, scales, out)] == pointers
 
 
 @pytest.mark.parametrize("inter", [1024, 2048, 6144, 12288])

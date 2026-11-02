@@ -13,13 +13,13 @@ import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Int32, Int64
 
-from ._common import Operand, Scalar, compile_program
+from ._common import GLMFGeometry, Operand, Scalar, compile_program
 from ._glm_kernels import BatchedBf16Gemm, glm_projection
 from ._glmf_kernels import kda_replay_layout
 from ._kda_contract import KDAGeometry, kda_layout
 from ._qwen4_attention_kernels import Qwen4GateMul
 from .glmf import (_Kda, _check_rows, _kda_state, _ptr, _state_geometry,
-                   _replay_geometry, kda_scratch_bytes)
+                   _replay_geometry, _align_i64, kda_scratch_bytes)
 from .kimi_mla import KimiMlaGeometry, _RankNormPack, _QueryTail, _align
 
 
@@ -145,6 +145,122 @@ def compile_kda_core_aot(g, *, max_rows=64, decode=True, state_dtype="float32",
         scratch={"scratch": lambda rows: launch.fab_offset + _align(rows * launch.aux_width * 2)},
         geometry={**vars(g), "max_rows": max_rows, "decode": decode, "output_kind": "norm",
                   "fab_offset": launch.fab_offset, **_state_geometry(state_dtype, state_rounding),
+                  **_replay_geometry(launch.core)})
+
+
+class _NoAuxProjection:
+    @cute.jit
+    def __call__(self, a: cute.Pointer, w: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        pass
+
+
+class _ProjectedKdaPack:
+    def __init__(self, g):
+        layout = kda_layout(g)
+        self.d, self.p, self.heads = g.kda_width, g.kda_in_width, g.kda_heads
+        self.fg_stride, self.beta_offset = layout["fg_stride"], layout["beta_offset"]
+        self.gate_offset, self.full = layout["gate_offset"], layout["full_rank_gate"]
+
+    @cute.jit
+    def __call__(self, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
+                 decay: cute.Pointer, gate: cute.Pointer, beta: cute.Pointer,
+                 proj: cute.Pointer, fg: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.kernel(q, k, v, decay, gate, beta, proj, fg).launch(
+            grid=((self.p + 255) // 256, rows, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
+               decay: cute.Pointer, gate: cute.Pointer, beta: cute.Pointer,
+               proj: cute.Pointer, fg: cute.Pointer):
+        col = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
+        row, d = Int64(cute.arch.block_idx()[1]), Int64(self.d)
+        if col < Int64(self.p):
+            value = BFloat16(0)
+            if col < d:
+                value = q[row * d + col]
+            elif col < Int64(2) * d:
+                value = k[row * d + col - d]
+            elif col < Int64(3) * d:
+                value = v[row * d + col - Int64(2) * d]
+            elif col >= Int64(self.beta_offset):
+                value = beta[row * Int64(self.heads) + col - Int64(self.beta_offset)]
+            else:
+                if cutlass.const_expr(self.full):
+                    if col >= Int64(self.gate_offset):
+                        value = gate[row * d + col - Int64(self.gate_offset)]
+            proj[row * Int64(self.p) + col] = value
+        if col < Int64(self.fg_stride):
+            value = BFloat16(0)
+            if col < d:
+                value = decay[row * d + col]
+            else:
+                value = gate[row * d + col - d]
+            fg[row * Int64(self.fg_stride) + col] = value
+
+
+class _ProjectedKdaCore:
+    def __init__(self, g, max_rows, decode, state_dtype, state_rounding):
+        self.core = _Kda(g, max_rows, state_dtype=state_dtype,
+                         state_rounding=state_rounding, decode=decode)
+        self.core.in_proj = _NoProjection()
+        self.core.fg = _NoAuxProjection()
+        self.core.output_norm = True
+        self.pack = _ProjectedKdaPack(g)
+        self.p = g.kda_in_width
+
+    @cute.jit
+    def __call__(self, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
+                 decay: cute.Pointer, gate: cute.Pointer, beta: cute.Pointer,
+                 conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer,
+                 o_norm: cute.Pointer, conv_state: cute.Pointer, state: cute.Pointer,
+                 slots: cute.Pointer, seq_first: cute.Pointer, out: cute.Pointer,
+                 replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, spec: Int32,
+                 stream: cuda.CUstream):
+        base = Int64(scratch.toint())
+        fg = _ptr(BFloat16, base + _align_i64(Int64(rows) * Int64(self.p * 2)))
+        self.pack(q, k, v, decay, gate, beta, cute.recast_ptr(scratch, dtype=BFloat16), fg, rows, stream)
+        # Projection pointers are unused: only the original state/norm body runs.
+        self.core.body(q, q, q, q, q, conv_w, a_log, dt_bias, o_norm,
+            q, q, q, conv_state, state, slots, seq_first, out, replay, scratch,
+            rows, Int32(0), spec, stream)
+
+
+def compile_projected_kda_core_aot(g, *, max_rows=64, decode=True,
+                                  state_dtype="float32", state_rounding="window"):
+    """All six inputs are projected BF16 rows; no resident projection weights.
+
+    decay=f_b(f_a(x)), gate=g_b(g_a(x)) (or the full-rank gate), beta=b(x).
+    The caller owns their native GEMMs and rounding; this stage preserves the
+    geometry's conv, recurrent/chunked, beta rounding, norm and replay rules.
+    """
+    if not isinstance(g, (KDAGeometry, GLMFGeometry)):
+        raise ValueError("projected KDA requires KDAGeometry or GLMFGeometry")
+    max_rows = _check_rows(max_rows)
+    state_torch = _kda_state(state_dtype, state_rounding)[1]
+    launch = _ProjectedKdaCore(g, max_rows, decode, state_dtype, state_rounding)
+    d, heads = g.kda_width, g.kda_heads
+    operands = (
+        *(Operand(n, torch.bfloat16, f"[rows,{d}]") for n in ("q", "k", "v", "decay", "gate")),
+        Operand("beta", torch.bfloat16, f"[rows,{heads}]"),
+        Operand("conv_w", torch.float32, f"[{3 * d},4]", align=4),
+        Operand("a_log", torch.float32, f"[{heads}]", align=4),
+        Operand("dt_bias", torch.float32, f"[{d}]", align=4),
+        Operand("o_norm", getattr(torch, kda_layout(g)["o_norm_dtype"]), "[128]"),
+        Operand("conv_state", torch.bfloat16, f"[slots,3,{3 * d}]", "inout", align=2),
+        Operand("state", state_torch, f"[slots,{heads},128,128]", "inout"),
+        Operand("slots", torch.int32, "[rows]", align=4),
+        Operand("seq_first", torch.int32, "[rows]", align=4),
+        Operand("out", torch.bfloat16, f"[rows,{d}]", "out"),
+        Operand("replay", torch.float32,
+                f"[{kda_replay_layout(heads, 3 * d, launch.core.replay_rows)[2] // 4}]", "inout"),
+        Operand("scratch", torch.uint8, "[projected_kda_scratch_bytes]", "scratch"))
+    return compile_program(launch, name="projected_kda_core", operands=operands,
+        scalars=(Scalar("rows"), Scalar("spec")),
+        key=(g, max_rows, decode, state_dtype, state_rounding),
+        scratch={"scratch": lambda rows: kda_scratch_bytes(g, rows, launch.core.chunked_bytes)},
+        geometry={**vars(g), "max_rows": max_rows, "decode": decode, "output_kind": "norm",
+                  "projected_inputs": True, **_state_geometry(state_dtype, state_rounding),
                   **_replay_geometry(launch.core)})
 
 
