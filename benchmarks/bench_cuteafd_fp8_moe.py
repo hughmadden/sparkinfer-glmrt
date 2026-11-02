@@ -159,6 +159,7 @@ def parse_args(argv=None):
                         help="explicit activation contract; defaults to the geometry contract")
     parser.add_argument("--rows", default="1,16,80,1024,4096")
     parser.add_argument("--capacity", type=int, help="fixed compiled export/workspace capacity; defaults to each live row count")
+    parser.add_argument("--experts", type=int, help="shipped STREAM screen resident experts; default preserves the L2-sized screen")
     parser.add_argument("--routes", type=Path, help="schema-1 histograms or an existing expert-routes JSONL")
     parser.add_argument("--route", default="auto")
     parser.add_argument("--iters", type=int, default=20)
@@ -198,8 +199,7 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.shipped_prefill and (not args.native_slices or not args.mxfp4_pair
             or args.geometry not in ("v41", "dsv4f", "dsv4p") or args.engine_policy_root is None
-            or args.capacity is not None or args.mxfp4_tilings or args.routes
-            or any(int(row) not in (256, 1024, 4096) for row in args.rows.split(","))):
+            or args.mxfp4_tilings):
         parser.error("shipped prefill requires native V4/V4.1 pairs, policy root and prefill capacities")
     if args.iters <= 0:
         parser.error("iters must be positive")
@@ -215,6 +215,10 @@ def parse_args(argv=None):
         parser.error("rows must be positive")
     if args.capacity is not None and (args.capacity < 1 or max(rows) > args.capacity):
         parser.error("capacity must be positive and cover every live row count")
+    if args.experts is not None and (not args.shipped_prefill or args.experts < 1):
+        parser.error("--experts requires shipped prefill and a positive count")
+    if args.shipped_prefill and any((args.capacity or row) not in (256, 1024, 4096) for row in rows):
+        parser.error("shipped prefill requires compiled capacities 256,1024,4096")
     if args.check_prefix_rows is not None and (not args.check or args.exact_sweep
             or args.capacity is None or not 1 <= args.check_prefix_rows < max(rows)):
         parser.error("--check-prefix-rows requires --check, fixed --capacity, a longer case and no --exact-sweep")
@@ -248,7 +252,7 @@ def parse_args(argv=None):
             parser.error("widths must be comma-separated K32 widths")
         if not args.mxfp4_pair or not widths or any(width <= 0 or width % 32 for width in widths):
             parser.error("--widths requires --mxfp4-pair and positive K32 widths")
-    if args.routes and args.mxfp4_pair and not args.mxfp4_tilings:
+    if args.routes and args.mxfp4_pair and not (args.mxfp4_tilings or args.shipped_prefill):
         parser.error("paired recorded routes require --mxfp4-tilings")
     if args.mxfp4_pair and (args.exact_sweep or args.profile_dir or args.check_prefix_rows
                            or args.compare_routes_exact or args.input != "wire"):
@@ -511,7 +515,7 @@ def native_slice_width(family, rank_width):
 
 def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
                     aligned_w2=False, aligned_w2_scales=False, stored_width=None,
-                    combine_output=False, fc1_k_splits=1):
+                    combine_output=False, fc1_k_splits=1, capacity=None):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -521,6 +525,8 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     from b12x.moe._shared.scale_codes import pack_scale_codes
     from tests.moe.test_v41_exact_slices import pack
 
+    live_rows = x.shape[0]
+    x, ids, routing = screen_capacity_inputs(x, ids, routing, capacity)
     rows, hidden = x.shape
     experts, intermediate = weights["w1"].shape[:2]
     logical = intermediate
@@ -600,11 +606,11 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
         if atomic and not combine_output:
             raise ValueError("atomic qualification requires combined token output")
         qualifier = qualify_atomic_pair_replay if atomic else qualify_pair_replay
-        qualifier(execute, ids, token_output, [partial, *scratch, output] if combine_output else [partial, *scratch],
+        qualifier(execute, ids[:live_rows], token_output[:live_rows if combine_output else live_rows * topk], [partial, *scratch, output] if combine_output else [partial, *scratch],
                   [*tensors, token_output], lambda live: token_output[:live if combine_output else live * topk])
     def run():
-        execute(rows)
-    return run, token_output, (tensors, args, launch, combine, execute)
+        execute(live_rows)
+    return run, token_output[:live_rows if combine_output else live_rows * topk], (tensors, args, launch, combine, execute)
 
 
 def mxfp4_decode_partitions(width):
@@ -737,7 +743,18 @@ def qualify_pair_replay(run, ids, output, scratch, buffers, prefix):
     return {"deterministic": True, "row_invariant": True, "graph_reuse": True}
 
 
-def production_stream_arm(x, ids, routing, weights, scales, coded):
+def screen_capacity_inputs(x, ids, routing, capacity):
+    """Pad dead rows while preserving the live launch scalar."""
+    capacity = capacity or x.shape[0]
+    if capacity < x.shape[0]:
+        raise ValueError("compiled capacity does not cover live rows")
+    extra = capacity - x.shape[0]
+    return (torch.nn.functional.pad(x, (0, 0, 0, extra)),
+            torch.nn.functional.pad(ids, (0, 0, 0, extra), value=-1),
+            torch.nn.functional.pad(routing, (0, 0, 0, extra))) if extra else (x, ids, routing)
+
+
+def production_stream_arm(x, ids, routing, weights, scales, coded, *, capacity=None):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -747,6 +764,8 @@ def production_stream_arm(x, ids, routing, weights, scales, coded):
     from tests.moe.test_v41_exact_slices import pack
     from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
 
+    live_rows = x.shape[0]
+    x, ids, routing = screen_capacity_inputs(x, ids, routing, capacity)
     rows, hidden = x.shape
     experts, width = weights["w1"].shape[:2]
     topk = ids.shape[1]
@@ -773,23 +792,23 @@ def production_stream_arm(x, ids, routing, weights, scales, coded):
     def execute(live):
         launch(*pointers, cutlass.Int32(live), current_cuda_stream())
         combine(pointers[-1], token_view.iterator, cutlass.Int32(live), current_cuda_stream())
-    qualification = qualify_pair_replay(execute, ids, output, [arena], [*tensors, output],
+    qualification = qualify_pair_replay(execute, ids[:live_rows], output[:live_rows], [arena], [*tensors, output],
                                          lambda live: output[:live])
     original_ids = ids.clone()
     ids[0].fill_(-1)
-    ids[-1, -1] = experts
-    execute(rows)
-    invalid_expected = output.clone()
+    ids[live_rows - 1, -1] = experts
+    execute(live_rows)
+    invalid_expected = output[:live_rows].clone()
     assert torch.count_nonzero(output[0]) == 0, "invalid route row must be zero"
     arena.fill_(255)
     output.fill_(float("nan"))
-    execute(rows)
-    assert torch.equal(output, invalid_expected), "invalid route poison/repeat"
-    assert torch.isfinite(output).all(), "invalid route output"
+    execute(live_rows)
+    assert torch.equal(output[:live_rows], invalid_expected), "invalid route poison/repeat"
+    assert torch.isfinite(output[:live_rows]).all(), "invalid route output"
     ids.copy_(original_ids)
-    execute(rows)
+    execute(live_rows)
     qualification["invalid_routes"] = True
-    return lambda: execute(rows), output, (arena, tensors, views, launch, combine, token_view), qualification
+    return lambda: execute(live_rows), output[:live_rows], (arena, tensors, views, launch, combine, token_view), qualification
 
 
 def shipped_stream_screen(g, args):
@@ -799,10 +818,20 @@ def shipped_stream_screen(g, args):
         raise ValueError("the V4 Pro shipped STREAM screen supports GB10 (SM121) only")
     l2_bytes = int(properties.L2_cache_size)
     flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
+    waves = recorded_waves(args.routes, g) if args.routes else None
+    selected_waves = {rows: screen_route_wave(waves, rows, args.seed)
+                      for rows in map(int, args.rows.split(","))} if waves else {}
+    route_fixture = ({"path": str(args.routes), "sha256": hashlib.sha256(args.routes.read_bytes()).hexdigest(),
+                      "family_attested": args.routes.suffix != ".jsonl"} if waves else None)
     records = []
     for width in paired_widths(g.intermediate, args.widths, args.engine_policy_root):
         expert_bytes = 3 * width * g.hidden // 2
-        experts = max(16, (2 * l2_bytes // (16 * expert_bytes) + 1) * 16)
+        experts = args.experts or max(16, (2 * l2_bytes // (16 * expert_bytes) + 1) * 16,
+                                      g.experts if waves else 0)
+        if experts < g.top_k or experts * expert_bytes <= 2 * l2_bytes:
+            raise ValueError("resident experts must cover top-k and exceed twice L2")
+        if waves and experts != g.experts:
+            raise ValueError("recorded routes require the checkpoint expert count")
         generator = torch.Generator().manual_seed(args.seed + width)
         weights, scales = {}, {}
         for name, shape in (("w1", (experts, width, g.hidden // 2)),
@@ -812,9 +841,11 @@ def shipped_stream_screen(g, args):
             scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
                                         dtype=torch.uint8, generator=generator)
         for rows in map(int, args.rows.split(",")):
+            capacity = args.capacity or rows
             torch.manual_seed(args.seed + rows)
             x = (torch.randn(rows, g.hidden, device="cuda") * .5).bfloat16()
-            ids = torch.rand(rows, experts, device="cuda").topk(g.top_k, -1).indices.int()
+            ids = (screen_route_ids(selected_waves[rows], experts, g.top_k, args.seed).cuda()
+                   if waves else torch.rand(rows, experts, device="cuda").topk(g.top_k, -1).indices.int())
             if args.routing == "hot":
                 ids.copy_(ids[:1].expand_as(ids))
             routing = torch.rand(rows, g.top_k, device="cuda")
@@ -823,16 +854,16 @@ def shipped_stream_screen(g, args):
                 recipe = dict(tile=192 if g.name == "v41" else 128, exact=True,
                               atomic=g.name == "dsv4f", coded=g.name == "v41")
             else:
-                recipe = shipped_prefill_recipe(g.name, g.hidden, width, rows, args.engine_policy_root)
+                recipe = shipped_prefill_recipe(g.name, g.hidden, width, capacity, args.engine_policy_root)
             runs, outputs, keepalive, qualifications = {}, {}, [], {}
             controls = ("current", "current-2", "current-3")
             for label in controls:
                 runs[label], outputs[label], keep = native_pair_arm(x, ids, routing, weights, scales,
                     recipe["tile"], recipe["exact"], recipe["atomic"], recipe["coded"],
-                    qualify=True, combine_output=True)
+                    qualify=True, combine_output=True, capacity=capacity)
                 keepalive.append(keep)
             runs["native-stream"], outputs["native-stream"], keep, qualifications["native-stream"] = (
-                production_stream_arm(x, ids, routing, weights, scales, recipe["coded"]))
+                production_stream_arm(x, ids, routing, weights, scales, recipe["coded"], capacity=capacity))
             keepalive.append(keep)
             oracle_routes = mxfp4_f32_reference(x, ids, routing, weights, scales, limit=10., native=True)
             oracle = torch.zeros_like(x, dtype=torch.float32)
@@ -854,7 +885,13 @@ def shipped_stream_screen(g, args):
             samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
             medians = {label: statistics.median(values) for label, values in samples.items()}
             control = [medians[label] for label in controls]
-            record = dict(geometry=g.name, sm=sm, width=width, rows=rows, shipped_recipe=recipe,
+            counts = torch.bincount(ids.flatten().long(), minlength=experts)
+            occupancy = dict(min=counts.min().item(), mean=counts.float().mean().item(), max=counts.max().item())
+            routing_mode = "recorded" if waves else args.routing
+            print(f"STREAM cell live={rows} compiled={capacity} experts={experts} routing={routing_mode} "
+                  f"rows/expert min/mean/max={occupancy['min']}/{occupancy['mean']:.3f}/{occupancy['max']}", flush=True)
+            record = dict(capacity=capacity, experts=experts, routing=routing_mode, rows_per_expert=occupancy,
+                route_fixture=route_fixture, geometry=g.name, sm=sm, width=width, rows=rows, shipped_recipe=recipe,
                 controls=controls, samples_us=samples, median_us=medians,
                 speedup=min(control) / medians["native-stream"],
                 control_spread=max(control) / min(control) - 1,
