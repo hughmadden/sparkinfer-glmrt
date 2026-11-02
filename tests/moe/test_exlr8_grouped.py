@@ -433,7 +433,7 @@ def test_swiglu_clamp_gpu_matches_flash_reference_and_graph(limit):
 
     def run():
         probe(*args, stream)
-        reference.launch(source, expected)
+        reference.launch(source, expected, scalars=())
 
     def check():
         g, u = source[:63].float(), source[63:].float()
