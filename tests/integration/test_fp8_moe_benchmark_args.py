@@ -459,6 +459,22 @@ def test_pro_stream_baseline_matches_shipped_equal_and_unequal_roles(monkeypatch
                          atomic=capacity >= 256 and width in (384, 512, 768, 1024, 1536))
 
 
+@pytest.mark.parametrize("capacity", [80, 256, 1024, 4096])
+@pytest.mark.parametrize("width", [256, 288, 352, 512, 704, 1024])
+def test_flash_stream_baseline_retains_ordered_output(monkeypatch, capacity, width):
+    monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
+        native_slice_width=lambda hidden, rank_width, sm, rows, matching: matching,
+        stored_width=lambda hidden, rank_width: rank_width))
+    assert bench.shipped_prefill_recipe("dsv4f", 4096, width, capacity, "engine") == dict(
+        tile=128, exact=True, coded=False, atomic=False)
+    screen = next(node for node in ast.parse(_PATH.read_text()).body
+                  if isinstance(node, ast.FunctionDef) and node.name == "shipped_stream_screen")
+    rtx = next(node for node in ast.walk(screen) if isinstance(node, ast.If)
+               and ast.unparse(node.test) == "sm == 120")
+    recipe = next(node.value for node in rtx.body if isinstance(node, ast.Assign))
+    assert next(keyword.value.value for keyword in recipe.keywords if keyword.arg == "atomic") is False
+
+
 def test_pro_stream_screen_rejects_unqualified_rtx_before_allocation(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_properties",
                         lambda device: SimpleNamespace(major=12, minor=0))
