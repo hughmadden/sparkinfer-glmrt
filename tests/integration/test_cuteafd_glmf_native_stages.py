@@ -203,6 +203,68 @@ def test_flash_native_fp8_mla_oracle(heads, stage, mode, rows):
     assert [t.data_ptr() for t in (a, packed, scales, out)] == pointers
 
 
+@pytest.mark.parametrize("capacity,rows", [(64, 1), (64, 17), (128, 128), (4096, 257)])
+def test_flash_projected_token_keys_bitwise(capacity, rows):
+    from b12x.integration.cuteafd._common import GLM53_FLASH as g
+    from b12x.integration.cuteafd.glmf import compile_glmf_index_producer_aot, _align
+    from b12x.integration.cuteafd.glmf_split import compile_glmf_projected_index_keys_aot
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    fused = compile_glmf_index_producer_aot(g, max_rows=capacity)
+    projected = compile_glmf_projected_index_keys_aot(g, max_rows=capacity)
+    x, qr = rand(rows, g.hidden), rand(rows, g.q_lora_rank)
+    wiq, wik = rand(32*128, g.q_lora_rank, scale=.02), rand(288, g.hidden, scale=.02)
+    norm, bias, ape = rand(128, scale=1), rand(128), rand(4, 128)
+    # Four-record pools remain contiguous, but successive pools jump between pages.
+    groups = (rows + 3)//4
+    record = [64*(groups - r//4) + r%4 for r in range(rows)]
+    pool = [64*(groups - r//4) + 7 if r%4 == 3 else -1 for r in range(rows)]
+    if rows % 4:
+        record[-1], pool[-1] = -1, -1
+    slots = torch.tensor(record, device="cuda", dtype=torch.int64)
+    pools = torch.tensor(pool, device="cuda", dtype=torch.int64)
+    initial_keys = rand((groups+2)*64, 256)
+    initial_cache = torch.full((groups+2, 8448), 173, device="cuda", dtype=torch.uint8)
+    keys, ref_keys = initial_keys.clone(), initial_keys.clone()
+    cache, ref_cache = initial_cache.clone(), initial_cache.clone()
+    query, ref_query = [torch.empty((rows, 32, 128), device="cuda", dtype=torch.float8_e4m3fn)
+                        for _ in range(2)]
+    heads, ref_heads = empty(rows, 32, dtype=torch.float32), empty(rows, 32, dtype=torch.float32)
+    fs = scratch(fused, capacity)
+    iq = fs[:rows*32*128*2].view(torch.bfloat16)
+    kw_at = _align(rows*32*128*2)
+    kw = fs[kw_at:kw_at+rows*288*2].view(torch.bfloat16)
+    saved_pointers = [t.data_ptr() for t in (keys, cache, query, heads, fs)]
+
+    def run():
+        fused.launch(x, qr, slots, pools, wiq, wik, norm, bias, ape, ref_keys, ref_cache,
+                     ref_query, ref_heads, fs, scalars=(rows,))
+        projected.launch(iq, kw, slots, pools, norm, bias, ape, keys, cache, query, heads,
+                         scalars=(rows,))
+
+    def check():
+        for a, b in ((keys, ref_keys), (cache, ref_cache), (query, ref_query), (heads, ref_heads)):
+            same(a, b)
+        written_keys = torch.zeros(keys.shape[0], device="cuda", dtype=torch.bool)
+        written_keys[slots[slots >= 0]] = True
+        same(keys[~written_keys], initial_keys[~written_keys])
+        assert torch.count_nonzero(query.view(torch.uint8)) > 0
+        assert torch.isfinite(heads).all()
+
+    run()
+    check()
+    with kernel_resolution_guard("projected token-key stages are precompiled"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for _ in range(3):
+            keys.copy_(initial_keys); ref_keys.copy_(initial_keys)
+            cache.copy_(initial_cache); ref_cache.copy_(initial_cache)
+            graph.replay()
+            check()
+    assert [t.data_ptr() for t in (keys, cache, query, heads, fs)] == saved_pointers
+
+
 @pytest.mark.parametrize("inter", [1024, 2048, 6144, 12288])
 def test_flash_ffn_clamped_stage_bitwise(inter):
     from b12x.integration.cuteafd._common import GLM53_FLASH

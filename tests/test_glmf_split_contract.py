@@ -102,6 +102,49 @@ def test_projected_index_reuses_original_post_and_pool():
     assert not any("projection" in name for name in calls)
 
 
+@pytest.mark.parametrize("capacity", [64, 128, 4096])
+def test_projected_token_keys_contract_and_composition(capacity):
+    g = Geometry(index_heads=32, index_kpool=4, page_rows=64, index_norm_eps=1e-6)
+    source = ROOT / "b12x/integration/cuteafd/glmf_split.py"
+    ns = extracted(source, {"compile_glmf_projected_index_keys_aot"}, dict(
+        GLM53_FLASH=g, GLMFGeometry=Geometry, _check_rows=int,
+        _ProjectedIndexKeys=Primitive, Operand=Operand, Scalar=lambda x: x,
+        torch=SimpleNamespace(bfloat16="bf16", uint8="u8", int64="i64",
+                              float8_e4m3fn="fp8", float32="f32"),
+        compile_program=lambda launch, **kw: dict(launch=launch, **kw)))
+    p = ns["compile_glmf_projected_index_keys_aot"](max_rows=capacity)
+    ops = {o.name: o for o in p["operands"]}
+    assert list(ops) == ["iq", "kw", "slots", "pool_slots", "k_norm_w", "k_norm_b",
+                         "ape", "token_keys", "index_cache", "q_fp8", "head_weights"]
+    assert ops["iq"].shape == "[rows,32,128]"
+    assert ops["kw"].shape == "[rows,288]"
+    assert ops["slots"].align == ops["pool_slots"].align == 8
+    assert ops["token_keys"].shape == "[record_slots,256]"
+    assert ops["token_keys"].role == ops["index_cache"].role == "inout"
+    assert p["scalars"] == ("rows",) and "scratch" not in p
+    assert p["geometry"]["token_key_row_bytes"] == 512
+    assert p["key"] == (g, capacity)
+    with pytest.raises(ValueError, match="GLMFGeometry"):
+        ns["compile_glmf_projected_index_keys_aot"](object())
+
+    calls = []
+    def primitive(kind):
+        def create(**kw):
+            return lambda *args: calls.append((kind, kw, args))
+        return create
+    tree = ast.parse(source.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_ProjectedIndexKeys")
+    env = dict(cute=SimpleNamespace(jit=lambda f: f, Pointer=object), Int32=int,
+        cuda=SimpleNamespace(CUstream=object), GlmfIndexPost=primitive("post"), GlmfPoolKeys=primitive("pool"))
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), env)
+    stage = env["_ProjectedIndexKeys"](g)
+    stage(*range(13))
+    assert calls == [
+        ("post", dict(heads=32, eps=1e-6, weight_scale=32**-.5 * 128**-.5),
+         (0, 1, 2, 4, 5, 9, 10, 7, 11, 12)),
+        ("pool", dict(kpool=4, page_rows=64), (2, 3, 6, 7, 8, 11, 12))]
+
+
 def test_kda_reuses_original_geometry_and_clamped_activation():
     split = (ROOT / "b12x/integration/cuteafd/glmf_split.py").read_text()
     shared = (ROOT / "b12x/integration/cuteafd/kimi_split.py").read_text()
