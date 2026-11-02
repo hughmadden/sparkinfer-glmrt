@@ -13,7 +13,8 @@ from cutlass import BFloat16, Float32, Int32, Int64
 
 from ._common import GLM53_FLASH, GLMFGeometry, Operand, Scalar, compile_program
 from .glmf import (_MlaProducer, _GlmfOutput, _GlmfFfn, _check_rows, _align, _ptr)
-from .kimi_split import compile_kda_core_aot
+from .kimi_split import compile_kda_core_aot, compile_projected_kda_core_aot
+from .glm_attention import compile_glm_attention_stage_aot
 
 
 class _Join:
@@ -124,3 +125,25 @@ def compile_glmf_kda_core_aot(g=GLM53_FLASH, *, max_rows=64, decode=True,
         raise ValueError("GLM Flash KDA requires its low-rank GLMFGeometry")
     return compile_kda_core_aot(g, max_rows=max_rows, decode=decode,
         state_dtype=state_dtype, state_rounding=state_rounding)
+
+
+def compile_glmf_projected_kda_aot(g=GLM53_FLASH, *, max_rows=64, decode=True,
+                                   state_dtype="float32", state_rounding="window"):
+    """Native-weight caller supplies q/k/v, f_b, g_b and raw beta BF16 rows."""
+    if not isinstance(g, GLMFGeometry):
+        raise ValueError("GLM Flash KDA requires its low-rank GLMFGeometry")
+    return compile_projected_kda_core_aot(g, max_rows=max_rows, decode=decode,
+        state_dtype=state_dtype, state_rounding=state_rounding)
+
+
+def compile_glmf_fp8_stage_aot(g=GLM53_FLASH, *, stage, max_rows=64, mode="decode",
+                               query_row=None):
+    """Reuse GLM's native FP8 UK/UV primitive with Flash's own NoPE geometry."""
+    if not isinstance(g, GLMFGeometry):
+        raise ValueError("GLM Flash FP8 stages require GLMFGeometry")
+    if stage not in ("absorb", "values"):
+        raise ValueError("GLM Flash FP8 stage must be absorb or values")
+    if mode not in ("decode", "prefill"):
+        raise ValueError("GLM Flash FP8 mode must be decode or prefill")
+    return compile_glm_attention_stage_aot(g, stage=stage, max_rows=max_rows,
+        fp8_only=mode, query_row=query_row)
