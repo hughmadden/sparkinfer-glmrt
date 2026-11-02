@@ -407,7 +407,7 @@ def test_malformed_jsonl_routes_fail_closed(tmp_path, record):
         bench.recorded_waves(jsonl_routes(tmp_path, [record]), SimpleNamespace(name="v41", experts=4, top_k=2))
 
 
-@pytest.mark.parametrize("family", ["v41", "dsv4f"])
+@pytest.mark.parametrize("family", ["v41", "dsv4f", "dsv4p"])
 def test_native_stream_screen_requires_shared_policy_and_prefill(family):
     args = ["--geometry", family, "--mxfp4-pair", "--native-slices", "--shipped-prefill",
             "--engine-policy-root", "engine", "--rows", "256,1024,4096"]
@@ -415,6 +415,28 @@ def test_native_stream_screen_requires_shared_policy_and_prefill(family):
     for extra in (["--rows", "80"], ["--capacity", "4096"], ["--mxfp4-tilings"]):
         with pytest.raises(SystemExit):
             bench.parse_args(args + extra)
+
+
+@pytest.mark.parametrize("capacity", [80, 256, 1024, 4096])
+@pytest.mark.parametrize("width", [384, 416, 448, 512, 608, 640, 768, 1024, 1536])
+def test_pro_stream_baseline_matches_shipped_equal_and_unequal_roles(monkeypatch, capacity, width):
+    calls = []
+    def tile(hidden, rank_width, sm, rows, matching):
+        calls.append((hidden, rank_width, sm, rows, matching))
+        return 128
+    monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
+        native_slice_width=tile, stored_width=lambda hidden, rank_width: rank_width))
+    recipe = bench.shipped_prefill_recipe("dsv4p", 7168, width, capacity, "engine")
+    assert calls == [(7168, width, 121, capacity, 128)]
+    assert recipe == dict(tile=128, exact=True, coded=False,
+                         atomic=capacity >= 256 and width in (384, 512, 768, 1024, 1536))
+
+
+def test_pro_stream_screen_rejects_unqualified_rtx_before_allocation(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda device: SimpleNamespace(major=12, minor=0))
+    with pytest.raises(ValueError, match="GB10"):
+        bench.shipped_stream_screen(SimpleNamespace(name="dsv4p"), SimpleNamespace())
 
 
 @pytest.mark.parametrize("capacity", [256, 1024, 4096])

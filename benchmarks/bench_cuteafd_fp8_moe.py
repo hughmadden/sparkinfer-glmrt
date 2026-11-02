@@ -197,7 +197,7 @@ def parse_args(argv=None):
                         help="identical padded controls in the tiling screen, including its reference")
     args = parser.parse_args(argv)
     if args.shipped_prefill and (not args.native_slices or not args.mxfp4_pair
-            or args.geometry not in ("v41", "dsv4f") or args.engine_policy_root is None
+            or args.geometry not in ("v41", "dsv4f", "dsv4p") or args.engine_policy_root is None
             or args.capacity is not None or args.mxfp4_tilings or args.routes
             or any(int(row) not in (256, 1024, 4096) for row in args.rows.split(","))):
         parser.error("shipped prefill requires native V4/V4.1 pairs, policy root and prefill capacities")
@@ -495,10 +495,12 @@ def paired_widths(intermediate, requested=None, policy_root=None):
 def shipped_prefill_recipe(family, hidden, rank_width, capacity, policy_root):
     policy = engine_layout_policy(policy_root)
     matching = 128 if family == "dsv4f" else native_slice_width(family, rank_width)
-    # Equal Flash roles pass atomic-min-capacity; unequal width exports do not.
+    # Equal V4 roles pass atomic-min-capacity; unequal width exports do not.
+    atomic_widths = {"dsv4f": (256, 512, 1024),
+                     "dsv4p": (384, 512, 768, 1024, 1536)}
     return dict(tile=policy.native_slice_width(hidden, rank_width, 121, capacity, matching),
                 exact=policy.stored_width(hidden, rank_width) == rank_width,
-                atomic=family == "dsv4f" and rank_width in (256, 512, 1024),
+                atomic=capacity >= 256 and rank_width in atomic_widths.get(family, ()),
                 coded=family == "v41")
 
 
@@ -792,6 +794,8 @@ def production_stream_arm(x, ids, routing, weights, scales, coded):
 def shipped_stream_screen(g, args):
     properties = torch.cuda.get_device_properties(0)
     sm = properties.major * 10 + properties.minor
+    if g.name == "dsv4p" and sm != 121:
+        raise ValueError("the V4 Pro shipped STREAM screen supports GB10 (SM121) only")
     l2_bytes = int(properties.L2_cache_size)
     flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
     records = []
