@@ -344,8 +344,8 @@ def test_explicit_rank_extents_and_identical_controls():
                              "--mxfp4-arm", "pad64:288:320:64", "--control-repeats", "3"])
     specs, controls = bench.tiling_specs(args, 288, 192, (64, 128, 192))
     assert controls == ["padded", "padded-control-1", "padded-control-2"]
-    assert specs == [(name, False, 192, None) for name in controls] + [
-        ("compact", True, 128, 288), ("pad64", True, 64, 320)]
+    assert specs == [(name, False, 192, None, 1) for name in controls] + [
+        ("compact", True, 128, 288, 1), ("pad64", True, 64, 320, 1)]
     samples = {name: [1., 2., 3.] for name in controls}
     samples.update(compact=[2., 4., 6.], pad64=[4., 8., 12.])
     result = bench.tiling_timing_summary(samples, {name: True for name in samples}, controls)
@@ -366,7 +366,7 @@ def test_explicit_tile32_is_benchmark_only():
     args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings",
                              "--mxfp4-arm", "tile32:288:288:32"])
     specs, _ = bench.tiling_specs(args, 288, 192, (64, 128, 192))
-    assert specs[-1] == ("tile32", True, 32, 288)
+    assert specs[-1] == ("tile32", True, 32, 288, 1)
 
 
 def test_explicit_names_and_mode_are_unambiguous():
@@ -598,10 +598,75 @@ def test_stream_capacity_padding_preserves_live_inputs():
 def test_stream_default_uses_checkpoint_population_and_hot_is_diagnostic(family, experts):
     args = bench.parse_args(["--geometry", family, "--mxfp4-pair", "--native-slices",
                              "--shipped-prefill", "--engine-policy-root", "engine", "--rows", "256"])
-    geometry = SimpleNamespace(experts=experts)
+    geometry = SimpleNamespace(experts=experts, top_k=6)
     assert args.routing == "random"
     assert bench.stream_screen_population(geometry, args) == (experts, True)
     args.routing = "hot"
     assert bench.stream_screen_population(geometry, args) == (experts, False)
     args.routing, args.experts = "random", 16
     assert bench.stream_screen_population(geometry, args) == (16, False)
+
+
+@pytest.mark.parametrize("tilings", [False, True])
+@pytest.mark.parametrize("native,experts,topk", [(True, 384, 6), (False, 384, 8)])
+def test_pair_population_defaults_to_checkpoint_and_labels_diagnostics(tilings, native, experts, topk, capsys):
+    argv = ["--mxfp4-pair"] + (["--mxfp4-tilings"] if tilings else [])
+    argv += ["--native-slices", "--geometry", "v41"] if native else ["--geometry", "mimop"]
+    geometry = SimpleNamespace(experts=experts, top_k=topk)
+    args = bench.parse_args(argv)
+    assert args.routing == "random"
+    assert bench.stream_screen_population(geometry, args) == (experts, True)
+    assert not capsys.readouterr().out
+    for flags in (["--routing", "hot"], ["--experts", "16"]):
+        diagnostic = bench.parse_args(argv + flags)
+        assert not bench.stream_screen_population(geometry, diagnostic)[1]
+        assert "DIAGNOSTIC ONLY" in capsys.readouterr().out
+    same = bench.parse_args(argv + ["--experts", str(experts)])
+    assert bench.stream_screen_population(geometry, same) == (experts, True)
+    with pytest.raises(ValueError, match="top-k"):
+        bench.stream_screen_population(geometry, bench.parse_args(argv + ["--experts", str(topk - 1)]))
+
+
+def test_recorded_pair_population_cannot_be_custom():
+    args = bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings", "--routes", "routes.jsonl", "--experts", "16"])
+    with pytest.raises(ValueError, match="checkpoint expert count"):
+        bench.stream_screen_population(SimpleNamespace(experts=384, top_k=8), args)
+
+
+@pytest.mark.parametrize("function", ["mxfp4_pair_screen", "mxfp4_tiling_screen"])
+def test_pair_paths_use_shared_population_not_l2_derived_experts(function):
+    tree = ast.parse(_PATH.read_text())
+    node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == function)
+    population = [call for call in ast.walk(node) if isinstance(call, ast.Call)
+                  and isinstance(call.func, ast.Name) and call.func.id == "stream_screen_population"]
+    assert len(population) == 1
+    assert "route_qualification_eligible" in ast.unparse(node)
+    assert "max(16," not in ast.unparse(node)
+    assert "topk = g.top_k" in ast.unparse(node)
+
+
+def test_explicit_split_defaults_and_shipped_identical_controls():
+    args = bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings", "--native-slices",
+                            "--mxfp4-arm", "old:384:384:192",
+                            "--mxfp4-arm", "shipped:384:384:128:2",
+                            "--mxfp4-control", "shipped", "--control-repeats", "3"])
+    specs, controls = bench.tiling_specs(args, 384, 192, (64, 128, 192))
+    assert ("old", True, 192, 384, 1) in specs
+    assert controls == ["shipped", "shipped-control-1", "shipped-control-2"]
+    for name in controls:
+        assert (name, True, 128, 384, 2) in specs
+    samples = {"padded": [20., 20.], "old": [20., 20.], **{name: [10., 10.] for name in controls}}
+    summary = bench.tiling_timing_summary(samples, {name: True for name in samples}, controls)
+    assert summary["paired_speedups"]["old"] == .5
+    assert summary["identical_control_speedups"] == {name: [1., 1.] for name in controls[1:]}
+
+
+@pytest.mark.parametrize("arm", ["x:384:384:128:0", "x:384:384:128:3", "x:384:384:128:2:8"])
+def test_invalid_native_split_fails_before_cuda(arm):
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings", "--native-slices", "--mxfp4-arm", arm])
+
+
+def test_explicit_control_requires_matching_arm():
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings", "--mxfp4-control", "absent"])
