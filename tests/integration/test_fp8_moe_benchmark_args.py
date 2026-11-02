@@ -439,7 +439,7 @@ def test_native_stream_screen_requires_shared_policy_and_prefill(family):
     args = ["--geometry", family, "--mxfp4-pair", "--native-slices", "--shipped-prefill",
             "--engine-policy-root", "engine", "--rows", "256,1024,4096"]
     assert bench.parse_args(args).shipped_prefill
-    for extra in (["--rows", "80"], ["--capacity", "4096"], ["--mxfp4-tilings"]):
+    for extra in (["--rows", "80"], ["--capacity", "2752"], ["--mxfp4-tilings"]):
         with pytest.raises(SystemExit):
             bench.parse_args(args + extra)
 
@@ -548,3 +548,31 @@ def test_native_stream_has_ordered_float_output_and_no_atomic_reduction():
     qualifier = ast.unparse(next(node for node in ast.parse(_PATH.read_text()).body
                                 if isinstance(node, ast.FunctionDef) and node.name == "qualify_pair_replay"))
     assert "repeat determinism" in qualifier and "torch.equal(output, expected)" in qualifier
+
+
+def test_stream_fixed_capacity_and_resident_experts():
+    base = ["--geometry", "v41", "--mxfp4-pair", "--native-slices", "--shipped-prefill",
+            "--engine-policy-root", "engine", "--rows", "256,1024,2752,4096", "--capacity", "4096"]
+    args = bench.parse_args(base + ["--experts", "384", "--routes", "routes.jsonl"])
+    assert args.capacity == 4096 and args.experts == 384
+    for extra in (["--experts", "0"], ["--capacity", "1024"], ["--routing", "hot", "--routes", "routes.jsonl"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(base + extra)
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--experts", "384"])
+
+
+def test_stream_capacity_padding_preserves_live_inputs():
+    x = torch.randn(3, 8)
+    ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32)
+    mix = torch.rand(3, 2)
+    padded = bench.screen_capacity_inputs(x, ids, mix, 8)
+    for original, actual in zip((x, ids, mix), padded):
+        assert actual.shape[0] == 8
+        assert torch.equal(actual[:3], original)
+    assert bool((padded[1][3:] == -1).all())
+    assert not bool(padded[0][3:].count_nonzero())
+    assert not bool(padded[2][3:].count_nonzero())
+    assert bench.screen_capacity_inputs(x, ids, mix, None)[0] is x
+    with pytest.raises(ValueError, match="cover live"):
+        bench.screen_capacity_inputs(x, ids, mix, 2)
