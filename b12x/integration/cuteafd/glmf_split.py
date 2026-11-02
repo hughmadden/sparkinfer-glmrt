@@ -13,7 +13,8 @@ from cutlass import BFloat16, Float32, Int32, Int64
 
 from ._common import GLM53_FLASH, GLMFGeometry, Operand, Scalar, compile_program
 from .glmf import (_MlaProducer, _GlmfOutput, _GlmfFfn, _check_rows, _align, _ptr,
-                   TAIL_BYTES, REPLAY_ROWS, GlmfIndexPostRows, GlmfPoolKeysTail)
+                   TAIL_BYTES, REPLAY_ROWS, GlmfIndexPostRows, GlmfPoolKeysTail,
+                   GlmfIndexPost, GlmfPoolKeys)
 from .kimi_split import compile_kda_core_aot, compile_projected_kda_core_aot
 from .glm_attention import compile_glm_attention_stage_aot
 
@@ -112,6 +113,50 @@ def compile_glmf_stage_aot(g=GLM53_FLASH, *, stage, max_rows=64, inter=2048):
     return compile_program(launch, name="glmf_stage_" + stage, operands=operands,
         scalars=(Scalar("rows"),), key=(g, stage, max_rows, inter), scratch=scratch,
         geometry={**vars(g), "stage": stage, "max_rows": max_rows, "inter": inter})
+
+
+class _ProjectedIndexKeys:
+    def __init__(self, g):
+        self.post = GlmfIndexPost(heads=g.index_heads, eps=g.index_norm_eps,
+            weight_scale=float(g.index_heads) ** -0.5 * 128.0 ** -0.5)
+        self.pool = GlmfPoolKeys(kpool=g.index_kpool, page_rows=g.page_rows)
+
+    @cute.jit
+    def __call__(self, iq: cute.Pointer, kw: cute.Pointer, slots: cute.Pointer,
+                 pool_slots: cute.Pointer, k_norm_w: cute.Pointer, k_norm_b: cute.Pointer,
+                 ape: cute.Pointer, token_keys: cute.Pointer, index_cache: cute.Pointer,
+                 q_fp8: cute.Pointer, head_weights: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        self.post(iq, kw, slots, k_norm_w, k_norm_b, q_fp8, head_weights, token_keys, rows, stream)
+        self.pool(slots, pool_slots, ape, token_keys, index_cache, rows, stream)
+
+
+def compile_glmf_projected_index_keys_aot(g=GLM53_FLASH, *, max_rows=64):
+    """Original token-key scatter and pooling over native-projected BF16 rows.
+
+    Slots address token-key rows; nonnegative pool slots complete four contiguous
+    token-key records ending at slots[row]. Negative token/pool slots skip writes.
+    Native projection and BF16 narrowing precede this allocation-free post-stage.
+    """
+    if not isinstance(g, GLMFGeometry):
+        raise ValueError("GLM Flash projected index requires GLMFGeometry")
+    max_rows = _check_rows(max_rows)
+    operands = (
+        Operand("iq", torch.bfloat16, f"[rows,{g.index_heads},128]"),
+        Operand("kw", torch.bfloat16, f"[rows,{256 + g.index_heads}]"),
+        Operand("slots", torch.int64, "[rows]", align=8),
+        Operand("pool_slots", torch.int64, "[rows]", align=8),
+        Operand("k_norm_w", torch.bfloat16, "[128]"),
+        Operand("k_norm_b", torch.bfloat16, "[128]"),
+        Operand("ape", torch.bfloat16, f"[{g.index_kpool},128]"),
+        Operand("token_keys", torch.bfloat16, "[record_slots,256]", "inout"),
+        Operand("index_cache", torch.uint8, "[pool_pages,8448]", "inout"),
+        Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{g.index_heads},128]", "out"),
+        Operand("head_weights", torch.float32, f"[rows,{g.index_heads}]", "out"))
+    return compile_program(_ProjectedIndexKeys(g), name="glmf_projected_index_keys",
+        operands=operands, scalars=(Scalar("rows"),), key=(g, max_rows),
+        geometry={**vars(g), "max_rows": max_rows, "projected_inputs": True,
+                  "token_key_row_bytes": 512})
 
 
 class _ProjectedIndexCompact:
