@@ -78,9 +78,10 @@ def test_role_inventory(contract):
         contract.exlr8_export_programs("rtx")
 
 
-@pytest.mark.parametrize("hidden,units,top_k,max_groups", [(6144, 16, 8, 512), (4096, 8, 4, 256)])
-def test_coordinator_reuses_spark_programs(contract, hidden, units, top_k, max_groups):
-    geometry = dict(hidden=hidden, units=units, top_k=top_k, max_groups=max_groups)
+@pytest.mark.parametrize("hidden,units,top_k,max_groups,experts", [
+    (6144, 16, 8, 512, 256), (4096, 8, 4, 256, 256), (4096, 16, 8, 512, 288)])
+def test_coordinator_reuses_spark_programs(contract, hidden, units, top_k, max_groups, experts):
+    geometry = dict(hidden=hidden, units=units, top_k=top_k, max_groups=max_groups, experts=experts)
     spark, coordinator = (programs(contract, role, **geometry) for role in ("spark", "coordinator"))
     for name, reference in spark.items():
         candidate = coordinator[name]
@@ -90,6 +91,25 @@ def test_coordinator_reuses_spark_programs(contract, hidden, units, top_k, max_g
         assert candidate.scalars == reference.scalars
         assert {n: size(1) for n, size in getattr(candidate, "scratch", {}).items()} == {
             n: size(1) for n, size in getattr(reference, "scratch", {}).items()}
+
+
+@pytest.mark.parametrize("experts,domain", [(1, 256), (256, 256), (257, 512), (288, 512), (512, 512)])
+def test_grouping_compile_time_domain(contract, experts, domain):
+    wrapper = contract._Group(experts, 8, 512, 4096, "fp8_k32")
+    assert wrapper.expert_domain == domain
+    assert wrapper.scan_steps == domain.bit_length() - 1
+
+
+def test_flash_export_geometry(contract):
+    exported = programs(contract, "coordinator", hidden=4096, experts=288)
+    for name in ("group", "grouped_group"):
+        assert exported[name].geometry["experts"] == 288
+        assert exported[name].geometry["hidden"] == 4096
+    for name in ("a16_grouped", "a8_grouped", "grouped_group"):
+        assert exported[name].geometry["max_groups"] == 800
+    assert exported["shared_group"].geometry["experts"] == 1
+    with pytest.raises(ValueError, match="experts1..512"):
+        contract.compile_exlr8_group_aot(experts=513)
 
 
 @pytest.mark.parametrize("name", ["a16_serving", "shared_a16_serving", "a16_grouped", "a8_grouped", "a16_grouped64"])

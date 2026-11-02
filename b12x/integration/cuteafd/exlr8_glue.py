@@ -86,6 +86,8 @@ def _f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None):
 class _Group:
     def __init__(self, experts, top_k, max_groups, hidden, input_format, max_rows=64, group_rows=16):
         self.experts, self.top_k, self.max_groups = experts, top_k, max_groups
+        self.expert_domain = max(256, 1 << (experts - 1).bit_length())
+        self.scan_steps = self.expert_domain.bit_length() - 1
         self.max_rows, self.group_rows = max_rows, group_rows
         self.hidden, self.blocks, self.input_format = hidden, hidden // 128, input_format
         # Wire rows: hidden E4M3 bytes, then hidden/32 UE8M0 scale bytes.
@@ -101,7 +103,7 @@ class _Group:
             ingress = (rows * Int32(self.blocks) + Int32(INGRESS_WARPS - 1)) // Int32(INGRESS_WARPS)
             self.kernel(ids, x, signs_in, group_expert, route_slots, route_group_lane,
                         group_count, activation, rows).launch(
-                grid=(Int32(1) + min(ingress, cta_limit), 1, 1), block=(256, 1, 1), stream=stream)
+                grid=(Int32(1) + min(ingress, cta_limit), 1, 1), block=(self.expert_domain, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, ids: cute.Pointer, x: cute.Pointer, signs_in: cute.Pointer,
@@ -109,13 +111,18 @@ class _Group:
                route_group_lane: cute.Pointer, group_count: cute.Pointer,
                activation: cute.Pointer, rows: Int32):
         smem = utils.SmemAllocator()
-        prefix = smem.allocate_tensor(Int32, cute.make_layout(256), byte_alignment=16)
+        prefix = smem.allocate_tensor(Int32, cute.make_layout(self.expert_domain), byte_alignment=16)
         valid = smem.allocate_tensor(Int32, cute.make_layout(1), byte_alignment=16)
         if Int32(cute.arch.block_idx()[0]) == Int32(0):
             self.pack(ids, group_expert, route_slots, route_group_lane, group_count,
                        prefix, valid, rows)
         else:
-            self.ingress(x, signs_in, activation, rows)
+            if cutlass.const_expr(self.expert_domain > 256):
+                # The extra expert-scan threads must not duplicate ingress rows.
+                if Int32(cute.arch.thread_idx()[0]) < Int32(INGRESS_WARPS * 32):
+                    self.ingress(x, signs_in, activation, rows)
+            else:
+                self.ingress(x, signs_in, activation, rows)
 
     @cute.jit
     def ingress(self, x: cute.Pointer, signs_in: cute.Pointer, activation: cute.Pointer,
@@ -170,7 +177,7 @@ class _Group:
             for route in cutlass.range(routes):
                 if ids[route] < Int32(0) or ids[route] >= Int32(self.experts):
                     valid[0] = Int32(0)
-        for route in cutlass.range(thread, routes, 256):
+        for route in cutlass.range(thread, routes, self.expert_domain):
             route_group_lane[route] = Int32(-1)
         count = Int32(0)
         if thread < Int32(self.experts):
@@ -182,7 +189,7 @@ class _Group:
         cute.arch.sync_threads()
         # Inclusive scan of per-expert group counts; neither atomics nor route
         # arrival order can change ascending-expert/ascending-route packing.
-        for step in cutlass.range_constexpr(8):
+        for step in cutlass.range_constexpr(self.scan_steps):
             distance = Int32(1 << step)
             addend = Int32(0)
             if thread >= distance:
@@ -190,7 +197,7 @@ class _Group:
             cute.arch.sync_threads()
             prefix[thread] = prefix[thread] + addend
             cute.arch.sync_threads()
-        total = prefix[Int32(255)]
+        total = prefix[Int32(self.expert_domain - 1)]
         if thread == Int32(0):
             group_count[0] = Int32(-1)
             if valid[0] != Int32(0) and total <= Int32(self.max_groups):
@@ -254,14 +261,19 @@ class _GroupPrefill(_Group):
                route_group_lane: cute.Pointer, group_count: cute.Pointer,
                activation: cute.Pointer, rows: Int32):
         smem = utils.SmemAllocator()
-        prefix = smem.allocate_tensor(Int32, cute.make_layout(256), byte_alignment=16)
+        prefix = smem.allocate_tensor(Int32, cute.make_layout(self.expert_domain), byte_alignment=16)
         valid = smem.allocate_tensor(Int32, cute.make_layout(1), byte_alignment=16)
-        s_counts = smem.allocate_tensor(Int32, cute.make_layout(8 * 256), byte_alignment=16)
+        s_counts = smem.allocate_tensor(Int32, cute.make_layout(8 * self.expert_domain), byte_alignment=16)
         if Int32(cute.arch.block_idx()[0]) == Int32(0):
             self.pack(ids, group_expert, route_slots, route_group_lane, group_count,
                       prefix, valid, s_counts, rows)
         else:
-            self.ingress(x, signs_in, activation, rows)
+            if cutlass.const_expr(self.expert_domain > 256):
+                # The extra expert-scan threads must not duplicate ingress rows.
+                if Int32(cute.arch.thread_idx()[0]) < Int32(INGRESS_WARPS * 32):
+                    self.ingress(x, signs_in, activation, rows)
+            else:
+                self.ingress(x, signs_in, activation, rows)
 
     @cute.jit
     def pack(self, ids: cute.Pointer, group_expert: cute.Pointer,
@@ -273,7 +285,7 @@ class _GroupPrefill(_Group):
         lane, warp = thread & Int32(31), thread >> Int32(5)
         routes = rows * Int32(self.top_k)
         for i in cutlass.range_constexpr(8):
-            s_counts[Int32(i * 256) + thread] = Int32(0)
+            s_counts[Int32(i * self.expert_domain) + thread] = Int32(0)
         if thread == Int32(0):
             valid[0] = Int32(1)
         cute.arch.sync_threads()
@@ -295,18 +307,18 @@ class _GroupPrefill(_Group):
                     eid = Int32(-1)
             cnt, rank = _warp_match_count_and_rank(eid)
             if eid >= Int32(0) and rank == Int32(0):
-                s_counts[warp * Int32(256) + eid] = s_counts[warp * Int32(256) + eid] + cnt
+                s_counts[warp * Int32(self.expert_domain) + eid] = s_counts[warp * Int32(self.expert_domain) + eid] + cnt
             r_base += Int32(32)
         cute.arch.sync_threads()
 
         c0 = s_counts[thread]
-        c1 = s_counts[Int32(256) + thread]
-        c2 = s_counts[Int32(512) + thread]
-        c3 = s_counts[Int32(768) + thread]
-        c4 = s_counts[Int32(1024) + thread]
-        c5 = s_counts[Int32(1280) + thread]
-        c6 = s_counts[Int32(1536) + thread]
-        c7 = s_counts[Int32(1792) + thread]
+        c1 = s_counts[Int32(1 * self.expert_domain) + thread]
+        c2 = s_counts[Int32(2 * self.expert_domain) + thread]
+        c3 = s_counts[Int32(3 * self.expert_domain) + thread]
+        c4 = s_counts[Int32(4 * self.expert_domain) + thread]
+        c5 = s_counts[Int32(5 * self.expert_domain) + thread]
+        c6 = s_counts[Int32(6 * self.expert_domain) + thread]
+        c7 = s_counts[Int32(7 * self.expert_domain) + thread]
         count = Int32(0)
         if thread < Int32(self.experts):
             count = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7
@@ -314,7 +326,7 @@ class _GroupPrefill(_Group):
         prefix[thread] = groups
         cute.arch.sync_threads()
 
-        for step in cutlass.range_constexpr(8):
+        for step in cutlass.range_constexpr(self.scan_steps):
             distance = Int32(1 << step)
             addend = Int32(0)
             if thread >= distance:
@@ -323,7 +335,7 @@ class _GroupPrefill(_Group):
             prefix[thread] = prefix[thread] + addend
             cute.arch.sync_threads()
 
-        total = prefix[Int32(255)]
+        total = prefix[Int32(self.expert_domain - 1)]
         if thread == Int32(0):
             group_count[0] = Int32(-1)
             if valid[0] != Int32(0) and total <= Int32(self.max_groups):
@@ -333,16 +345,16 @@ class _GroupPrefill(_Group):
             first = prefix[thread] - groups
             base_slot = first * Int32(self.group_rows)
             s_counts[thread] = base_slot
-            s_counts[Int32(256) + thread] = base_slot + c0
-            s_counts[Int32(512) + thread] = base_slot + c0 + c1
-            s_counts[Int32(768) + thread] = base_slot + c0 + c1 + c2
-            s_counts[Int32(1024) + thread] = base_slot + c0 + c1 + c2 + c3
-            s_counts[Int32(1280) + thread] = base_slot + c0 + c1 + c2 + c3 + c4
-            s_counts[Int32(1536) + thread] = base_slot + c0 + c1 + c2 + c3 + c4 + c5
-            s_counts[Int32(1792) + thread] = base_slot + c0 + c1 + c2 + c3 + c4 + c5 + c6
+            s_counts[Int32(1 * self.expert_domain) + thread] = base_slot + c0
+            s_counts[Int32(2 * self.expert_domain) + thread] = base_slot + c0 + c1
+            s_counts[Int32(3 * self.expert_domain) + thread] = base_slot + c0 + c1 + c2
+            s_counts[Int32(4 * self.expert_domain) + thread] = base_slot + c0 + c1 + c2 + c3
+            s_counts[Int32(5 * self.expert_domain) + thread] = base_slot + c0 + c1 + c2 + c3 + c4
+            s_counts[Int32(6 * self.expert_domain) + thread] = base_slot + c0 + c1 + c2 + c3 + c4 + c5
+            s_counts[Int32(7 * self.expert_domain) + thread] = base_slot + c0 + c1 + c2 + c3 + c4 + c5 + c6
             for local in cutlass.range(groups):
                 group_expert[first + local] = thread
-            for idx in cutlass.range(thread, total * Int32(self.group_rows), 256):
+            for idx in cutlass.range(thread, total * Int32(self.group_rows), self.expert_domain):
                 route_slots[idx] = Int32(-1)
             cute.arch.sync_threads()
 
@@ -355,11 +367,11 @@ class _GroupPrefill(_Group):
                 cnt, rank = _warp_match_count_and_rank(eid)
                 base_val = Int32(0)
                 if eid >= Int32(0):
-                    base_val = s_counts[warp * Int32(256) + eid]
+                    base_val = s_counts[warp * Int32(self.expert_domain) + eid]
                 _warp_sync()
                 if eid >= Int32(0):
                     if rank == Int32(0):
-                        s_counts[warp * Int32(256) + eid] = base_val + cnt
+                        s_counts[warp * Int32(self.expert_domain) + eid] = base_val + cnt
                     packed = base_val + rank
                     route_slots[packed] = r
                     route_group_lane[r] = packed
@@ -377,9 +389,9 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
     if shared_expert and ((experts, top_k, max_groups) != (1, 1, 4) or input_format != "bf16"):
         raise ValueError("shared EXLR8 grouping requires experts=1, top_k=1, max_groups=4 and BF16 rows")
     if (any(type(v) is not int for v in (experts, top_k, max_groups, hidden))
-            or not (1 <= experts <= 256 and 1 <= top_k <= 32
+            or not (1 <= experts <= 512 and 1 <= top_k <= 32
                     and 0 < max_groups <= (2**31 - 1) // group_rows)):
-        raise ValueError("EXLR8 grouping requires experts1..256, top_k1..32 and positive capacity")
+        raise ValueError("EXLR8 grouping requires experts1..512, top_k1..32 and positive capacity")
     if input_format not in INPUT_FORMATS:
         raise ValueError(f"unknown EXLR8 ingress format {input_format!r}")
     # 32-bit column and per-chunk element indexing: a 64-row F16 chunk's bytes fit int32.
@@ -409,7 +421,7 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
                       ctas_per_sm=4, ingress_warps=INGRESS_WARPS))
 
 
-def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_groups=512):
+def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_groups=512, experts=256):
     """Exporter tuples and role ownership; callers must not duplicate this list."""
     from .exlr8 import DEFAULT_SERVING_VARIANT, compile_exlr8_a16_aot
     if role not in ("all", "coordinator", "spark"):
@@ -424,7 +436,7 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
                                       max_groups=max_groups, device_count=True,
                                       serving_variant=DEFAULT_SERVING_VARIANT)),
         ("group", "exlr8_group", {"max_rows": 64},
-         lambda: compile_exlr8_group_aot(top_k=top_k, max_groups=max_groups, hidden=hidden)),
+         lambda: compile_exlr8_group_aot(experts=experts, top_k=top_k, max_groups=max_groups, hidden=hidden)),
         ("shared_a16_serving", "exlr8_a16", {"max_rows": 64},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=1,
                                       max_groups=4, device_count=True, shared_expert=True)),
@@ -435,14 +447,14 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
     grouped = [
         ("a16_grouped", "exlr8_a16", {"max_rows": 4096},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
-             max_groups=(4096 * top_k + 63)//64 + 256, device_count=True, grouped=True)),
+             max_groups=(4096 * top_k + 63)//64 + experts, device_count=True, grouped=True)),
         ("a8_grouped", "exlr8_a16", {"max_rows": 4096, "activations": "a8"},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
-             max_groups=(4096 * top_k + 63)//64 + 256, device_count=True, grouped=True,
+             max_groups=(4096 * top_k + 63)//64 + experts, device_count=True, grouped=True,
              activations="a8")),
         ("grouped_group", "exlr8_group", {"max_rows": 4096},
-         lambda: compile_exlr8_group_aot(hidden=hidden, top_k=top_k,
-             max_groups=(4096 * top_k + 63)//64 + 256, max_rows=4096, group_rows=64)),
+         lambda: compile_exlr8_group_aot(experts=experts, hidden=hidden, top_k=top_k,
+             max_groups=(4096 * top_k + 63)//64 + experts, max_rows=4096, group_rows=64)),
         # 64-row grouped decode instance: the same grouped core below the K1
         # threshold, with F32 FC2 partials so output stays bit-identical to K1.
         # It pairs with the 64-row "group" glue entry above.
