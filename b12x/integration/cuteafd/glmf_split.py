@@ -12,7 +12,8 @@ import torch
 from cutlass import BFloat16, Float32, Int32, Int64
 
 from ._common import GLM53_FLASH, GLMFGeometry, Operand, Scalar, compile_program
-from .glmf import (_MlaProducer, _GlmfOutput, _GlmfFfn, _check_rows, _align, _ptr)
+from .glmf import (_MlaProducer, _GlmfOutput, _GlmfFfn, _check_rows, _align, _ptr,
+                   TAIL_BYTES, REPLAY_ROWS, GlmfIndexPostRows, GlmfPoolKeysTail)
 from .kimi_split import compile_kda_core_aot, compile_projected_kda_core_aot
 from .glm_attention import compile_glm_attention_stage_aot
 
@@ -111,6 +112,60 @@ def compile_glmf_stage_aot(g=GLM53_FLASH, *, stage, max_rows=64, inter=2048):
     return compile_program(launch, name="glmf_stage_" + stage, operands=operands,
         scalars=(Scalar("rows"),), key=(g, stage, max_rows, inter), scratch=scratch,
         geometry={**vars(g), "stage": stage, "max_rows": max_rows, "inter": inter})
+
+
+class _ProjectedIndexCompact:
+    def __init__(self, g, max_rows):
+        self.post = GlmfIndexPostRows(heads=g.index_heads, eps=g.index_norm_eps,
+            weight_scale=float(g.index_heads) ** -0.5 * 128.0 ** -0.5)
+        self.pool = GlmfPoolKeysTail(kpool=g.index_kpool, page_rows=g.page_rows, max_rows=max_rows)
+
+    @cute.jit
+    def __call__(self, iq: cute.Pointer, kw: cute.Pointer, pool_slots: cute.Pointer,
+                 positions: cute.Pointer, kda_slots: cute.Pointer, seq_first: cute.Pointer,
+                 k_norm_w: cute.Pointer, k_norm_b: cute.Pointer, ape: cute.Pointer,
+                 tails: cute.Pointer, replay: cute.Pointer, index_cache: cute.Pointer,
+                 q_fp8: cute.Pointer, head_weights: cute.Pointer, scratch: cute.Pointer,
+                 rows: Int32, spec: Int32, stream: cuda.CUstream):
+        keys = cute.recast_ptr(scratch, dtype=BFloat16)
+        self.post(iq, kw, k_norm_w, k_norm_b, q_fp8, head_weights, keys, replay, spec, rows, stream)
+        self.pool(pool_slots, positions, kda_slots, seq_first, ape, keys, replay, tails,
+                  index_cache, spec, rows, stream)
+
+
+def compile_glmf_projected_index_c_aot(g=GLM53_FLASH, *, max_rows=64, verify_rows=None):
+    """Compact index post-stage over projected BF16 iq and key | head-weight | gate rows.
+
+    Native projections and their final BF16 narrowing precede this stage. Query quantization,
+    normalization, pool tails and speculative replay are the original compact producer's.
+    """
+    if not isinstance(g, GLMFGeometry):
+        raise ValueError("GLM Flash projected index requires GLMFGeometry")
+    max_rows = _check_rows(max_rows)
+    replay_rows = REPLAY_ROWS if verify_rows is None else verify_rows
+    if type(replay_rows) is not int or replay_rows <= 0:
+        raise ValueError("positive integer verify_rows required")
+    operands = (
+        Operand("iq", torch.bfloat16, f"[rows,{g.index_heads},128]"),
+        Operand("kw", torch.bfloat16, f"[rows,{256 + g.index_heads}]"),
+        Operand("pool_slots", torch.int64, "[rows]", align=8),
+        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("kda_slots", torch.int32, "[rows]", align=4),
+        Operand("seq_first", torch.int32, "[rows]", align=4),
+        Operand("k_norm_w", torch.bfloat16, "[128]"),
+        Operand("k_norm_b", torch.bfloat16, "[128]"),
+        Operand("ape", torch.bfloat16, f"[{g.index_kpool},128]"),
+        Operand("tails", torch.uint8, f"[slots,{TAIL_BYTES}]", "inout"),
+        Operand("replay", torch.bfloat16, f"[{replay_rows},256]", "out"),
+        Operand("index_cache", torch.uint8, "[pool_pages,8448]", "inout"),
+        Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{g.index_heads},128]", "out"),
+        Operand("head_weights", torch.float32, f"[rows,{g.index_heads}]", "out"),
+        Operand("scratch", torch.uint8, "[index_keys_scratch]", "scratch"))
+    return compile_program(_ProjectedIndexCompact(g, max_rows), name="glmf_projected_index_c",
+        operands=operands, scalars=(Scalar("rows"), Scalar("spec")),
+        key=(g, max_rows, replay_rows), scratch={"scratch": lambda rows: _align(max(int(rows), 1) * 512)},
+        geometry={**vars(g), "max_rows": max_rows, "replay_rows": replay_rows,
+                  "tail_bytes": TAIL_BYTES, "projected_inputs": True})
 
 
 def compile_glmf_kda_core_aot(g=GLM53_FLASH, *, max_rows=64, decode=True,

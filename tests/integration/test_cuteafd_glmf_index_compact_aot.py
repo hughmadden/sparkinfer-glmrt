@@ -39,9 +39,10 @@ def _b12x():
 def P(kind, **kw):
     key = (kind, tuple(sorted(kw.items())))
     if key not in _PROGRAMS:
-        from b12x.integration.cuteafd import GLM53_FLASH, glmf
+        from b12x.integration.cuteafd import GLM53_FLASH, glmf, glmf_split
 
         fn = {"keys": glmf.compile_glmf_index_producer_aot, "compact": glmf.compile_glmf_index_producer_c_aot,
+              "projected": glmf_split.compile_glmf_projected_index_c_aot,
               "commit": glmf.compile_glmf_kda_commit_aot, "commit_c": glmf.compile_glmf_kda_commit_c_aot}[kind]
         _PROGRAMS[key] = fn(GLM53_FLASH, **kw)
     return _PROGRAMS[key]
@@ -100,8 +101,9 @@ class World:
     """Sequences over shared paged caches (allocation units of four 64-row MLA pages and one
     pool page, as the engine's), run through the per-token-key producer and the compact one."""
 
-    def __init__(self, g, weights, *, slots=16, units=48, seed=0, x_rows=None):
+    def __init__(self, g, weights, *, slots=16, units=48, seed=0, x_rows=None, projected=False):
         self.g, self.w, self.slots = g, weights, slots
+        self.projected = projected
         self.gen = torch.Generator(device="cuda").manual_seed(1000 + seed)
         self.x_rows = x_rows or (lambda rows: torch.randn((rows, g.hidden), generator=self.gen,
                                                           device="cuda").bfloat16())
@@ -162,6 +164,8 @@ class World:
         self.replay.view(torch.int16).random_(-32768, 32767, generator=self.gen)
         (s0, q0, h0), (s1, q1, h1) = outs
         tails_before = self.tails.clone()
+        if self.projected:
+            tails2, replay2, cache2 = tails_before.clone(), self.replay.clone(), self.cache_compact.clone()
         keys.launch(x, q_resid, t(records, torch.int64), t(pools, torch.int64), w["w_iq"], w["w_ik"], w["k_norm_w"],
                     w["k_norm_b"], w["ape"], self.token_keys, self.cache_keys, q0.view(torch.float8_e4m3fn), h0, s0,
                     scalars=(rows,))
@@ -169,6 +173,25 @@ class World:
                        t(first, torch.int32), w["w_iq"], w["w_ik"], w["k_norm_w"], w["k_norm_b"], w["ape"],
                        self.tails, self.replay, self.cache_compact, q1.view(torch.float8_e4m3fn), h1, s1,
                        scalars=(rows, int(spec)))
+        if self.projected:
+            from b12x.integration.cuteafd.glmf import _align
+            projected = P("projected", max_rows=cap)
+            projected_scratch = torch.empty((projected.scratch_bytes(cap)["scratch"],),
+                                            dtype=torch.uint8, device="cuda")
+            q2, h2 = torch.empty_like(q1), torch.empty_like(h1)
+            # The compact producer leaves its actual rounded projection rows in scratch.
+            iq = s1[:rows*g.index_heads*128*2].view(torch.bfloat16)
+            kw_at = _align(rows*g.index_heads*128*2)
+            kw = s1[kw_at:kw_at+rows*(256+g.index_heads)*2].view(torch.bfloat16)
+            projected.launch(iq, kw, t(pools, torch.int64), t(positions, torch.int64), t(kda, torch.int32),
+                t(first, torch.int32), w["k_norm_w"], w["k_norm_b"], w["ape"], tails2, replay2,
+                cache2, q2.view(torch.float8_e4m3fn), h2, projected_scratch, scalars=(rows, int(spec)))
+            torch.cuda.synchronize()
+            assert torch.equal(q2, q1)
+            assert torch.equal(h2.view(torch.int32), h1.view(torch.int32))
+            assert torch.equal(tails2, self.tails)
+            assert torch.equal(replay2.view(torch.int16), self.replay.view(torch.int16))
+            assert torch.equal(cache2, self.cache_compact)
         torch.cuda.synchronize()
         assert torch.equal(q0, q1)
         assert torch.equal(h0.view(torch.int32), h1.view(torch.int32))
@@ -240,14 +263,47 @@ def _g():
     return GLM53_FLASH
 
 
+@pytest.mark.parametrize("projected", [False, True])
 @pytest.mark.parametrize("cap", [64, 4096])
-def test_prefill_chunks_end_at_every_position_mod_4(cap):
-    world = World(_g(), _random_weights(_g(), 1), seed=1)
+def test_prefill_chunks_end_at_every_position_mod_4(cap, projected):
+    world = World(_g(), _random_weights(_g(), 1), seed=1, projected=projected)
     seq = world.admit(1200)
     chunks = [1, 2, 3, 4, 5, 6, 7, 61, 64, 63, 1, 1, 1, 2, 3] if cap == 64 else [1, 2, 3, 70, 129, 257, 255, 3, 2, 1]
     for n in chunks:
         world.step([(seq, n)], cap)
     assert seq["len"] == sum(chunks)
+
+
+def test_projected_index_pool_page_past_int32_byte_offset():
+    g = _g()
+    program = P("projected", max_rows=64)
+    page_bytes = PAGE * 132
+    page = (1 << 31) // page_bytes + 1
+    # Only the live tail page is initialized; the sparse allocation stays bounded at ~2 GiB.
+    high = torch.empty(((page + 1) * page_bytes,), dtype=torch.uint8, device="cuda")
+    high[page*page_bytes:].fill_(165)
+    low = torch.full((page_bytes,), 165, dtype=torch.uint8, device="cuda")
+    iq = torch.randn((4, g.index_heads, 128), device="cuda").bfloat16()
+    kw = torch.randn((4, 256 + g.index_heads), device="cuda").bfloat16()
+    weights = _random_weights(g, 151)
+    positions = torch.arange(4, dtype=torch.int64, device="cuda")
+    slots = torch.zeros(4, dtype=torch.int32, device="cuda")
+    outputs = []
+    for cache, pid in ((low, 0), (high, page)):
+        tails = torch.zeros((1, TAIL_BYTES), dtype=torch.uint8, device="cuda")
+        replay = torch.zeros((64, 256), dtype=torch.bfloat16, device="cuda")
+        query = torch.empty((4, g.index_heads, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        heads = torch.empty((4, g.index_heads), dtype=torch.float32, device="cuda")
+        scratch = torch.empty((program.scratch_bytes(64)["scratch"],), dtype=torch.uint8, device="cuda")
+        pools = torch.tensor([-1, -1, -1, pid*PAGE], dtype=torch.int64, device="cuda")
+        program.launch(iq, kw, pools, positions, slots, slots, weights["k_norm_w"], weights["k_norm_b"],
+            weights["ape"], tails, replay, cache, query, heads, scratch, scalars=(4, 0))
+        outputs.append((query, heads, tails))
+    torch.cuda.synchronize()
+    assert torch.equal(low, high[page*page_bytes:])
+    for a, b in zip(*outputs):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    assert torch.any(low != 165)
 
 
 def test_prefill_lanes_then_decode_steps_of_several_sequences():
@@ -268,11 +324,12 @@ def test_prefill_lanes_then_decode_steps_of_several_sequences():
         world.step(parts, 64)
 
 
+@pytest.mark.parametrize("projected", [False, True])
 @pytest.mark.parametrize("rows", [1, 3, 6])
-def test_speculative_commit_at_every_kept_count(rows):
+def test_speculative_commit_at_every_kept_count(rows, projected):
     g = _g()
     for keep in range(rows + 1):
-        world = World(g, _random_weights(g, 4), seed=10 + keep)
+        world = World(g, _random_weights(g, 4), seed=10 + keep, projected=projected)
         # Four sequences, one per start position mod 4, in one speculative step.
         seqs = [world.admit(600) for _ in range(4)]
         for r, seq in enumerate(seqs):

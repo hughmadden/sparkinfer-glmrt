@@ -63,6 +63,45 @@ def test_stage_abi(stage, names):
         assert p["scratch"]["scratch"](17) == 17*2048*4
 
 
+@pytest.mark.parametrize("capacity,rows,replay", [(64, 1, None), (64, 17, None), (4096, 257, 128)])
+def test_projected_index_contract(capacity, rows, replay):
+    g = Geometry(index_heads=32, index_kpool=4, page_rows=64, index_norm_eps=1e-6)
+    ns = extracted(ROOT / "b12x/integration/cuteafd/glmf_split.py",
+        {"compile_glmf_projected_index_c_aot"}, dict(
+            GLM53_FLASH=g, GLMFGeometry=Geometry, REPLAY_ROWS=64, TAIL_BYTES=1552,
+            _check_rows=int, _ProjectedIndexCompact=Primitive, Operand=Operand, Scalar=lambda x: x,
+            _align=lambda n: (n + 1023)//1024*1024,
+            torch=SimpleNamespace(bfloat16="bf16", uint8="u8", int64="i64", int32="i32",
+                                  float8_e4m3fn="fp8", float32="f32"),
+            compile_program=lambda launch, **kw: dict(launch=launch, **kw)))
+    compile_index = ns["compile_glmf_projected_index_c_aot"]
+    p = compile_index(max_rows=capacity, verify_rows=replay)
+    ops = {o.name: o for o in p["operands"]}
+    assert list(ops) == ["iq", "kw", "pool_slots", "positions", "kda_slots", "seq_first",
+        "k_norm_w", "k_norm_b", "ape", "tails", "replay", "index_cache", "q_fp8", "head_weights", "scratch"]
+    assert ops["iq"].shape == "[rows,32,128]"
+    assert ops["kw"].shape == "[rows,288]"
+    assert ops["replay"].shape == f"[{64 if replay is None else replay},256]"
+    assert ops["tails"].role == ops["index_cache"].role == "inout"
+    assert p["scalars"] == ("rows", "spec")
+    assert p["key"] == (g, capacity, 64 if replay is None else replay)
+    assert p["scratch"]["scratch"](rows) == (rows*512 + 1023)//1024*1024
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="verify_rows"):
+            compile_index(verify_rows=invalid)
+    with pytest.raises(ValueError, match="GLMFGeometry"):
+        compile_index(object())
+
+
+def test_projected_index_reuses_original_post_and_pool():
+    tree = ast.parse((ROOT / "b12x/integration/cuteafd/glmf_split.py").read_text())
+    stage = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_ProjectedIndexCompact")
+    calls = [ast.unparse(n.func) for n in ast.walk(stage) if isinstance(n, ast.Call)]
+    assert "GlmfIndexPostRows" in calls and "GlmfPoolKeysTail" in calls
+    assert "self.post" in calls and "self.pool" in calls
+    assert not any("projection" in name for name in calls)
+
+
 def test_kda_reuses_original_geometry_and_clamped_activation():
     split = (ROOT / "b12x/integration/cuteafd/glmf_split.py").read_text()
     shared = (ROOT / "b12x/integration/cuteafd/kimi_split.py").read_text()
