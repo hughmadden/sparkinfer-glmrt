@@ -432,7 +432,7 @@ def test_swiglu_clamp_gpu_matches_flash_reference_and_graph(limit):
         scalars=(), key=(limit,), geometry={"swiglu_limit": limit})
 
     def run():
-        probe(*args, stream)
+        probe(*args, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
         reference.launch(source, expected, scalars=())
 
     def check():
