@@ -159,7 +159,7 @@ def parse_args(argv=None):
                         help="explicit activation contract; defaults to the geometry contract")
     parser.add_argument("--rows", default="1,16,80,1024,4096")
     parser.add_argument("--capacity", type=int, help="fixed compiled export/workspace capacity; defaults to each live row count")
-    parser.add_argument("--experts", type=int, help="shipped STREAM screen resident experts; default preserves the L2-sized screen")
+    parser.add_argument("--experts", type=int, help="shipped STREAM resident experts; defaults to checkpoint count; overrides are diagnostic")
     parser.add_argument("--routes", type=Path, help="schema-1 histograms or an existing expert-routes JSONL")
     parser.add_argument("--route", default="auto")
     parser.add_argument("--iters", type=int, default=20)
@@ -811,6 +811,12 @@ def production_stream_arm(x, ids, routing, weights, scales, coded, *, capacity=N
     return lambda: execute(live_rows), output[:live_rows], (arena, tensors, views, launch, combine, token_view), qualification
 
 
+def stream_screen_population(g, args):
+    """Only checkpoint-population, non-hot routes can qualify a prefill route."""
+    experts = args.experts if args.experts is not None else g.experts
+    return experts, experts == g.experts and args.routing != "hot"
+
+
 def shipped_stream_screen(g, args):
     properties = torch.cuda.get_device_properties(0)
     sm = properties.major * 10 + properties.minor
@@ -823,11 +829,12 @@ def shipped_stream_screen(g, args):
                       for rows in map(int, args.rows.split(","))} if waves else {}
     route_fixture = ({"path": str(args.routes), "sha256": hashlib.sha256(args.routes.read_bytes()).hexdigest(),
                       "family_attested": args.routes.suffix != ".jsonl"} if waves else None)
+    if not stream_screen_population(g, args)[1]:
+        print("DIAGNOSTIC ONLY: hot routing or non-checkpoint expert count cannot qualify a route", flush=True)
     records = []
     for width in paired_widths(g.intermediate, args.widths, args.engine_policy_root):
         expert_bytes = 3 * width * g.hidden // 2
-        experts = args.experts or max(16, (2 * l2_bytes // (16 * expert_bytes) + 1) * 16,
-                                      g.experts if waves else 0)
+        experts, route_qualification_eligible = stream_screen_population(g, args)
         if experts < g.top_k or experts * expert_bytes <= 2 * l2_bytes:
             raise ValueError("resident experts must cover top-k and exceed twice L2")
         if waves and experts != g.experts:
@@ -891,6 +898,7 @@ def shipped_stream_screen(g, args):
             print(f"STREAM cell live={rows} compiled={capacity} experts={experts} routing={routing_mode} "
                   f"rows/expert min/mean/max={occupancy['min']}/{occupancy['mean']:.3f}/{occupancy['max']}", flush=True)
             record = dict(capacity=capacity, experts=experts, routing=routing_mode, rows_per_expert=occupancy,
+                route_qualification_eligible=route_qualification_eligible,
                 route_fixture=route_fixture, geometry=g.name, sm=sm, width=width, rows=rows, shipped_recipe=recipe,
                 controls=controls, samples_us=samples, median_us=medians,
                 speedup=min(control) / medians["native-stream"],
