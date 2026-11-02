@@ -421,24 +421,24 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
                       ctas_per_sm=4, ingress_warps=INGRESS_WARPS))
 
 
-def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_groups=512, experts=256):
+def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_groups=512, experts=256, swiglu_limit=0):
     """Exporter tuples and role ownership; callers must not duplicate this list."""
     from .exlr8 import DEFAULT_SERVING_VARIANT, compile_exlr8_a16_aot
     if role not in ("all", "coordinator", "spark"):
         raise ValueError(f"unknown EXLR8 export role {role!r}")
     result = [
         ("a16_decode", "exlr8_a16", {"max_rows": 64},
-         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k, max_groups=max_groups)),
+         lambda: compile_exlr8_a16_aot(swiglu_limit=swiglu_limit, hidden=hidden, units=units, top_k=top_k, max_groups=max_groups)),
         # Routed <=64-row decode: the compact-unit routed serving core (ported
         # from the S3 Gemini duel branch) beside the 64-row grouped instance.
         ("a16_serving", "exlr8_a16", {"max_rows": 64, "serving_variant": DEFAULT_SERVING_VARIANT},
-         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+         lambda: compile_exlr8_a16_aot(swiglu_limit=swiglu_limit, hidden=hidden, units=units, top_k=top_k,
                                       max_groups=max_groups, device_count=True,
                                       serving_variant=DEFAULT_SERVING_VARIANT)),
         ("group", "exlr8_group", {"max_rows": 64},
          lambda: compile_exlr8_group_aot(experts=experts, top_k=top_k, max_groups=max_groups, hidden=hidden)),
         ("shared_a16_serving", "exlr8_a16", {"max_rows": 64},
-         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=1,
+         lambda: compile_exlr8_a16_aot(swiglu_limit=swiglu_limit, hidden=hidden, units=units, top_k=1,
                                       max_groups=4, device_count=True, shared_expert=True)),
         ("shared_group", "exlr8_group", {"max_rows": 64},
          lambda: compile_exlr8_group_aot(experts=1, top_k=1, max_groups=4, hidden=hidden,
@@ -446,10 +446,10 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
     ]
     grouped = [
         ("a16_grouped", "exlr8_a16", {"max_rows": 4096},
-         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+         lambda: compile_exlr8_a16_aot(swiglu_limit=swiglu_limit, hidden=hidden, units=units, top_k=top_k,
              max_groups=(4096 * top_k + 63)//64 + experts, device_count=True, grouped=True)),
         ("a8_grouped", "exlr8_a16", {"max_rows": 4096, "activations": "a8"},
-         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+         lambda: compile_exlr8_a16_aot(swiglu_limit=swiglu_limit, hidden=hidden, units=units, top_k=top_k,
              max_groups=(4096 * top_k + 63)//64 + experts, device_count=True, grouped=True,
              activations="a8")),
         ("grouped_group", "exlr8_group", {"max_rows": 4096},
@@ -459,7 +459,7 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
         # threshold, with F32 FC2 partials so output stays bit-identical to K1.
         # It pairs with the 64-row "group" glue entry above.
         ("a16_grouped64", "exlr8_a16", {"max_rows": 64, "fc2_partials": "f32"},
-         lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+         lambda: compile_exlr8_a16_aot(swiglu_limit=swiglu_limit, hidden=hidden, units=units, top_k=top_k,
              max_groups=max_groups, device_count=True, grouped=True, group_rows=16,
              grouped_rows=64, fc2_partials="f32")),
     ]

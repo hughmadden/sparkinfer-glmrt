@@ -213,3 +213,105 @@ def test_grouped_l2_scalar_is_runtime_only(contract):
     core = next(n for n in kernel.body if isinstance(n, ast.ClassDef) and n.name == "Exlr8GroupedKernel")
     serving = next(n for n in core.body if isinstance(n, ast.FunctionDef) and n.name == "serving")
     assert tuple(a.arg for a in serving.args.args[-4:]) == ("cta_limit", "unit_limit", "l2_bytes", "stream")
+
+
+@pytest.mark.parametrize("role", ["all", "coordinator", "spark"])
+def test_swiglu_limit_is_static_and_covers_every_expert_program(contract, role):
+    default = programs(contract, role)
+    explicit_zero = programs(contract, role, swiglu_limit=0)
+    flash = programs(contract, role, hidden=4096, experts=288, swiglu_limit=10)
+    for name, program in default.items():
+        assert program.key == explicit_zero[name].key
+        assert program.geometry == explicit_zero[name].geometry
+        if "group" not in name or name.startswith(("a16_", "a8_")):
+            assert "swiglu_limit" not in program.geometry
+            assert flash[name].geometry["swiglu_limit"] == 10
+            assert flash[name].key[-2:] == ("swiglu_limit", 10.0)
+        else:
+            assert "swiglu_limit" not in flash[name].geometry
+
+
+@pytest.mark.parametrize("limit", [-1, float("inf"), float("nan")])
+def test_invalid_swiglu_limit_rejected(contract, limit):
+    with pytest.raises(ValueError, match="swiglu_limit"):
+        contract.compile_exlr8_a16_aot(swiglu_limit=limit)
+
+
+def _cpu_function(node, scope):
+    node.decorator_list = []
+    node.returns = None
+    for arg in node.args.args + node.args.kwonlyargs:
+        arg.annotation = None
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "cpu_exlr8_activation", "exec"), scope)
+    return scope[node.name]
+
+
+def test_flash_swiglu_clamp_matches_reference_beyond_both_limits():
+    """Execute the real scalar DSL expressions on CPU, not a copied clamp.
+
+    This is a clamp oracle, not GPU qualification. EXLR8 retains its FP32
+    activation chain; the ordinary Flash reference rounds SiLU to BF16.
+    """
+    import math
+    import struct
+
+    def bf16(value):
+        bits = struct.unpack("I", struct.pack("f", value))[0]
+        bits = (bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000
+        return struct.unpack("f", struct.pack("I", bits))[0]
+
+    root = ROOT / "b12x/moe/_shared/kernels/w4a16"
+    tree = ast.parse((root / "exlr8.py").read_text())
+    scope = dict(cutlass=SimpleNamespace(const_expr=bool), Float32=float,
+                 fmin_f32=min, fmax_f32=max)
+    clamp = _cpu_function(next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                               and n.name == "exlr8_clamp_swiglu"), scope)
+    flash = ast.parse((INTEGRATION / "_glm_kernels.py").read_text())
+    cls = next(n for n in flash.body if isinstance(n, ast.ClassDef) and n.name == "GlmSwiGLU")
+    kernel = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "kernel")
+    reference_clamp = next(n for n in ast.walk(kernel) if isinstance(n, ast.If)
+                           and isinstance(n.test, ast.Call)
+                           and ast.unparse(n.test.func) == "cutlass.const_expr")
+    reference = compile(ast.fix_missing_locations(ast.Module(body=reference_clamp.body,
+                                                            type_ignores=[])), "flash_clamp", "exec")
+    exercised = set()
+    for gate in (-40., -11., -10., -1., 0., 1., 10., 11., 40.):
+        for up in (-40., -11., -10., 0., 10., 11., 40.):
+            actual_gate, actual_up = clamp(gate, up, 10)
+            ref = dict(scope, gate=gate, up=up, self=SimpleNamespace(limit=10))
+            exec(reference, ref)
+            assert (actual_gate, actual_up) == (ref["gate"], ref["up"])
+            assert clamp(gate, up, 0) == (gate, up)
+            silu = actual_gate / (1 + math.exp(-actual_gate))
+            actual = bf16(silu * actual_up)
+            expected = bf16(bf16(ref["gate"] / (1 + math.exp(-ref["gate"]))) * ref["up"])
+            assert abs(actual - expected) <= max(abs(expected) * 0.008, 1e-30)
+            if gate > 10:
+                assert actual_gate == 10
+                exercised.add("gate_upper")
+            if gate < -10:
+                assert actual_gate == gate
+                exercised.add("gate_lower_unchanged")
+            if up > 10:
+                assert actual_up == 10
+                exercised.add("up_upper")
+            if up < -10:
+                assert actual_up == -10
+                exercised.add("up_lower")
+    assert exercised == {"gate_upper", "gate_lower_unchanged", "up_upper", "up_lower"}
+
+
+def test_every_exlr8_activation_site_uses_shared_clamp():
+    root = ROOT / "b12x/moe/_shared/kernels/w4a16"
+    sites = []
+    for name in ("exlr8.py", "exlr8_grouped.py"):
+        tree = ast.parse((root / name).read_text())
+        for cls in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+            for method in (n for n in cls.body if isinstance(n, ast.FunctionDef)):
+                calls = [n for n in ast.walk(method) if isinstance(n, ast.Call)
+                         and isinstance(n.func, ast.Name) and n.func.id == "exlr8_clamp_swiglu"]
+                for call in calls:
+                    assert ast.unparse(call.args[-1]) == "self.swiglu_limit"
+                    sites.append(cls.name)
+    assert sorted(sites) == sorted(["Exlr8A16Kernel", "Exlr8A16CompactKernel",
+                                    "Exlr8RoutedServingKernel", "Exlr8GroupedKernel"])

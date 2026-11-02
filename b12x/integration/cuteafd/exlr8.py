@@ -49,7 +49,8 @@ def scratch_bytes(g):
 class _Exlr8Pointers:
     def __init__(self, g):
         from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
-        self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"], g["max_groups"])
+        self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"], g["max_groups"],
+                                   swiglu_limit=g.get("swiglu_limit", 0))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -80,13 +81,16 @@ class _Exlr8ServingPointers:
         if g.get("max_rows", 64) > 64:
             from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
             self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
-                                           g["max_groups"], g["group_rows"])
+                                           g["max_groups"], g["group_rows"],
+                                           swiglu_limit=g.get("swiglu_limit", 0))
         elif g.get("serving_variant", "baseline") == "baseline":
             self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"],
-                                      g["max_groups"], device_count=True)
+                                      g["max_groups"], device_count=True,
+                                      swiglu_limit=g.get("swiglu_limit", 0))
         else:
             self.core = Exlr8RoutedServingKernel(g["hidden"], g["units"], g["top_k"],
-                                                 g["max_groups"], variant=g["serving_variant"])
+                                                 g["max_groups"], variant=g["serving_variant"],
+                                                 swiglu_limit=g.get("swiglu_limit", 0))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -127,7 +131,8 @@ class _Exlr8GroupedServingPointers:
                                        g["max_groups"], g["group_rows"],
                                        activations=g.get("activations", "a16"),
                                        quantize_pass=g.get("quantize_pass", True),
-                                       fc2_f32=g.get("fc2_partials", "f16") == "f32")
+                                       fc2_f32=g.get("fc2_partials", "f16") == "f32",
+                                       swiglu_limit=g.get("swiglu_limit", 0))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -189,7 +194,8 @@ class _Exlr8CompactServingPointers:
     def __init__(self, g):
         from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16CompactKernel
         self.core = Exlr8A16CompactKernel(g["hidden"], g["units"], g["top_k"],
-                                          g["max_groups"], device_count=True)
+                                          g["max_groups"], device_count=True,
+                                          swiglu_limit=g.get("swiglu_limit", 0))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -225,7 +231,9 @@ DEFAULT_SERVING_VARIANT = "k1_k23_coalesced"
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                          device_count=False, shared_expert=False, grouped=False, group_rows=64,
                          grouped_rows=4096, fc2_partials="f16", compact_units=False,
-                         activations="a16", quantize_pass=True, serving_variant=None):
+                         activations="a16", quantize_pass=True, serving_variant=None, swiglu_limit=0):
+    if not 0 <= swiglu_limit < float("inf"):
+        raise ValueError("EXLR8 swiglu_limit must be finite and nonnegative")
     if activations not in ("a16", "a8") or (activations == "a8" and not grouped):
         raise ValueError("EXLR8 A8 activations require grouped prefill")
     # Routed <=64-row decode defaults to the compact-unit routed serving core;
@@ -253,6 +261,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     if fc2_partials not in ("f16", "f32"):
         raise ValueError("EXLR8 FC2 partials must be f16 or f32")
     g = geometry(hidden, units, top_k, max_groups)
+    if swiglu_limit:
+        g["swiglu_limit"] = float(swiglu_limit)
     if routed_serving:
         g["serving_variant"] = variant
     if grouped:
@@ -324,6 +334,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                 + (("fused_quantize",) if grouped and activations != "a16" and not quantize_pass else ())
                                 + ((grouped_rows,) if grouped and grouped_rows != 4096 else ())
                                 + ((fc2_partials,) if grouped and fc2_partials != "f16" else ())
-                                + ((variant,) if routed_serving else ())), geometry=g,
+                                + ((variant,) if routed_serving else ())
+                                + (("swiglu_limit", float(swiglu_limit)) if swiglu_limit else ())), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)
