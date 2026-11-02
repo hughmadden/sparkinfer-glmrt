@@ -20,12 +20,15 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import (
 
 class V41SlicePipeline:
     def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576,
-                 hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False):
+                 hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False,
+                 fc1_k_splits=1):
         self.capacity = capacity
         self.hidden = hidden
         self.atomic_tokens = atomic_tokens
         self.experts = experts
         self.topk = topk
+        if atomic_tokens and fc1_k_splits != 1:
+            raise ValueError("FC1 K splits require ordered route output")
         self.plan = V41RoutePlan(capacity, experts, topk, route_metadata=not atomic_tokens)
         if atomic_tokens:
             self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=True,
@@ -36,7 +39,8 @@ class V41SlicePipeline:
         else:
             self.compute = None
             self.fc1 = V41SliceFc1Kernel(width, capacity, topk=topk, intermediate=intermediate,
-                                         hidden=hidden, exact_storage=exact_storage, scale_codes=scale_codes)
+                                         hidden=hidden, exact_storage=exact_storage, scale_codes=scale_codes,
+                                         fc1_k_splits=fc1_k_splits)
             self.fc2 = V41SliceFc2Kernel(width, capacity, topk=topk, intermediate=intermediate,
                                          hidden=hidden, exact_storage=exact_storage, fc2_n_splits=fc2_n_splits,
                                          scale_codes=scale_codes)

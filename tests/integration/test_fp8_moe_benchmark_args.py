@@ -17,10 +17,37 @@ bench = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(bench)
 
 
+def test_v41_fc1_split_is_explicit_and_defaults_to_one():
+    path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v41_slice_pipeline.py"
+    tree = ast.parse(path.read_text())
+    pipeline = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                    and node.name == "V41SlicePipeline")
+    init = next(node for node in pipeline.body if isinstance(node, ast.FunctionDef)
+                and node.name == "__init__")
+    defaults = dict(zip((arg.arg for arg in init.args.kwonlyargs), init.args.kw_defaults))
+    assert ast.literal_eval(defaults["fc1_k_splits"]) == 1
+    assert "get_sm_version" not in path.read_text()
+    assert "FC1_DECODE_K_SPLITS" not in path.read_text()
+
+
+def test_seed_oracle_control_does_not_inherit_default_split():
+    path = _PATH.parents[1] / "tests/moe/test_v41_exact_slices.py"
+    tree = ast.parse(path.read_text())
+    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "_synthetic_oracle_seeds")
+    arms = [node for node in ast.walk(helper) if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id == "native_pair_arm"]
+    control, candidate = arms
+    assert isinstance(control.args[2], ast.Name) and control.args[2].id == "exact_control"
+    assert next(kw.value.value for kw in control.keywords if kw.arg == "fc1_k_splits") == 1
+    assert next(kw.value.id for kw in candidate.keywords if kw.arg == "fc1_k_splits") == "k_split"
+
+
 def test_mxfp4_pair_widths_cover_all_worlds_without_padding(monkeypatch):
     monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
         ownership_unit=lambda intermediate, world: 64 if (intermediate, world) == (2304, 5) else 32))
     assert bench.paired_widths(2304) == [288, 320, 352, 384, 448, 512, 576, 768, 1152]
+
     assert bench.paired_widths(2048) == [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024]
     assert bench.paired_widths(3072) == [384, 416, 448, 512, 608, 640, 768, 1024, 1536]
     args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--geometry", "v41", "--widths", "448,480"])

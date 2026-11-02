@@ -510,7 +510,8 @@ def native_slice_width(family, rank_width):
 
 
 def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
-                    aligned_w2=False, aligned_w2_scales=False, stored_width=None, combine_output=False):
+                    aligned_w2=False, aligned_w2_scales=False, stored_width=None,
+                    combine_output=False, fc1_k_splits=1):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -569,7 +570,7 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     pipeline = V41SlicePipeline(rows, width, experts=experts, topk=topk,
                                 intermediate=intermediate, hidden=hidden,
                                 exact_storage=tail or stored_width is not None,
-                                atomic_tokens=atomic, scale_codes=coded)
+                                atomic_tokens=atomic, scale_codes=coded, fc1_k_splits=fc1_k_splits)
     if stored_width is not None:
         # Physical strides come from P; the launch only visits the real S slices.
         for kernel in (pipeline.fc1, pipeline.fc2, pipeline.reduce):
