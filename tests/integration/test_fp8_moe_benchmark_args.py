@@ -576,3 +576,16 @@ def test_stream_capacity_padding_preserves_live_inputs():
     assert bench.screen_capacity_inputs(x, ids, mix, None)[0] is x
     with pytest.raises(ValueError, match="cover live"):
         bench.screen_capacity_inputs(x, ids, mix, 2)
+
+
+@pytest.mark.parametrize("family,experts", [("v41", 384), ("dsv4f", 256), ("dsv4p", 384)])
+def test_stream_default_uses_checkpoint_population_and_hot_is_diagnostic(family, experts):
+    args = bench.parse_args(["--geometry", family, "--mxfp4-pair", "--native-slices",
+                             "--shipped-prefill", "--engine-policy-root", "engine", "--rows", "256"])
+    geometry = SimpleNamespace(experts=experts)
+    assert args.routing == "random"
+    assert bench.stream_screen_population(geometry, args) == (experts, True)
+    args.routing = "hot"
+    assert bench.stream_screen_population(geometry, args) == (experts, False)
+    args.routing, args.experts = "random", 16
+    assert bench.stream_screen_population(geometry, args) == (16, False)
