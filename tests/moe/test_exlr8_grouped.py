@@ -378,3 +378,84 @@ def test_every_live_row_count_a8_invariance(units):
                 compute(grouped_a8[1], state, weights, pointers, bits, signs, live, limit)
                 assert torch.equal(state["output"][:live].view(torch.int16), grouped_expected[:live].view(torch.int16)), (live, limit, "reverse")
                 assert torch.isnan(state["output"][live:]).all()
+
+
+@pytest.mark.parametrize("limit", [0, 10])
+def test_swiglu_clamp_gpu_matches_flash_reference_and_graph(limit):
+    """Qualify the production clamp against GlmSwiGLU, without a checkpoint."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Float32, Int32
+    from cutlass.cute.runtime import from_dlpack
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd._glm_kernels import GlmSwiGLU
+    from b12x.moe._shared.kernels.w4a16.exlr8 import exlr8_clamp_swiglu
+
+    class ClampProbe:
+        @cute.jit
+        def __call__(self, source: cute.Tensor, clipped: cute.Tensor,
+                     output: cute.Tensor, stream: cuda.CUstream):
+            self.kernel(source, clipped, output).launch(
+                grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
+
+        @cute.kernel
+        def kernel(self, source: cute.Tensor, clipped: cute.Tensor, output: cute.Tensor):
+            col = Int32(cute.arch.thread_idx()[0])
+            if col < Int32(63):
+                gate, up = exlr8_clamp_swiglu(Float32(source[col]), Float32(source[63 + col]), limit)
+                clipped[col] = gate
+                clipped[63 + col] = up
+                output[col] = gate / (Float32(1) + cute.math.exp(-gate, fastmath=False)) * up
+
+    class FlashProbe:
+        def __init__(self):
+            self.core = GlmSwiGLU(63, limit=limit if limit else None)
+
+        @cute.jit
+        def __call__(self, source: cute.Pointer, output: cute.Pointer, stream: cuda.CUstream):
+            self.core(source, output, Int32(1), stream)
+
+    gates = torch.tensor([-40., -11., -10., -1., 0., 1., 10., 11., 40.], device="cuda")
+    ups = torch.tensor([-40., -11., -10., 0., 10., 11., 40.], device="cuda")
+    gate, up = torch.meshgrid(gates, ups, indexing="ij")
+    source = torch.cat((gate.flatten(), up.flatten())).bfloat16()
+    clipped = torch.empty(126, device="cuda")
+    actual = torch.empty(63, device="cuda")
+    expected = torch.empty(63, device="cuda", dtype=torch.bfloat16)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = [from_dlpack(t) for t in (source, clipped, actual)]
+    probe = cute.compile(ClampProbe(), *args, stream)
+    from b12x.integration.cuteafd._common import Operand, compile_program
+    reference = compile_program(FlashProbe(), name="test_flash_swiglu_reference",
+        operands=(Operand("source", torch.bfloat16, "[126]"),
+                  Operand("output", torch.bfloat16, "[63]", "out")),
+        scalars=(), key=(limit,), geometry={"swiglu_limit": limit})
+
+    def run():
+        probe(*args, stream)
+        reference.launch(source, expected)
+
+    def check():
+        g, u = source[:63].float(), source[63:].float()
+        expected_g = g.clamp(max=limit) if limit else g
+        expected_u = u.clamp(-limit, limit) if limit else u
+        assert torch.equal(clipped[:63], expected_g)
+        assert torch.equal(clipped[63:], expected_u)
+        assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
+        # The ordinary Flash path rounds SiLU to BF16 before multiplying up;
+        # EXLR8 deliberately retains its FP32 activation chain before H128.
+        error = (actual - expected.float()).abs()
+        assert torch.all(error <= expected.float().abs() * 0.008 + 1e-30)
+
+    run()
+    check()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for factor in (-1., 0.5, 4.):
+        source.mul_(factor)
+        clipped.fill_(float("nan"))
+        actual.fill_(float("nan"))
+        graph.replay()
+        check()
