@@ -5052,8 +5052,53 @@ def fp4_decode_4bytes(
 
 
 @dsl_user_op
+def _fp4_decode_2_prmt(byte_val: Uint32, *, loc=None, ip=None) -> Uint32:
+    """``fp4_decode_2`` without ``cvt.*.e2m1x2`` (SM100+): every E2M1 value is
+    an F16 with a zero low byte, so one prmt magnitude lookup builds both
+    halves and the nibble sign bits move to bits 15 and 31. Exact."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(byte_val).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b32 sel, hi, mag, sgn, tbl_a, tbl_b;
+                // F16 high bytes of {0, .5, 1, 1.5, 2, 3, 4, 6}.
+                mov.b32 tbl_a, 0x3E3C3800;
+                mov.b32 tbl_b, 0x46444240;
+                // Selector nibbles 1 and 3: low and high magnitude codes;
+                // nibbles 0 and 2 select the zero byte.
+                shl.b32 sel, $1, 4;
+                and.b32 sel, sel, 0x70;
+                shl.b32 hi, $1, 8;
+                and.b32 hi, hi, 0x7000;
+                or.b32 sel, sel, hi;
+                prmt.b32 mag, tbl_a, tbl_b, sel;
+                shl.b32 sgn, $1, 12;
+                and.b32 sgn, sgn, 0x8000;
+                shl.b32 hi, $1, 24;
+                and.b32 hi, hi, 0x80000000;
+                or.b32 sgn, sgn, hi;
+                or.b32 $0, mag, sgn;
+            }
+            """,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def fp4_decode_2(byte_val: Uint32, *, loc=None, ip=None) -> Uint32:
     """Decode 1 FP4 byte into 1 f16x2 pair."""
+    from .sm80_pipeline import target_arch_major_minor
+
+    if target_arch_major_minor()[0] < 10:
+        return _fp4_decode_2_prmt(byte_val, loc=loc, ip=ip)
     return Uint32(
         llvm.inline_asm(
             T.i32(),
