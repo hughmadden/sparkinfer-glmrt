@@ -185,6 +185,63 @@ def test_block32_projection_replays_in_cuda_graph(capacity, rows):
     _run_projection(1280, 5120, 1, capacity, rows, graph=True)
 
 
+@pytest.mark.parametrize("slices", [2, 4])
+def test_split_k_gemv_partial_planes_sum_to_reference(slices):
+    require_sm89()
+    from b12x._lib.sm89_fp8 import Sm89Block32Gemv
+
+    n, k, rows = 512, 5120, 11
+    torch.manual_seed(slices)
+    a = (torch.randn(rows, k, device="cuda") * 3).to(torch.float8_e4m3fn)
+    sa = torch.randint(110, 135, (rows, k // 32), device="cuda", dtype=torch.uint8)
+    w = (torch.randn(n, k, device="cuda") * 2).to(torch.float8_e4m3fn)
+    sb = torch.randint(115, 130, (n // 32, k // 32), device="cuda", dtype=torch.uint8)
+    planes = torch.zeros(slices * 16 * n, device="cuda")
+    gemv = Sm89Block32Gemv(n, k, max_rows=16, warps=8, slices=slices)
+    args = [_ptr(cutlass.Float8E4M3FN, a), _ptr(cutlass.Float8E4M3FN, w),
+            _ptr(cutlass.Float8E8M0FNU, sa), _ptr(cutlass.Float8E8M0FNU, sb)]
+    c = _ptr(cutlass.Float32, planes)
+    compiled = cute.compile(gemv, *args, c, c, c, c, _ptr(cutlass.Float32, planes), Int32(rows), _stream())
+    compiled(*args, c, c, c, c, _ptr(cutlass.Float32, planes), Int32(rows), _stream())
+    torch.cuda.synchronize()
+    total = planes[: slices * rows * n].view(slices, rows, n).double().sum(0)
+    da = (a.double().view(rows, k // 32, 32) * torch.exp2(sa.double() - 127)[..., None]).view(rows, k)
+    db = (w.double().view(n // 32, 32, k // 32, 32) * torch.exp2(sb.double() - 127)[:, None, :, None]).view(n, k)
+    ref = da @ db.T
+    # FP32 partials: only the tensor core K32 partial rounding and FP32 adds.
+    assert ((total - ref).abs().max() / ref.abs().max()).item() < 1e-3
+    assert bool((planes[slices * rows * n:] == 0).all())
+
+
+def test_output_projection_rows_bitwise_identical_across_decode_and_verify():
+    """o_b shares one reduction recipe for every capacity up to 80 rows: a row's
+    bits must not depend on the capacity (decode 1/16, verify 64/80)."""
+    require_sm89()
+    from b12x._lib.dense_gemm import compile_dense_gemm_mxfp8_aot
+
+    n, k = 2560, 8192
+    torch.manual_seed(5)
+    a = (torch.randn(80, k, device="cuda") * 3).to(torch.float8_e4m3fn)
+    sa = torch.randint(110, 135, (80, k // 32), device="cuda", dtype=torch.uint8)
+    w = (torch.randn(n, k, device="cuda") * 2).to(torch.float8_e4m3fn)
+    sb = torch.randint(115, 130, (n // 32, k // 32), device="cuda", dtype=torch.uint8)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    first = None
+    for capacity, rows in ((1, 1), (16, 16), (64, 64), (80, 80)):
+        gemm, split = compile_dense_gemm_mxfp8_aot(
+            size_m=capacity, size_n=n, size_k=k, expected_m=16, return_split_k_metadata=True,
+            sm_count=sms)
+        assert split == 1
+        out = torch.zeros(rows, n, device="cuda", dtype=torch.bfloat16)
+        c = _ptr(cutlass.BFloat16, out)
+        gemm(_ptr(cutlass.Float8E4M3FN, a), _ptr(cutlass.Float8E4M3FN, w), _ptr(cutlass.Float8E8M0FNU, sa),
+             _ptr(cutlass.Float8E8M0FNU, sb), c, c, c, c, _ptr(cutlass.Float32, out), Int32(rows), _stream())
+        torch.cuda.synchronize()
+        if first is None:
+            first = out[0].clone()
+        assert torch.equal(out[0], first), capacity
+
+
 def test_mhc_projection_runs_on_sm89():
     require_sm89()
     from b12x.norm.mhc._v41_project import compile_v41_mhc_project_aot

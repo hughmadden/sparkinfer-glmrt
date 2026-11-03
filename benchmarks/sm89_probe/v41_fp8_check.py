@@ -172,7 +172,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--projections', default=','.join(p[0] for p in PROJECTIONS))
     ap.add_argument('--rows', default=','.join(map(str, CAPACITIES)))
-    ap.add_argument('--live', default='full', help="'full' (rows = capacity) or 'odd' (capacity - 3)")
+    ap.add_argument('--live', default='full',
+                    help="'full' (rows = capacity), 'odd' (capacity - 3) or a row list such as 4,8 "
+                         "(each row count runs on the smallest listed capacity that holds it)")
     ap.add_argument('--time', action='store_true')
     args = ap.parse_args()
     sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -183,8 +185,12 @@ def main() -> int:
     for name, n, k in PROJECTIONS:
         if name not in wanted:
             continue
-        for capacity in (int(r) for r in args.rows.split(',')):
-            rows = capacity if args.live == 'full' else max(1, capacity - 3)
+        capacities = sorted(int(r) for r in args.rows.split(','))
+        if args.live in ('full', 'odd'):
+            runs = [(c, c if args.live == 'full' else max(1, c - 3)) for c in capacities]
+        else:
+            runs = [(next(c for c in capacities if c >= r), r) for r in map(int, args.live.split(','))]
+        for capacity, rows in runs:
             ok &= check(name, n, k, capacity, rows, sms, stream, args.time)
     print('V41_FP8', 'PASS' if ok else 'FAIL')
     return 0 if ok else 1
