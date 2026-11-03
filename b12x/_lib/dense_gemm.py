@@ -1779,6 +1779,26 @@ class DenseGemmKernel:
         tCc: cute.Tensor,
         row_limit: Int32,
     ) -> cute.Tensor:
+        if cutlass.const_expr(self.pre_hopper):
+            # One predicate per copied row: each rest-M step of the copy moves
+            # other rows, and the activation buffers end at the live rows.
+            tPred = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (
+                        cute.size(tCc, mode=[0, 1]),
+                        cute.size(tCc, mode=[1]),
+                        cute.size(tCc, mode=[2]),
+                    ),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tPred.shape[0]):
+                for rest_m in cutlass.range_constexpr(tPred.shape[1]):
+                    for rest_k in cutlass.range_constexpr(tPred.shape[2]):
+                        tPred[rest_v, rest_m, rest_k] = (
+                            tCc[(0, rest_v), rest_m, rest_k][0] < row_limit
+                        )
+            return tPred
         tPred = cute.make_rmem_tensor(
             cute.make_layout(
                 (
@@ -6400,9 +6420,11 @@ def compile_dense_gemm_mxfp8_aot(
 
         if sfb_k_replicated or split_k_all_m:
             raise ValueError("SM89 MXFP8 AOT supports the K32 32x32 recipe only")
+        # A caller pinning a smaller expected M (the output reduction recipe:
+        # m16 arithmetic up to 80 rows) keeps every row on the decode GEMV.
         compiled, slices = compile_sm89_block32_gemm_aot(
             size_m=size_m, size_n=size_n, size_k=size_k, num_groups=num_groups,
-            sm_count=sm_count,
+            sm_count=sm_count, fixed_rows=regime_m < size_m,
         )
         if slices != 1 and not return_split_k_metadata:
             raise ValueError("SM89 split-K MXFP8 AOT requires return_split_k_metadata")
