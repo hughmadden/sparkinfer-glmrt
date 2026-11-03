@@ -226,8 +226,16 @@ class _TopK:
     def __call__(self, q_fp8: cute.Pointer, weights: cute.Pointer, index_k_cache: cute.Pointer,
                  page_table: cute.Pointer, cache_lengths: cute.Pointer,
                  output_indices: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-                 table_width: Int32, table_stride: Int32, stream: cuda.CUstream,
-                 device_sm_count: Int32 = 0):
+                 table_width: Int32, table_stride: Int32, stream: cuda.CUstream):
+        self._launch(q_fp8, weights, index_k_cache, page_table, cache_lengths,
+                     output_indices, scratch, rows, table_width, table_stride, stream, Int32(0))
+
+    @cute.jit
+    def _launch(self, q_fp8: cute.Pointer, weights: cute.Pointer, index_k_cache: cute.Pointer,
+                page_table: cute.Pointer, cache_lengths: cute.Pointer,
+                output_indices: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                table_width: Int32, table_stride: Int32, stream: cuda.CUstream,
+                device_sm_count: Int32):
         L = self.layout
         base = Int64(scratch.toint())
         cache = Int64(index_k_cache.toint())
@@ -414,8 +422,8 @@ class _RuntimeTopK:
                  output_indices: cute.Pointer, scratch: cute.Pointer, rows: Int32,
                  table_width: Int32, table_stride: Int32, device_sm_count: Int32,
                  stream: cuda.CUstream):
-        self.launch(q_fp8, weights, index_k_cache, page_table, cache_lengths,
-                    output_indices, scratch, rows, table_width, table_stride, stream, device_sm_count)
+        self.launch._launch(q_fp8, weights, index_k_cache, page_table, cache_lengths,
+                            output_indices, scratch, rows, table_width, table_stride, stream, device_sm_count)
 
 
 def _topk_program_launch(launch):

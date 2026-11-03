@@ -288,7 +288,8 @@ def test_export_to_c_signature(programs, key, tmp_path):
 
 @pytest.mark.parametrize("family", ["flash", "pro", "glm", "glmf"])
 @pytest.mark.parametrize("rows", [1, 16])
-def test_portable_fused_groups_match_static_and_time(monkeypatch, family, rows):
+@pytest.mark.parametrize("width", [33, 300])
+def test_portable_fused_groups_match_static_and_time(monkeypatch, family, rows, width):
     """Same compiled callable, runtime SM counts, graph replay, high physical IDs."""
     require_b12x()
     from b12x.integration.cuteafd import FLASH, PRO, GLM53, GLM53_FLASH, exportable_compilation
@@ -299,7 +300,6 @@ def test_portable_fused_groups_match_static_and_time(monkeypatch, family, rows):
          "glmf": _PoolTopK(GLM53_FLASH.index_topk // GLM53_FLASH.index_kpool, GLM53_FLASH.index_heads)}[family]
     heads = 64 if family in ("flash", "pro") else g.index_heads
     build = module.compile_dsv4_index_topk_aot if heads == 64 else glm_indexer.compile_glm_index_topk_aot
-    width = 300
     original = module._TopK
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     with exportable_compilation():
@@ -314,6 +314,8 @@ def test_portable_fused_groups_match_static_and_time(monkeypatch, family, rows):
                     k_quant_page_stride=8448, k_scales_row_stride=2112,
                     max_seq_capacity=width * 64, vectorized_q_load=True,
                     q_row_stride_bytes=heads * 128)
+            key = launch.key()
+            launch.key = lambda: key + ("static-baseline", sms)
             return launch
         monkeypatch.setattr(module, "_TopK", static)
         baseline = build(g, max_rows=rows, max_pages=width, mode="decode")
@@ -345,5 +347,67 @@ def test_portable_fused_groups_match_static_and_time(monkeypatch, family, rows):
         elapsed.append(start.elapsed_time(end) * 1000 / 30)
         outputs.append(torch.sort(out, dim=1).values)
     assert torch.equal(outputs[0], outputs[1]), "canonical selected indices must be byte-exact"
+    if candidate.geometry["runtime_sm_count"]:
+        for runtime_sms in (170, 188):
+            if runtime_sms > sms:
+                continue
+            candidate.launch(q, weights, cache, table, lengths, out, scratch,
+                             scalars=(rows, width, width, runtime_sms))
+            torch.cuda.synchronize()
+            assert torch.equal(outputs[0], torch.sort(out, dim=1).values)
     print(f"PORTABLE_TOPK {family} m{rows} route={candidate.geometry['route']} width={width} "
           f"base_us={elapsed[0]:.3f} candidate_us={elapsed[1]:.3f} speedup={elapsed[0]/elapsed[1]:.4f}")
+
+
+@pytest.mark.parametrize("family", ["flash", "pro", "glm", "glmf"])
+@pytest.mark.parametrize("route", ["decode", "prefill"])
+def test_sparse_consumer_permutation_diagnostic(family, route):
+    """Report whether arrival-order top-k is bitwise invisible to attention."""
+    require_b12x()
+    from b12x.integration.cuteafd import FLASH, PRO, GLM53, GLM53_FLASH, exportable_compilation
+    from b12x.integration.cuteafd.dsv4_sparse_mla import compile_dsv4_sparse_mla_aot
+    from b12x.integration.cuteafd.glm_sparse_mla import compile_glm_sparse_mla_aot
+    from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
+    from .test_cuteafd_dsv4_sparse_mla_aot import _pack
+
+    g = {"flash": FLASH, "pro": PRO, "glm": GLM53, "glmf": GLM53_FLASH}[family]
+    rows, tokens = 2, 4096
+    gen = torch.Generator().manual_seed(1876)
+    dsv4 = family in ("flash", "pro")
+    width = g.index_topk if family != "glmf" else g.index_topk + 64
+    with exportable_compilation():
+        program = (compile_dsv4_sparse_mla_aot(g, route=route, max_rows=16,
+                   indexed_width=width, indexed_page_rows=64) if dsv4 else
+                   compile_glm_sparse_mla_aot(g, route=route, max_rows=64,
+                                            fp32_partials=family == "glmf" and route == "decode"))
+    qwidth = 512 if dsv4 or family == "glmf" else 576
+    q = (torch.randn((rows, g.heads, qwidth), generator=gen) * 0.5).bfloat16().cuda()
+    indices = torch.stack([torch.randperm(tokens, generator=gen)[:width] for _ in range(rows)]).int().cuda()
+    permuted = indices.flip(1).contiguous()
+    lengths = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    scratch = torch.empty(program.scratch_bytes(64)["scratch"], dtype=torch.uint8, device="cuda")
+    if dsv4:
+        swa = _pack(256, 256, 1, gen, "cuda")
+        cache = _pack(tokens, 64, tokens // 64, gen, "cuda")
+        swa_indices = torch.arange(128, dtype=torch.int32, device="cuda").repeat(rows, 1)
+        swa_lengths = torch.full((rows,), 128, dtype=torch.int32, device="cuda")
+        sink = torch.randn((g.heads,), generator=gen).cuda()
+    else:
+        latent = torch.randn((tokens, 512), generator=gen).cuda()
+        rope = torch.randn((tokens, 64), generator=gen).bfloat16().cuda() if family == "glm" else None
+        cache = pack_mla_kv_cache_reference(latent, rope).reshape(tokens // 64, g.kv_page_bytes)
+    outputs = []
+    for selected in (indices, permuted):
+        out = torch.empty((rows, g.heads, 512), dtype=torch.bfloat16, device="cuda")
+        if dsv4:
+            program.launch(q, swa, swa_indices, swa_lengths, cache, selected, lengths, sink,
+                           out, scratch, scalars=(rows,))
+        else:
+            program.launch(q, cache, selected, lengths, out, scratch,
+                           scalars=(rows, 8) if route == "decode" else (rows,))
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all()
+        outputs.append(out)
+    differing = int((outputs[0].view(torch.uint8) != outputs[1].view(torch.uint8)).sum())
+    max_abs = (outputs[0].float() - outputs[1].float()).abs().max().item()
+    print(f"TOPK_CONSUMER_PERMUTATION {family} {route} differing_bytes={differing} max_abs={max_abs:.9g}")
