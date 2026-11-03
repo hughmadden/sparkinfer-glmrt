@@ -284,3 +284,66 @@ def test_fused_decode_replays_in_cuda_graph(programs, pool):
 def test_export_to_c_signature(programs, key, tmp_path):
     info = check_export(programs[key], tmp_path, f"dsv4_index_topk_{key}")
     assert info["argument_count"] == len(programs[key].operands) + len(programs[key].scalars) + 1
+
+
+@pytest.mark.parametrize("family", ["flash", "pro", "glm", "glmf"])
+@pytest.mark.parametrize("rows", [1, 16])
+def test_portable_fused_groups_match_static_and_time(monkeypatch, family, rows):
+    """Same compiled callable, runtime SM counts, graph replay, high physical IDs."""
+    require_b12x()
+    from b12x.integration.cuteafd import FLASH, PRO, GLM53, GLM53_FLASH, exportable_compilation
+    from b12x.integration.cuteafd import dsv4_indexer as module, glm_indexer
+    from b12x.integration.cuteafd.glmf import _PoolTopK
+    from b12x.attention.dsa_indexer.fused_indexer import _build_fused_indexer_kernel, KV_LAYOUT_PAGED
+    g = {"flash": FLASH, "pro": PRO, "glm": GLM53,
+         "glmf": _PoolTopK(GLM53_FLASH.index_topk // GLM53_FLASH.index_kpool, GLM53_FLASH.index_heads)}[family]
+    heads = 64 if family in ("flash", "pro") else g.index_heads
+    build = module.compile_dsv4_index_topk_aot if heads == 64 else glm_indexer.compile_glm_index_topk_aot
+    width = 300
+    original = module._TopK
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    with exportable_compilation():
+        candidate = build(g, max_rows=rows, max_pages=width, mode="decode")
+        def static(*args, **kwargs):
+            launch = original(*args, **kwargs)
+            if launch.route == "paged_fused":
+                ctas = max(1, min(width, sms // rows))
+                launch.fused = _build_fused_indexer_kernel(
+                    KV_LAYOUT_PAGED, heads, g.index_topk, True, ctas,
+                    num_sms=sms, merge_threshold=0 if ctas > 1 else 1 << 30,
+                    k_quant_page_stride=8448, k_scales_row_stride=2112,
+                    max_seq_capacity=width * 64, vectorized_q_load=True,
+                    q_row_stride_bytes=heads * 128)
+            return launch
+        monkeypatch.setattr(module, "_TopK", static)
+        baseline = build(g, max_rows=rows, max_pages=width, mode="decode")
+    # Allocate, but never clear, the unused 2 GiB prefix of the high-ID pool.
+    cache = torch.empty((HIGH_PAGE + width, PAGE_BYTES), dtype=torch.uint8, device="cuda")
+    gen = torch.Generator().manual_seed(876 + rows)
+    cache[HIGH_PAGE:] = _pack_pages(width, gen, "cuda")
+    table = (torch.arange(width, dtype=torch.int32, device="cuda") + HIGH_PAGE).repeat(rows, 1)
+    q = torch.randn((rows, heads, 128), generator=gen).to(torch.float8_e4m3fn).cuda()
+    weights = (torch.randn((rows, heads), generator=gen) * 0.02).cuda()
+    lengths = torch.full((rows,), width * 64, dtype=torch.int32, device="cuda")
+    outputs, elapsed = [], []
+    for program in (baseline, candidate):
+        scratch = torch.zeros(program.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
+        out = torch.empty((rows, g.index_topk), dtype=torch.int32, device="cuda")
+        def run():
+            program.launch(q, weights, cache, table, lengths, out, scratch, scalars=(rows, width, width))
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for _ in range(5):
+            graph.replay()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(30):
+            graph.replay()
+        end.record(); end.synchronize()
+        elapsed.append(start.elapsed_time(end) * 1000 / 30)
+        outputs.append(torch.sort(out, dim=1).values)
+    assert torch.equal(outputs[0], outputs[1]), "canonical selected indices must be byte-exact"
+    print(f"PORTABLE_TOPK {family} m{rows} route={candidate.geometry['route']} width={width} "
+          f"base_us={elapsed[0]:.3f} candidate_us={elapsed[1]:.3f} speedup={elapsed[0]/elapsed[1]:.4f}")
