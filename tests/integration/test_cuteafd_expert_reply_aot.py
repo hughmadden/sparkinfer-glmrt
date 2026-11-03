@@ -13,7 +13,10 @@ def reference(x, format):
     values = x.float().reshape(rows, -1, block)
     amax = values.abs().amax(-1)
     if format == 1:
-        exponent = torch.ceil(torch.log2(amax.double() / 448)).clamp(-127, 127)
+        # 448 = .875 * 2**9. frexp is exact at power-of-two boundaries;
+        # CUDA log2 can round just above an integer and make ceil add a bit.
+        mantissa, binary_exponent = torch.frexp(amax.double())
+        exponent = (binary_exponent - 9 + (mantissa > .875)).clamp(-127, 127)
         exponent = torch.where(amax == 0, -127, exponent)
         scale = torch.exp2(exponent).float()
         codes = (exponent + 127).to(torch.uint8)
@@ -73,6 +76,23 @@ def programs():
     from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
     return (compile_expert_reply_aot(quantize=True),
             compile_expert_reply_aot(stage=True), compile_expert_reply_aot())
+
+
+def test_fp8_reference_exact_power_of_two_boundary(programs):
+    quantize, stage, decode = programs
+    boundary = torch.tensor(float.fromhex("0x1.cp-18"), device="cuda", dtype=torch.bfloat16)
+    above = torch.nextafter(boundary, torch.full_like(boundary, float("inf")))
+    x = torch.stack((boundary, above, torch.zeros_like(boundary))).unsqueeze(1).expand(-1, 32).contiguous()
+    wire, restored = reference(x, 1)
+    assert wire[:, -1].tolist() == [101, 102, 0]
+    packed, scratch, output = torch.empty_like(wire), torch.empty_like(wire), torch.empty_like(x)
+    mode = torch.tensor([1], device="cuda", dtype=torch.uint32)
+    quantize.launch(x, packed, None, scalars=(3, 32, 1))
+    stage.launch(packed, scratch, mode, scalars=(3, 32, -1))
+    decode.launch(scratch, output, mode, scalars=(3, 32, -1))
+    torch.cuda.synchronize()
+    assert torch.equal(packed, wire), mismatch_details(x, packed, wire, 1)
+    assert torch.equal(output.view(torch.int16), restored.view(torch.int16))
 
 
 @pytest.mark.parametrize("width", [32, 128, 4096, 5120, 7168])
