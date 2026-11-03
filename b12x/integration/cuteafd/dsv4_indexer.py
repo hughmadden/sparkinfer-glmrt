@@ -71,7 +71,7 @@ def _descriptor(shape, dtype, strides=None):
 
 
 def _prepared_layout(geometry: DSV4Geometry, max_rows: int, max_pages: int, mode: str,
-                     heads: int = _HEADS, route: str = "auto"):
+                     heads: int = _HEADS, route: str = "auto", *, sm_count: int | None = None):
     """The scratch layout (and route) of the prepared plan for this capacity."""
     from b12x.attention import dsa_indexer
     from b12x.attention.dsa_indexer import _preparation as prep
@@ -98,7 +98,7 @@ def _prepared_layout(geometry: DSV4Geometry, max_rows: int, max_pages: int, mode
     configuration = TUNING.configure(query, device=detect_device(device).identity)
     config = configuration.default if configuration.pinned is None else configuration.pinned
     plan = plan_indexer_scratch(prep._scratch_caps(query, device=device, config=config),
-                                fused_merge=config.fused_merge)
+                                fused_merge=config.fused_merge, sm_count=sm_count)
     return plan.layout
 
 
@@ -118,7 +118,10 @@ def index_topk_scratch_bytes(geometry: DSV4Geometry, *, max_rows: int, max_pages
     ``4``, and for the fused decode route the merge pack
     ``2 * num_sms*K*4`` and merge state ``R * 8968 * 4``.
     """
-    return int(_prepared_layout(geometry, max_rows, max_pages, mode).nbytes)
+    layout = _prepared_layout(geometry, max_rows, max_pages, mode)
+    if layout.route == "paged_fused":
+        layout = _prepared_layout(geometry, max_rows, max_pages, mode, sm_count=256)
+    return int(layout.nbytes)
 
 
 class _TopK:
@@ -138,13 +141,16 @@ class _TopK:
         # arrival-order selector cannot provide this context-split contract.
         route = "paged_tiled" if scored_logical and mode == "decode" else "auto"
         layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route)
+        if layout.route == "paged_fused":
+            # A capacity bound, not a card identity. Live grouping uses the launch device.
+            layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route, sm_count=256)
         self.layout = layout
         self.route = layout.route
         self.mode = mode
         self.topk = int(geometry.index_topk)
         self.max_rows = int(max_rows)
         self.max_pages = int(max_pages)
-        self.num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        self.num_sms = 256 if self.route == "paged_fused" else 0
         self.supertile = int(layout.supertile_tokens)
         self.supertile_pages = max(1, self.supertile // _PAGE)
         if self.route == "paged_fused":
@@ -155,7 +161,7 @@ class _TopK:
                 num_sms=self.num_sms, merge_threshold=int(layout.fused_merge_threshold),
                 k_quant_page_stride=_PAGE_BYTES, k_scales_row_stride=_PAGE_BYTES // 4,
                 max_seq_capacity=self.max_pages * _PAGE, vectorized_q_load=True,
-                q_row_stride_bytes=self.heads * _HEAD_DIM,
+                q_row_stride_bytes=self.heads * _HEAD_DIM, runtime_ctas=True,
             )
             return
         if self.route == "packed_contiguous":
@@ -220,7 +226,8 @@ class _TopK:
     def __call__(self, q_fp8: cute.Pointer, weights: cute.Pointer, index_k_cache: cute.Pointer,
                  page_table: cute.Pointer, cache_lengths: cute.Pointer,
                  output_indices: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-                 table_width: Int32, table_stride: Int32, stream: cuda.CUstream):
+                 table_width: Int32, table_stride: Int32, stream: cuda.CUstream,
+                 device_sm_count: Int32 = 0):
         L = self.layout
         base = Int64(scratch.toint())
         cache = Int64(index_k_cache.toint())
@@ -246,7 +253,9 @@ class _TopK:
             pack_indices = self._flat(cutlass.Int32, base, L.fused_pack_indices_offset_bytes, L.fused_pack_elements)
             state = self._flat(cutlass.Int32, base, L.fused_merge_state_offset_bytes, L.fused_state_words)
             self.fused(q_bytes, w, k_quant, k_scales, table, lengths, lengths, lengths, out, values,
-                       pack_values, pack_indices, state, stream)
+                       pack_values, pack_indices, state, stream,
+                       cute.max(Int32(1), cute.min(Int32(self.max_pages),
+                           cute.min(device_sm_count, Int32(256)) // Int32(self.max_rows))))
         else:
             self._chunked(q_fp8, w, cache, q_bytes, page_table, lengths, cache_lengths,
                           output_indices, base, rows, table_width, table_stride, stream)
@@ -394,6 +403,28 @@ class _TopK:
                    tokens_here, token_begin, Int32(1), Int32(1), Int32(0), stream)
 
 
+
+class _RuntimeTopK:
+    def __init__(self, launch):
+        self.launch = launch
+
+    @cute.jit
+    def __call__(self, q_fp8: cute.Pointer, weights: cute.Pointer, index_k_cache: cute.Pointer,
+                 page_table: cute.Pointer, cache_lengths: cute.Pointer,
+                 output_indices: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 table_width: Int32, table_stride: Int32, device_sm_count: Int32,
+                 stream: cuda.CUstream):
+        self.launch(q_fp8, weights, index_k_cache, page_table, cache_lengths,
+                    output_indices, scratch, rows, table_width, table_stride, stream, device_sm_count)
+
+
+def _topk_program_launch(launch):
+    scalars = (Scalar("rows"), Scalar("table_width"), Scalar("table_stride"))
+    if launch.route == "paged_fused":
+        return _RuntimeTopK(launch), scalars + (Scalar("device_sm_count"),)
+    return launch, scalars
+
+
 def compile_dsv4_index_topk_aot(geometry: DSV4Geometry = FLASH, *, max_rows: int, max_pages: int,
                                 mode: str = "prefill"):
     """C4 index top-k for ``rows <= max_rows`` and ``table_width <= max_pages``."""
@@ -414,14 +445,14 @@ def compile_dsv4_index_topk_aot(geometry: DSV4Geometry = FLASH, *, max_rows: int
         Operand("scratch", torch.uint8, "[index_topk_scratch_bytes]", "scratch"),
     )
     nbytes = int(launch.layout.nbytes)
+    callable_, scalars = _topk_program_launch(launch)
     return compile_program(
-        launch, name=f"dsv4_index_topk_{mode}", operands=operands,
-        scalars=(Scalar("rows"), Scalar("table_width"), Scalar("table_stride")),
+        callable_, name=f"dsv4_index_topk_{mode}", operands=operands,
+        scalars=scalars,
         key=launch.key(),
         geometry={"topk": k, "max_rows": int(max_rows), "max_pages": int(max_pages), "mode": mode,
                   "route": launch.route, "supertile_tokens": launch.supertile,
-                  "minimum_sms": (int(launch.layout.fused_ctas_per_group)
-                                  if launch.route == "paged_fused" and launch.fused.coop_merge_possible else 0)},
+                  "minimum_sms": 0, "runtime_sm_count": launch.route == "paged_fused"},
         scratch={"scratch": lambda rows: nbytes},
         doc=__doc__,
     )

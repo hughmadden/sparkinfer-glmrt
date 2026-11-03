@@ -40,13 +40,16 @@ __all__ = ["compile_glm_index_topk_aot", "glm_index_topk_scratch_bytes"]
 def glm_index_topk_scratch_bytes(g: GLMGeometry = GLM53, *, max_rows: int, max_pages: int, mode: str) -> int:
     from .dsv4_indexer import _prepared_layout
 
-    return int(_prepared_layout(g, max_rows, max_pages, mode, g.index_heads).nbytes)
+    layout = _prepared_layout(g, max_rows, max_pages, mode, g.index_heads)
+    if layout.route == "paged_fused":
+        layout = _prepared_layout(g, max_rows, max_pages, mode, g.index_heads, sm_count=256)
+    return int(layout.nbytes)
 
 
 def compile_glm_index_topk_aot(g: GLMGeometry = GLM53, *, max_rows: int, max_pages: int,
                                mode: str = "prefill"):
     """GLM index top-k for ``rows <= max_rows`` and ``table_width <= max_pages``."""
-    from .dsv4_indexer import _TopK
+    from .dsv4_indexer import _TopK, _topk_program_launch
 
     if mode not in ("prefill", "decode"):
         raise ValueError("mode must be prefill or decode")
@@ -65,14 +68,14 @@ def compile_glm_index_topk_aot(g: GLMGeometry = GLM53, *, max_rows: int, max_pag
         Operand("scratch", torch.uint8, "[index_topk_scratch_bytes]", "scratch"),
     )
     nbytes = int(launch.layout.nbytes)
+    callable_, scalars = _topk_program_launch(launch)
     return compile_program(
-        launch, name=f"glm_index_topk_{mode}", operands=operands,
-        scalars=(Scalar("rows"), Scalar("table_width"), Scalar("table_stride")),
+        callable_, name=f"glm_index_topk_{mode}", operands=operands,
+        scalars=scalars,
         key=launch.key(),
         geometry={"topk": k, "heads": i, "max_rows": int(max_rows), "max_pages": int(max_pages),
                   "mode": mode, "route": launch.route, "supertile_tokens": launch.supertile,
-                  "minimum_sms": (int(launch.layout.fused_ctas_per_group)
-                                  if launch.route == "paged_fused" and launch.fused.coop_merge_possible else 0)},
+                  "minimum_sms": 0, "runtime_sm_count": launch.route == "paged_fused"},
         scratch={"scratch": lambda rows: nbytes},
         doc=__doc__,
     )

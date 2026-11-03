@@ -93,8 +93,8 @@ def _assert_same_selection(actual, expected, lengths, topk):
 
 
 @pytest.mark.parametrize("route,cooperative,ctas,minimum", [
-    ("paged_fused", True, 188, 188),
-    ("paged_fused", True, 11, 11),
+    ("paged_fused", True, 188, 0),
+    ("paged_fused", True, 11, 0),
     ("paged_fused", False, 188, 0),
     ("paged_tiled", False, 0, 0),
 ])
@@ -116,6 +116,8 @@ def test_export_geometry_declares_cooperative_minimum_sms(monkeypatch, route, co
         else:
             result = glm_indexer.compile_glm_index_topk_aot(max_rows=1, max_pages=4096, mode="decode")
     assert result["geometry"]["minimum_sms"] == minimum
+    assert result["geometry"]["runtime_sm_count"] == (route == "paged_fused")
+    assert [s.name for s in result["scalars"]] == ["rows", "table_width", "table_stride"] + (["device_sm_count"] if route == "paged_fused" else [])
 
 
 @pytest.fixture(scope="module")
@@ -281,4 +283,4 @@ def test_fused_decode_replays_in_cuda_graph(programs, pool):
 @pytest.mark.parametrize("key", ["prefill", "decode_fused", "decode_tiled"])
 def test_export_to_c_signature(programs, key, tmp_path):
     info = check_export(programs[key], tmp_path, f"dsv4_index_topk_{key}")
-    assert info["argument_count"] == len(programs[key].operands) + 4
+    assert info["argument_count"] == len(programs[key].operands) + len(programs[key].scalars) + 1
