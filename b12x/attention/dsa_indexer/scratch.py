@@ -958,6 +958,7 @@ def _resolve_indexer_paged_route(
 
 def _indexer_paged_scratch_layout(
     caps: B12XIndexerPagedScratchCaps,
+    *, sm_count: int | None = None,
 ) -> _B12XIndexerPagedScratchLayout:
     max_q_rows = max(int(caps.max_q_rows), 1)
     raw_stream_scorer = os.environ.get(_INDEXER_STREAM_SCORER_ENV)
@@ -999,7 +1000,9 @@ def _indexer_paged_scratch_layout(
         * _PAGED_INDEX_TILE_BLOCK_K,
     )
     device = torch.device(caps.device)
-    if device.type == "cuda":
+    if sm_count is not None:
+        num_sms = int(sm_count)
+    elif device.type == "cuda":
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     else:
         num_sms = 1
@@ -2398,8 +2401,9 @@ class B12XIndexerContiguousScratchPlan:
 
 def plan_indexer_paged_scratch(
     caps: B12XIndexerPagedScratchCaps,
+    *, sm_count: int | None = None,
 ) -> B12XIndexerPagedScratchPlan:
-    layout = _indexer_paged_scratch_layout(caps)
+    layout = _indexer_paged_scratch_layout(caps, sm_count=sm_count)
     return B12XIndexerPagedScratchPlan(
         caps=caps,
         layout=layout,
@@ -2460,6 +2464,7 @@ def plan_indexer_scratch(
     caps: B12XIndexerScratchCaps,
     *,
     fused_merge: str = FUSED_MERGE_AUTO,
+    sm_count: int | None = None,
 ) -> B12XIndexerScratchPlan:
     """Build a private layout after preparation selected its immutable config."""
     if not isinstance(caps, B12XIndexerScratchCaps):
@@ -2495,7 +2500,7 @@ def plan_indexer_scratch(
                 score_mode=caps.score_mode,
                 num_idx_heads=caps.num_idx_heads,
                 fused_merge=fused_merge,
-            )
+            ), sm_count=sm_count,
         )
     elif caps.source_layout == INDEXER_SOURCE_LAYOUT_CONTIGUOUS:
         assert caps.max_k_rows is not None

@@ -677,6 +677,9 @@ class AotProgram:
         """
         if len(tensors) != len(self.operands):
             raise ValueError(f"{self.name}: expected {len(self.operands)} pointers, got {len(tensors)}")
+        if (self.geometry.get("runtime_sm_count") and len(scalars) + 1 == len(self.scalars)):
+            sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            scalars = (*scalars, sms)
         if len(scalars) != len(self.scalars):
             raise ValueError(f"{self.name}: expected {len(self.scalars)} scalars")
         pointers = []

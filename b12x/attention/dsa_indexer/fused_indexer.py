@@ -1535,7 +1535,9 @@ class DSAFusedIndexerKernel:
         max_seq_capacity: int = 1 << 30,
         vectorized_q_load: bool = False,
         q_row_stride_bytes: int = 0,
+        runtime_ctas: bool = False,
     ):
+        self.runtime_ctas = bool(runtime_ctas)
         self.num_heads_static = int(num_heads_static)
         self.topk = int(topk)
         self.kv_layout = int(kv_layout)
@@ -1613,7 +1615,7 @@ class DSAFusedIndexerKernel:
         # packs its REAL local candidates into a per-group global slab of
         # capacity ctas_per_group * topk; the last-arriving CTA radix-selects the
         # final top-k over the packed reals (no host merge launch).
-        self.merge_in_kernel = self.ctas_per_group > 1
+        self.merge_in_kernel = self.runtime_ctas or self.ctas_per_group > 1
         # Cooperative grid-barrier merge (_fused_group_barrier) spins until every one of
         # the group's ctas_per_group CTAs has arrived, so they must all be co-resident
         # at once. This kernel launches one CTA per SM (1024 threads + min_blocks_per_mp
@@ -1664,7 +1666,9 @@ class DSAFusedIndexerKernel:
         pack_indices: cute.Tensor,
         merge_state: cute.Tensor,
         stream: cuda.CUstream,
+        runtime_ctas: Int32 = 1,
     ):
+        ctas_pg = runtime_ctas if cutlass.const_expr(self.runtime_ctas) else Int32(self.ctas_per_group)
         self.kernel(
             q_bytes,
             weights,
@@ -1679,8 +1683,9 @@ class DSAFusedIndexerKernel:
             pack_values,
             pack_indices,
             merge_state,
+            ctas_pg,
         ).launch(
-            grid=(q_bytes.shape[0] * self.ctas_per_group, 1, 1),
+            grid=(q_bytes.shape[0] * ctas_pg, 1, 1),
             block=[_RADIX_THREADS, 1, 1],
             # The 1024-thread radix CTA is architecturally limited to one
             # resident block on SM120 (1536 threads/SM).  The cooperative
@@ -1705,6 +1710,7 @@ class DSAFusedIndexerKernel:
         pack_values: cute.Tensor,
         pack_indices: cute.Tensor,
         merge_state: cute.Tensor,
+        ctas_pg: Int32,
     ):
         tx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -1712,7 +1718,6 @@ class DSAFusedIndexerKernel:
         # Relay: ctas_per_group CTAs cooperate on one row (group). Each owns a
         # page-slice and emits a LOCAL top-k into candidate[cta_in_group, group, :];
         # the host merges the per-CTA partials. ctas_per_group==1 => single-CTA.
-        ctas_pg = Int32(self.ctas_per_group)
         group_id = bid // ctas_pg
         cta_in_group = bid - group_id * ctas_pg
         q_idx = group_id
@@ -2462,7 +2467,8 @@ class DSAFusedIndexerKernel:
                         i += Int32(_RADIX_THREADS)
                     cute.arch.sync_threads()
                     carry_count = topk_static
-        if cutlass.const_expr(not self.merge_in_kernel):
+        single_cta = ctas_pg == Int32(1) if cutlass.const_expr(self.runtime_ctas) else not self.merge_in_kernel
+        if single_cta:
             # ---- single CTA per row: carry0 is already the final top-k ----
             i = Int32(tx)
             while i < topk_static:
@@ -2484,17 +2490,16 @@ class DSAFusedIndexerKernel:
             #     packed slab (no grid barriers; cheaper for few-row/short-K).
             # Both arms index the per-group _COOP_STATE_WORDS state block via
             # _fused_state_offset, so groups taking different arms never collide.
-            ctas_pg = Int32(self.ctas_per_group)
             barrier_phase = Int32(0)
-            cap = Int32(self.pack_cap)
+            cap = ctas_pg * Int32(self.topk) if cutlass.const_expr(self.runtime_ctas) else self.pack_cap
             slab_base = group_id * cap
             pack_v_row = cute.make_tensor(
                 pack_values.iterator + slab_base,
-                cute.make_layout((self.pack_cap,), stride=(1,)),
+                cute.make_layout((cap,), stride=(1,)),
             )
             pack_i_row = cute.make_tensor(
                 pack_indices.iterator + slab_base,
-                cute.make_layout((self.pack_cap,), stride=(1,)),
+                cute.make_layout((cap,), stride=(1,)),
             )
             # Pre-declare every variable assigned inside the dynamic arms below;
             # cute forbids a None->typed transition inside a dynamic `if`.
@@ -2844,6 +2849,7 @@ def _build_fused_indexer_kernel(
     max_seq_capacity: int = 1 << 30,
     vectorized_q_load: bool = False,
     q_row_stride_bytes: int = 0,
+    runtime_ctas: bool = False,
 ):
     return DSAFusedIndexerKernel(
         num_heads_static=num_heads_static,
@@ -2858,6 +2864,7 @@ def _build_fused_indexer_kernel(
         max_seq_capacity=max_seq_capacity,
         vectorized_q_load=vectorized_q_load,
         q_row_stride_bytes=q_row_stride_bytes,
+        runtime_ctas=runtime_ctas,
     )
 
 
