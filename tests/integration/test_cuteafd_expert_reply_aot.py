@@ -42,6 +42,24 @@ def reference(x, format):
     return torch.cat((packed, codes), -1), restored.bfloat16()
 
 
+def mismatch_details(x, actual, expected, format):
+    width = x.shape[1]
+    block = 32 if format == 1 else 16
+    value_bytes = width if format == 1 else width // 2
+    changed_values = (actual[:, :value_bytes] != expected[:, :value_bytes]).reshape(
+        x.shape[0], -1, block if format == 1 else block // 2).sum(-1)
+    changed_scales = actual[:, value_bytes:] != expected[:, value_bytes:]
+    blocks = ((changed_values != 0) | changed_scales).nonzero()
+    details = []
+    for row, index in blocks[:16].tolist():
+        amax = float(x[row, index * block:(index + 1) * block].float().abs().max())
+        details.append(dict(row=row, block=index, changed_values=int(changed_values[row, index]),
+            actual_scale=int(actual[row, value_bytes + index]),
+            expected_scale=int(expected[row, value_bytes + index]),
+            amax_hex=amax.hex(), ratio_448_hex=(amax / 448).hex()))
+    return dict(changed_blocks=len(blocks), changed_scales=int(changed_scales.sum()), blocks=details)
+
+
 @pytest.fixture(scope="module")
 def programs():
     require_b12x()
@@ -72,7 +90,8 @@ def test_reply_pair_exact_and_graph_dynamic_mode(programs, width, format):
         mismatch = (packed != expected_wire).nonzero()
         samples = [(r, c, int(packed[r, c]), int(expected_wire[r, c]),
                     float(x[r, min(c, width - 1)])) for r, c in mismatch[:16].tolist()]
-        assert not mismatch.numel(), (rows, width, format, samples)
+        assert not mismatch.numel(), (rows, width, format, samples,
+                                      mismatch_details(x, packed, expected_wire, format))
         assert torch.equal(scratch, expected_wire)
         assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
         # The actual consumer expands into the BF16-sized landing plane only
@@ -94,3 +113,26 @@ def test_reply_pair_exact_and_graph_dynamic_mode(programs, width, format):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(plane, x.view(torch.uint8).flatten())
+
+
+@pytest.mark.parametrize("format", [1, 2])
+def test_reply_chunking_is_byte_identical_above_arena_capacity(programs, format):
+    quantize, _, _ = programs
+    rows, width, capacity = 4161, 128, 4096
+    torch.manual_seed(format)
+    x = (torch.randn(rows, width, device="cuda") * .3).bfloat16()
+    # Distinct scale regimes immediately before and after the arena boundary.
+    x[capacity - 1] *= 1e-5
+    x[capacity] = 0
+    x[capacity + 1] *= 128
+    expected, _ = reference(x, format)
+    whole = torch.full_like(expected, 0xA5)
+    chunked = torch.full_like(expected, 0x5A)
+    quantize.launch(x, whole, None, scalars=(rows, width, format))
+    for first in range(0, rows, capacity):
+        count = min(capacity, rows - first)
+        quantize.launch(x[first:first + count], chunked[first:first + count], None,
+                        scalars=(count, width, format))
+    torch.cuda.synchronize()
+    assert torch.equal(chunked, whole)
+    assert torch.equal(whole, expected), mismatch_details(x, whole, expected, format)
