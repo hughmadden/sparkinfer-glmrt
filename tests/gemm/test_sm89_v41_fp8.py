@@ -162,21 +162,58 @@ def _run_projection(n, k, groups, capacity, rows, graph=False):
 
 
 @pytest.mark.parametrize("n,k,groups,capacity,rows", [
-    (1280, 5120, 1, 1, 1), (512, 5120, 1, 16, 9), (5120, 2304, 1, 64, 61),
-    (2304, 5120, 1, 80, 80), (8192, 32768, 8, 16, 5), (8192, 32768, 8, 80, 77),
+    (1280, 5120, 1, 1, 1), (512, 5120, 1, 16, 9), (8192, 32768, 8, 16, 5),
+    # Verify capacities: rows on both sides of each plan's kernel split.
+    (5120, 2304, 1, 64, 61), (5120, 15360, 1, 64, 23), (5120, 15360, 1, 64, 47),
+    (2304, 5120, 1, 80, 80), (1280, 5120, 1, 80, 30), (8192, 32768, 8, 80, 77),
+    (8192, 32768, 8, 64, 40), (32768, 1280, 1, 80, 70),
 ])
-def test_block32_gemv_matches_fp64(n, k, groups, capacity, rows):
+def test_block32_decode_verify_matches_fp64(n, k, groups, capacity, rows):
     require_sm89()
     _run_projection(n, k, groups, capacity, rows)
 
 
 @pytest.mark.parametrize("n,k,groups,capacity,rows", [
     (512, 5120, 1, 256, 251), (2304, 5120, 1, 1024, 1024), (5120, 1152, 1, 4096, 777),
-    (8192, 32768, 8, 256, 130),
+    (8192, 32768, 8, 256, 130), (5120, 15360, 1, 256, 90), (8192, 32768, 8, 256, 85),
 ])
-def test_block32_dense_matches_fp64(n, k, groups, capacity, rows):
+def test_block32_prefill_matches_fp64(n, k, groups, capacity, rows):
     require_sm89()
     _run_projection(n, k, groups, capacity, rows)
+
+
+@pytest.mark.parametrize("max_rows", [32, 80])
+def test_block32_gemv_every_live_tile_count(max_rows):
+    """Each live row-tile count runs its own specialized loop (whole-block
+    register prefetch up to 32 rows, the shared-memory ring above)."""
+    require_sm89()
+    from b12x._lib.sm89_fp8 import Sm89Block32Gemv
+
+    n, k = 1024, 3072
+    torch.manual_seed(max_rows)
+    a = (torch.randn(max_rows, k, device="cuda") * 3).to(torch.float8_e4m3fn)
+    sa = torch.randint(110, 135, (max_rows, k // 32), device="cuda", dtype=torch.uint8)
+    w = (torch.randn(n, k, device="cuda") * 2).to(torch.float8_e4m3fn)
+    sb = torch.randint(115, 130, (n // 32, k // 32), device="cuda", dtype=torch.uint8)
+    da = (a.double().view(max_rows, k // 32, 32) * torch.exp2(sa.double() - 127)[..., None]).view(max_rows, k)
+    db = (w.double().view(n // 32, 32, k // 32, 32) * torch.exp2(sb.double() - 127)[:, None, :, None]).view(n, k)
+    gemv = Sm89Block32Gemv(n, k, max_rows=max_rows, warps=8, col_groups=4)
+    out = torch.zeros(max_rows * n, device="cuda", dtype=torch.bfloat16)
+    args = [_ptr(cutlass.Float8E4M3FN, a), _ptr(cutlass.Float8E4M3FN, w),
+            _ptr(cutlass.Float8E8M0FNU, sa), _ptr(cutlass.Float8E8M0FNU, sb)]
+    c = _ptr(cutlass.BFloat16, out)
+    compiled = cute.compile(gemv, *args, c, c, c, c, _ptr(cutlass.Float32, out), Int32(1), _stream())
+    for rows in sorted({1, 7, 16, 17, 30, 32, 33, 48, 49, 63, 64, 65, 79, 80} & set(range(1, max_rows + 1))):
+        # Rows are packed with live M: the row scales' stride follows the live count.
+        sa_live = sa[:rows].contiguous()
+        args[2] = _ptr(cutlass.Float8E8M0FNU, sa_live)
+        out.zero_()
+        compiled(*args, c, c, c, c, _ptr(cutlass.Float32, out), Int32(rows), _stream())
+        torch.cuda.synchronize()
+        ref = da[:rows] @ db.T
+        got = out[: rows * n].view(rows, n).double()
+        assert ((got - ref).abs().max() / ref.abs().max()).item() < 8e-3, rows
+        assert bool((out[rows * n:] == 0).all()), rows
 
 
 @pytest.mark.parametrize("capacity,rows", [(16, 16), (1024, 600)])
@@ -215,7 +252,8 @@ def test_split_k_gemv_partial_planes_sum_to_reference(slices):
 
 def test_output_projection_rows_bitwise_identical_across_decode_and_verify():
     """o_b shares one reduction recipe for every capacity up to 80 rows: a row's
-    bits must not depend on the capacity (decode 1/16, verify 64/80)."""
+    bits must not depend on the capacity (decode 1/16, verify 64/80) nor on how
+    many rows are live (each verify kernel and live row-tile count)."""
     require_sm89()
     from b12x._lib.dense_gemm import compile_dense_gemm_mxfp8_aot
 
@@ -226,20 +264,29 @@ def test_output_projection_rows_bitwise_identical_across_decode_and_verify():
     w = (torch.randn(n, k, device="cuda") * 2).to(torch.float8_e4m3fn)
     sb = torch.randint(115, 130, (n // 32, k // 32), device="cuda", dtype=torch.uint8)
     sms = torch.cuda.get_device_properties(0).multi_processor_count
-    first = None
-    for capacity, rows in ((1, 1), (16, 16), (64, 64), (80, 80)):
+    gemms = {}
+    for capacity in (1, 16, 64, 80):
         gemm, split = compile_dense_gemm_mxfp8_aot(
             size_m=capacity, size_n=n, size_k=k, expected_m=16, return_split_k_metadata=True,
             sm_count=sms)
         assert split == 1
+        gemms[capacity] = gemm
+
+    def run(capacity, first, rows):
         out = torch.zeros(rows, n, device="cuda", dtype=torch.bfloat16)
         c = _ptr(cutlass.BFloat16, out)
-        gemm(_ptr(cutlass.Float8E4M3FN, a), _ptr(cutlass.Float8E4M3FN, w), _ptr(cutlass.Float8E8M0FNU, sa),
-             _ptr(cutlass.Float8E8M0FNU, sb), c, c, c, c, _ptr(cutlass.Float32, out), Int32(rows), _stream())
+        a_rows = a[first:first + rows].contiguous()
+        sa_rows = sa[first:first + rows].contiguous()
+        gemms[capacity](_ptr(cutlass.Float8E4M3FN, a_rows), _ptr(cutlass.Float8E4M3FN, w),
+                        _ptr(cutlass.Float8E8M0FNU, sa_rows), _ptr(cutlass.Float8E8M0FNU, sb),
+                        c, c, c, c, _ptr(cutlass.Float32, out), Int32(rows), _stream())
         torch.cuda.synchronize()
-        if first is None:
-            first = out[0].clone()
-        assert torch.equal(out[0], first), capacity
+        return out
+
+    decode = torch.cat([run(1, r, 1) for r in range(80)])
+    for capacity, rows in ((16, 16), (16, 9), (64, 17), (64, 33), (64, 50), (64, 64),
+                           (80, 20), (80, 47), (80, 65), (80, 80)):
+        assert torch.equal(run(capacity, 0, rows), decode[:rows]), (capacity, rows)
 
 
 def test_mhc_projection_runs_on_sm89():
