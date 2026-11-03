@@ -32,6 +32,9 @@ class TileSchedulerArguments(ParamsBase):
     headdim_v: Int32
     total_q: Int32
     tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
+    # Device L2 bytes: a launch scalar, never a compile-time constant, so one
+    # exported image serves every card whose L2 differs from the build host's.
+    size_l2: Optional[Int32] = None
     cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
     mCuSeqlensQ: cute.Tensor | None = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
@@ -142,8 +145,8 @@ class SingleTileVarlenScheduler:
         @cute.jit
         def create(args: TileSchedulerArguments, *, loc=None, ip=None):
             del loc, ip
-            size_l2 = 50 * 1024 * 1024
-            max_kvblock_in_l2 = size_l2 // (
+            assert args.size_l2 is not None, "varlen attention needs the device L2 size"
+            max_kvblock_in_l2 = args.size_l2 // (
                 (args.headdim + args.headdim_v)
                 * args.element_size
                 * args.tile_shape_mn[1]

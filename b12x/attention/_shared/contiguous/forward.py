@@ -562,6 +562,7 @@ class ContiguousAttentionForwardKernel:
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
+        l2_cache_size: Optional[Int32] = None,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
@@ -714,6 +715,7 @@ class ContiguousAttentionForwardKernel:
             headdim_v=mV.shape[1],
             total_q=logical_total_q,
             tile_shape_mn=(self.tile_m, self.tile_n),
+            size_l2=l2_cache_size,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead
             if const_expr(self.pack_gqa)
             else 1,

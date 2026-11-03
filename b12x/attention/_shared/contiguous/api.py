@@ -25,7 +25,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils import current_cuda_stream, get_l2_cache_bytes, make_ptr
 from b12x.attention._shared.contiguous.forward import (
     ContiguousAttentionForwardKernel,
 )
@@ -979,6 +979,7 @@ class _VarlenAttentionForwardLaunch:
         cu_seqlens_k_ptr: cute.Pointer,
         attention_sink_bias_ptr: cute.Pointer,
         softmax_scale: float,
+        l2_cache_size: Int32,
         current_stream: cuda.CUstream,
     ):
         q_tensor = cute.make_tensor(
@@ -1032,6 +1033,7 @@ class _VarlenAttentionForwardLaunch:
             logical_num_batch_static=self._num_batch,
             logical_seqlen_q_static=self._max_seqlen_q,
             logical_seqlen_k_static=self._max_seqlen_k,
+            l2_cache_size=l2_cache_size,
             window_size_left=(
                 None if self._window_size_left == -1 else Int32(self._window_size_left)
             ),
@@ -1144,6 +1146,9 @@ def _compile_varlen_attention(
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         1.0,
+        # Tracing placeholder: the L2 size is a launch scalar, so the compiled
+        # image is device-independent and one build serves every card.
+        cutlass.Int32(50 * 1024 * 1024),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "attention.contiguous.varlen_forward",
@@ -2254,7 +2259,7 @@ def b12x_varlen_attention_forward(
         make_ptr(cutlass.Int32, cu_seqlens_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cu_seqlens_k.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, attention_sink_bias.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        float(softmax_scale), current_cuda_stream(),
+        float(softmax_scale), get_l2_cache_bytes(resolved_plan.device), current_cuda_stream(),
     )
     return output, lse
 
