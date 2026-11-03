@@ -3382,7 +3382,7 @@ class DSAPagedStreamLogitsKernel:
         stream: cuda.CUstream,
         runtime_ctas: Int32 = 1,
     ):
-        ctas = runtime_ctas if const_expr(self.runtime_ctas) else self.persistent_ctas
+        ctas = runtime_ctas if cutlass.const_expr(self.runtime_ctas) else self.persistent_ctas
         self.kernel(
             q_bytes,
             weights,
@@ -3494,7 +3494,7 @@ class DSAPagedStreamLogitsKernel:
             g = lane // Int32(4)
             t = lane % Int32(4)
 
-            if const_expr(self.runtime_ctas):
+            if cutlass.const_expr(self.runtime_ctas):
                 _, ctas_stride, _ = cute.arch.grid_dim()
             else:
                 ctas_stride = Int32(self.persistent_ctas)
