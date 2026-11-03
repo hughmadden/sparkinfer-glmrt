@@ -101,7 +101,7 @@ def _assert_same_selection(actual, expected, lengths, topk):
 @pytest.mark.parametrize("family", ["dsv4", "glm", "glmf"])
 def test_export_geometry_declares_cooperative_minimum_sms(monkeypatch, route, cooperative, ctas, minimum, family):
     from b12x.integration.cuteafd import dsv4_indexer, glm_indexer, GLM53_FLASH
-    launch = SimpleNamespace(topk=512, route=route, supertile=4096,
+    launch = SimpleNamespace(topk=512, route=route, supertile=4096, runtime_sm_count=route == "paged_fused",
                              layout=SimpleNamespace(nbytes=64, fused_ctas_per_group=ctas),
                              fused=SimpleNamespace(coop_merge_possible=cooperative), key=lambda: ())
     monkeypatch.setattr(dsv4_indexer, "_TopK", lambda *_, **__: launch)
@@ -314,6 +314,12 @@ def test_portable_fused_groups_match_static_and_time(monkeypatch, family, rows, 
                     k_quant_page_stride=8448, k_scales_row_stride=2112,
                     max_seq_capacity=width * 64, vectorized_q_load=True,
                     q_row_stride_bytes=heads * 128)
+            elif launch.runtime_tiled:
+                from b12x.attention.dsa_indexer.kernel import _build_dsa_paged_stream_supertile_kernel
+                launch.runtime_tiled = False
+                launch.runtime_sm_count = False
+                launch.scorer = _build_dsa_paged_stream_supertile_kernel(
+                    max(1, (sms + rows - 1) // rows), heads, 32, 512, 8448, 2112)
             key = launch.key()
             launch.key = lambda: key + ("static-baseline", sms)
             return launch

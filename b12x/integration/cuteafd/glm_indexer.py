@@ -75,7 +75,7 @@ def compile_glm_index_topk_aot(g: GLMGeometry = GLM53, *, max_rows: int, max_pag
         key=launch.key(),
         geometry={"topk": k, "heads": i, "max_rows": int(max_rows), "max_pages": int(max_pages),
                   "mode": mode, "route": launch.route, "supertile_tokens": launch.supertile,
-                  "minimum_sms": 0, "runtime_sm_count": launch.route == "paged_fused"},
+                  "minimum_sms": 0, "runtime_sm_count": launch.runtime_sm_count},
         scratch={"scratch": lambda rows: nbytes},
         doc=__doc__,
     )

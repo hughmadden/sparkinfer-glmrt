@@ -3329,8 +3329,10 @@ class DSAPagedStreamLogitsKernel:
         score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
         k_quant_page_stride: int,
         k_scales_row_stride: int,
+        runtime_ctas: bool = False,
     ):
         self.persistent_ctas = int(persistent_ctas)
+        self.runtime_ctas = bool(runtime_ctas)
         self.num_heads_static = int(num_heads_static)
         self.tile_block_q = int(tile_block_q)
         self.tile_block_k = int(tile_block_k)
@@ -3378,7 +3380,9 @@ class DSAPagedStreamLogitsKernel:
         output_width_tokens: Int32,
         logits_out: cute.Tensor,
         stream: cuda.CUstream,
+        runtime_ctas: Int32 = 1,
     ):
+        ctas = runtime_ctas if const_expr(self.runtime_ctas) else self.persistent_ctas
         self.kernel(
             q_bytes,
             weights,
@@ -3391,7 +3395,7 @@ class DSAPagedStreamLogitsKernel:
             output_width_tokens,
             logits_out,
         ).launch(
-            grid=(q_bytes.shape[0], self.persistent_ctas, 1),
+            grid=(q_bytes.shape[0], ctas, 1),
             block=[_STREAM_THREADS_PER_CTA, 1, 1],
             stream=stream,
         )
@@ -3490,7 +3494,10 @@ class DSAPagedStreamLogitsKernel:
             g = lane // Int32(4)
             t = lane % Int32(4)
 
-            ctas_stride = Int32(self.persistent_ctas)
+            if const_expr(self.runtime_ctas):
+                _, ctas_stride, _ = cute.arch.grid_dim()
+            else:
+                ctas_stride = Int32(self.persistent_ctas)
             # This CTA's page count and iteration count (uniform across CTA).
             n_pages_cta = (
                 total_work - Int32(cta_idx) + ctas_stride - Int32(1)
@@ -3720,10 +3727,12 @@ def _build_dsa_paged_stream_supertile_kernel(
     k_quant_page_stride: int,
     k_scales_row_stride: int,
     score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
+    runtime_ctas: bool = False,
 ) -> DSAPagedStreamLogitsKernel:
     return DSAPagedStreamLogitsKernel(
         persistent_ctas,
         num_heads_static,
+        runtime_ctas=runtime_ctas,
         tile_block_q=tile_block_q,
         tile_block_k=tile_block_k,
         score_mode=score_mode,

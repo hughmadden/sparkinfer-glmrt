@@ -141,11 +141,13 @@ class _TopK:
         # arrival-order selector cannot provide this context-split contract.
         route = "paged_tiled" if scored_logical and mode == "decode" else "auto"
         layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route)
-        if layout.route == "paged_fused":
+        self.runtime_tiled = layout.route == "paged_tiled" and mode == "decode" and max_rows < 64
+        if layout.route == "paged_fused" or self.runtime_tiled:
             # A capacity bound, not a card identity. Live grouping uses the launch device.
             layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route, sm_count=256)
         self.layout = layout
         self.route = layout.route
+        self.runtime_sm_count = self.route == "paged_fused" or self.runtime_tiled
         self.mode = mode
         self.topk = int(geometry.index_topk)
         self.max_rows = int(max_rows)
@@ -186,7 +188,7 @@ class _TopK:
             self.block_k = _PAGED_TILE_BLOCK_K
             self.scorer = _build_dsa_paged_stream_supertile_kernel(
                 int(layout.stream_scorer_ctas), self.heads, _TILE_BLOCK_Q, _PAGED_TILE_BLOCK_K,
-                _PAGE_BYTES, _PAGE_BYTES // 4)
+                _PAGE_BYTES, _PAGE_BYTES // 4, runtime_ctas=self.runtime_tiled)
             self.active_width = WriteActiveWidth()
         else:
             raise NotImplementedError(f"unsupported indexer route {self.route!r}")
@@ -305,7 +307,7 @@ class _TopK:
             token_begin = page_begin * Int32(_PAGE)
             tokens_here = pages_here * Int32(_PAGE)
             self._score(q_fp8, w, cache, q_bytes, page_table, lengths, cache_lengths, base,
-                        rows, table_width, table_stride, page_begin, tile_logits, dummy_desc, stream)
+                        rows, table_width, table_stride, page_begin, tile_logits, dummy_desc, stream, device_sm_count)
             is_first = chunk == Int32(0)
             is_last = chunk == chunks - Int32(1)
             odd = (chunk % Int32(2)) == Int32(1)
@@ -344,7 +346,7 @@ class _TopK:
                page_table: cute.Pointer, lengths: cute.Tensor, cache_lengths: cute.Pointer,
                base: Int64, rows: Int32, table_width: Int32, table_stride: Int32,
                page_begin: Int32, tile_logits: cute.Tensor, dummy_desc: cute.Tensor,
-               stream: cuda.CUstream):
+               stream: cuda.CUstream, device_sm_count: Int32):
         L = self.layout
         m = rows
         if const_expr(self.route == "packed_contiguous"):
@@ -389,8 +391,13 @@ class _TopK:
             active = cute.make_tensor(self._ptr(cutlass.Int32, base, L.active_width_offset_bytes, 4),
                                       cute.make_layout((1,)))
             scalar_flag = active
-            self.scorer(q_bytes, w, k_quant, dummy_desc, scalar_flag, k_scales, table, lengths,
-                        active, page_begin, Int32(self.supertile), tile_logits, stream)
+            if const_expr(self.runtime_tiled):
+                self.scorer(q_bytes, w, k_quant, dummy_desc, scalar_flag, k_scales, table, lengths,
+                            active, page_begin, Int32(self.supertile), tile_logits, stream,
+                            cute.max(Int32(1), (device_sm_count + Int32(self.max_rows - 1)) // Int32(self.max_rows)))
+            else:
+                self.scorer(q_bytes, w, k_quant, dummy_desc, scalar_flag, k_scales, table, lengths,
+                            active, page_begin, Int32(self.supertile), tile_logits, stream)
 
     @cute.jit
     def _fold(self, first: cutlass.Constexpr, phys: cutlass.Constexpr, tile_logits: cute.Tensor,
@@ -428,7 +435,7 @@ class _RuntimeTopK:
 
 def _topk_program_launch(launch):
     scalars = (Scalar("rows"), Scalar("table_width"), Scalar("table_stride"))
-    if launch.route == "paged_fused":
+    if launch.runtime_sm_count:
         return _RuntimeTopK(launch), scalars + (Scalar("device_sm_count"),)
     return launch, scalars
 
@@ -460,7 +467,7 @@ def compile_dsv4_index_topk_aot(geometry: DSV4Geometry = FLASH, *, max_rows: int
         key=launch.key(),
         geometry={"topk": k, "max_rows": int(max_rows), "max_pages": int(max_pages), "mode": mode,
                   "route": launch.route, "supertile_tokens": launch.supertile,
-                  "minimum_sms": 0, "runtime_sm_count": launch.route == "paged_fused"},
+                  "minimum_sms": 0, "runtime_sm_count": launch.runtime_sm_count},
         scratch={"scratch": lambda rows: nbytes},
         doc=__doc__,
     )
