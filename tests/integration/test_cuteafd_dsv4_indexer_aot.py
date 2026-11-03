@@ -417,3 +417,56 @@ def test_sparse_consumer_permutation_diagnostic(family, route):
     differing = int((outputs[0].view(torch.uint8) != outputs[1].view(torch.uint8)).sum())
     max_abs = (outputs[0].float() - outputs[1].float()).abs().max().item()
     print(f"TOPK_CONSUMER_PERMUTATION {family} {route} differing_bytes={differing} max_abs={max_abs:.9g}")
+
+
+@pytest.mark.parametrize("family", ["flash", "pro", "glm", "glmf"])
+@pytest.mark.parametrize("width", [33, 300])
+def test_production_m64_raw_order_repeat_and_export_sms(monkeypatch, family, width):
+    """Production ordering must survive repeat launches and export-SM changes."""
+    require_b12x()
+    from b12x.integration.cuteafd import FLASH, PRO, GLM53, GLM53_FLASH, exportable_compilation
+    from b12x.integration.cuteafd import dsv4_indexer as module, glm_indexer
+    from b12x.integration.cuteafd.glmf import _PoolTopK
+    g = {"flash": FLASH, "pro": PRO, "glm": GLM53,
+         "glmf": _PoolTopK(GLM53_FLASH.index_topk // GLM53_FLASH.index_kpool, GLM53_FLASH.index_heads)}[family]
+    heads = 64 if family in ("flash", "pro") else g.index_heads
+    build = module.compile_dsv4_index_topk_aot if heads == 64 else glm_indexer.compile_glm_index_topk_aot
+    real_properties = torch.cuda.get_device_properties
+    properties = real_properties(0)
+    programs = []
+    with exportable_compilation():
+        for sms in (188, 170):
+            class Properties:
+                multi_processor_count = sms
+
+                def __getattr__(self, name):
+                    return getattr(properties, name)
+            with monkeypatch.context() as patch:
+                patch.setattr(torch.cuda, "get_device_properties", lambda *_: Properties())
+                programs.append(build(g, max_rows=64, max_pages=width, mode="decode"))
+    gen = torch.Generator().manual_seed(1128)
+    cache = _pack_pages(width, gen, "cuda")
+    table = torch.arange(width, dtype=torch.int32, device="cuda").repeat(64, 1)
+    q = torch.randn((64, heads, 128), generator=gen).to(torch.float8_e4m3fn).cuda()
+    weights = (torch.randn((64, heads), generator=gen) * .02).cuda()
+    lengths = torch.full((64,), width * 64, dtype=torch.int32, device="cuda")
+    reference = None
+    for sms, program in zip((188, 170), programs):
+        assert program.geometry["route"] == "paged_tiled"
+        assert not program.geometry["runtime_sm_count"]
+        scratch = torch.zeros(program.scratch_bytes(64)["scratch"], dtype=torch.uint8, device="cuda")
+        out = torch.empty((64, g.index_topk), dtype=torch.int32, device="cuda")
+        for _ in range(3):
+            program.launch(q, weights, cache, table, lengths, out, scratch, scalars=(64, width, width))
+            torch.cuda.synchronize()
+            if reference is None:
+                reference = out.clone()
+            assert torch.equal(reference, out), f"raw selected-index bytes changed for {family} export SM{sms}"
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            program.launch(q, weights, cache, table, lengths, out, scratch, scalars=(64, width, width))
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(reference, out)
+    print(f"PRODUCTION_TOPK_RAW {family} m64 width={width} repeat_and_graph=True export_sms=188,170 identical=True")

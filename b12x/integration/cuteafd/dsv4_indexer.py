@@ -268,13 +268,13 @@ class _TopK:
                            cute.min(device_sm_count, Int32(256)) // Int32(self.max_rows))))
         else:
             self._chunked(q_fp8, w, cache, q_bytes, page_table, lengths, cache_lengths,
-                          output_indices, base, rows, table_width, table_stride, stream)
+                          output_indices, base, rows, table_width, table_stride, stream, device_sm_count)
 
     @cute.jit
     def _chunked(self, q_fp8: cute.Pointer, w: cute.Tensor, cache: Int64, q_bytes: cute.Tensor,
                  page_table: cute.Pointer, lengths: cute.Tensor, cache_lengths: cute.Pointer,
                  output_indices: cute.Pointer, base: Int64, rows: Int32, table_width: Int32,
-                 table_stride: Int32, stream: cuda.CUstream):
+                 table_stride: Int32, stream: cuda.CUstream, device_sm_count: Int32):
         L = self.layout
         topk = self.topk
         m = rows
