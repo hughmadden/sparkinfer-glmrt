@@ -3,12 +3,16 @@
 The ordered default writes FP32 route planes. Opt-in atomic_tokens clears and
 writes a flat FP32 token output without materializing route/slice intermediates.
 Both paths keep live rows out of compile keys and bound launches by live work.
+
+Pre-Hopper targets (SM89) run the ordered path with the promoted-MMA kernels of
+``w4a8_v41_sm89`` over the same resident weights, scratch and route output.
 """
 
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from cutlass import Int32, Int64, Float32
+from b12x._lib.sm80_pipeline import target_is_pre_hopper
 from b12x._lib.utils import runtime_num_sm
 from b12x.moe._shared.kernels.v41_route_plan import V41RoutePlan, V41SliceReduce
 from b12x.moe._shared.kernels.w4a8_v41_slice import (
@@ -16,6 +20,25 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import (
     V41SliceFc1Kernel,
     V41SliceFc2Kernel,
 )
+from b12x.moe._shared.kernels.w4a8_v41_sm89 import V41Sm89Fc1Kernel, V41Sm89Fc2Kernel
+
+
+def sm89_expert_tuning():
+    """SM89 load schedule: (FC1 batch, FC2 batch, FC1 warps, FC2 K parts).
+
+    Batches are K32 steps (whole K128 tiles). The default was qualified on an
+    RTX 4090 D from 1 to 109 live experts; B12X_SM89_V41_EXPERTS=a,b,c,d
+    overrides it for sweeps.
+    """
+    import os
+    raw = os.environ.get("B12X_SM89_V41_EXPERTS")
+    if raw:
+        values = tuple(int(v) for v in raw.split(","))
+        if (len(values) != 4 or any(v < 4 or v % 4 for v in values[:2])
+                or values[2] not in (4, 8) or values[3] not in (1, 2, 4)):
+            raise ValueError("B12X_SM89_V41_EXPERTS takes FC1 batch, FC2 batch, FC1 warps, FC2 K parts")
+        return values
+    return (4, 4, 8, 2)
 
 
 class V41SlicePipeline:
@@ -30,7 +53,24 @@ class V41SlicePipeline:
         if atomic_tokens and fc1_k_splits != 1:
             raise ValueError("FC1 K splits require ordered route output")
         self.plan = V41RoutePlan(capacity, experts, topk, route_metadata=not atomic_tokens)
-        if atomic_tokens:
+        self.pre_hopper = target_is_pre_hopper()
+        if self.pre_hopper:
+            # SM89 has no block-scaled MMA: promoted-MMA projections with the
+            # ordered route output. The partial scratch keeps the size the
+            # width-plane recipe reserves (an exact fit when width divides I).
+            if atomic_tokens or exact_storage or fc1_k_splits != 1:
+                raise ValueError("SM89 V4.1 experts support ordered, 128-aligned slices only")
+            if (intermediate + width - 1) // width * width != intermediate:
+                raise ValueError("SM89 V4.1 experts need a slice width that divides the intermediate")
+            self.compute = None
+            tune = sm89_expert_tuning()
+            self.fc1 = V41Sm89Fc1Kernel(capacity, topk=topk, intermediate=intermediate,
+                                        hidden=hidden, scale_codes=scale_codes,
+                                        batch=tune[0], warps=tune[2])
+            self.fc2 = V41Sm89Fc2Kernel(capacity, topk=topk, intermediate=intermediate,
+                                        hidden=hidden, scale_codes=scale_codes,
+                                        batch=tune[1], k_split=tune[3])
+        elif atomic_tokens:
             self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=True,
                                                intermediate=intermediate, hidden=hidden, exact_storage=exact_storage,
                                                fc2_n_splits=fc2_n_splits, scale_codes=scale_codes)
