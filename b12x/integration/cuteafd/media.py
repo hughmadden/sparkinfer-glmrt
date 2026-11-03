@@ -382,8 +382,8 @@ class VisionAttention:
     @cute.jit
     def __call__(self, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
                  out: cute.Pointer, lse: cute.Pointer, cu: cute.Pointer,
-                 scale: Float32, stream: cuda.CUstream):
-        self.launch(q, k, v, out, lse, cu, cu, lse, scale, stream)
+                 scale: Float32, l2_cache_size: Int32, stream: cuda.CUstream):
+        self.launch(q, k, v, out, lse, cu, cu, lse, scale, l2_cache_size, stream)
 
 
 def compile_vision_attention_aot(*, dim, windowed=False):
@@ -406,6 +406,6 @@ def compile_vision_attention_aot(*, dim, windowed=False):
             Operand("out", torch.bfloat16, f"[{capacity},16,{dim}]", "out"),
             Operand("lse", torch.float32, f"[16,{capacity}]", "scratch"),
             Operand("cu", torch.int32, f"[{segments + 1}]")),
-        scalars=(Scalar("scale", "float32"),), key=(dim, bool(windowed)),
+        scalars=(Scalar("scale", "float32"), Scalar("l2_cache_size", "int32")), key=(dim, bool(windowed)),
         geometry=dict(dim=dim, heads=16, capacity=capacity, segments=segments,
                       max_segment_rows=limit, windowed=bool(windowed)))

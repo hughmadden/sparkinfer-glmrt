@@ -199,6 +199,31 @@ def verify_mxfp6_smem_tile_k(
 
 
 _num_sm_cache: dict[int, int] = {}
+_l2_cache_bytes: dict[int, int] = {}
+
+
+def get_l2_cache_bytes(device: torch.device | None = None) -> int:
+    """Return the device's L2 cache size in bytes, queried once per device.
+
+    Schedulers take this as a launch scalar instead of a compile-time
+    constant: one image serves every card whose L2 differs from the host the
+    image was built on.
+    """
+    index = None if device is None or device.type != "cuda" else device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    cached = _l2_cache_bytes.get(index)
+    if cached is None:
+        status, value = cuda.cuDeviceGetAttribute(
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, index
+        )
+        if status != cuda.CUresult.CUDA_SUCCESS or int(value) <= 0:
+            raise RuntimeError(
+                f"L2 cache size query failed for device {index}: {status}"
+            )
+        cached = int(value)
+        _l2_cache_bytes[index] = cached
+    return cached
 
 
 def get_num_sm(device: torch.device) -> int:
