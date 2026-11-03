@@ -10,7 +10,13 @@ the prefill top-k is a 4096-row first chunk (causal lengths 1..4096).
 Decode programs also run with FP8 weight operands (``*_m64 fp8``): E4M3
 weights and FP32 block scales next to the BF16 copy.
 
+``--muse-router`` times the Muse native F32 router instead: the scalar
+baseline, each ROWSxEXPERTS register tile, and the production row-count
+dispatch at each threshold, every arm checked bit-for-bit against the scalar
+route before it is timed.
+
   python benchmarks/bench_cuteafd_glm_programs.py [--iters 30] [--decode-context 8192]
+  python benchmarks/bench_cuteafd_glm_programs.py --muse-router [--muse-rows 1,16,2752]
 """
 
 from __future__ import annotations

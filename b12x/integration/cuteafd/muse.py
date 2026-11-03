@@ -20,8 +20,10 @@ from .pointwise import _add, _mul, _sqrt_rn, _view
 
 # Router tile geometry. The grid is derived from the live row count only, so one
 # compiled program serves every SM120/SM121 card; nothing here depends on an SM
-# count, L2 size or wave size.
-ROUTER_SCALAR_MAX_ROWS = 256
+# count, L2 size or wave size. The dispatch threshold is the measured crossover
+# between the scalar GEMV and the register tile (16 rows scalar beats tiled by
+# 1.5x, 64 rows tiled beats scalar by 1.6x on RTX PRO 6000 and Max-Q).
+ROUTER_SCALAR_MAX_ROWS = 16
 ROUTER_TILE_ROWS = 8
 ROUTER_TILE_EXPERTS = 8
 ROUTER_BLOCK_WARPS = 8
