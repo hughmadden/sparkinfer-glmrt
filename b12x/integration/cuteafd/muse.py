@@ -18,7 +18,17 @@ from ._qwen4_kernels import _sigmoid
 from .pointwise import _add, _mul, _sqrt_rn, _view
 
 
-class RouterProjection:
+# Router tile geometry. The grid is derived from the live row count only, so one
+# compiled program serves every SM120/SM121 card; nothing here depends on an SM
+# count, L2 size or wave size.
+ROUTER_SCALAR_MAX_ROWS = 256
+ROUTER_TILE_ROWS = 8
+ROUTER_TILE_EXPERTS = 8
+ROUTER_BLOCK_WARPS = 8
+ROUTER_BLOCK_ROW_GROUPS = 4
+
+
+class _RouterScalar:
     """Native F32 checkpoint weights; BF16 input widened before each product."""
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
@@ -42,12 +52,122 @@ class RouterProjection:
             out[row * Int64(256) + expert] = total
 
 
-def compile_router_aot():
-    return compile_program(RouterProjection(), name="muse_router", operands=(
+class _RouterTiled:
+    """Register-tiled router: one warp owns a ROWS x EXPERTS output tile.
+
+    Warps of a CTA stack ``row_groups`` tiles deep on rows and
+    ``block_warps // row_groups`` wide on experts, so the CTA re-reads the same
+    input lines and the same weight lines from L1 instead of L2.
+
+    Bit-identical to :class:`_RouterScalar` by construction: for every
+    ``(row, expert)`` pair, lane ``l`` still sums the columns ``32*k + l`` for
+    ``k = 0..255`` in ascending order, each term a separate IEEE ``mul.rn.f32``
+    followed by a separate ``add.rn.f32`` from the accumulator's initial
+    ``+0.0``, and the five-stage butterfly warp sum is the shared
+    ``_warp_sum``. Tiling only changes which loaded value a lane reuses; the
+    per-product and per-addition rounding sequence is unchanged, so the stored
+    bits are the same as the scalar kernel's for the same rows.
+    """
+
+    def __init__(self, rows_per_warp: int = ROUTER_TILE_ROWS,
+                 experts_per_warp: int = ROUTER_TILE_EXPERTS,
+                 block_warps: int = ROUTER_BLOCK_WARPS,
+                 row_groups: int = ROUTER_BLOCK_ROW_GROUPS):
+        self.rows, self.experts = int(rows_per_warp), int(experts_per_warp)
+        self.warps, self.row_groups = int(block_warps), int(row_groups)
+        self.expert_groups = self.warps // self.row_groups
+        if self.row_groups * self.expert_groups != self.warps:
+            raise ValueError("router block warps must split into row groups")
+        if 256 % (self.experts * self.expert_groups):
+            raise ValueError("router expert groups must divide 256 experts")
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        block_rows = self.rows * self.row_groups
+        self.kernel(x, weight, out, rows).launch(
+            grid=((rows + Int32(block_rows - 1)) // Int32(block_rows),
+                  256 // (self.experts * self.expert_groups), 1),
+            block=(32 * self.warps, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer, rows: Int32):
+        x, weight, out = _view(x), _view(weight), _view(out)
+        tid = Int32(cute.arch.thread_idx()[0])
+        warp = Int64(tid) // Int64(32)
+        lane = Int64(tid % Int32(32))
+        row_base = (Int64(cute.arch.block_idx()[0]) * Int64(self.row_groups)
+                    + warp // Int64(self.expert_groups)) * Int64(self.rows)
+        expert_base = (Int64(cute.arch.block_idx()[1]) * Int64(self.expert_groups)
+                       + warp % Int64(self.expert_groups)) * Int64(self.experts)
+        live, last = Int64(rows), Int64(rows) - Int64(1)
+        # Clamp every row slot to the last live row so a partial tile never reads
+        # or writes outside `x`; the clamped slots are computed and not stored.
+        col_at = cute.make_rmem_tensor(cute.make_layout((self.rows,), stride=(1,)), Int64)
+        weight_at = cute.make_rmem_tensor(cute.make_layout((self.experts,), stride=(1,)), Int64)
+        x_value = cute.make_rmem_tensor(cute.make_layout((self.rows,), stride=(1,)), Float32)
+        w_value = cute.make_rmem_tensor(cute.make_layout((self.experts,), stride=(1,)), Float32)
+        acc = cute.make_rmem_tensor(cute.make_layout((self.rows * self.experts,), stride=(1,)), Float32)
+        for r in cutlass.range_constexpr(self.rows):
+            col_at[r] = cutlass.min(row_base + Int64(r), last) * Int64(8192) + lane
+        for e in cutlass.range_constexpr(self.experts):
+            weight_at[e] = (expert_base + Int64(e)) * Int64(8192) + lane
+        for i in cutlass.range_constexpr(self.rows * self.experts):
+            acc[i] = Float32(0.0)
+        for chunk in cutlass.range(256, unroll=1):
+            offset = Int64(chunk) * Int64(32)
+            for r in cutlass.range_constexpr(self.rows):
+                x_value[r] = Float32(x[col_at[r] + offset])
+            for e in cutlass.range_constexpr(self.experts):
+                w_value[e] = Float32(weight[weight_at[e] + offset])
+            for r in cutlass.range_constexpr(self.rows):
+                for e in cutlass.range_constexpr(self.experts):
+                    at = r * self.experts + e
+                    acc[at] = _add(acc[at], _mul(x_value[r], w_value[e]))
+        for i in cutlass.range_constexpr(self.rows * self.experts):
+            acc[i] = _warp_sum(acc[i])
+        if lane == Int64(0):
+            for r in cutlass.range_constexpr(self.rows):
+                if row_base + Int64(r) < live:
+                    for e in cutlass.range_constexpr(self.experts):
+                        at = (row_base + Int64(r)) * Int64(256) + expert_base + Int64(e)
+                        out[at] = acc[r * self.experts + e]
+
+
+class RouterProjection:
+    """Narrow batches keep the scalar GEMV; wide ones take the register tile.
+
+    Both kernels store the same bits, so the row-count route can never move a
+    result: an arbitrary row's logits are identical whether it is launched
+    alone (scalar) or inside a wide prefill unit (tiled).
+    """
+
+    def __init__(self, scalar_max_rows: int = ROUTER_SCALAR_MAX_ROWS):
+        self.scalar_max_rows = int(scalar_max_rows)
+        self.scalar = _RouterScalar()
+        self.tiled = _RouterTiled()
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        if rows <= Int32(self.scalar_max_rows):
+            self.scalar(x, weight, out, rows, stream)
+        else:
+            self.tiled(x, weight, out, rows, stream)
+
+
+def compile_router_aot(*, scalar_max_rows: int = ROUTER_SCALAR_MAX_ROWS):
+    return compile_program(RouterProjection(scalar_max_rows), name="muse_router", operands=(
         Operand("x", torch.bfloat16, "[rows,8192]"),
         Operand("weight", torch.float32, "[256,8192]"),
         Operand("out", torch.float32, "[rows,256]", "out")),
-        scalars=(Scalar("rows"),), key=(8192, 256), geometry=dict(width=8192, outputs=256, weight_dtype="f32"))
+        scalars=(Scalar("rows"),),
+        key=(8192, 256, int(scalar_max_rows), ROUTER_TILE_ROWS, ROUTER_TILE_EXPERTS,
+             ROUTER_BLOCK_WARPS, ROUTER_BLOCK_ROW_GROUPS),
+        geometry=dict(width=8192, outputs=256, weight_dtype="f32",
+                      scalar_max_rows=int(scalar_max_rows), tile_rows=ROUTER_TILE_ROWS,
+                      tile_experts=ROUTER_TILE_EXPERTS, block_warps=ROUTER_BLOCK_WARPS,
+                      block_row_groups=ROUTER_BLOCK_ROW_GROUPS))
 
 
 class Softcap:
