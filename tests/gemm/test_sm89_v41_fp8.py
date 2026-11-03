@@ -176,6 +176,8 @@ def test_block32_decode_verify_matches_fp64(n, k, groups, capacity, rows):
 @pytest.mark.parametrize("n,k,groups,capacity,rows", [
     (512, 5120, 1, 256, 251), (2304, 5120, 1, 1024, 1024), (5120, 1152, 1, 4096, 777),
     (8192, 32768, 8, 256, 130), (5120, 15360, 1, 256, 90), (8192, 32768, 8, 256, 85),
+    # Multistage GEMM: partial row tiles, grouped, full capacity.
+    (5120, 15360, 1, 256, 200), (8192, 32768, 8, 1024, 600), (1280, 5120, 1, 4096, 4093),
 ])
 def test_block32_prefill_matches_fp64(n, k, groups, capacity, rows):
     require_sm89()
