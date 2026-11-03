@@ -38,9 +38,12 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
     ld_global_nc_u32,
     ld_global_nc_u32_pred,
+    ld_shared_u32,
     ld_shared_v2_u32,
+    ldmatrix_m8n8x4_b16,
     mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
+    st_global_u32,
     u32_as_f32,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
@@ -112,6 +115,30 @@ def _cp_async16_zfill(smem_addr, gmem_addr, live, *, loc=None, ip=None):
 def _warp_sync(*, loc=None, ip=None):
     llvm.inline_asm(None, [], "bar.warp.sync -1;", "~{memory}", has_side_effects=True,
                     is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _cp_async4_zfill(smem_addr, gmem_addr, live, *, loc=None, ip=None):
+    """4-byte ``cp.async.ca`` that zero-fills (reads nothing) when ``live`` is
+    false."""
+    llvm.inline_asm(
+        None,
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip), Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+         Int32(live).ir_value(loc=loc, ip=ip)],
+        "{ .reg .pred p; .reg .u32 n; setp.ne.b32 p, $2, 0; selp.u32 n, 4, 0, p; "
+        "cp.async.ca.shared.global [$0], [$1], 4, n; }",
+        "r,l,r,~{memory}", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _pack_bf16x2(lo, hi, *, loc=None, ip=None):
+    """Two FP32 values to one bf16x2 word (``lo`` in the low half)."""
+    return Uint32(llvm.inline_asm(
+        T.i32(),
+        [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+        "cvt.rn.bf16x2.f32 $0, $2, $1;", "=r,f,f", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
 
 
 @cute.jit
@@ -570,6 +597,245 @@ class Sm89DenseBlock32Launch:
         )
 
 
+class Sm89Block32Gemm:
+    """Prefill K32 block-scaled projection: a multistage cp.async main loop in
+    which every warp loads and computes. With no producer warp the CTA keeps
+    eight warps (two per scheduler) and each thread up to 255 registers on
+    SM89, where the warp-specialized kernel's ninth warp caps threads at 168.
+
+    Per stage (one 128-wide K block): the A tile [BM rows x 128 B], the B tile
+    [BN rows x 128 B] (16-byte chunks XOR-swizzled by row so ldmatrix reads
+    are conflict-free), the activation row-scale words [BM x 4 B] and the
+    weight scale words [BN/32 x 4 B], all by cp.async from every thread.
+    Fragments come from ``ldmatrix`` (standard k-slot order); every K32 step
+    runs one MMA per atom into a zero FP32 partial promoted by
+    ``2^(ea + eb - 254)``.
+    """
+
+    def __init__(self, n: int, k: int, *, groups: int = 1, tile_mn=(128, 128),
+                 stages: int = 3, warp_layout=(2, 4), promote: bool = True):
+        self.n, self.k, self.groups = int(n), int(k), int(groups)
+        # promote=False: plain FP8 (MMA accumulates, scales ignored), a reference.
+        self.promote = bool(promote)
+        self.bm, self.bn = (int(v) for v in tile_mn)
+        self.stages = int(stages)
+        self.wm, self.wn = (int(v) for v in warp_layout)
+        self.warps = self.wm * self.wn
+        self.threads = 32 * self.warps
+        self.warp_rows = self.bm // self.wm
+        self.warp_cols = self.bn // self.wn
+        self.mt = self.warp_rows // 16
+        self.nt = self.warp_cols // 8
+        if (self.n % self.bn or self.k % 128 or self.warp_rows % 16 or self.warp_cols % 32
+                or self.bm % self.wm or self.bn % self.wn):
+            raise ValueError("SM89 block-32 GEMM tile does not divide the problem")
+        self.nb32 = self.warp_cols // 32
+        self.k_blocks = self.k // 128
+        self.a_off = 0
+        self.b_off = self.bm * 128
+        self.sa_off = self.b_off + self.bn * 128
+        self.sb_off = self.sa_off + self.bm * 4
+        self.stage_bytes = -(-(self.sb_off + (self.bn // 32) * 4) // 128) * 128
+        self.a_chunks = self.bm * 8 // self.threads
+        self.b_chunks = self.bn * 8 // self.threads
+        if self.bm + self.bn // 32 > self.threads:
+            raise ValueError("SM89 block-32 GEMM copies one scale word per thread")
+        if self.a_chunks * self.threads != self.bm * 8 or self.b_chunks * self.threads != self.bn * 8:
+            raise ValueError("SM89 block-32 GEMM tile rows must fill the CTA's copies")
+
+    def key(self) -> tuple:
+        return ("sm89_block32_gemm", self.n, self.k, self.groups, self.bm, self.bn,
+                self.stages, self.wm, self.wn, self.promote)
+
+    def _storage(self):
+        class Storage:
+            pass
+
+        Storage.__annotations__ = {
+            "ring": cute.struct.Align[
+                cute.struct.MemRange[Float32, self.stages * self.stage_bytes // 4], 128],
+        }
+        return cute.struct(Storage)
+
+    @cute.jit
+    def __call__(self, a_ptr: cute.Pointer, b_ptr: cute.Pointer, sfa_ptr: cute.Pointer,
+                 sfb_ptr: cute.Pointer, c_ptr: cute.Pointer, quant_c_values_ptr: cute.Pointer,
+                 quant_c_scale_rows_ptr: cute.Pointer, quant_c_scale_mma_ptr: cute.Pointer,
+                 alpha_ptr: cute.Pointer, m: Int32, current_stream: cuda.CUstream):
+        m_tiles = cutlass.max((m + Int32(self.bm - 1)) // Int32(self.bm), Int32(1))
+        self.kernel(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, m).launch(
+            grid=(m_tiles, self.n // self.bn, self.groups), block=(self.threads, 1, 1),
+            stream=current_stream)
+
+    @cute.jit
+    def _issue(self, smem: Int32, a_src, a_dst, a_live, b_src, b_dst, sa_src, sa_live,
+               sb_src, tidx: Int32, kb: Int32):
+        k_byte = Int64(kb) * Int64(128)
+        k_word = Int64(kb) * Int64(4)
+        for i in cutlass.range_constexpr(self.a_chunks):
+            _cp_async16_zfill(smem + Int32(self.a_off) + a_dst[i], a_src[i] + k_byte, a_live[i])
+        for i in cutlass.range_constexpr(self.b_chunks):
+            _cp_async16_zfill(smem + Int32(self.b_off) + b_dst[i], b_src[i] + k_byte, True)
+        if tidx < Int32(self.bm):
+            _cp_async4_zfill(smem + Int32(self.sa_off) + tidx * Int32(4), sa_src + k_word, sa_live)
+        elif tidx < Int32(self.bm + self.bn // 32):
+            _cp_async4_zfill(smem + Int32(self.sb_off) + (tidx - Int32(self.bm)) * Int32(4),
+                             sb_src + k_word, True)
+
+    @cute.jit
+    def _load_frags(self, afr: cute.Tensor, bfr: cute.Tensor, buf: int, stage: Int32,
+                    a_row: Int32, a_half: Int32, b_row: Int32, b_half: Int32, st: int):
+        """ldmatrix the A (every row tile) and B (every column tile) fragments
+        of K32 step ``st`` into register buffer ``buf``."""
+        for mt in cutlass.range_constexpr(self.mt):
+            row = a_row + Int32(16 * mt)
+            ch = Int32(2 * st) + a_half
+            addr = (stage + Int32(self.a_off) + row * Int32(128)
+                    + ((ch ^ (row & Int32(7))) << Int32(4)))
+            f = (buf * self.mt + mt) * 4
+            afr[f], afr[f + 1], afr[f + 2], afr[f + 3] = ldmatrix_m8n8x4_b16(addr)
+        for np in cutlass.range_constexpr(self.nt // 2):
+            row = b_row + Int32(16 * np)
+            ch = Int32(2 * st) + b_half
+            addr = (stage + Int32(self.b_off) + row * Int32(128)
+                    + ((ch ^ (row & Int32(7))) << Int32(4)))
+            f = (buf * self.nt + 2 * np) * 2
+            bfr[f], bfr[f + 1], bfr[f + 2], bfr[f + 3] = ldmatrix_m8n8x4_b16(addr)
+
+    @cute.kernel
+    def kernel(self, a_ptr: cute.Pointer, b_ptr: cute.Pointer, sfa_ptr: cute.Pointer,
+               sfb_ptr: cute.Pointer, c_ptr: cute.Pointer, m: Int32):
+        tidx = Int32(cute.arch.thread_idx()[0])
+        warp = tidx // Int32(32)
+        lane = tidx % Int32(32)
+        g = lane // Int32(4)
+        j = lane % Int32(4)
+        tile_m, tile_n, group = cute.arch.block_idx()
+        m0 = Int32(tile_m) * Int32(self.bm)
+        n0 = Int32(tile_n) * Int32(self.bn)
+        grp = Int64(group)
+        live = Int64(m)
+        k32 = self.k // 32
+        a_base = Int64(a_ptr.toint()) + grp * live * Int64(self.k)
+        b_base = Int64(b_ptr.toint()) + grp * Int64(self.n) * Int64(self.k)
+        sa_base = Int64(sfa_ptr.toint()) + grp * live * Int64(k32)
+        sb_base = Int64(sfb_ptr.toint()) + grp * Int64(self.n // 32) * Int64(k32)
+        c_base = Int64(c_ptr.toint()) + grp * live * Int64(self.n) * Int64(2)
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
+        ring = shared_ptr_to_u32(storage.ring.get_tensor(cute.make_layout((4,))).iterator)
+
+        # This thread's copies: 16-byte chunk c = tidx + threads * i of the A/B
+        # tiles (row c / 8, chunk c % 8, stored at chunk ^ (row % 8)).
+        a_src = cute.make_rmem_tensor(cute.make_layout((self.a_chunks,), stride=(1,)), Int64)
+        a_dst = cute.make_rmem_tensor(cute.make_layout((self.a_chunks,), stride=(1,)), Int32)
+        a_live = cute.make_rmem_tensor(cute.make_layout((self.a_chunks,), stride=(1,)),
+                                       cutlass.Boolean)
+        for i in cutlass.range_constexpr(self.a_chunks):
+            c = tidx + Int32(self.threads * i)
+            row = c >> Int32(3)
+            ch = c & Int32(7)
+            a_src[i] = a_base + Int64(m0 + row) * Int64(self.k) + Int64(ch) * Int64(16)
+            a_dst[i] = row * Int32(128) + ((ch ^ (row & Int32(7))) << Int32(4))
+            a_live[i] = m0 + row < m
+        b_src = cute.make_rmem_tensor(cute.make_layout((self.b_chunks,), stride=(1,)), Int64)
+        b_dst = cute.make_rmem_tensor(cute.make_layout((self.b_chunks,), stride=(1,)), Int32)
+        for i in cutlass.range_constexpr(self.b_chunks):
+            c = tidx + Int32(self.threads * i)
+            row = c >> Int32(3)
+            ch = c & Int32(7)
+            b_src[i] = b_base + Int64(n0 + row) * Int64(self.k) + Int64(ch) * Int64(16)
+            b_dst[i] = row * Int32(128) + ((ch ^ (row & Int32(7))) << Int32(4))
+        sa_src = sa_base + Int64(m0 + tidx) * Int64(k32)
+        sa_live = m0 + tidx < m
+        sb_src = sb_base + Int64(n0 // Int32(32) + tidx - Int32(self.bm)) * Int64(k32)
+
+        # Fragment addresses (stage-relative): ldmatrix x4 rows and chunks.
+        wm_i = warp // Int32(self.wn)
+        wn_i = warp % Int32(self.wn)
+        q = lane >> Int32(3)
+        r8 = lane & Int32(7)
+        a_row = wm_i * Int32(self.warp_rows) + r8 + ((q & Int32(1)) << Int32(3))
+        a_half = q >> Int32(1)
+        b_row = wn_i * Int32(self.warp_cols) + r8 + ((q >> Int32(1)) << Int32(3))
+        b_half = q & Int32(1)
+
+        acc = cute.make_rmem_tensor(cute.make_layout((self.mt * self.nt * 4,), stride=(1,)),
+                                    Float32)
+        for i in cutlass.range_constexpr(self.mt * self.nt * 4):
+            acc[i] = Float32(0.0)
+        afr = cute.make_rmem_tensor(cute.make_layout((2 * self.mt * 4,), stride=(1,)), Uint32)
+        bfr = cute.make_rmem_tensor(cute.make_layout((2 * self.nt * 2,), stride=(1,)), Uint32)
+        sa_w = cute.make_rmem_tensor(cute.make_layout((2 * self.mt,), stride=(1,)), Uint32)
+        sb_w = cute.make_rmem_tensor(cute.make_layout((self.nb32,), stride=(1,)), Uint32)
+
+        for s in cutlass.range_constexpr(self.stages - 1):
+            if const_expr(s < self.k_blocks):
+                self._issue(ring + Int32(s * self.stage_bytes), a_src, a_dst, a_live, b_src,
+                            b_dst, sa_src, sa_live, sb_src, tidx, Int32(s))
+            cute.arch.cp_async_commit_group()
+        for kb in cutlass.range(self.k_blocks, unroll=1):
+            cute.arch.cp_async_wait_group(self.stages - 2)
+            cute.arch.sync_threads()
+            nxt = kb + Int32(self.stages - 1)
+            if nxt < Int32(self.k_blocks):
+                self._issue(ring + (nxt % Int32(self.stages)) * Int32(self.stage_bytes), a_src,
+                            a_dst, a_live, b_src, b_dst, sa_src, sa_live, sb_src, tidx, nxt)
+            cute.arch.cp_async_commit_group()
+            stage = ring + (kb % Int32(self.stages)) * Int32(self.stage_bytes)
+            for mt in cutlass.range_constexpr(self.mt):
+                for h in cutlass.range_constexpr(2):
+                    row = wm_i * Int32(self.warp_rows) + Int32(16 * mt + 8 * h) + g
+                    sa_w[2 * mt + h] = ld_shared_u32(stage + Int32(self.sa_off) + row * Int32(4))
+            for b in cutlass.range_constexpr(self.nb32):
+                sb_w[b] = ld_shared_u32(stage + Int32(self.sb_off)
+                                        + (wn_i * Int32(self.nb32) + Int32(b)) * Int32(4))
+            # Fragments one K32 step ahead (two register buffers).
+            self._load_frags(afr, bfr, 0, stage, a_row, a_half, b_row, b_half, 0)
+            for st in cutlass.range_constexpr(4):
+                buf = st % 2
+                if const_expr(st < 3):
+                    self._load_frags(afr, bfr, 1 - buf, stage, a_row, a_half, b_row, b_half,
+                                     st + 1)
+                for mt in cutlass.range_constexpr(self.mt):
+                    ea_lo = _scale_byte(sa_w[2 * mt], st)
+                    ea_hi = _scale_byte(sa_w[2 * mt + 1], st)
+                    fa = (buf * self.mt + mt) * 4
+                    for b in cutlass.range_constexpr(self.nb32):
+                        eb = _scale_byte(sb_w[b], st) - Int32(127)
+                        scale_lo = _pow2_biased(ea_lo + eb)
+                        scale_hi = _pow2_biased(ea_hi + eb)
+                        for nq in cutlass.range_constexpr(4):
+                            nt = 4 * b + nq
+                            fb = (buf * self.nt + nt) * 2
+                            o = (mt * self.nt + nt) * 4
+                            if const_expr(self.promote):
+                                zero = Float32(0.0)
+                                d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
+                                    zero, zero, zero, zero, afr[fa], afr[fa + 1], afr[fa + 2],
+                                    afr[fa + 3], bfr[fb], bfr[fb + 1])
+                                acc[o] = acc[o] + d0 * scale_lo
+                                acc[o + 1] = acc[o + 1] + d1 * scale_lo
+                                acc[o + 2] = acc[o + 2] + d2 * scale_hi
+                                acc[o + 3] = acc[o + 3] + d3 * scale_hi
+                            else:
+                                acc[o], acc[o + 1], acc[o + 2], acc[o + 3] = (
+                                    mma_m16n8k32_f32_e4m3(
+                                        acc[o], acc[o + 1], acc[o + 2], acc[o + 3], afr[fa],
+                                        afr[fa + 1], afr[fa + 2], afr[fa + 3], bfr[fb],
+                                        bfr[fb + 1]))
+        cute.arch.cp_async_wait_group(0)
+        for mt in cutlass.range_constexpr(self.mt):
+            for h in cutlass.range_constexpr(2):
+                row = m0 + wm_i * Int32(self.warp_rows) + Int32(16 * mt + 8 * h) + g
+                if row < m:
+                    for nt in cutlass.range_constexpr(self.nt):
+                        col = n0 + wn_i * Int32(self.warp_cols) + Int32(8 * nt) + Int32(2) * j
+                        o = (mt * self.nt + nt) * 4 + 2 * h
+                        st_global_u32(c_base + (Int64(row) * Int64(self.n) + Int64(col)) * Int64(2),
+                                      _pack_bf16x2(acc[o], acc[o + 1]))
+
+
 def _wave_efficiency(tiles: int, sm_count: int) -> float:
     return tiles / (-(-tiles // sm_count) * sm_count)
 
@@ -601,6 +867,16 @@ def _verify_dense_part(rows: int, size_n: int, num_groups: int, sm_count: int) -
             cands.append(((64, 32), 4 * tiles, False))
     tile, _, atom_24 = max(cands, key=lambda c: round(_wave_efficiency(c[1], sm_count), 6))
     return _dense_part(rows, tile, atom_24)
+
+
+def _prefill_part(rows: int, size_n: int, num_groups: int, sm_count: int) -> dict:
+    tiles = -(-rows // 128) * (size_n // 128) * num_groups
+    multistage = -(-tiles // sm_count) * 1.5
+    warp_specialized = -(-2 * tiles // sm_count)
+    # Ties go multistage: partial chunks below the capacity favour it.
+    if size_n % 128 == 0 and multistage <= warp_specialized:
+        return dict(rows=rows, kind="gemm", tile_mn=(128, 128), stages=3, warp_layout=(2, 4))
+    return _dense_part(rows, (128, 64))
 
 
 def sm89_block32_plan(*, size_m: int, size_n: int, size_k: int, num_groups: int,
@@ -658,11 +934,12 @@ def sm89_block32_plan(*, size_m: int, size_n: int, size_k: int, num_groups: int,
         if low["kind"] == high["kind"] == "dense" and low["tile_mn"] == high["tile_mn"]:
             return dict(parts=[high], slices=1)
         return dict(parts=[low, high], slices=1)
-    # Prefill. 128x64: the 9-warp warp-specialized CTA caps threads at 168
-    # registers on SM89 (no setmaxnreg); 128x128 with K32 activation and weight
-    # scales spills (181-209 TF/s against 265-281 here, M=1024-4096). Rows up
-    # to 96 (verify beyond 80) take the verify dense tile.
-    prefill = _dense_part(size_m, (128, 64))
+    # Prefill: the multistage 128x128 GEMM (every warp loads and computes, no
+    # 168-register cap) unless its grid quantizes worse than the
+    # warp-specialized 128x64 one's at the capacity: a 128x128 tile takes
+    # about 1.5x as long as a 128x64 tile, so it wins once its waves cost no
+    # more. Rows up to 96 (verify beyond 80) take the verify dense tile.
+    prefill = _prefill_part(size_m, size_n, num_groups, sm_count)
     if size_m <= 256:
         return dict(parts=[_verify_dense_part(96, size_n, num_groups, sm_count), prefill],
                     slices=1)
@@ -710,6 +987,9 @@ def _part_launch(part: dict, n: int, k: int, groups: int):
         return Sm89Block32Gemv(n, k, groups=groups, max_rows=part["max_rows"],
                                warps=part["warps"], col_groups=part["col_groups"],
                                slices=part.get("slices", 1))
+    if part["kind"] == "gemm":
+        return Sm89Block32Gemm(n, k, groups=groups, tile_mn=part["tile_mn"],
+                               stages=part["stages"], warp_layout=part["warp_layout"])
     return Sm89DenseBlock32Launch(n, k, groups=groups, tile_mn=part["tile_mn"],
                                   atom_24=part.get("atom_24", False))
 
