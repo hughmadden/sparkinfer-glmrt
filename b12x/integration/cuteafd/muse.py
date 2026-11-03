@@ -142,10 +142,14 @@ class RouterProjection:
     alone (scalar) or inside a wide prefill unit (tiled).
     """
 
-    def __init__(self, scalar_max_rows: int = ROUTER_SCALAR_MAX_ROWS):
+    def __init__(self, scalar_max_rows: int = ROUTER_SCALAR_MAX_ROWS,
+                 rows_per_warp: int = ROUTER_TILE_ROWS,
+                 experts_per_warp: int = ROUTER_TILE_EXPERTS,
+                 block_warps: int = ROUTER_BLOCK_WARPS,
+                 row_groups: int = ROUTER_BLOCK_ROW_GROUPS):
         self.scalar_max_rows = int(scalar_max_rows)
         self.scalar = _RouterScalar()
-        self.tiled = _RouterTiled()
+        self.tiled = _RouterTiled(rows_per_warp, experts_per_warp, block_warps, row_groups)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
@@ -156,18 +160,29 @@ class RouterProjection:
             self.tiled(x, weight, out, rows, stream)
 
 
-def compile_router_aot(*, scalar_max_rows: int = ROUTER_SCALAR_MAX_ROWS):
-    return compile_program(RouterProjection(scalar_max_rows), name="muse_router", operands=(
-        Operand("x", torch.bfloat16, "[rows,8192]"),
-        Operand("weight", torch.float32, "[256,8192]"),
-        Operand("out", torch.float32, "[rows,256]", "out")),
+def compile_router_aot(*, scalar_max_rows: int = ROUTER_SCALAR_MAX_ROWS,
+                       rows_per_warp: int = ROUTER_TILE_ROWS,
+                       experts_per_warp: int = ROUTER_TILE_EXPERTS,
+                       block_warps: int = ROUTER_BLOCK_WARPS,
+                       row_groups: int = ROUTER_BLOCK_ROW_GROUPS):
+    """Compile the router program; the tile geometry only changes load reuse.
+
+    Every geometry stores the same bits, so the geometry is a launch-time
+    choice, never a numerics choice.
+    """
+    return compile_program(
+        RouterProjection(scalar_max_rows, rows_per_warp, experts_per_warp, block_warps, row_groups),
+        name="muse_router", operands=(
+            Operand("x", torch.bfloat16, "[rows,8192]"),
+            Operand("weight", torch.float32, "[256,8192]"),
+            Operand("out", torch.float32, "[rows,256]", "out")),
         scalars=(Scalar("rows"),),
-        key=(8192, 256, int(scalar_max_rows), ROUTER_TILE_ROWS, ROUTER_TILE_EXPERTS,
-             ROUTER_BLOCK_WARPS, ROUTER_BLOCK_ROW_GROUPS),
+        key=(8192, 256, int(scalar_max_rows), int(rows_per_warp), int(experts_per_warp),
+             int(block_warps), int(row_groups)),
         geometry=dict(width=8192, outputs=256, weight_dtype="f32",
-                      scalar_max_rows=int(scalar_max_rows), tile_rows=ROUTER_TILE_ROWS,
-                      tile_experts=ROUTER_TILE_EXPERTS, block_warps=ROUTER_BLOCK_WARPS,
-                      block_row_groups=ROUTER_BLOCK_ROW_GROUPS))
+                      scalar_max_rows=int(scalar_max_rows), tile_rows=int(rows_per_warp),
+                      tile_experts=int(experts_per_warp), block_warps=int(block_warps),
+                      block_row_groups=int(row_groups)))
 
 
 class Softcap:

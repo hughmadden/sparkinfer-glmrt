@@ -319,9 +319,12 @@ ROUTER_ROWS = (1, 7, 8, 16, 64, 80, 256, 257, 1024, 2048, 2721, 2752, 4096)
 
 
 @functools.lru_cache(maxsize=None)
-def _router_program(scalar_max_rows):
+def _router_program(scalar_max_rows, rows_per_warp=8, experts_per_warp=8,
+                    block_warps=8, row_groups=4):
     from b12x.integration.cuteafd.muse import compile_router_aot
-    return compile_router_aot(scalar_max_rows=scalar_max_rows)
+    return compile_router_aot(
+        scalar_max_rows=scalar_max_rows, rows_per_warp=rows_per_warp,
+        experts_per_warp=experts_per_warp, block_warps=block_warps, row_groups=row_groups)
 
 
 def _router_bits(out):
@@ -347,6 +350,19 @@ def test_router_tile_bit_exact(rows):
     replay = torch.empty_like(tiled)
     _router_program(0).launch(x, weight, replay, scalars=[rows])
     assert torch.equal(_router_bits(replay), _router_bits(tiled))
+
+
+@pytest.mark.parametrize("rows", (64, 2721, 2752))
+@pytest.mark.parametrize("tile", ((8, 8, 8, 4), (8, 4, 8, 4), (4, 8, 8, 4)))
+def test_router_tile_geometry_bit_exact(rows, tile):
+    """Every screened tile geometry stores the scalar route's bits."""
+    require_b12x()
+    x, weight = _router_inputs(rows, seed=53)
+    scalar = torch.empty(rows, 256, device="cuda")
+    tiled = torch.empty_like(scalar)
+    _router_program(2**31 - 1).launch(x, weight, scalar, scalars=[rows])
+    _router_program(0, *tile).launch(x, weight, tiled, scalars=[rows])
+    assert torch.equal(_router_bits(tiled), _router_bits(scalar))
 
 
 @pytest.mark.parametrize("rows", (256, 257, 512, 2752, 2753))
@@ -406,8 +422,16 @@ def test_router_nonfinite_and_tie_policy():
     assert torch.isfinite(scalar[0][finite_experts]).all()
     assert torch.isfinite(scalar[9][finite_experts]).all()
     # Identical checkpoint rows keep identical logits, ties included, and the
-    # cancellation row is exactly +0.0 (positive zero, not only == 0).
-    assert torch.equal(scalar[:, 1], scalar[:, 2])
+    # cancellation row is exactly +0.0 (positive zero, not only == 0). NaN rows
+    # are compared by classification: torch.equal rejects NaN != NaN.
+    tie = _router_bits(scalar)
+    finite_rows = torch.isfinite(scalar[:, 1])
+    tie_finite = finite_rows.cpu()
+    assert tie_finite.any() and not tie_finite.all()
+    assert torch.equal(tie[tie_finite, 1], tie[tie_finite, 2])
+    nan_rows = torch.isnan(scalar[:, 1])
+    assert nan_rows.any()
+    assert torch.isnan(scalar[nan_rows, 2]).all()
     assert int(_router_bits(scalar)[8, 6]) == 0
 
 
