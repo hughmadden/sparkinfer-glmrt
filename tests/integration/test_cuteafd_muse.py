@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import functools
 
 import numpy as np
 import pytest
@@ -310,6 +311,128 @@ def test_native_f32_router(rows):
     one = torch.empty_like(out[:1])
     program.launch(xd[:1], wd, one, scalars=[1])
     assert torch.equal(one, out[:1])
+
+
+# Every width the router sees: decode/verify widths, partial tiles, the scalar
+# route cap and its neighbour, and the three prefill unit widths.
+ROUTER_ROWS = (1, 7, 8, 16, 64, 80, 256, 257, 1024, 2048, 2721, 2752, 4096)
+
+
+@functools.lru_cache(maxsize=None)
+def _router_program(scalar_max_rows, rows_per_warp=8, experts_per_warp=8,
+                    block_warps=8, row_groups=4):
+    from b12x.integration.cuteafd.muse import compile_router_aot
+    return compile_router_aot(
+        scalar_max_rows=scalar_max_rows, rows_per_warp=rows_per_warp,
+        experts_per_warp=experts_per_warp, block_warps=block_warps, row_groups=row_groups)
+
+
+def _router_bits(out):
+    return out.detach().view(torch.int32).cpu()
+
+
+def _router_inputs(rows, seed=37):
+    gen = torch.Generator().manual_seed(seed)
+    return (torch.randn(rows, 8192, generator=gen).bfloat16().cuda(),
+            (torch.randn(256, 8192, generator=gen) * 0.01).cuda())
+
+
+@pytest.mark.parametrize("rows", ROUTER_ROWS)
+def test_router_tile_bit_exact(rows):
+    """Forcing either route stores identical bits at every live width."""
+    require_b12x()
+    x, weight = _router_inputs(rows)
+    scalar = torch.empty(rows, 256, device="cuda")
+    tiled = torch.empty_like(scalar)
+    _router_program(2**31 - 1).launch(x, weight, scalar, scalars=[rows])
+    _router_program(0).launch(x, weight, tiled, scalars=[rows])
+    assert torch.equal(_router_bits(tiled), _router_bits(scalar))
+    replay = torch.empty_like(tiled)
+    _router_program(0).launch(x, weight, replay, scalars=[rows])
+    assert torch.equal(_router_bits(replay), _router_bits(tiled))
+
+
+@pytest.mark.parametrize("rows", (64, 2721, 2752))
+@pytest.mark.parametrize("tile", ((8, 8, 8, 4), (8, 4, 8, 4), (4, 8, 8, 4)))
+def test_router_tile_geometry_bit_exact(rows, tile):
+    """Every screened tile geometry stores the scalar route's bits."""
+    require_b12x()
+    x, weight = _router_inputs(rows, seed=53)
+    scalar = torch.empty(rows, 256, device="cuda")
+    tiled = torch.empty_like(scalar)
+    _router_program(2**31 - 1).launch(x, weight, scalar, scalars=[rows])
+    _router_program(0, *tile).launch(x, weight, tiled, scalars=[rows])
+    assert torch.equal(_router_bits(tiled), _router_bits(scalar))
+
+
+@pytest.mark.parametrize("rows", (256, 257, 512, 2752, 2753))
+def test_router_route_invariance(rows):
+    """The row-count route cannot move a result: every row is bit-identical to
+    the scalar route's row, and a row launched alone matches its batch row."""
+    require_b12x()
+    from b12x.integration.cuteafd.muse import ROUTER_SCALAR_MAX_ROWS
+    x, weight = _router_inputs(rows, seed=41)
+    dispatch = torch.empty(rows, 256, device="cuda")
+    scalar_route = torch.empty_like(dispatch)
+    program = _router_program(ROUTER_SCALAR_MAX_ROWS)
+    program.launch(x, weight, dispatch, scalars=[rows])
+    _router_program(2**31 - 1).launch(x, weight, scalar_route, scalars=[rows])
+    assert torch.equal(_router_bits(dispatch), _router_bits(scalar_route))
+    for at in (0, rows // 2, rows - 1):
+        one = torch.empty(1, 256, device="cuda")
+        program.launch(x[at:at + 1], weight, one, scalars=[1])
+        assert torch.equal(_router_bits(one), _router_bits(dispatch[at:at + 1]))
+
+
+def test_router_nonfinite_and_tie_policy():
+    """Both routes share the IEEE rounding policy: infinities, NaN, zeros and
+    exact weight ties produce the same bits, and no row poisons another."""
+    require_b12x()
+    rows = 40
+    x, weight = _router_inputs(rows, seed=11)
+    x, weight = x.cpu(), weight.cpu()
+    x[3] = float("inf")
+    x[4, 0] = float("nan")
+    x[5] = 0.0
+    x[6, 7] = -0.0
+    x[7] = torch.finfo(torch.bfloat16).tiny
+    weight[0] = 0.0
+    weight[1] = 1.0
+    weight[2] = weight[1]
+    weight[3, 0] = float("inf")
+    weight[4, 0] = float("nan")
+    weight[5, 0] = -0.0
+    # Exact cancellation: alternating +-1 inputs against an all-ones row sums to
+    # zero in both routes (every partial is an exact small integer).
+    weight[6] = 1.0
+    x[8] = 0.0
+    x[8, ::2] = 1.0
+    x[8, 1::2] = -1.0
+    xd, wd = x.cuda(), weight.cuda()
+    scalar = torch.empty(rows, 256, device="cuda")
+    tiled = torch.empty_like(scalar)
+    _router_program(2**31 - 1).launch(xd, wd, scalar, scalars=[rows])
+    _router_program(0).launch(xd, wd, tiled, scalars=[rows])
+    assert torch.equal(_router_bits(tiled), _router_bits(scalar))
+    # A NaN input row stays NaN for every expert; unrelated rows and experts
+    # stay finite, so neither route poisons data it does not own.
+    assert torch.isnan(scalar[4]).all()
+    finite_experts = torch.ones(256, dtype=torch.bool)
+    finite_experts[[3, 4]] = False
+    assert torch.isfinite(scalar[0][finite_experts]).all()
+    assert torch.isfinite(scalar[9][finite_experts]).all()
+    # Identical checkpoint rows keep identical logits, ties included, and the
+    # cancellation row is exactly +0.0 (positive zero, not only == 0). NaN rows
+    # are compared by classification: torch.equal rejects NaN != NaN.
+    tie = _router_bits(scalar)
+    finite_rows = torch.isfinite(scalar[:, 1])
+    tie_finite = finite_rows.cpu()
+    assert tie_finite.any() and not tie_finite.all()
+    assert torch.equal(tie[tie_finite, 1], tie[tie_finite, 2])
+    nan_rows = torch.isnan(scalar[:, 1])
+    assert nan_rows.any()
+    assert torch.isnan(scalar[nan_rows, 2]).all()
+    assert int(_router_bits(scalar)[8, 6]) == 0
 
 
 @pytest.mark.parametrize("heads", (64, 128))

@@ -10,7 +10,13 @@ the prefill top-k is a 4096-row first chunk (causal lengths 1..4096).
 Decode programs also run with FP8 weight operands (``*_m64 fp8``): E4M3
 weights and FP32 block scales next to the BF16 copy.
 
+``--muse-router`` times the Muse native F32 router instead: the scalar
+baseline, each ROWSxEXPERTS register tile, and the production row-count
+dispatch at each threshold, every arm checked bit-for-bit against the scalar
+route before it is timed.
+
   python benchmarks/bench_cuteafd_glm_programs.py [--iters 30] [--decode-context 8192]
+  python benchmarks/bench_cuteafd_glm_programs.py --muse-router [--muse-rows 1,16,2752]
 """
 
 from __future__ import annotations
@@ -37,11 +43,102 @@ def time_us(fn, iters: int, flush: torch.Tensor) -> float:
     return times[len(times) // 2]
 
 
+def muse_router_mode(args) -> None:
+    """Time the Muse native F32 router: scalar baseline, tile geometries, and
+    the production row-count dispatch at each threshold.
+
+    Every arm stores the scalar route's bits; the check below runs before the
+    timing so a timing column can never describe a different result.
+    """
+    from b12x.integration.cuteafd import muse as m
+
+    dev = "cuda"
+    gen = torch.Generator(device=dev).manual_seed(0)
+    flush = torch.zeros(512 << 20, dtype=torch.uint8, device=dev)
+    rows_list = tuple(int(v) for v in args.muse_rows.split(","))
+    tiles = [tuple(int(v) for v in spec.split("x")) for spec in args.muse_tiles.split(",")]
+    thresholds = [int(v) for v in args.muse_thresholds.split(",")]
+
+    max_rows = max(rows_list)
+    x = (torch.randn(max_rows, 8192, generator=gen, device=dev) * 0.02).bfloat16()
+    weight = torch.randn(256, 8192, generator=gen, device=dev) * 0.01
+    out = torch.empty(max_rows, 256, dtype=torch.float32, device=dev)
+
+    progs = {}
+
+    def prog(name, fn):
+        if name not in progs:
+            progs[name] = fn()
+        return progs[name]
+
+    def router(scalar_max_rows, r, e):
+        return prog(f"{scalar_max_rows}:{r}x{e}", lambda: m.compile_router_aot(
+            scalar_max_rows=scalar_max_rows, rows_per_warp=r, experts_per_warp=e))
+
+    def bits(rows):
+        return out[:rows].detach().view(torch.int32).cpu()
+
+    scalar = router(2**31 - 1, 8, 8)
+    refs = {}
+    for rows in rows_list:
+        scalar.launch(x[:rows], weight, out[:rows], scalars=(rows,))
+        torch.cuda.synchronize()
+        refs[rows] = bits(rows)
+
+    arms = [("scalar route", lambda rows: scalar)]
+    for r, e in tiles:
+        arms.append((f"tile {r}x{e} (tiled everywhere)",
+                     lambda rows, r=r, e=e: router(0, r, e)))
+
+    results = []
+    for name, arm in arms:
+        for rows in rows_list:
+            program = arm(rows)
+            fn = lambda program=program, rows=rows: program.launch(  # noqa: B023
+                x[:rows], weight, out[:rows], scalars=(rows,))
+            us = time_us(fn, args.iters, flush)
+            assert torch.equal(bits(rows), refs[rows]), f"{name} moved result bits at {rows} rows"
+            results.append((name, rows, us))
+
+    total = {}
+    for name, rows, us in results:
+        total.setdefault(name, {})[rows] = us
+    wide = max(rows_list)
+    winner = min((name for name, _ in arms[1:]), key=lambda name: total[name][wide])
+    r, e = next(tile for tile in tiles if f"tile {tile[0]}x{tile[1]}" in winner)
+    for threshold in thresholds:
+        name = f"dispatch<{threshold} tile {r}x{e}"
+        for rows in rows_list:
+            program = router(threshold, r, e)
+            fn = lambda program=program, rows=rows: program.launch(  # noqa: B023
+                x[:rows], weight, out[:rows], scalars=(rows,))
+            us = time_us(fn, args.iters, flush)
+            assert torch.equal(bits(rows), refs[rows]), f"{name} moved result bits at {rows} rows"
+            results.append((name, rows, us))
+            total.setdefault(name, {})[rows] = us
+
+    width = max(len(name) for name, _, _ in results) + 2
+    print(f"{'program':{width}s} " + " ".join(f"{rows:>8d}" for rows in rows_list) + "   (us, L2-cold)")
+    for name in dict.fromkeys(name for name, _, _ in results):
+        print(f"{name:{width}s} " + " ".join(f"{total[name][rows]:8.1f}" for rows in rows_list))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--decode-context", type=int, default=8192)
+    parser.add_argument("--muse-router", action="store_true",
+                        help="time the Muse native F32 router instead of the GLM programs")
+    parser.add_argument("--muse-rows", default="1,16,64,256,2721,2752")
+    parser.add_argument("--muse-tiles", default="8x8,8x4,4x8",
+                        help="comma-separated ROWSxEXPERTS warp tiles")
+    parser.add_argument("--muse-thresholds", default="16,64,128,256",
+                        help="row-count dispatch thresholds for the winning tile")
     args = parser.parse_args()
+
+    if args.muse_router:
+        muse_router_mode(args)
+        return
 
     from b12x.integration.cuteafd import GLM53 as g
     from b12x.integration.cuteafd import glm_attention as attn
