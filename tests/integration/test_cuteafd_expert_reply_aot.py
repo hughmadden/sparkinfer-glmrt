@@ -53,11 +53,18 @@ def mismatch_details(x, actual, expected, format):
     details = []
     for row, index in blocks[:16].tolist():
         amax = float(x[row, index * block:(index + 1) * block].float().abs().max())
+        import math
         details.append(dict(row=row, block=index, changed_values=int(changed_values[row, index]),
             actual_scale=int(actual[row, value_bytes + index]),
             expected_scale=int(expected[row, value_bytes + index]),
-            amax_hex=amax.hex(), ratio_448_hex=(amax / 448).hex()))
-    return dict(changed_blocks=len(blocks), changed_scales=int(changed_scales.sum()), blocks=details)
+            amax_hex=amax.hex(), ratio_448_hex=(amax / 448).hex(),
+            fp32_subnormal=0 < amax < 2.0 ** -126, zero_amax=amax == 0,
+            cpu_exponent=max(-127, min(127, math.ceil(math.log2(amax / 448)))) if amax else -127))
+    result = dict(changed_blocks=len(blocks), changed_scales=int(changed_scales.sum()), blocks=details)
+    if len(blocks):
+        import json
+        print("reply_codec_mismatch=" + json.dumps(result, sort_keys=True))
+    return result
 
 
 @pytest.fixture(scope="module")
