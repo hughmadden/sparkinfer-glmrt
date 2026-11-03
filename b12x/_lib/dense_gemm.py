@@ -6395,16 +6395,18 @@ def compile_dense_gemm_mxfp8_aot(
         raise ValueError(f"MXFP8 AOT expected_m must be positive, got {regime_m}")
     if target_is_pre_hopper():
         # SM89: same pointer ABI, plain K32 scale layouts (activation row
-        # scales [L,M,K/32], weight scales [L,N/32,K/32]), never split.
+        # scales [L,M,K/32], weight scales [L,N/32,K/32]); split plans return their FP32 slice count.
         from b12x._lib.sm89_fp8 import compile_sm89_block32_gemm_aot
 
         if sfb_k_replicated or split_k_all_m:
             raise ValueError("SM89 MXFP8 AOT supports the K32 32x32 recipe only")
-        compiled = compile_sm89_block32_gemm_aot(
+        compiled, slices = compile_sm89_block32_gemm_aot(
             size_m=size_m, size_n=size_n, size_k=size_k, num_groups=num_groups,
             sm_count=sm_count,
         )
-        return (compiled, 1) if return_split_k_metadata else compiled
+        if slices != 1 and not return_split_k_metadata:
+            raise ValueError("SM89 split-K MXFP8 AOT requires return_split_k_metadata")
+        return (compiled, slices) if return_split_k_metadata else compiled
 
     plan = _select_default_dense_gemm_plan(
         size_m,
