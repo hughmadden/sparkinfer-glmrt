@@ -69,7 +69,10 @@ def test_reply_pair_exact_and_graph_dynamic_mode(programs, width, format):
         stage.launch(packed, scratch, mode, scalars=(rows, width, -1))
         decode.launch(scratch, out, mode, scalars=(rows, width, -1))
         torch.cuda.synchronize()
-        assert torch.equal(packed, expected_wire)
+        mismatch = (packed != expected_wire).nonzero()
+        samples = [(r, c, int(packed[r, c]), int(expected_wire[r, c]),
+                    float(x[r, min(c, width - 1)])) for r, c in mismatch[:16].tolist()]
+        assert not mismatch.numel(), (rows, width, format, samples)
         assert torch.equal(scratch, expected_wire)
         assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
         # The actual consumer expands into the BF16-sized landing plane only
