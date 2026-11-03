@@ -518,6 +518,29 @@ def ld_global_nc_u32(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def ld_global_nc_u32_pred(base_ptr: Int64, pred, *, loc=None, ip=None) -> Uint32:
+    """32-bit ``ld.global.nc`` that returns 0, touching no memory, when ``pred``
+    is false."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(base_ptr).ir_value(loc=loc, ip=ip),
+                Int32(pred).ir_value(loc=loc, ip=ip),
+            ],
+            "{ .reg .pred p; setp.ne.b32 p, $2, 0; mov.u32 $0, 0; "
+            "@p ld.global.nc.u32 $0, [$1]; }",
+            "=r,l,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ld_global_nc_u32_l2hint(
     base_ptr: Int64, cache_policy: Uint64, offset: int = 0, *, loc=None, ip=None
 ) -> Uint32:

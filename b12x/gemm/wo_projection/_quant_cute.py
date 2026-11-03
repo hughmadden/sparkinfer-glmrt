@@ -127,6 +127,11 @@ class _WOQuantCuTeLaunch:
         self._cos_sin_type = cos_sin_type
         self._threads = int(threads)
         self._warps_per_cta = self._threads // 32
+        # Pre-Hopper GEMMs read the row scales directly: no cluster launch and
+        # no swizzled MMA-scale copy (scale_mma_ptr may alias scale_rows_ptr).
+        from b12x._lib.sm80_pipeline import target_is_pre_hopper
+
+        self._pre_hopper = target_is_pre_hopper()
 
     @cute.jit
     def __call__(
@@ -165,7 +170,7 @@ class _WOQuantCuTeLaunch:
         ).launch(
             grid=(grid_x, 1, 1),
             block=[self._threads, 1, 1],
-            cluster=(1, 1, 1),
+            cluster=None if self._pre_hopper else (1, 1, 1),
             stream=stream,
         )
 
@@ -365,20 +370,21 @@ class _WOQuantCuTeLaunch:
         chunk: Int32,
         scale_byte: Uint32,
     ) -> None:
-        row32 = row % Int32(32)
-        row4 = (row // Int32(32)) % Int32(4)
-        tile_m = row // Int32(128)
-        k4 = chunk % Int32(4)
-        tile_k = chunk // Int32(4)
-        offset = (
-            base
-            + row32 * Int32(16)
-            + row4 * Int32(4)
-            + tile_m * (tiles_k * Int32(512))
-            + k4
-            + tile_k * Int32(512)
-        )
-        scale_mma[offset] = Uint8(scale_byte)
+        if cutlass.const_expr(not self._pre_hopper):
+            row32 = row % Int32(32)
+            row4 = (row // Int32(32)) % Int32(4)
+            tile_m = row // Int32(128)
+            k4 = chunk % Int32(4)
+            tile_k = chunk // Int32(4)
+            offset = (
+                base
+                + row32 * Int32(16)
+                + row4 * Int32(4)
+                + tile_m * (tiles_k * Int32(512))
+                + k4
+                + tile_k * Int32(512)
+            )
+            scale_mma[offset] = Uint8(scale_byte)
 
 
 def _cutlass_source_type(dtype: torch.dtype) -> type[cutlass.Numeric]:

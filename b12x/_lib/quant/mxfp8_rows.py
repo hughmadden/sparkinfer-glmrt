@@ -29,6 +29,7 @@ from b12x._lib.intrinsics import (
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
 )
+from b12x._lib.sm80_pipeline import target_is_pre_hopper
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
 
@@ -78,6 +79,9 @@ class _MXFP8RowsQuantLaunch:
         self._warps_per_cta = self._threads // 32
         self._scale_block_size = int(scale_block_size)
         self._trellis_native_mma_order = bool(trellis_native_mma_order)
+        # Pre-Hopper GEMMs read the row scales directly: no cluster launch and
+        # no swizzled MMA-scale copy (scale_mma_ptr may alias scale_rows_ptr).
+        self._pre_hopper = target_is_pre_hopper()
 
     @cute.jit
     def __call__(
@@ -110,7 +114,7 @@ class _MXFP8RowsQuantLaunch:
         self.kernel(source, values_u32, scale_rows, scale_mma, m, source_k).launch(
             grid=(grid_x, 1, 1),
             block=[self._threads, 1, 1],
-            cluster=(1, 1, 1),
+            cluster=None if self._pre_hopper else (1, 1, 1),
             stream=stream,
         )
 
@@ -356,7 +360,7 @@ class _MXFP8RowsQuantLaunch:
     ) -> None:
         scale_u8 = Uint8(scale_byte)
         scale_rows[row, group] = scale_u8
-        if cutlass.const_expr(not self._wire_rows):
+        if cutlass.const_expr(not self._wire_rows and not self._pre_hopper):
             row32 = row % Int32(32)
             row4 = (row // Int32(32)) % Int32(4)
             tile_m = row // Int32(128)

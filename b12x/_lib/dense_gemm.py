@@ -88,6 +88,7 @@ from b12x._lib.intrinsics import (
     get_ptr_as_int64,
     ld_global_b16,
     ld_global_nc_u32,
+    ld_global_nc_u32_pred,
     ld_global_v4_u32,
     ld_shared_v4_u32,
     mma_m16n8k32_f32_e4m3,
@@ -154,11 +155,6 @@ _FP6_DECODE_TILE = (16, 64)
 _FP6_PREFILL_TILE = (128, 128)
 _B12X_DENSE_ATOM_24 = os.getenv("B12X_DENSE_ATOM_24", "0") == "1"
 _DENSE_LOAD_PATHS = ("tma", "cpasync")
-# Probe knob: "promote" (each K32 MMA into a zero partial, scaled, added in
-# FP32) or "chain" (rescale the running accumulator by 2^(e_prev - e_cur) and
-# let the MMA accumulate in place: no partial registers, but tensor-core
-# accumulation precision like plain FP8).
-_BLOCK32_MODE = os.getenv("B12X_PROBE_B32_MODE", "promote")
 
 # Expand-ahead for packed-B: at k_block 0 the MMA warps wait for stage s+1 and
 # expand it in place, overlapping the expansion with ALL of stage s's MMA work
@@ -318,19 +314,20 @@ def _emit_plain_fp8_dense_mma_k_block(
 
 
 @cute.jit
-def _emit_block32_fp8_dense_mma_k_block(
+def _emit_promoted_fp8_mma_k_block(
     accumulators: cute.Tensor,
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
     mt: int,
     nt: int,
     k_block_idx: int,
-    scale_word: Uint32,
+    scale_lo,
+    scale_hi,
 ) -> None:
-    """One K32 step of a 32x32 block-scaled E4M3 weight: the MMA runs into a
-    zero partial, then ``acc += partial * 2^(e - 127)`` with ``e`` the step's
-    UE8M0 byte of ``scale_word`` (four consecutive K32 scales). Power-of-two
-    scales make the product exact."""
+    """Per-K32 promotion: one E4M3 m16n8k32 MMA into a zero partial, then
+    ``acc += partial * scale`` in FP32. ``scale_lo``/``scale_hi`` multiply the
+    atom's rows g and g+8 (C values 0-1 and 2-3); ``None`` adds unscaled.
+    Power-of-two scales make each product exact."""
     acc = accumulators[None, mt, nt]
     a_frag = cute.flatten(
         cute.recast_tensor(tCrA[None, mt, k_block_idx], cutlass.Uint32)
@@ -344,52 +341,26 @@ def _emit_block32_fp8_dense_mma_k_block(
         a_frag[0], a_frag[1], a_frag[2], a_frag[3],
         b_frag[0], b_frag[1],
     )
-    scale = u32_as_f32(
-        ((scale_word >> Uint32(8 * k_block_idx)) & Uint32(0xFF)) << Uint32(23)
-    )
-    acc[0] = acc[0] + d0 * scale
-    acc[1] = acc[1] + d1 * scale
-    acc[2] = acc[2] + d2 * scale
-    acc[3] = acc[3] + d3 * scale
+    if cutlass.const_expr(scale_lo is None):
+        acc[0] = acc[0] + d0
+        acc[1] = acc[1] + d1
+        acc[2] = acc[2] + d2
+        acc[3] = acc[3] + d3
+    else:
+        acc[0] = acc[0] + d0 * scale_lo
+        acc[1] = acc[1] + d1 * scale_lo
+        acc[2] = acc[2] + d2 * scale_hi
+        acc[3] = acc[3] + d3 * scale_hi
 
 
 @cute.jit
-def _emit_block32_chain_mma_k_block(
-    accumulators: cute.Tensor,
-    tCrA: cute.Tensor,
-    tCrB: cute.Tensor,
-    mt: int,
-    nt: int,
-    k_block_idx: int,
-    rescale: cutlass.Float32,
-) -> None:
-    """``acc = mma(a, b, acc * rescale)``: the accumulator is kept in units of
-    the current K32 block's power-of-two scale."""
-    acc = accumulators[None, mt, nt]
-    a_frag = cute.flatten(
-        cute.recast_tensor(tCrA[None, mt, k_block_idx], cutlass.Uint32)
-    )
-    b_frag = cute.flatten(
-        cute.recast_tensor(tCrB[None, nt, k_block_idx], cutlass.Uint32)
-    )
-    d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
-        acc[0] * rescale, acc[1] * rescale, acc[2] * rescale, acc[3] * rescale,
-        a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-        b_frag[0], b_frag[1],
-    )
-    acc[0] = d0
-    acc[1] = d1
-    acc[2] = d2
-    acc[3] = d3
+def _ue8m0_byte(word: Uint32, k_block_idx: int) -> Int32:
+    """UE8M0 byte ``k_block_idx`` of four consecutive K32 scales."""
+    return Int32((word >> Uint32(8 * k_block_idx)) & Uint32(0xFF))
 
 
 @cute.jit
-def _block32_byte(word: Uint32, k_block_idx: int) -> Uint32:
-    return (word >> Uint32(8 * k_block_idx)) & Uint32(0xFF)
-
-
-@cute.jit
-def _pow2_from_biased(e) -> cutlass.Float32:
+def _pow2_biased(e: Int32) -> cutlass.Float32:
     """2^(e - 127) for a biased exponent ``e`` in [1, 254]."""
     return u32_as_f32(Uint32(e) << Uint32(23))
 
@@ -853,6 +824,7 @@ class DenseGemmKernel:
         block_fp8_row_b: bool = False,
         plain_bf16: bool = False,
         block32_fp8: bool = False,
+        block32_act_scales: bool = False,
         four_mma_warps: bool = False,
     ):
         if weight_only not in (None, "nvfp4", "mxfp8"):
@@ -889,6 +861,11 @@ class DenseGemmKernel:
         # 32x32 UE8M0 block-scaled E4M3 weights (``sfb`` = scale bytes
         # [N/32, K/32], K contiguous): plain E4M3 MMAs promoted per K32 step.
         self.block32_fp8 = bool(block32_fp8)
+        # W8A8 K32 contract: ``sfa`` holds UE8M0 activation row scales
+        # [L, M, K/32] (as the row quantizer writes them) multiplied into each
+        # K32 promotion next to the weight block scale.
+        self.block32_act_scales = bool(block32_act_scales)
+        assert not self.block32_act_scales or self.block32_fp8
         if self.block32_fp8:
             assert not block_fp8 and (tile_k or 0) == 128 and mma_k == 32
             assert mma_tiler_mn[1] % 32 == 0
@@ -911,6 +888,11 @@ class DenseGemmKernel:
         # paths are wired there: an inline-PTX mbarrier ring feeds the MMA
         # warps and the epilogue stores straight from registers.
         self.pre_hopper = target_is_pre_hopper()
+        # Every pre-Hopper FP8 MMA is promoted per K32 step: on Ada, long-K FP8
+        # tensor-core accumulation runs at reduced precision (max rel error
+        # 5.7-9.1e-3 at K=4096/12288, against 2.2-2.7e-3 promoted), and K32
+        # promotion also tracks SM120's block-scaled MMA numerics.
+        self.promote_k32 = self.pre_hopper and self.plain_fp8
         if self.pre_hopper:
             assert load_path == "cpasync", "pre-Hopper needs load_path='cpasync'"
             assert (self.plain_fp8 and not self.block_fp8) or self.plain_bf16, (
@@ -1649,35 +1631,63 @@ class DenseGemmKernel:
                 scale_cols[acc_n] = cutlass.Float32(sfb[(n_coord, k_tile_global, tile_coord_mnl[2])])
 
     @cute.jit
-    def _emit_block32_k_block(self, accumulators: cute.Tensor, tCrA: cute.Tensor,
-                              tCrB: cute.Tensor, k_block_idx: cutlass.Constexpr[int],
-                              words: cute.Tensor, elast) -> None:
+    def _emit_promoted_k_block(self, accumulators: cute.Tensor, tCrA: cute.Tensor,
+                               tCrB: cute.Tensor, k_block_idx: cutlass.Constexpr[int],
+                               b_words: cute.Tensor, a_words: cute.Tensor) -> None:
+        """One K32 step over every atom with per-K32 promotion. Block-32 mode
+        scales by 2^(ea + eb - 254): ``b_words`` hold each N atom's weight
+        block bytes, ``a_words`` each thread row's activation bytes (rows
+        g, g+8 of every M atom), four K32 steps per word."""
         for _nt in cutlass.range_constexpr(self.num_n_tiles):
-            if cutlass.const_expr(elast is None):
-                for _mt in cutlass.range_constexpr(self.num_m_tiles):
-                    _emit_block32_fp8_dense_mma_k_block(
-                        accumulators, tCrA, tCrB, _mt, _nt, k_block_idx, words[_nt],
+            for _mt in cutlass.range_constexpr(self.num_m_tiles):
+                if cutlass.const_expr(self.block32_fp8):
+                    e_b = _ue8m0_byte(b_words[_nt], k_block_idx)
+                    if cutlass.const_expr(self.block32_act_scales):
+                        scale_lo = _pow2_biased(
+                            _ue8m0_byte(a_words[2 * _mt], k_block_idx) + e_b - Int32(127)
+                        )
+                        scale_hi = _pow2_biased(
+                            _ue8m0_byte(a_words[2 * _mt + 1], k_block_idx) + e_b - Int32(127)
+                        )
+                    else:
+                        scale_lo = _pow2_biased(e_b)
+                        scale_hi = scale_lo
+                    _emit_promoted_fp8_mma_k_block(
+                        accumulators, tCrA, tCrB, _mt, _nt, k_block_idx,
+                        scale_lo, scale_hi,
                     )
-            else:
-                e_cur = Int32(_block32_byte(words[_nt], k_block_idx))
-                rescale = _pow2_from_biased(Int32(127) + elast[_nt] - e_cur)
-                elast[_nt] = e_cur
-                for _mt in cutlass.range_constexpr(self.num_m_tiles):
-                    _emit_block32_chain_mma_k_block(
-                        accumulators, tCrA, tCrB, _mt, _nt, k_block_idx, rescale,
+                else:
+                    _emit_promoted_fp8_mma_k_block(
+                        accumulators, tCrA, tCrB, _mt, _nt, k_block_idx, None, None,
                     )
 
     @cute.jit
-    def _load_block32_words(self, words: cute.Tensor, cols: cute.Tensor, base: Int64,
-                            k32_per_row: Int32, tile_coord_mnl, k_tile_global: Int32) -> None:
-        """Per N atom, the UE8M0 bytes of K tile ``k_tile_global`` (four K32
-        steps, one 32-bit word) from the ``[N/32, K/32]`` scale grid."""
+    def _load_block32_words(self, b_words: cute.Tensor, a_words: cute.Tensor,
+                            coords: cute.Tensor, sfb_base: Int64, sfa_base: Int64,
+                            k32_per_row: Int32, sfb_group_bytes: Int64, live_m: Int32,
+                            tile_coord_mnl, k_tile_global: Int32) -> None:
+        """UE8M0 bytes of K tile ``k_tile_global`` (four K32 steps, one word):
+        per N atom from the weight grid [L, N/32, K/32], per thread row from
+        the activation grid [L, M, K/32] (zero past live M)."""
         n0 = tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
+        group = Int64(tile_coord_mnl[2])
+        k_word = Int64(k_tile_global * Int32(4))
+        b_group = sfb_base + group * sfb_group_bytes
         for nt in cutlass.range_constexpr(self.num_n_tiles):
-            n32 = (n0 + cols[(0, 0, nt)][1]) // Int32(32)
-            words[nt] = ld_global_nc_u32(
-                base + Int64(n32 * k32_per_row + k_tile_global * Int32(4))
+            n32 = (n0 + coords[(0, 0, nt)][1]) // Int32(32)
+            b_words[nt] = ld_global_nc_u32(
+                b_group + Int64(n32) * Int64(k32_per_row) + k_word
             )
+        if cutlass.const_expr(self.block32_act_scales):
+            m0 = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
+            a_group = sfa_base + group * Int64(live_m) * Int64(k32_per_row)
+            for mt in cutlass.range_constexpr(self.num_m_tiles):
+                for half in cutlass.range_constexpr(2):
+                    row = m0 + coords[(2 * half, mt, 0)][0]
+                    a_words[2 * mt + half] = ld_global_nc_u32_pred(
+                        a_group + Int64(row) * Int64(k32_per_row) + k_word,
+                        row < live_m,
+                    )
 
     @cute.jit
     def _accumulate_block_fp8_stage(
@@ -2361,27 +2371,36 @@ class DenseGemmKernel:
                 transpose=True,
             )
         if cutlass.const_expr(self.block32_fp8):
-            # Column of each N atom this thread accumulates; an atom's eight
-            # columns share one 32-wide scale block.
-            block32_cols = thr_mma.partition_C(
+            # (row, column) of each accumulator; an N atom's eight columns
+            # share one 32-wide weight scale block.
+            block32_coords = thr_mma.partition_C(
                 cute.make_identity_tensor(
                     cute.slice_(self.tile_shape_mnk, (None, None, 0))
                 )
             )
-            block32_words = cute.make_rmem_tensor(
+            block32_b_words = cute.make_rmem_tensor(
                 cute.make_layout((self.num_n_tiles,), stride=(1,)), Uint32
+            )
+            block32_a_words = cute.make_rmem_tensor(
+                cute.make_layout((2 * self.num_m_tiles,), stride=(1,)), Uint32
             )
             # Next K tile's scales, loaded once its stage is acquired.
-            block32_next = cute.make_rmem_tensor(
+            block32_b_next = cute.make_rmem_tensor(
                 cute.make_layout((self.num_n_tiles,), stride=(1,)), Uint32
             )
+            block32_a_next = cute.make_rmem_tensor(
+                cute.make_layout((2 * self.num_m_tiles,), stride=(1,)), Uint32
+            )
+            for _i in cutlass.range_constexpr(2 * self.num_m_tiles):
+                block32_a_words[_i] = Uint32(0)
+                block32_a_next[_i] = Uint32(0)
             block32_k32_per_row = Int32(directB_nkl.shape[1]) // Int32(32)
-            block32_base = get_ptr_as_int64(directSFB_nkl, Int32(0))
-            if cutlass.const_expr(_BLOCK32_MODE == "chain"):
-                # Biased exponent the accumulator of each N atom is kept in.
-                block32_elast = cute.make_rmem_tensor(
-                    cute.make_layout((self.num_n_tiles,), stride=(1,)), Int32
-                )
+            block32_sfb_group_bytes = Int64(directB_nkl.shape[0] // 32) * Int64(
+                block32_k32_per_row
+            )
+            block32_live_m = Int32(directA_mkl.shape[0])
+            block32_sfb_base = get_ptr_as_int64(directSFB_nkl, Int32(0))
+            block32_sfa_base = get_ptr_as_int64(directSFA_mkl, Int32(0))
         if cutlass.const_expr(self.pre_hopper):
             pre_hopper_acc_mn = _reshape_acc_to_mn(accumulators)
             pre_hopper_coord_mn = _reshape_acc_to_mn(
@@ -2612,13 +2631,12 @@ class DenseGemmKernel:
                         tCrSFB_tile = tCrSFB_full
                         tCrSFB_tile_copy_view = tCrSFB_copy_view_full
                 accumulators.fill(0.0)
-                if cutlass.const_expr(self.block32_fp8 and _BLOCK32_MODE == "chain"):
-                    for _nt in cutlass.range_constexpr(self.num_n_tiles):
-                        block32_elast[_nt] = Int32(127)
                 if cutlass.const_expr(self.block32_fp8):
                     self._load_block32_words(
-                        block32_words, block32_cols, block32_base,
-                        block32_k32_per_row, tile_coord_mnl, k_tile_start,
+                        block32_b_words, block32_a_words, block32_coords,
+                        block32_sfb_base, block32_sfa_base, block32_k32_per_row,
+                        block32_sfb_group_bytes, block32_live_m, tile_coord_mnl,
+                        k_tile_start,
                     )
                 if cutlass.const_expr(self.block_fp8):
                     stage_accumulators.fill(0.0)
@@ -2793,8 +2811,10 @@ class DenseGemmKernel:
                             )
                             if cutlass.const_expr(self.block32_fp8):
                                 self._load_block32_words(
-                                    block32_next, block32_cols, block32_base,
-                                    block32_k32_per_row, tile_coord_mnl,
+                                    block32_b_next, block32_a_next, block32_coords,
+                                    block32_sfb_base, block32_sfa_base,
+                                    block32_k32_per_row, block32_sfb_group_bytes,
+                                    block32_live_m, tile_coord_mnl,
                                     k_tile_start + Int32(k_tile) + Int32(1),
                                 )
                             if cutlass.const_expr(
@@ -2828,19 +2848,19 @@ class DenseGemmKernel:
                             cute.gemm(tiled_mma, accumulators,
                                       tCrA[None, None, k_block_idx],
                                       tCrB[None, None, k_block_idx], accumulators)
-                        if cutlass.const_expr(self.block32_fp8):
+                        if cutlass.const_expr(self.promote_k32):
                             # Trace-time unrolled so each atom's scale word is a
                             # static register (a dynamic index spills the array).
-                            self._emit_block32_k_block(
+                            self._emit_promoted_k_block(
                                 accumulators, tCrA, tCrB, k_block_idx,
-                                block32_words, block32_elast if cutlass.const_expr(
-                                    _BLOCK32_MODE == "chain") else None,
+                                block32_b_words if cutlass.const_expr(self.block32_fp8) else None,
+                                block32_a_words if cutlass.const_expr(self.block32_fp8) else None,
                             )
                         # Manual atom unroll: avoids hasAuxTensor address space bug
                         for _mt in range(self.num_m_tiles):
                             for _nt in range(self.num_n_tiles):
                                 if cutlass.const_expr(
-                                    self.a16 or self.plain_bf16 or self.block32_fp8
+                                    self.a16 or self.plain_bf16 or self.promote_k32
                                 ):
                                     pass
                                 elif cutlass.const_expr(self.plain_fp8):
@@ -2896,7 +2916,9 @@ class DenseGemmKernel:
                         if cutlass.const_expr(self.block32_fp8):
                             if k_block_idx == num_k_blocks - 1:
                                 for _nt in cutlass.range_constexpr(self.num_n_tiles):
-                                    block32_words[_nt] = block32_next[_nt]
+                                    block32_b_words[_nt] = block32_b_next[_nt]
+                                for _i in cutlass.range_constexpr(2 * self.num_m_tiles):
+                                    block32_a_words[_i] = block32_a_next[_i]
                         if cutlass.const_expr(self.block_fp8):
                             if k_block_idx == num_k_blocks - 1:
                                 self._accumulate_block_fp8_stage(
@@ -3012,17 +3034,17 @@ class DenseGemmKernel:
                         cute.gemm(tiled_mma, accumulators,
                                   tCrA[None, None, k_block_idx],
                                   tCrB[None, None, k_block_idx], accumulators)
-                    if cutlass.const_expr(self.block32_fp8):
-                        self._emit_block32_k_block(
+                    if cutlass.const_expr(self.promote_k32):
+                        self._emit_promoted_k_block(
                             accumulators, tCrA, tCrB, k_block_idx,
-                            block32_words, block32_elast if cutlass.const_expr(
-                                _BLOCK32_MODE == "chain") else None,
+                            block32_b_words if cutlass.const_expr(self.block32_fp8) else None,
+                            block32_a_words if cutlass.const_expr(self.block32_fp8) else None,
                         )
                     # Manual atom unroll: avoids hasAuxTensor address space bug
                     for _mt in range(self.num_m_tiles):
                         for _nt in range(self.num_n_tiles):
                             if cutlass.const_expr(
-                                self.a16 or self.plain_bf16 or self.block32_fp8
+                                self.a16 or self.plain_bf16 or self.promote_k32
                             ):
                                 pass
                             elif cutlass.const_expr(self.plain_fp8):
@@ -3125,14 +3147,6 @@ class DenseGemmKernel:
                         tile_sched.advance_to_next_work()
                         work_tile = tile_sched.get_current_work()
 
-                if cutlass.const_expr(self.block32_fp8 and _BLOCK32_MODE == "chain"):
-                    for _nt in cutlass.range_constexpr(self.num_n_tiles):
-                        final_scale = _pow2_from_biased(block32_elast[_nt])
-                        for _mt in cutlass.range_constexpr(self.num_m_tiles):
-                            for _v in cutlass.range_constexpr(4):
-                                accumulators[_v, _mt, _nt] = (
-                                    accumulators[_v, _mt, _nt] * final_scale
-                                )
                 if cutlass.const_expr(self.pre_hopper):
                     # Pre-Hopper epilogue: registers straight to global (no
                     # stmatrix, no TMA store), alpha in FP32 before rounding.
@@ -6379,6 +6393,18 @@ def compile_dense_gemm_mxfp8_aot(
     regime_m = size_m if expected_m is None else int(expected_m)
     if regime_m <= 0:
         raise ValueError(f"MXFP8 AOT expected_m must be positive, got {regime_m}")
+    if target_is_pre_hopper():
+        # SM89: same pointer ABI, plain K32 scale layouts (activation row
+        # scales [L,M,K/32], weight scales [L,N/32,K/32]), never split.
+        from b12x._lib.sm89_fp8 import compile_sm89_block32_gemm_aot
+
+        if sfb_k_replicated or split_k_all_m:
+            raise ValueError("SM89 MXFP8 AOT supports the K32 32x32 recipe only")
+        compiled = compile_sm89_block32_gemm_aot(
+            size_m=size_m, size_n=size_n, size_k=size_k, num_groups=num_groups,
+            sm_count=sm_count,
+        )
+        return (compiled, 1) if return_split_k_metadata else compiled
 
     plan = _select_default_dense_gemm_plan(
         size_m,
