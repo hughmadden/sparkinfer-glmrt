@@ -116,6 +116,37 @@ def test_reply_pair_exact_and_graph_dynamic_mode(programs, width, format):
 
 
 @pytest.mark.parametrize("format", [1, 2])
+def test_reply_shared_scratch_is_fenced_across_consumer_streams(programs, format):
+    quantize, stage, decode = programs
+    rows, width = 129, 4096
+    torch.manual_seed(100 + format)
+    inputs = [(torch.randn(rows, width, device="cuda") * scale).bfloat16()
+              for scale in [.03, 3.]]
+    expected = [reference(x, format) for x in inputs]
+    packed = [torch.empty_like(wire) for wire, _ in expected]
+    outputs = [torch.empty_like(x) for x in inputs]
+    scratch = torch.empty_like(packed[0])
+    mode = torch.tensor([format], device="cuda", dtype=torch.uint32)
+    for x, wire in zip(inputs, packed):
+        quantize.launch(x, wire, None, scalars=(rows, width, format))
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    released = torch.cuda.Event()
+    for iteration in range(32):
+        index = iteration % 2
+        stream = streams[index]
+        with torch.cuda.stream(stream):
+            if iteration:
+                stream.wait_event(released)
+            stage.launch(packed[index], scratch, mode, scalars=(rows, width, -1))
+            decode.launch(scratch, outputs[index], mode, scalars=(rows, width, -1))
+            released.record(stream)
+    torch.cuda.synchronize()
+    for actual, (_, restored) in zip(outputs, expected):
+        assert torch.equal(actual.view(torch.int16), restored.view(torch.int16))
+
+
+@pytest.mark.parametrize("format", [1, 2])
 def test_reply_chunking_is_byte_identical_above_arena_capacity(programs, format):
     quantize, _, _ = programs
     rows, width, capacity = 4161, 128, 4096
