@@ -286,6 +286,7 @@ def test_decode_core_reply_matches_opaque_bytes_and_graph(variant):
     wire, _ = make_wire(torch.randn(rows, hidden, device="cuda") * .02)
     ids = torch.rand(rows, 4, device="cuda").topk(topk, -1).indices.int()
     weights = torch.rand(rows, topk, device="cuda") / topk
+    original_weights = weights.clone()
     options = dict(hidden=hidden, units=units, top_k=topk, max_groups=capacity,
                    device_count=True, serving_variant=variant)
     baseline = compile_exlr8_a16_aot(**options)
@@ -320,6 +321,8 @@ def test_decode_core_reply_matches_opaque_bytes_and_graph(variant):
                 epilogue.launch(state["inverse"], weights, state["fc2"], signs[1], output,
                                 state["count"], scalars=(live, 48))
 
+            weights.copy_(original_weights)
+            assert weights[:live].count_nonzero().item() > 0
             reference()
             fused()
             torch.cuda.synchronize()
@@ -327,13 +330,19 @@ def test_decode_core_reply_matches_opaque_bytes_and_graph(variant):
             with kernel_resolution_guard("EXLR8 core+reply byte oracle"):
                 with torch.cuda.graph(graph):
                     fused()
-                for factor in (1., .5, 0.):
-                    weights.mul_(factor)
+                for factor in (1., .5, -1.):
+                    weights.copy_(original_weights * factor)
+                    assert weights[:live].count_nonzero().item() > 0
                     reference()
                     canary.fill_(0xA5)
                     graph.replay()
                     torch.cuda.synchronize()
                     assert torch.equal(output[:live], expected[:live]), (variant, live, format)
+                    if format and factor == 1.:
+                        corrupted = output[:live].clone()
+                        corrupted[0, 0] ^= 1
+                        with pytest.raises(AssertionError, match="compressed byte oracle"):
+                            assert torch.equal(corrupted, expected[:live]), "compressed byte oracle"
                     assert (unused == -123).all(), "core-only wrote opaque output"
                     assert (canary[:256] == 0xA5).all() and (canary[-256:] == 0xA5).all()
                     assert (output[live:] == 0xA5).all()
@@ -377,6 +386,7 @@ def test_grouped_compressed_reply_matches_bf16_codec_and_graph(
     wire, _ = make_wire(torch.randn(rows, hidden, generator=gen, device="cuda") * .02)
     ids = torch.rand(rows, 4, generator=gen, device="cuda").topk(topk, -1).indices.int()
     weights = torch.rand(rows, topk, generator=gen, device="cuda") / topk
+    original_weights = weights.clone()
     options = dict(hidden=hidden, units=units, top_k=topk, max_groups=capacity,
                    group_rows=group_rows, grouped=True, device_count=True,
                    grouped_rows=grouped_rows, fc2_partials=fc2_partials,
@@ -410,6 +420,8 @@ def test_grouped_compressed_reply_matches_bf16_codec_and_graph(
                 state["output"] = output
                 run((group, candidate), state, wire, ids, weights, pointers, bits, signs, live, 48)
 
+            weights.copy_(original_weights)
+            assert weights[:live].count_nonzero().item() > 0
             reference()
             fused()
             torch.cuda.synchronize()
@@ -417,13 +429,19 @@ def test_grouped_compressed_reply_matches_bf16_codec_and_graph(
             with kernel_resolution_guard("EXLR8 grouped compressed wire byte oracle"):
                 with torch.cuda.graph(graph):
                     fused()
-                for factor in (1., .5, 0.):
-                    weights.mul_(factor)
+                for factor in (1., .5, -1.):
+                    weights.copy_(original_weights * factor)
+                    assert weights[:live].count_nonzero().item() > 0
                     reference()
                     canary.fill_(0xA5)
                     graph.replay()
                     torch.cuda.synchronize()
                     assert torch.equal(output[:live], expected[:live]), (hidden, live, format)
+                    if factor == 1.:
+                        corrupted = output[:live].clone()
+                        corrupted[0, 0] ^= 1
+                        with pytest.raises(AssertionError, match="compressed byte oracle"):
+                            assert torch.equal(corrupted, expected[:live]), "compressed byte oracle"
                     assert (canary[:256] == 0xA5).all() and (canary[-256:] == 0xA5).all()
                     assert (output[live:] == 0xA5).all()
                     decode.launch(output, restored, None, scalars=(live, hidden, format))

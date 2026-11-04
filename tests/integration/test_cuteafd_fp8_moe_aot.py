@@ -114,6 +114,7 @@ def test_core_reply_matches_opaque_bytes_and_graph(route, wire, prefill, segment
     ids = torch.rand(capacity, g.experts, device="cuda").topk(g.top_k, -1).indices.int()
     ids[-1] = -1
     weights = torch.rand(capacity, g.top_k, device="cuda") / g.top_k
+    original_weights = weights.clone()
     baseline = torch.empty_like(x)
     baseline_ptrs = torch.tensor([baseline[r].data_ptr() for r in range(capacity)],
                                 device="cuda", dtype=torch.int64) if segmented else baseline
@@ -147,6 +148,8 @@ def test_core_reply_matches_opaque_bytes_and_graph(route, wire, prefill, segment
                 core.launch(source, ids, weights, *operands, unused, scratch, scalars=(rows,))
                 epilogue.launch(down, positions, weights, out, scalars=(rows,))
 
+            weights.copy_(original_weights)
+            assert weights[:rows].count_nonzero().item() > 0
             reference()
             fused()
             torch.cuda.synchronize()
@@ -154,14 +157,20 @@ def test_core_reply_matches_opaque_bytes_and_graph(route, wire, prefill, segment
             with kernel_resolution_guard("FP8 core+reply byte oracle"):
                 with torch.cuda.graph(graph):
                     fused()
-                for factor in (1., 0.5, 0.):
-                    weights.mul_(factor)
+                for factor in (1., 0.5, -1.):
+                    weights.copy_(original_weights * factor)
+                    assert weights[:rows].count_nonzero().item() > 0
                     reference()
                     canary.fill_(0xA5)
                     graph.replay()
                     torch.cuda.synchronize()
                     actual = canary[:rows, 256:256 + row_bytes] if segmented else out[:rows]
                     assert torch.equal(actual, expected[:rows]), (route, rows, format)
+                    if format and factor == 1.:
+                        corrupted = actual.clone()
+                        corrupted[0, 0] ^= 1
+                        with pytest.raises(AssertionError, match="compressed byte oracle"):
+                            assert torch.equal(corrupted, expected[:rows]), "compressed byte oracle"
                     assert (unused == -123).all(), "core-only wrote opaque output"
                     if segmented:
                         assert (canary[:, :256] == 0xA5).all() and (canary[:, -256:] == 0xA5).all()
