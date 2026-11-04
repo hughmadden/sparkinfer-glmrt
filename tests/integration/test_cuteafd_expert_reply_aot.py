@@ -190,3 +190,129 @@ def test_reply_chunking_is_byte_identical_above_arena_capacity(programs, format)
     torch.cuda.synchronize()
     assert torch.equal(chunked, whole)
     assert torch.equal(whole, expected), mismatch_details(x, whole, expected, format)
+
+
+@pytest.mark.parametrize("format", [1, 2])
+def test_fused_w4a16_topk_sum_reply_exact_and_frozen_graph_replay(programs, format):
+    quantize, _, _ = programs
+    import cuda.bindings.driver as cuda
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
+
+    max_rows, width, topk, experts = 129, 512, 8, 32
+    row_bytes = (width + width // 32) if format == 1 else (width // 2 + width // 16)
+    common_kwargs = dict(
+        m=max_rows,
+        topk=topk,
+        hidden_size=width,
+        element_dtype="fp16",
+        full_rotation=True,
+        full_rotation_output_dtype="bf16",
+        coupled_hadamard=False,
+        num_experts=experts,
+        route_num_experts=experts,
+        route_ids_dtype=torch.int32,
+        use_expert_map=True,
+        broadcast_svh=False,
+        float32_output=False,
+    )
+    sum_bf16 = compile_w4a16_topk_sum(**common_kwargs, reply_format=0)
+    sum_fused = compile_w4a16_topk_sum(**common_kwargs, reply_format=format)
+
+    torch.manual_seed(2026 + format)
+    fc2 = (torch.randn(max_rows * topk, width, device="cuda") * 0.35).half()
+    # Zero token, tiny-amax token, and exact power-of-two scale regime token.
+    fc2[:topk] = 0
+    fc2[topk:2 * topk] *= 1e-4
+    weights = torch.rand(max_rows, topk, device="cuda", dtype=torch.float32)
+    weights /= weights.sum(-1, keepdim=True)
+    ids = torch.randint(0, experts, (max_rows, topk), device="cuda", dtype=torch.int32)
+    ids[2, 0] = -1
+    ids[2, 1] = experts
+    expert_map = torch.randperm(experts, device="cuda", dtype=torch.int32)
+    expert_map[0] = -1
+    svh = (torch.randn(experts, width, device="cuda") * 0.25).half()
+
+    bf16_out = torch.empty((max_rows, width), device="cuda", dtype=torch.bfloat16)
+    baseline_wire = torch.empty((max_rows, row_bytes), device="cuda", dtype=torch.uint8)
+    guarded = torch.full((max_rows * row_bytes + 512,), 0xA5, device="cuda", dtype=torch.uint8)
+    fused_wire = guarded[256:-256].view(max_rows, row_bytes)
+
+    with kernel_resolution_guard("test_fused_w4a16_topk_sum_reply"):
+        # Re-resolving with a different live m must hit the compiled cache entry.
+        cached = compile_w4a16_topk_sum(**{**common_kwargs, "m": 17}, reply_format=format)
+        assert cached.compiled is sum_fused.compiled
+
+        for rows in (1, 17, 65, max_rows):
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            sum_bf16(
+                fc2[:rows * topk],
+                bf16_out[:rows],
+                weights[:rows],
+                ids[:rows],
+                expert_map,
+                svh,
+                rows,
+                stream,
+            )
+            quantize.launch(
+                bf16_out[:rows],
+                baseline_wire[:rows],
+                None,
+                scalars=(rows, width, format),
+            )
+            ref_wire, _ = reference(bf16_out[:rows], format)
+            assert torch.equal(baseline_wire[:rows], ref_wire)
+
+            guarded.fill_(0xA5)
+            sum_fused(
+                fc2[:rows * topk],
+                fused_wire[:rows],
+                weights[:rows],
+                ids[:rows],
+                expert_map,
+                svh,
+                rows,
+                stream,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(fused_wire[:rows], baseline_wire[:rows]), mismatch_details(
+                bf16_out[:rows], fused_wire[:rows], baseline_wire[:rows], format
+            )
+            assert (guarded[:256] == 0xA5).all()
+            assert (guarded[256 + rows * row_bytes:] == 0xA5).all()
+
+        # Verify CUDA Graph capture and replay on a non-default stream.
+        work_stream = torch.cuda.Stream()
+        with torch.cuda.stream(work_stream):
+            guarded.fill_(0x5A)
+            sum_fused(
+                fc2,
+                fused_wire,
+                weights,
+                ids,
+                expert_map,
+                svh,
+                max_rows,
+                cuda.CUstream(work_stream.cuda_stream),
+            )
+        work_stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=work_stream):
+            sum_fused(
+                fc2,
+                fused_wire,
+                weights,
+                ids,
+                expert_map,
+                svh,
+                max_rows,
+                cuda.CUstream(work_stream.cuda_stream),
+            )
+        with torch.cuda.stream(work_stream):
+            guarded.fill_(0xA5)
+            graph.replay()
+        work_stream.synchronize()
+        assert torch.equal(fused_wire, baseline_wire)
+        assert (guarded[:256] == 0xA5).all() and (guarded[-256:] == 0xA5).all()
+
