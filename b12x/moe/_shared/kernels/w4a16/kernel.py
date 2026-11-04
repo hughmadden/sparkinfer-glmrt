@@ -13,7 +13,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.compiler import OptLevel
 from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
+from cutlass.cutlass_dsl import Int32, Int64, T, Uint8, Uint32, dsl_user_op
 
 from b12x._lib.compiler import (
     KernelCompileSpec,
@@ -35,6 +35,10 @@ from b12x._lib.intrinsics import (
     cp_async4_shared_global_pred,
     cp_async4_shared_global_pred_l2hint,
     create_l2_evict_first_policy,
+    cvt_e4m3_to_f32_via_f16,
+    cvt_f32_to_e4m3,
+    cvt_f32x4_to_e4m3x4,
+    div_rn_f32,
     fabs_f32,
     fmax_f32,
     f16_mma_m16n8k16_f32,
@@ -84,6 +88,8 @@ from b12x._lib.intrinsics import (
     st_global_v4_u32,
     st_global_i32,
     st_global_f32,
+    st_global_u8,
+    st_global_u16,
     st_global_u32,
     st_global_v4_f32,
     st_shared_bf16_from_f32,
@@ -752,6 +758,104 @@ class W4A16TopKSumCompileResult:
     use_expert_map: bool = False
     full_rotation_output_dtype: str = "fp32"
     broadcast_svh: bool = False
+    reply_format: int = 0
+    reply_schedule: str = "auto"
+    element_dtype: str = "bf16"
+    float32_output: bool = False
+
+    def __call__(
+        self,
+        fc2_out: torch.Tensor,
+        output: torch.Tensor,
+        topk_weights: torch.Tensor | None,
+        route_expert_ids: torch.Tensor | None,
+        expert_map: torch.Tensor | None,
+        svh_table: torch.Tensor | None,
+        active_m: int,
+        stream: cuda.CUstream,
+    ) -> None:
+        dummy_addr = output.data_ptr()
+        weights_addr = (
+            dummy_addr if topk_weights is None else topk_weights.data_ptr()
+        )
+        route_ids_addr = (
+            dummy_addr
+            if route_expert_ids is None
+            else route_expert_ids.data_ptr()
+        )
+        expert_map_addr = (
+            dummy_addr if expert_map is None else expert_map.data_ptr()
+        )
+        svh_addr = dummy_addr if svh_table is None else svh_table.data_ptr()
+        route_cutlass_dtype = (
+            cutlass.Int32
+            if self.route_ids_dtype == torch.int32
+            else cutlass.Int64
+        )
+        route_align = 4 if self.route_ids_dtype == torch.int32 else 8
+        fc2_dtype = (
+            cutlass.Float16
+            if fc2_out.dtype == torch.float16
+            else cutlass.BFloat16
+        )
+        out_dtype = (
+            cutlass.Uint8
+            if self.reply_format != 0 or output.dtype == torch.uint8
+            else (
+                cutlass.BFloat16
+                if self.full_rotation_output_dtype == "bf16"
+                or output.dtype == torch.bfloat16
+                else (
+                    cutlass.Float32
+                    if self.full_rotation
+                    or self.float32_output
+                    or output.dtype == torch.float32
+                    else cutlass.Float16
+                )
+            )
+        )
+        self.compiled(
+            make_ptr(
+                fc2_dtype,
+                fc2_out.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                out_dtype,
+                output.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Float32,
+                weights_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            ),
+            make_ptr(
+                route_cutlass_dtype,
+                route_ids_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=route_align,
+            ),
+            make_ptr(
+                cutlass.Int32,
+                expert_map_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            ),
+            make_ptr(
+                cutlass.Float16,
+                svh_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            Int32(self.num_experts),
+            Int32(self.route_num_experts),
+            int(active_m),
+            stream,
+        )
 
 
 @dataclass(frozen=True)
@@ -9099,6 +9203,298 @@ class W4A16ActivationKernel:
                 activated_flat[idx] = self._cast_elem(x * x)
 
 
+@dsl_user_op
+def _round_f32_via_bf16(
+    x: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(x).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b16 b; cvt.rn.bf16.f32 b, $1; cvt.f32.bf16 $0, b; }",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _reply_fp4_quad_u16(
+    x0: cutlass.Float32,
+    x1: cutlass.Float32,
+    x2: cutlass.Float32,
+    x3: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Float32(x0).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(x1).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(x2).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(x3).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .b8 b0, b1;
+                .reg .b16 h;
+                cvt.rn.satfinite.e2m1x2.f32 b0, $2, $1;
+                cvt.rn.satfinite.e2m1x2.f32 b1, $4, $3;
+                mov.b16 h, {b0, b1};
+                cvt.u32.u16 $0, h;
+            }
+            """,
+            "=r,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _reply_fp8_scale(
+    amax: cutlass.Float32, *, loc=None, ip=None
+) -> tuple[cutlass.Float32, Uint32]:
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.i32()]),
+        [cutlass.Float32(amax).ir_value(loc=loc, ip=ip)],
+        """
+        { .reg .pred tiny, above; .reg .f32 x; .reg .b32 bits, mant;
+          .reg .s32 exponent, adjust;
+          mov.f32 x, $2;
+          setp.lt.f32 tiny, x, 0f00800000;
+          @tiny mul.rn.f32 x, x, 0f4B800000;
+          selp.s32 adjust, 24, 0, tiny;
+          mov.b32 bits, x;
+          bfe.u32 exponent, bits, 23, 8;
+          sub.s32 exponent, exponent, 135;
+          sub.s32 exponent, exponent, adjust;
+          and.b32 mant, bits, 8388607;
+          setp.gt.u32 above, mant, 6291456;
+          @above add.s32 exponent, exponent, 1;
+          max.s32 exponent, exponent, -127;
+          min.s32 exponent, exponent, 127;
+          add.s32 $1, exponent, 127;
+          shl.b32 bits, $1, 23;
+          setp.eq.u32 tiny, $1, 0;
+          @tiny mov.b32 bits, 4194304;
+          mov.b32 $0, bits;
+        }""",
+        "=f,=r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _ld_global_nc_i32_pred(
+    addr: Int64, pred: Int32, *, loc=None, ip=None
+) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred p;
+                setp.ne.s32 p, $2, 0;
+                @p ld.global.nc.s32 $0, [$1];
+                @!p mov.b32 $0, -1;
+            }
+            """,
+            "=r,l,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_global_nc_f32_pred(
+    addr: Int64, pred: Int32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred p;
+                setp.ne.s32 p, $2, 0;
+                @p ld.global.nc.f32 $0, [$1];
+                @!p mov.f32 $0, 0f00000000;
+            }
+            """,
+            "=f,l,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_global_nc_v2_u32_pred(
+    addr: Int64, pred: Int32, *, loc=None, ip=None
+) -> tuple[Uint32, Uint32]:
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(pred).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred p;
+            setp.ne.s32 p, $3, 0;
+            @p ld.global.nc.v2.u32 {$0, $1}, [$2];
+            @!p mov.b32 $0, 0;
+            @!p mov.b32 $1, 0;
+        }
+        """,
+        "=r,=r,l,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _ld_global_nc_v2_u32_evict_first_pred(
+    addr: Int64, pred: Int32, policy: Int64, *, loc=None, ip=None
+) -> tuple[Uint32, Uint32]:
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(pred).ir_value(loc=loc, ip=ip),
+            Int64(policy).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred p;
+            setp.ne.s32 p, $3, 0;
+            @p ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {$0, $1}, [$2], $4;
+            @!p mov.b32 $0, 0;
+            @!p mov.b32 $1, 0;
+        }
+        """,
+        "=r,=r,l,r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _had_bfly_quad_fma(
+    h0: cutlass.Float32,
+    h1: cutlass.Float32,
+    h2: cutlass.Float32,
+    h3: cutlass.Float32,
+    p0: cutlass.Float32,
+    p1: cutlass.Float32,
+    p2: cutlass.Float32,
+    p3: cutlass.Float32,
+    sign: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            cutlass.Float32(h0).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(h1).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(h2).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(h3).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(p0).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(p1).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(p2).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(p3).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(sign).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            fma.rn.f32 $0, $4, $12, $8;
+            fma.rn.f32 $1, $5, $12, $9;
+            fma.rn.f32 $2, $6, $12, $10;
+            fma.rn.f32 $3, $7, $12, $11;
+        }
+        """,
+        "=f,=f,=f,=f,f,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [2], loc=loc, ip=ip)),
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [3], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _lane_bit_sign_f32(
+    lane: Int32, mask: Int32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(lane).ir_value(loc=loc, ip=ip), Int32(mask).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .u32 m;
+                .reg .pred p;
+                and.b32 m, $1, $2;
+                setp.ne.u32 p, m, 0;
+                selp.f32 $0, 0fBF800000, 0f3F800000, p;
+            }
+            """,
+            "=f,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 class W4A16TopKSumKernel:
     def __init__(
         self,
@@ -9114,11 +9510,15 @@ class W4A16TopKSumKernel:
         use_expert_map: bool = False,
         broadcast_svh: bool = False,
         float32_output: bool = False,
+        reply_format: int = 0,
+        reply_schedule: str = "auto",
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if topk <= 0 or hidden_size <= 0:
             raise ValueError("topk and hidden_size must be positive")
+        if reply_format not in (0, 1, 2):
+            raise ValueError(f"unsupported reply_format {reply_format!r}")
         self.topk = int(topk)
         self.hidden_size = int(hidden_size)
         self.element_dtype = element_dtype
@@ -9134,6 +9534,7 @@ class W4A16TopKSumKernel:
         # shared-su artifacts); index it with a zero expert stride.
         self.broadcast_svh = bool(broadcast_svh)
         self.float32_output = bool(float32_output)
+        self.reply_format = int(reply_format)
         if self.use_expert_map:
             if self.route_num_experts <= 0:
                 raise ValueError("expert-map top-k sum requires route_num_experts > 0")
@@ -9163,8 +9564,57 @@ class W4A16TopKSumKernel:
                 raise ValueError(
                     "coupled-Hadamard top-k sum requires hidden_size % 512 == 0"
                 )
+        if self.reply_format != 0:
+            if not self.full_rotation or self.coupled_hadamard or not self.full_rotation_output_bf16:
+                raise ValueError(
+                    "reply_format != 0 requires full_rotation=True, coupled_hadamard=False, and full_rotation_output_dtype='bf16'"
+                )
+            if self.reply_format == 1:
+                self.reply_row_bytes = self.hidden_size + self.hidden_size // 32
+            else:
+                self.reply_row_bytes = self.hidden_size // 2 + self.hidden_size // 16
+        else:
+            self.reply_row_bytes = 0
+
+        if reply_schedule == "auto":
+            resolved_schedule = "warp_b1_tok"
+        else:
+            resolved_schedule = str(reply_schedule)
+        if self.reply_format != 0 and resolved_schedule not in {
+            "cta_smem",
+            "cta_smem_nc",
+            "cta_smem_blk_major",
+            "cta_2slab",
+            "cta_4slab",
+            "cta_8slab",
+            "warp_b1",
+            "warp_b1_tok",
+            "warp_b1_tok_8w",
+            "warp_b1_tok_r2",
+            "warp_b1_tok_r2_8w",
+            "warp_b1_8w",
+            "warp_b1_all8",
+            "warp_b2",
+            "warp_b2_tok",
+            "warp_b4",
+        }:
+            raise ValueError(f"unsupported reply_schedule {resolved_schedule!r}")
+        self.reply_schedule = resolved_schedule
         self.route_warps = 8
-        self.cta_threads = 256
+        if self.reply_format != 0 and self.reply_schedule in {
+            "warp_b1",
+            "warp_b1_tok",
+            "warp_b1_tok_r2",
+            "warp_b1_all8",
+            "warp_b2",
+            "warp_b2_tok",
+            "warp_b4",
+        }:
+            self.cta_threads = 128
+            self.warps_per_cta = 4
+        else:
+            self.cta_threads = 256
+            self.warps_per_cta = 8
 
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
@@ -9194,10 +9644,20 @@ class W4A16TopKSumKernel:
                 (active_m * Int32(self.topk * self.hidden_size),), stride=(1,)
             ),
         )
-        output_flat = cute.make_tensor(
-            output_ptr,
-            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
-        )
+        if cutlass.const_expr(self.reply_format != 0):
+            output_flat = cute.make_tensor(
+                output_ptr,
+                layout=cute.make_layout(
+                    (Int64(active_m) * Int64(self.reply_row_bytes),), stride=(1,)
+                ),
+            )
+        else:
+            output_flat = cute.make_tensor(
+                output_ptr,
+                layout=cute.make_layout(
+                    (active_m * Int32(self.hidden_size),), stride=(1,)
+                ),
+            )
         topk_weights_flat = cute.make_tensor(
             topk_weights_ptr,
             layout=cute.make_layout((active_m * Int32(self.topk),), stride=(1,)),
@@ -9222,15 +9682,50 @@ class W4A16TopKSumKernel:
         if cutlass.const_expr(self.full_rotation):
             if cutlass.const_expr(self.coupled_hadamard):
                 total = active_m * Int32(self.hidden_size // 512)
+                grid = (total, 1, 1)
+            elif cutlass.const_expr(
+                self.reply_format != 0
+                and self.reply_schedule
+                in (
+                    "warp_b1",
+                    "warp_b1_tok",
+                    "warp_b1_tok_8w",
+                    "warp_b1_tok_r2",
+                    "warp_b1_tok_r2_8w",
+                    "warp_b1_8w",
+                    "warp_b1_all8",
+                )
+            ):
+                total = active_m * Int32(self.hidden_size // 128)
+                grid = (_covering_count(total, self.warps_per_cta), 1, 1)
+            elif cutlass.const_expr(
+                self.reply_format != 0 and self.reply_schedule in ("warp_b2", "warp_b2_tok")
+            ):
+                total = active_m * Int32(self.hidden_size // 256)
+                grid = (_covering_count(total, self.warps_per_cta), 1, 1)
+            elif cutlass.const_expr(
+                self.reply_format != 0 and self.reply_schedule == "warp_b4"
+            ):
+                total = active_m * Int32(self.hidden_size // 512)
+                grid = (_covering_count(total, self.warps_per_cta), 1, 1)
+            elif cutlass.const_expr(
+                self.reply_format != 0 and self.reply_schedule == "cta_2slab"
+            ):
+                total = active_m * Int32(self.hidden_size // 256)
+                grid = (total, 1, 1)
+            elif cutlass.const_expr(
+                self.reply_format != 0 and self.reply_schedule == "cta_4slab"
+            ):
+                total = active_m * Int32(self.hidden_size // 512)
+                grid = (total, 1, 1)
+            elif cutlass.const_expr(
+                self.reply_format != 0 and self.reply_schedule == "cta_8slab"
+            ):
+                total = active_m * Int32(self.hidden_size // 1024)
+                grid = (total, 1, 1)
             else:
                 total = active_m * Int32(self.hidden_size // 128)
-            # One CTA owns one H128 output slab.  The full-rotation kernel
-            # parallelizes the top-k routes across its eight warps, then has
-            # warp zero accumulate the staged route values in router order.
-            # The previous launch assigned one slab to one warp; K3 decode
-            # consequently launched only 28 active warps and serialized all
-            # 16 routes in each of them.
-            grid = (total, 1, 1)
+                grid = (total, 1, 1)
         else:
             total = active_m * Int32(self.hidden_size)
             grid = (_covering_count(total, self.cta_threads), 1, 1)
@@ -9481,6 +9976,717 @@ class W4A16TopKSumKernel:
                         output_flat[out_base + Int32(256)] = o2
                         output_flat[out_base + Int32(384)] = o3
             return
+        if cutlass.const_expr(self.full_rotation and self.reply_format != 0):
+            tid = Int32(tidx)
+            lane = tid & Int32(31)
+            warp = tid >> Int32(5)
+            sg0 = _lane_bit_sign_f32(lane, Int32(1))
+            sg1 = _lane_bit_sign_f32(lane, Int32(2))
+            sg2 = _lane_bit_sign_f32(lane, Int32(4))
+            sg3 = _lane_bit_sign_f32(lane, Int32(8))
+            sg4 = _lane_bit_sign_f32(lane, Int32(16))
+            fc2_policy = create_l2_evict_first_policy()
+
+            if cutlass.const_expr(
+                self.reply_schedule
+                in (
+                    "warp_b1",
+                    "warp_b1_tok",
+                    "warp_b1_tok_8w",
+                    "warp_b1_tok_r2",
+                    "warp_b1_tok_r2_8w",
+                    "warp_b1_8w",
+                    "warp_b1_all8",
+                )
+            ):
+                unit = Int32(bidx) * Int32(self.warps_per_cta) + warp
+                nblk = Int32(self.hidden_size // 128)
+                total_units = active_m * nblk
+                if unit < total_units:
+                    if cutlass.const_expr(
+                        self.reply_schedule
+                        in ("warp_b1_tok", "warp_b1_tok_8w", "warp_b1_tok_r2", "warp_b1_tok_r2_8w")
+                    ):
+                        token = unit // nblk
+                        blk = unit - token * nblk
+                    else:
+                        blk = unit // active_m
+                        token = unit - blk * active_m
+                    col0 = blk * Int32(128) + lane * Int32(4)
+                    acc0 = cutlass.Float32(0.0)
+                    acc1 = cutlass.Float32(0.0)
+                    acc2 = cutlass.Float32(0.0)
+                    acc3 = cutlass.Float32(0.0)
+                    if cutlass.const_expr(self.topk == 8):
+                        my_valid, my_sbase_row, my_weight = self._resolve_route_lane(
+                            token,
+                            lane,
+                            route_expert_ids_flat,
+                            expert_map_flat,
+                            topk_weights_flat,
+                            weight_num_experts,
+                            route_num_experts,
+                        )
+                        base_row0 = token * Int32(self.topk * self.hidden_size) + col0
+                        if cutlass.const_expr(self.reply_schedule == "warp_b1_all8"):
+                            v_0 = cute.arch.shuffle_sync(my_valid, offset=0)
+                            s_0 = cute.arch.shuffle_sync(my_sbase_row, offset=0) + col0
+                            w_0 = cute.arch.shuffle_sync(my_weight, offset=0)
+                            v_1 = cute.arch.shuffle_sync(my_valid, offset=1)
+                            s_1 = cute.arch.shuffle_sync(my_sbase_row, offset=1) + col0
+                            w_1 = cute.arch.shuffle_sync(my_weight, offset=1)
+                            v_2 = cute.arch.shuffle_sync(my_valid, offset=2)
+                            s_2 = cute.arch.shuffle_sync(my_sbase_row, offset=2) + col0
+                            w_2 = cute.arch.shuffle_sync(my_weight, offset=2)
+                            v_3 = cute.arch.shuffle_sync(my_valid, offset=3)
+                            s_3 = cute.arch.shuffle_sync(my_sbase_row, offset=3) + col0
+                            w_3 = cute.arch.shuffle_sync(my_weight, offset=3)
+                            v_4 = cute.arch.shuffle_sync(my_valid, offset=4)
+                            s_4 = cute.arch.shuffle_sync(my_sbase_row, offset=4) + col0
+                            w_4 = cute.arch.shuffle_sync(my_weight, offset=4)
+                            v_5 = cute.arch.shuffle_sync(my_valid, offset=5)
+                            s_5 = cute.arch.shuffle_sync(my_sbase_row, offset=5) + col0
+                            w_5 = cute.arch.shuffle_sync(my_weight, offset=5)
+                            v_6 = cute.arch.shuffle_sync(my_valid, offset=6)
+                            s_6 = cute.arch.shuffle_sync(my_sbase_row, offset=6) + col0
+                            w_6 = cute.arch.shuffle_sync(my_weight, offset=6)
+                            v_7 = cute.arch.shuffle_sync(my_valid, offset=7)
+                            s_7 = cute.arch.shuffle_sync(my_sbase_row, offset=7) + col0
+                            w_7 = cute.arch.shuffle_sync(my_weight, offset=7)
+
+                            p01_0, p23_0 = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(base_row0)), v_0, fc2_policy
+                            )
+                            sp01_0, sp23_0 = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_0)), v_0
+                            )
+                            p01_1, p23_1 = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(base_row0 + Int32(self.hidden_size))), v_1, fc2_policy
+                            )
+                            sp01_1, sp23_1 = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_1)), v_1
+                            )
+                            p01_2, p23_2 = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(base_row0 + Int32(2 * self.hidden_size))), v_2, fc2_policy
+                            )
+                            sp01_2, sp23_2 = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_2)), v_2
+                            )
+                            p01_3, p23_3 = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(base_row0 + Int32(3 * self.hidden_size))), v_3, fc2_policy
+                            )
+                            sp01_3, sp23_3 = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_3)), v_3
+                            )
+                            p01_4, p23_4 = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(base_row0 + Int32(4 * self.hidden_size))), v_4, fc2_policy
+                            )
+                            sp01_4, sp23_4 = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_4)), v_4
+                            )
+                            p01_5, p23_5 = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(base_row0 + Int32(5 * self.hidden_size))), v_5, fc2_policy
+                            )
+                            sp01_5, sp23_5 = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_5)), v_5
+                            )
+                            p01_6, p23_6 = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(base_row0 + Int32(6 * self.hidden_size))), v_6, fc2_policy
+                            )
+                            sp01_6, sp23_6 = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_6)), v_6
+                            )
+                            p01_7, p23_7 = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(base_row0 + Int32(7 * self.hidden_size))), v_7, fc2_policy
+                            )
+                            sp01_7, sp23_7 = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_7)), v_7
+                            )
+
+                            acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                acc0, acc1, acc2, acc3, p01_0, p23_0, sp01_0, sp23_0, w_0, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                acc0, acc1, acc2, acc3, p01_1, p23_1, sp01_1, sp23_1, w_1, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                acc0, acc1, acc2, acc3, p01_2, p23_2, sp01_2, sp23_2, w_2, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                acc0, acc1, acc2, acc3, p01_3, p23_3, sp01_3, sp23_3, w_3, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                acc0, acc1, acc2, acc3, p01_4, p23_4, sp01_4, sp23_4, w_4, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                acc0, acc1, acc2, acc3, p01_5, p23_5, sp01_5, sp23_5, w_5, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                acc0, acc1, acc2, acc3, p01_6, p23_6, sp01_6, sp23_6, w_6, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                acc0, acc1, acc2, acc3, p01_7, p23_7, sp01_7, sp23_7, w_7, sg0, sg1, sg2, sg3, sg4
+                            )
+                        elif cutlass.const_expr(
+                            self.reply_schedule in ("warp_b1_tok_r2", "warp_b1_tok_r2_8w")
+                        ):
+                            for pair_idx in cutlass.range_constexpr(4):
+                                r0 = pair_idx * 2
+                                b0 = base_row0 + Int32(r0 * self.hidden_size)
+                                v_0 = cute.arch.shuffle_sync(my_valid, offset=r0)
+                                s_0 = cute.arch.shuffle_sync(my_sbase_row, offset=r0) + col0
+                                w_0 = cute.arch.shuffle_sync(my_weight, offset=r0)
+                                v_1 = cute.arch.shuffle_sync(my_valid, offset=r0 + 1)
+                                s_1 = cute.arch.shuffle_sync(my_sbase_row, offset=r0 + 1) + col0
+                                w_1 = cute.arch.shuffle_sync(my_weight, offset=r0 + 1)
+
+                                p01_0, p23_0 = _ld_global_nc_v2_u32_evict_first_pred(
+                                    get_ptr_as_int64(fc2_flat, Int64(b0)), v_0, fc2_policy
+                                )
+                                sp01_0, sp23_0 = _ld_global_nc_v2_u32_pred(
+                                    get_ptr_as_int64(svh_flat, Int64(s_0)), v_0
+                                )
+                                p01_1, p23_1 = _ld_global_nc_v2_u32_evict_first_pred(
+                                    get_ptr_as_int64(fc2_flat, Int64(b0 + Int32(self.hidden_size))), v_1, fc2_policy
+                                )
+                                sp01_1, sp23_1 = _ld_global_nc_v2_u32_pred(
+                                    get_ptr_as_int64(svh_flat, Int64(s_1)), v_1
+                                )
+
+                                acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                    acc0, acc1, acc2, acc3, p01_0, p23_0, sp01_0, sp23_0, w_0, sg0, sg1, sg2, sg3, sg4
+                                )
+                                acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                    acc0, acc1, acc2, acc3, p01_1, p23_1, sp01_1, sp23_1, w_1, sg0, sg1, sg2, sg3, sg4
+                                )
+                        else:
+                            for half_idx in cutlass.range_constexpr(2):
+                                r0 = half_idx * 4
+                                b0 = base_row0 + Int32(r0 * self.hidden_size)
+                                v_0 = cute.arch.shuffle_sync(my_valid, offset=r0)
+                                s_0 = cute.arch.shuffle_sync(my_sbase_row, offset=r0) + col0
+                                w_0 = cute.arch.shuffle_sync(my_weight, offset=r0)
+                                v_1 = cute.arch.shuffle_sync(my_valid, offset=r0 + 1)
+                                s_1 = cute.arch.shuffle_sync(my_sbase_row, offset=r0 + 1) + col0
+                                w_1 = cute.arch.shuffle_sync(my_weight, offset=r0 + 1)
+                                v_2 = cute.arch.shuffle_sync(my_valid, offset=r0 + 2)
+                                s_2 = cute.arch.shuffle_sync(my_sbase_row, offset=r0 + 2) + col0
+                                w_2 = cute.arch.shuffle_sync(my_weight, offset=r0 + 2)
+                                v_3 = cute.arch.shuffle_sync(my_valid, offset=r0 + 3)
+                                s_3 = cute.arch.shuffle_sync(my_sbase_row, offset=r0 + 3) + col0
+                                w_3 = cute.arch.shuffle_sync(my_weight, offset=r0 + 3)
+
+                                p01_0, p23_0 = _ld_global_nc_v2_u32_evict_first_pred(
+                                    get_ptr_as_int64(fc2_flat, Int64(b0)), v_0, fc2_policy
+                                )
+                                sp01_0, sp23_0 = _ld_global_nc_v2_u32_pred(
+                                    get_ptr_as_int64(svh_flat, Int64(s_0)), v_0
+                                )
+                                p01_1, p23_1 = _ld_global_nc_v2_u32_evict_first_pred(
+                                    get_ptr_as_int64(fc2_flat, Int64(b0 + Int32(self.hidden_size))), v_1, fc2_policy
+                                )
+                                sp01_1, sp23_1 = _ld_global_nc_v2_u32_pred(
+                                    get_ptr_as_int64(svh_flat, Int64(s_1)), v_1
+                                )
+                                p01_2, p23_2 = _ld_global_nc_v2_u32_evict_first_pred(
+                                    get_ptr_as_int64(fc2_flat, Int64(b0 + Int32(2 * self.hidden_size))), v_2, fc2_policy
+                                )
+                                sp01_2, sp23_2 = _ld_global_nc_v2_u32_pred(
+                                    get_ptr_as_int64(svh_flat, Int64(s_2)), v_2
+                                )
+                                p01_3, p23_3 = _ld_global_nc_v2_u32_evict_first_pred(
+                                    get_ptr_as_int64(fc2_flat, Int64(b0 + Int32(3 * self.hidden_size))), v_3, fc2_policy
+                                )
+                                sp01_3, sp23_3 = _ld_global_nc_v2_u32_pred(
+                                    get_ptr_as_int64(svh_flat, Int64(s_3)), v_3
+                                )
+
+                                acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                    acc0, acc1, acc2, acc3, p01_0, p23_0, sp01_0, sp23_0, w_0, sg0, sg1, sg2, sg3, sg4
+                                )
+                                acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                    acc0, acc1, acc2, acc3, p01_1, p23_1, sp01_1, sp23_1, w_1, sg0, sg1, sg2, sg3, sg4
+                                )
+                                acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                    acc0, acc1, acc2, acc3, p01_2, p23_2, sp01_2, sp23_2, w_2, sg0, sg1, sg2, sg3, sg4
+                                )
+                                acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                    acc0, acc1, acc2, acc3, p01_3, p23_3, sp01_3, sp23_3, w_3, sg0, sg1, sg2, sg3, sg4
+                                )
+                    else:
+                        for route in cutlass.range_constexpr(self.topk):
+                            row = token * Int32(self.topk) + Int32(route)
+                            raw_expert = route_expert_ids_flat[row].to(Int32)
+                            expert = raw_expert
+                            if cutlass.const_expr(self.use_expert_map):
+                                expert = Int32(-1)
+                                if raw_expert >= Int32(0) and raw_expert < route_num_experts:
+                                    expert = expert_map_flat[raw_expert].to(Int32)
+                            if expert >= Int32(0) and expert < weight_num_experts:
+                                weight = topk_weights_flat[row].to(cutlass.Float32)
+                                base = row * Int32(self.hidden_size) + col0
+                                if cutlass.const_expr(self.broadcast_svh):
+                                    sbase = col0
+                                else:
+                                    sbase = expert * Int32(self.hidden_size) + col0
+                                p01, p23 = ld_global_nc_v2_u32(
+                                    get_ptr_as_int64(fc2_flat, Int64(base))
+                                )
+                                sp01, sp23 = ld_global_nc_v2_u32(
+                                    get_ptr_as_int64(svh_flat, Int64(sbase))
+                                )
+                                acc0, acc1, acc2, acc3 = self._accum_route_quad(
+                                    acc0, acc1, acc2, acc3, p01, p23, sp01, sp23, weight, sg0, sg1, sg2, sg3, sg4
+                                )
+                    self._quantize_and_store_reply_slab(
+                        output_flat, token, blk, col0, lane, acc0, acc1, acc2, acc3
+                    )
+                return
+
+            if cutlass.const_expr(self.reply_schedule in ("warp_b2", "warp_b2_tok")):
+                unit = Int32(bidx) * Int32(self.warps_per_cta) + warp
+                npair = Int32(self.hidden_size // 256)
+                total_units = active_m * npair
+                if unit < total_units:
+                    if cutlass.const_expr(self.reply_schedule == "warp_b2_tok"):
+                        token = unit // npair
+                        pair = unit - token * npair
+                    else:
+                        pair = unit // active_m
+                        token = unit - pair * active_m
+                    blk0 = pair * Int32(2)
+                    blk1 = blk0 + Int32(1)
+                    col0 = blk0 * Int32(128) + lane * Int32(4)
+                    col1 = blk1 * Int32(128) + lane * Int32(4)
+                    acc0_0 = cutlass.Float32(0.0)
+                    acc0_1 = cutlass.Float32(0.0)
+                    acc0_2 = cutlass.Float32(0.0)
+                    acc0_3 = cutlass.Float32(0.0)
+                    acc1_0 = cutlass.Float32(0.0)
+                    acc1_1 = cutlass.Float32(0.0)
+                    acc1_2 = cutlass.Float32(0.0)
+                    acc1_3 = cutlass.Float32(0.0)
+                    if cutlass.const_expr(self.topk == 8):
+                        my_valid, my_sbase_row, my_weight = self._resolve_route_lane(
+                            token,
+                            lane,
+                            route_expert_ids_flat,
+                            expert_map_flat,
+                            topk_weights_flat,
+                            weight_num_experts,
+                            route_num_experts,
+                        )
+                        base_row0 = token * Int32(self.topk * self.hidden_size)
+                        for pair_idx in cutlass.range_constexpr(4):
+                            r0 = pair_idx * 2
+                            b_r0 = base_row0 + Int32(r0 * self.hidden_size)
+                            b_r1 = b_r0 + Int32(self.hidden_size)
+                            v_0 = cute.arch.shuffle_sync(my_valid, offset=r0)
+                            s_0 = cute.arch.shuffle_sync(my_sbase_row, offset=r0)
+                            w_0 = cute.arch.shuffle_sync(my_weight, offset=r0)
+                            v_1 = cute.arch.shuffle_sync(my_valid, offset=r0 + 1)
+                            s_1 = cute.arch.shuffle_sync(my_sbase_row, offset=r0 + 1)
+                            w_1 = cute.arch.shuffle_sync(my_weight, offset=r0 + 1)
+
+                            p01_0a, p23_0a = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(b_r0 + col0)), v_0, fc2_policy
+                            )
+                            sp01_0a, sp23_0a = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_0 + col0)), v_0
+                            )
+                            p01_0b, p23_0b = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(b_r0 + col1)), v_0, fc2_policy
+                            )
+                            sp01_0b, sp23_0b = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_0 + col1)), v_0
+                            )
+                            p01_1a, p23_1a = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(b_r1 + col0)), v_1, fc2_policy
+                            )
+                            sp01_1a, sp23_1a = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_1 + col0)), v_1
+                            )
+                            p01_1b, p23_1b = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(b_r1 + col1)), v_1, fc2_policy
+                            )
+                            sp01_1b, sp23_1b = _ld_global_nc_v2_u32_pred(
+                                get_ptr_as_int64(svh_flat, Int64(s_1 + col1)), v_1
+                            )
+
+                            acc0_0, acc0_1, acc0_2, acc0_3 = self._accum_route_quad(
+                                acc0_0, acc0_1, acc0_2, acc0_3, p01_0a, p23_0a, sp01_0a, sp23_0a, w_0, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc1_0, acc1_1, acc1_2, acc1_3 = self._accum_route_quad(
+                                acc1_0, acc1_1, acc1_2, acc1_3, p01_0b, p23_0b, sp01_0b, sp23_0b, w_0, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc0_0, acc0_1, acc0_2, acc0_3 = self._accum_route_quad(
+                                acc0_0, acc0_1, acc0_2, acc0_3, p01_1a, p23_1a, sp01_1a, sp23_1a, w_1, sg0, sg1, sg2, sg3, sg4
+                            )
+                            acc1_0, acc1_1, acc1_2, acc1_3 = self._accum_route_quad(
+                                acc1_0, acc1_1, acc1_2, acc1_3, p01_1b, p23_1b, sp01_1b, sp23_1b, w_1, sg0, sg1, sg2, sg3, sg4
+                            )
+                    else:
+                        for route in cutlass.range_constexpr(self.topk):
+                            row = token * Int32(self.topk) + Int32(route)
+                            raw_expert = route_expert_ids_flat[row].to(Int32)
+                            expert = raw_expert
+                            if cutlass.const_expr(self.use_expert_map):
+                                expert = Int32(-1)
+                                if raw_expert >= Int32(0) and raw_expert < route_num_experts:
+                                    expert = expert_map_flat[raw_expert].to(Int32)
+                            if expert >= Int32(0) and expert < weight_num_experts:
+                                weight = topk_weights_flat[row].to(cutlass.Float32)
+                                base_r = row * Int32(self.hidden_size)
+                                sbase_r = Int32(0) if cutlass.const_expr(self.broadcast_svh) else expert * Int32(self.hidden_size)
+                                p01_a, p23_a = ld_global_nc_v2_u32(
+                                    get_ptr_as_int64(fc2_flat, Int64(base_r + col0))
+                                )
+                                sp01_a, sp23_a = ld_global_nc_v2_u32(
+                                    get_ptr_as_int64(svh_flat, Int64(sbase_r + col0))
+                                )
+                                p01_b, p23_b = ld_global_nc_v2_u32(
+                                    get_ptr_as_int64(fc2_flat, Int64(base_r + col1))
+                                )
+                                sp01_b, sp23_b = ld_global_nc_v2_u32(
+                                    get_ptr_as_int64(svh_flat, Int64(sbase_r + col1))
+                                )
+                                acc0_0, acc0_1, acc0_2, acc0_3 = self._accum_route_quad(
+                                    acc0_0, acc0_1, acc0_2, acc0_3, p01_a, p23_a, sp01_a, sp23_a, weight, sg0, sg1, sg2, sg3, sg4
+                                )
+                                acc1_0, acc1_1, acc1_2, acc1_3 = self._accum_route_quad(
+                                    acc1_0, acc1_1, acc1_2, acc1_3, p01_b, p23_b, sp01_b, sp23_b, weight, sg0, sg1, sg2, sg3, sg4
+                                )
+                    self._quantize_and_store_reply_slab(
+                        output_flat, token, blk0, col0, lane, acc0_0, acc0_1, acc0_2, acc0_3
+                    )
+                    self._quantize_and_store_reply_slab(
+                        output_flat, token, blk1, col1, lane, acc1_0, acc1_1, acc1_2, acc1_3
+                    )
+                return
+
+            if cutlass.const_expr(self.reply_schedule == "warp_b4"):
+                unit = Int32(bidx) * Int32(self.warps_per_cta) + warp
+                nquad = Int32(self.hidden_size // 512)
+                total_units = active_m * nquad
+                if unit < total_units:
+                    quad = unit // active_m
+                    token = unit - quad * active_m
+                    blk0 = quad * Int32(4)
+                    blk1 = blk0 + Int32(1)
+                    blk2 = blk0 + Int32(2)
+                    blk3 = blk0 + Int32(3)
+                    col0 = blk0 * Int32(128) + lane * Int32(4)
+                    col1 = blk1 * Int32(128) + lane * Int32(4)
+                    col2 = blk2 * Int32(128) + lane * Int32(4)
+                    col3 = blk3 * Int32(128) + lane * Int32(4)
+                    acc0_0 = cutlass.Float32(0.0)
+                    acc0_1 = cutlass.Float32(0.0)
+                    acc0_2 = cutlass.Float32(0.0)
+                    acc0_3 = cutlass.Float32(0.0)
+                    acc1_0 = cutlass.Float32(0.0)
+                    acc1_1 = cutlass.Float32(0.0)
+                    acc1_2 = cutlass.Float32(0.0)
+                    acc1_3 = cutlass.Float32(0.0)
+                    acc2_0 = cutlass.Float32(0.0)
+                    acc2_1 = cutlass.Float32(0.0)
+                    acc2_2 = cutlass.Float32(0.0)
+                    acc2_3 = cutlass.Float32(0.0)
+                    acc3_0 = cutlass.Float32(0.0)
+                    acc3_1 = cutlass.Float32(0.0)
+                    acc3_2 = cutlass.Float32(0.0)
+                    acc3_3 = cutlass.Float32(0.0)
+                    my_valid, my_sbase_row, my_weight = self._resolve_route_lane(
+                        token,
+                        lane,
+                        route_expert_ids_flat,
+                        expert_map_flat,
+                        topk_weights_flat,
+                        weight_num_experts,
+                        route_num_experts,
+                    )
+                    base_row0 = token * Int32(self.topk * self.hidden_size)
+                    for route in cutlass.range_constexpr(self.topk):
+                        b_r = base_row0 + Int32(route * self.hidden_size)
+                        v_r = cute.arch.shuffle_sync(my_valid, offset=route)
+                        s_r = cute.arch.shuffle_sync(my_sbase_row, offset=route)
+                        w_r = cute.arch.shuffle_sync(my_weight, offset=route)
+
+                        p01_0, p23_0 = _ld_global_nc_v2_u32_evict_first_pred(
+                            get_ptr_as_int64(fc2_flat, Int64(b_r + col0)), v_r, fc2_policy
+                        )
+                        sp01_0, sp23_0 = _ld_global_nc_v2_u32_pred(
+                            get_ptr_as_int64(svh_flat, Int64(s_r + col0)), v_r
+                        )
+                        p01_1, p23_1 = _ld_global_nc_v2_u32_evict_first_pred(
+                            get_ptr_as_int64(fc2_flat, Int64(b_r + col1)), v_r, fc2_policy
+                        )
+                        sp01_1, sp23_1 = _ld_global_nc_v2_u32_pred(
+                            get_ptr_as_int64(svh_flat, Int64(s_r + col1)), v_r
+                        )
+                        p01_2, p23_2 = _ld_global_nc_v2_u32_evict_first_pred(
+                            get_ptr_as_int64(fc2_flat, Int64(b_r + col2)), v_r, fc2_policy
+                        )
+                        sp01_2, sp23_2 = _ld_global_nc_v2_u32_pred(
+                            get_ptr_as_int64(svh_flat, Int64(s_r + col2)), v_r
+                        )
+                        p01_3, p23_3 = _ld_global_nc_v2_u32_evict_first_pred(
+                            get_ptr_as_int64(fc2_flat, Int64(b_r + col3)), v_r, fc2_policy
+                        )
+                        sp01_3, sp23_3 = _ld_global_nc_v2_u32_pred(
+                            get_ptr_as_int64(svh_flat, Int64(s_r + col3)), v_r
+                        )
+
+                        acc0_0, acc0_1, acc0_2, acc0_3 = self._accum_route_quad(
+                            acc0_0, acc0_1, acc0_2, acc0_3, p01_0, p23_0, sp01_0, sp23_0, w_r, sg0, sg1, sg2, sg3, sg4
+                        )
+                        acc1_0, acc1_1, acc1_2, acc1_3 = self._accum_route_quad(
+                            acc1_0, acc1_1, acc1_2, acc1_3, p01_1, p23_1, sp01_1, sp23_1, w_r, sg0, sg1, sg2, sg3, sg4
+                        )
+                        acc2_0, acc2_1, acc2_2, acc2_3 = self._accum_route_quad(
+                            acc2_0, acc2_1, acc2_2, acc2_3, p01_2, p23_2, sp01_2, sp23_2, w_r, sg0, sg1, sg2, sg3, sg4
+                        )
+                        acc3_0, acc3_1, acc3_2, acc3_3 = self._accum_route_quad(
+                            acc3_0, acc3_1, acc3_2, acc3_3, p01_3, p23_3, sp01_3, sp23_3, w_r, sg0, sg1, sg2, sg3, sg4
+                        )
+                    self._quantize_and_store_reply_slab(
+                        output_flat, token, blk0, col0, lane, acc0_0, acc0_1, acc0_2, acc0_3
+                    )
+                    self._quantize_and_store_reply_slab(
+                        output_flat, token, blk1, col1, lane, acc1_0, acc1_1, acc1_2, acc1_3
+                    )
+                    self._quantize_and_store_reply_slab(
+                        output_flat, token, blk2, col2, lane, acc2_0, acc2_1, acc2_2, acc2_3
+                    )
+                    self._quantize_and_store_reply_slab(
+                        output_flat, token, blk3, col3, lane, acc3_0, acc3_1, acc3_2, acc3_3
+                    )
+                return
+
+            if cutlass.const_expr(
+                self.reply_schedule in ("cta_2slab", "cta_4slab", "cta_8slab")
+            ):
+                nslabs = (
+                    2
+                    if self.reply_schedule == "cta_2slab"
+                    else (4 if self.reply_schedule == "cta_4slab" else 8)
+                )
+                unit = Int32(bidx)
+                ngrp = Int32(self.hidden_size // (128 * nslabs))
+                total_units = active_m * ngrp
+                if unit < total_units:
+                    token = unit // ngrp
+                    grp = unit - token * ngrp
+                    blk_base = grp * Int32(nslabs)
+                    col_base = blk_base * Int32(128) + lane * Int32(4)
+                    route_values_ptr = cute.arch.alloc_smem(
+                        cutlass.Float32, nslabs * self.topk * 128
+                    )
+                    route_values = cute.make_tensor(
+                        route_values_ptr,
+                        cute.make_layout(nslabs * self.topk * 128),
+                    )
+                    route_weights_ptr = cute.arch.alloc_smem(
+                        cutlass.Float32, self.topk
+                    )
+                    route_weights = cute.make_tensor(
+                        route_weights_ptr, cute.make_layout(self.topk)
+                    )
+                    for route_group in cutlass.range_constexpr(
+                        (self.topk + self.route_warps - 1) // self.route_warps
+                    ):
+                        route = warp + Int32(route_group * self.route_warps)
+                        valid_route = Int32(0)
+                        expert = Int32(-1)
+                        row = token * Int32(self.topk) + route
+                        if route < Int32(self.topk):
+                            raw_expert = route_expert_ids_flat[row].to(Int32)
+                            expert = raw_expert
+                            if cutlass.const_expr(self.use_expert_map):
+                                expert = Int32(-1)
+                                if raw_expert >= Int32(0) and raw_expert < Int32(
+                                    route_num_experts
+                                ):
+                                    expert = expert_map_flat[raw_expert].to(Int32)
+                            if expert >= Int32(0) and expert < Int32(
+                                weight_num_experts
+                            ):
+                                valid_route = Int32(1)
+                            if lane == Int32(0):
+                                weight = cutlass.Float32(0.0)
+                                if valid_route != Int32(0):
+                                    weight = topk_weights_flat[row].to(
+                                        cutlass.Float32
+                                    )
+                                route_weights[route] = weight
+
+                        if valid_route != Int32(0):
+                            base0 = row * Int32(self.hidden_size) + col_base
+                            if cutlass.const_expr(self.broadcast_svh):
+                                sbase0 = col_base
+                            else:
+                                sbase0 = (
+                                    expert * Int32(self.hidden_size) + col_base
+                                )
+                            for s_idx in cutlass.range_constexpr(nslabs):
+                                off_col = Int32(s_idx * 128)
+                                p01, p23 = ld_global_nc_v2_u32(
+                                    get_ptr_as_int64(fc2_flat, Int64(base0 + off_col))
+                                )
+                                sp01, sp23 = ld_global_nc_v2_u32(
+                                    get_ptr_as_int64(svh_flat, Int64(sbase0 + off_col))
+                                )
+                                v0, v1 = f16x2_to_f32x2(p01)
+                                v2, v3 = f16x2_to_f32x2(p23)
+                                h0, h1, h2, h3 = self._had128_quad_branchless(
+                                    v0, v1, v2, v3, sg0, sg1, sg2, sg3, sg4
+                                )
+                                s0, s1 = f16x2_to_f32x2(sp01)
+                                s2, s3 = f16x2_to_f32x2(sp23)
+                                value_base = (
+                                    Int32(s_idx * self.topk * 128)
+                                    + route * Int32(128)
+                                    + lane * Int32(4)
+                                )
+                                route_values[value_base + Int32(0)] = h0 * s0
+                                route_values[value_base + Int32(1)] = h1 * s1
+                                route_values[value_base + Int32(2)] = h2 * s2
+                                route_values[value_base + Int32(3)] = h3 * s3
+                        elif route < Int32(self.topk):
+                            for s_idx in cutlass.range_constexpr(nslabs):
+                                value_base = (
+                                    Int32(s_idx * self.topk * 128)
+                                    + route * Int32(128)
+                                    + lane * Int32(4)
+                                )
+                                route_values[value_base + Int32(0)] = cutlass.Float32(0.0)
+                                route_values[value_base + Int32(1)] = cutlass.Float32(0.0)
+                                route_values[value_base + Int32(2)] = cutlass.Float32(0.0)
+                                route_values[value_base + Int32(3)] = cutlass.Float32(0.0)
+                    cute.arch.sync_threads()
+
+                    if warp < Int32(nslabs):
+                        blk_s = blk_base + warp
+                        col_s = blk_s * Int32(128) + lane * Int32(4)
+                        slab_smem_base = warp * Int32(self.topk * 128) + lane * Int32(4)
+                        acc0 = cutlass.Float32(0.0)
+                        acc1 = cutlass.Float32(0.0)
+                        acc2 = cutlass.Float32(0.0)
+                        acc3 = cutlass.Float32(0.0)
+                        for route in cutlass.range_constexpr(self.topk):
+                            value_base = slab_smem_base + Int32(route * 128)
+                            weight = route_weights[Int32(route)]
+                            acc0 += route_values[value_base + Int32(0)] * weight
+                            acc1 += route_values[value_base + Int32(1)] * weight
+                            acc2 += route_values[value_base + Int32(2)] * weight
+                            acc3 += route_values[value_base + Int32(3)] * weight
+                        self._quantize_and_store_reply_slab(
+                            output_flat, token, blk_s, col_s, lane, acc0, acc1, acc2, acc3
+                        )
+                return
+
+            unit = Int32(bidx)
+            nblk = Int32(self.hidden_size // 128)
+            total_units = active_m * nblk
+            if unit < total_units:
+                if cutlass.const_expr(self.reply_schedule == "cta_smem_blk_major"):
+                    blk = unit // active_m
+                    token = unit - blk * active_m
+                else:
+                    token = unit // nblk
+                    blk = unit - token * nblk
+                col0 = blk * Int32(128) + lane * Int32(4)
+                route_values_ptr = cute.arch.alloc_smem(
+                    cutlass.Float32, self.topk * 128
+                )
+                route_values = cute.make_tensor(
+                    route_values_ptr, cute.make_layout(self.topk * 128)
+                )
+                route_weights_ptr = cute.arch.alloc_smem(cutlass.Float32, self.topk)
+                route_weights = cute.make_tensor(
+                    route_weights_ptr, cute.make_layout(self.topk)
+                )
+                for route_group in cutlass.range_constexpr(
+                    (self.topk + self.route_warps - 1) // self.route_warps
+                ):
+                    route = warp + Int32(route_group * self.route_warps)
+                    valid_route = Int32(0)
+                    expert = Int32(-1)
+                    row = token * Int32(self.topk) + route
+                    if route < Int32(self.topk):
+                        raw_expert = route_expert_ids_flat[row].to(Int32)
+                        expert = raw_expert
+                        if cutlass.const_expr(self.use_expert_map):
+                            expert = Int32(-1)
+                            if raw_expert >= Int32(0) and raw_expert < Int32(
+                                route_num_experts
+                            ):
+                                expert = expert_map_flat[raw_expert].to(Int32)
+                        if expert >= Int32(0) and expert < Int32(weight_num_experts):
+                            valid_route = Int32(1)
+
+                    hs0 = cutlass.Float32(0.0)
+                    hs1 = cutlass.Float32(0.0)
+                    hs2 = cutlass.Float32(0.0)
+                    hs3 = cutlass.Float32(0.0)
+                    if valid_route != Int32(0):
+                        base = row * Int32(self.hidden_size) + col0
+                        if cutlass.const_expr(self.broadcast_svh):
+                            sbase = col0
+                        else:
+                            sbase = expert * Int32(self.hidden_size) + col0
+                        if cutlass.const_expr(self.reply_schedule == "cta_smem_nc"):
+                            p01, p23 = ld_global_nc_v2_u32(
+                                get_ptr_as_int64(fc2_flat, Int64(base))
+                            )
+                        else:
+                            p01, p23 = _ld_global_nc_v2_u32_evict_first_pred(
+                                get_ptr_as_int64(fc2_flat, Int64(base)),
+                                Int32(1),
+                                fc2_policy,
+                            )
+                        sp01, sp23 = ld_global_nc_v2_u32(
+                            get_ptr_as_int64(svh_flat, Int64(sbase))
+                        )
+                        v0, v1 = f16x2_to_f32x2(p01)
+                        v2, v3 = f16x2_to_f32x2(p23)
+                        h0, h1, h2, h3 = self._had128_quad_branchless(
+                            v0, v1, v2, v3, sg0, sg1, sg2, sg3, sg4
+                        )
+                        s0, s1 = f16x2_to_f32x2(sp01)
+                        s2, s3 = f16x2_to_f32x2(sp23)
+                        hs0 = h0 * s0
+                        hs1 = h1 * s1
+                        hs2 = h2 * s2
+                        hs3 = h3 * s3
+                    value_base = route * Int32(128) + lane * Int32(4)
+                    if route < Int32(self.topk):
+                        route_values[value_base + Int32(0)] = hs0
+                        route_values[value_base + Int32(1)] = hs1
+                        route_values[value_base + Int32(2)] = hs2
+                        route_values[value_base + Int32(3)] = hs3
+                        if lane == Int32(0):
+                            weight = cutlass.Float32(0.0)
+                            if valid_route != Int32(0):
+                                weight = topk_weights_flat[row].to(cutlass.Float32)
+                            route_weights[route] = weight
+                cute.arch.sync_threads()
+
+                if warp == Int32(0):
+                    acc0 = cutlass.Float32(0.0)
+                    acc1 = cutlass.Float32(0.0)
+                    acc2 = cutlass.Float32(0.0)
+                    acc3 = cutlass.Float32(0.0)
+                    for route in cutlass.range_constexpr(self.topk):
+                        value_base = Int32(route * 128) + lane * Int32(4)
+                        weight = route_weights[Int32(route)]
+                        acc0 += route_values[value_base + Int32(0)] * weight
+                        acc1 += route_values[value_base + Int32(1)] * weight
+                        acc2 += route_values[value_base + Int32(2)] * weight
+                        acc3 += route_values[value_base + Int32(3)] * weight
+                    self._quantize_and_store_reply_slab(
+                        output_flat, token, blk, col0, lane, acc0, acc1, acc2, acc3
+                    )
+            return
         if cutlass.const_expr(self.full_rotation):
             tid = Int32(tidx)
             lane = tid & Int32(31)
@@ -9610,6 +10816,228 @@ class W4A16TopKSumKernel:
                     )
                     acc += _materialize_w4a16_topk_route_f32(route_value)
             output_flat[idx] = self._cast_elem(acc)
+
+    @cute.jit
+    def _resolve_route_lane(
+        self,
+        token: Int32,
+        lane: Int32,
+        route_expert_ids_flat: cute.Tensor,
+        expert_map_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        weight_num_experts: Int32,
+        route_num_experts: Int32,
+    ):
+        my_valid = Int32(0)
+        my_sbase_row = Int32(0)
+        my_weight = cutlass.Float32(0.0)
+        if lane < Int32(self.topk):
+            row_l = token * Int32(self.topk) + lane
+            raw_expert = route_expert_ids_flat[row_l].to(Int32)
+            my_expert = raw_expert
+            if cutlass.const_expr(self.use_expert_map):
+                in_map = Int32(0)
+                safe_raw = Int32(0)
+                if raw_expert >= Int32(0) and raw_expert < route_num_experts:
+                    in_map = Int32(1)
+                    safe_raw = raw_expert
+                my_expert = _ld_global_nc_i32_pred(
+                    get_ptr_as_int64(expert_map_flat, Int64(safe_raw)),
+                    in_map,
+                )
+            if my_expert >= Int32(0) and my_expert < weight_num_experts:
+                my_valid = Int32(1)
+                if not cutlass.const_expr(self.broadcast_svh):
+                    my_sbase_row = my_expert * Int32(self.hidden_size)
+            my_weight = _ld_global_nc_f32_pred(
+                get_ptr_as_int64(topk_weights_flat, Int64(row_l)),
+                my_valid,
+            )
+        return my_valid, my_sbase_row, my_weight
+
+    @cute.jit
+    def _accum_route_quad(
+        self,
+        acc0: cutlass.Float32,
+        acc1: cutlass.Float32,
+        acc2: cutlass.Float32,
+        acc3: cutlass.Float32,
+        p01: Uint32,
+        p23: Uint32,
+        sp01: Uint32,
+        sp23: Uint32,
+        weight: cutlass.Float32,
+        sg0: cutlass.Float32,
+        sg1: cutlass.Float32,
+        sg2: cutlass.Float32,
+        sg3: cutlass.Float32,
+        sg4: cutlass.Float32,
+    ):
+        v0, v1 = f16x2_to_f32x2(p01)
+        v2, v3 = f16x2_to_f32x2(p23)
+        h0, h1, h2, h3 = self._had128_quad_branchless(
+            v0, v1, v2, v3, sg0, sg1, sg2, sg3, sg4
+        )
+        s0, s1 = f16x2_to_f32x2(sp01)
+        s2, s3 = f16x2_to_f32x2(sp23)
+        acc0 += (h0 * s0) * weight
+        acc1 += (h1 * s1) * weight
+        acc2 += (h2 * s2) * weight
+        acc3 += (h3 * s3) * weight
+        return acc0, acc1, acc2, acc3
+
+    @cute.jit
+    def _had128_quad_branchless(
+        self,
+        v0: cutlass.Float32,
+        v1: cutlass.Float32,
+        v2: cutlass.Float32,
+        v3: cutlass.Float32,
+        sg0: cutlass.Float32,
+        sg1: cutlass.Float32,
+        sg2: cutlass.Float32,
+        sg3: cutlass.Float32,
+        sg4: cutlass.Float32,
+    ):
+        s0 = v0 + v1
+        d0 = v0 - v1
+        s1 = v2 + v3
+        d1 = v2 - v3
+        h0 = s0 + s1
+        h1 = d0 + d1
+        h2 = s0 - s1
+        h3 = d0 - d1
+        p0 = cute.arch.shuffle_sync_bfly(h0, offset=1)
+        p1 = cute.arch.shuffle_sync_bfly(h1, offset=1)
+        p2 = cute.arch.shuffle_sync_bfly(h2, offset=1)
+        p3 = cute.arch.shuffle_sync_bfly(h3, offset=1)
+        h0, h1, h2, h3 = _had_bfly_quad_fma(h0, h1, h2, h3, p0, p1, p2, p3, sg0)
+        p0 = cute.arch.shuffle_sync_bfly(h0, offset=2)
+        p1 = cute.arch.shuffle_sync_bfly(h1, offset=2)
+        p2 = cute.arch.shuffle_sync_bfly(h2, offset=2)
+        p3 = cute.arch.shuffle_sync_bfly(h3, offset=2)
+        h0, h1, h2, h3 = _had_bfly_quad_fma(h0, h1, h2, h3, p0, p1, p2, p3, sg1)
+        p0 = cute.arch.shuffle_sync_bfly(h0, offset=4)
+        p1 = cute.arch.shuffle_sync_bfly(h1, offset=4)
+        p2 = cute.arch.shuffle_sync_bfly(h2, offset=4)
+        p3 = cute.arch.shuffle_sync_bfly(h3, offset=4)
+        h0, h1, h2, h3 = _had_bfly_quad_fma(h0, h1, h2, h3, p0, p1, p2, p3, sg2)
+        p0 = cute.arch.shuffle_sync_bfly(h0, offset=8)
+        p1 = cute.arch.shuffle_sync_bfly(h1, offset=8)
+        p2 = cute.arch.shuffle_sync_bfly(h2, offset=8)
+        p3 = cute.arch.shuffle_sync_bfly(h3, offset=8)
+        h0, h1, h2, h3 = _had_bfly_quad_fma(h0, h1, h2, h3, p0, p1, p2, p3, sg3)
+        p0 = cute.arch.shuffle_sync_bfly(h0, offset=16)
+        p1 = cute.arch.shuffle_sync_bfly(h1, offset=16)
+        p2 = cute.arch.shuffle_sync_bfly(h2, offset=16)
+        p3 = cute.arch.shuffle_sync_bfly(h3, offset=16)
+        h0, h1, h2, h3 = _had_bfly_quad_fma(h0, h1, h2, h3, p0, p1, p2, p3, sg4)
+        rs = cutlass.Float32(0.088388347648)
+        return h0 * rs, h1 * rs, h2 * rs, h3 * rs
+
+    @cute.jit
+    def _quantize_and_store_reply_slab(
+        self,
+        output_flat: cute.Tensor,
+        token: Int32,
+        blk: Int32,
+        col0: Int32,
+        lane: Int32,
+        acc0: cutlass.Float32,
+        acc1: cutlass.Float32,
+        acc2: cutlass.Float32,
+        acc3: cutlass.Float32,
+    ):
+        acc0 = _round_f32_via_bf16(acc0)
+        acc1 = _round_f32_via_bf16(acc1)
+        acc2 = _round_f32_via_bf16(acc2)
+        acc3 = _round_f32_via_bf16(acc3)
+        amax = fmax_f32(
+            fmax_f32(fabs_f32(acc0), fabs_f32(acc1)),
+            fmax_f32(fabs_f32(acc2), fabs_f32(acc3)),
+        )
+        row_byte_base = Int64(token) * Int64(self.reply_row_bytes)
+        if cutlass.const_expr(self.reply_format == 1):
+            for offset in (4, 2, 1):
+                amax = fmax_f32(
+                    amax, cute.arch.shuffle_sync_bfly(amax, offset=offset)
+                )
+            scale, scale_u8 = _reply_fp8_scale(amax)
+            q0 = div_rn_f32(acc0, scale)
+            q1 = div_rn_f32(acc1, scale)
+            q2 = div_rn_f32(acc2, scale)
+            q3 = div_rn_f32(acc3, scale)
+            packed_u32 = cvt_f32x4_to_e4m3x4(q0, q1, q2, q3)
+            if amax == cutlass.Float32(0.0):
+                packed_u32 = Uint32(0)
+                scale_u8 = Uint32(0)
+            data_byte_offset = row_byte_base + Int64(col0)
+            st_global_u32(
+                get_ptr_as_int64(output_flat, data_byte_offset),
+                packed_u32,
+            )
+            s1 = cute.arch.shuffle_sync(scale_u8, offset=8)
+            s2 = cute.arch.shuffle_sync(scale_u8, offset=16)
+            s3 = cute.arch.shuffle_sync(scale_u8, offset=24)
+            if lane == Int32(0):
+                packed_scale_u32 = (
+                    (scale_u8 & Uint32(0xFF))
+                    | ((s1 & Uint32(0xFF)) << Uint32(8))
+                    | ((s2 & Uint32(0xFF)) << Uint32(16))
+                    | ((s3 & Uint32(0xFF)) << Uint32(24))
+                )
+                scale_byte_offset = (
+                    row_byte_base
+                    + Int64(self.hidden_size)
+                    + Int64(blk * Int32(4))
+                )
+                st_global_u32(
+                    get_ptr_as_int64(output_flat, scale_byte_offset),
+                    packed_scale_u32,
+                )
+        else:
+            for offset in (2, 1):
+                amax = fmax_f32(
+                    amax, cute.arch.shuffle_sync_bfly(amax, offset=offset)
+                )
+            scale_u8 = cvt_f32_to_e4m3(div_rn_f32(amax, cutlass.Float32(6.0)))
+            if scale_u8 < Uint32(1):
+                scale_u8 = Uint32(1)
+            scale = cvt_e4m3_to_f32_via_f16(scale_u8)
+            q0 = div_rn_f32(acc0, scale)
+            q1 = div_rn_f32(acc1, scale)
+            q2 = div_rn_f32(acc2, scale)
+            q3 = div_rn_f32(acc3, scale)
+            packed_u16 = _reply_fp4_quad_u16(q0, q1, q2, q3)
+            if amax == cutlass.Float32(0.0):
+                packed_u16 = Uint32(0)
+                scale_u8 = Uint32(0)
+            hi_u16 = cute.arch.shuffle_sync_bfly(packed_u16, offset=1)
+            if (lane & Int32(1)) == Int32(0):
+                packed_data_u32 = (packed_u16 & Uint32(0xFFFF)) | (
+                    (hi_u16 & Uint32(0xFFFF)) << Uint32(16)
+                )
+                data_byte_offset = row_byte_base + Int64(col0 >> Int32(1))
+                st_global_u32(
+                    get_ptr_as_int64(output_flat, data_byte_offset),
+                    packed_data_u32,
+                )
+            s_adj = cute.arch.shuffle_sync_bfly(scale_u8, offset=4)
+            s_pair = (scale_u8 & Uint32(0xFF)) | (
+                (s_adj & Uint32(0xFF)) << Uint32(8)
+            )
+            s_pair_hi = cute.arch.shuffle_sync_bfly(s_pair, offset=8)
+            if (lane & Int32(15)) == Int32(0):
+                packed_scale_u32 = s_pair | (s_pair_hi << Uint32(16))
+                scale_byte_offset = (
+                    row_byte_base
+                    + Int64(self.hidden_size // 2)
+                    + Int64(blk * Int32(8) + (lane >> Int32(2)))
+                )
+                st_global_u32(
+                    get_ptr_as_int64(output_flat, scale_byte_offset),
+                    packed_scale_u32,
+                )
 
     @cute.jit
     def _had128_quad(
@@ -11063,14 +12491,33 @@ def compile_w4a16_topk_sum(
     use_expert_map: bool = False,
     broadcast_svh: bool = False,
     float32_output: bool = False,
+    reply_format: int = 0,
+    reply_schedule: str = "auto",
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("top-k route expert ids must be int32 or int64")
+    if reply_format not in (0, 1, 2):
+        raise ValueError(f"unsupported reply_format {reply_format!r}")
     route_cutlass_dtype = (
         cutlass.Int32 if route_ids_dtype == torch.int32 else cutlass.Int64
     )
-    cache_key = (
+    kernel = W4A16TopKSumKernel(
+        topk=topk,
+        hidden_size=hidden_size,
+        element_dtype=element_dtype,
+        full_rotation=full_rotation,
+        full_rotation_output_dtype=full_rotation_output_dtype,
+        coupled_hadamard=coupled_hadamard,
+        num_experts=num_experts,
+        route_num_experts=route_num_experts,
+        use_expert_map=use_expert_map,
+        broadcast_svh=broadcast_svh,
+        float32_output=float32_output,
+        reply_format=reply_format,
+        reply_schedule=reply_schedule,
+    )
+    base_cache_key = (
         "w4a16_topk_sum",
         element_dtype,
         topk,
@@ -11085,6 +12532,11 @@ def compile_w4a16_topk_sum(
         bool(broadcast_svh),
         bool(float32_output),
     )
+    cache_key = (
+        base_cache_key
+        if reply_format == 0
+        else (*base_cache_key, int(reply_format), str(kernel.reply_schedule))
+    )
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
         return attach_programs(
@@ -11097,7 +12549,9 @@ def compile_w4a16_topk_sum(
         )
 
     fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    if full_rotation:
+    if reply_format != 0:
+        output_dtype = cutlass.Uint8
+    elif full_rotation:
         if full_rotation_output_dtype == "fp32":
             output_dtype = cutlass.Float32
         elif full_rotation_output_dtype == "bf16":
@@ -11127,19 +12581,6 @@ def compile_w4a16_topk_sum(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
     svh_fake = make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16)
-    kernel = W4A16TopKSumKernel(
-        topk=topk,
-        hidden_size=hidden_size,
-        element_dtype=element_dtype,
-        full_rotation=full_rotation,
-        full_rotation_output_dtype=full_rotation_output_dtype,
-        coupled_hadamard=coupled_hadamard,
-        num_experts=num_experts,
-        route_num_experts=route_num_experts,
-        use_expert_map=use_expert_map,
-        broadcast_svh=broadcast_svh,
-        float32_output=float32_output,
-    )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
     )
@@ -11174,10 +12615,80 @@ def compile_w4a16_topk_sum(
         use_expert_map=bool(use_expert_map),
         full_rotation_output_dtype=str(full_rotation_output_dtype),
         broadcast_svh=bool(broadcast_svh),
+        reply_format=int(reply_format),
+        reply_schedule=str(kernel.reply_schedule),
     )
     attach_programs(result, compiled)
     _SUM_CACHE[cache_key] = result
     return result
+
+
+def compile_w4a16_topk_sum_reply(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs)
+
+
+def compile_w4a16_topk_sum_reply_cta_smem(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="cta_smem")
+
+
+def compile_w4a16_topk_sum_reply_cta_smem_nc(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="cta_smem_nc")
+
+
+def compile_w4a16_topk_sum_reply_cta_smem_blk_major(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="cta_smem_blk_major")
+
+
+def compile_w4a16_topk_sum_reply_cta_2slab(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="cta_2slab")
+
+
+def compile_w4a16_topk_sum_reply_cta_4slab(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="cta_4slab")
+
+
+def compile_w4a16_topk_sum_reply_cta_8slab(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="cta_8slab")
+
+
+def compile_w4a16_topk_sum_reply_warp_b1(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b1")
+
+
+def compile_w4a16_topk_sum_reply_warp_b1_tok(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b1_tok")
+
+
+def compile_w4a16_topk_sum_reply_warp_b1_tok_8w(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b1_tok_8w")
+
+
+def compile_w4a16_topk_sum_reply_warp_b1_tok_r2(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b1_tok_r2")
+
+
+def compile_w4a16_topk_sum_reply_warp_b1_tok_r2_8w(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b1_tok_r2_8w")
+
+
+def compile_w4a16_topk_sum_reply_warp_b1_8w(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b1_8w")
+
+
+def compile_w4a16_topk_sum_reply_warp_b1_all8(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b1_all8")
+
+
+def compile_w4a16_topk_sum_reply_warp_b2(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b2")
+
+
+def compile_w4a16_topk_sum_reply_warp_b2_tok(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b2_tok")
+
+
+def compile_w4a16_topk_sum_reply_warp_b4(**kwargs) -> W4A16TopKSumCompileResult:
+    return compile_w4a16_topk_sum(**kwargs, reply_schedule="warp_b4")
 
 
 def _w4a16_small_m_direct_launch_flat(
@@ -12253,12 +13764,16 @@ def _w4a16_topk_sum_launch_flat(
         ),
         make_ptr(
             (
-                cutlass.BFloat16
-                if full_rotation_output_dtype == "bf16"
+                cutlass.Uint8
+                if sum_kernel.reply_format != 0 or output.dtype == torch.uint8
                 else (
-                    cutlass.Float32
-                    if full_rotation or output.dtype == torch.float32
-                    else _cutlass_element_dtype(element_dtype)
+                    cutlass.BFloat16
+                    if full_rotation_output_dtype == "bf16"
+                    else (
+                        cutlass.Float32
+                        if full_rotation or output.dtype == torch.float32
+                        else _cutlass_element_dtype(element_dtype)
+                    )
                 )
             ),
             output.data_ptr(),
