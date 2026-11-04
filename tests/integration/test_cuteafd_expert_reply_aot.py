@@ -78,6 +78,13 @@ def reduction():
 
 
 @pytest.fixture(scope="module")
+def tier_reduction():
+    require_b12x()
+    from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_reduce_tier_aot
+    return compile_expert_reply_reduce_tier_aot()
+
+
+@pytest.fixture(scope="module")
 def programs():
     require_b12x()
     from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
@@ -169,6 +176,86 @@ def test_fused_reply_reduce_rank_rounding_and_dynamic_graph(programs, reduction,
             assert (guarded[:256] == 0x5A).all() and (guarded[-256:] == 0x5A).all()
             assert all(torch.equal(p, snapshot) for p, snapshot in zip(planes, before))
             assert all((p[:256] == 0xA5).all() and (p[-256:] == 0xA5).all() for p in planes)
+
+
+@pytest.mark.parametrize("width", [32, 160, 4096, 5120, 7168])
+@pytest.mark.parametrize("ranks", [1, 2, 3, 6, 7, 8])
+@pytest.mark.parametrize("has_shared", [False, True])
+def test_fused_reply_reduce_adds_the_tier_plane_after_the_ranks(reduction, tier_reduction, width, ranks,
+                                                                has_shared):
+    """``expert_reply_reduce_tier`` = the ranks in order, then the GPU expert
+    tier's BF16 plane, then shared, in FP32 with one BF16 round; and
+    ``expert_reply_reduce`` on the same wire planes. The planes are encoded by
+    the torch oracle, not the quantize program, so this also runs on SM89
+    (whose coordinator only decodes)."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    rows = 65 if width < 4096 else 3
+    torch.manual_seed(width + ranks + 11)
+    inputs = [(torch.randn(rows, width, device="cuda") * (2. ** (rank % 5 - 2))).bfloat16()
+              for rank in range(ranks)]
+    for x in inputs:
+        x[0] = -0.0
+        x[-1, ::32] *= 1e-5
+    tier = (torch.randn(rows, width, device="cuda") * .5).bfloat16()
+    # Row 0: every addend is -0 for BF16 wires, so only an exact ordered FP32
+    # sum keeps the sign; and a tier value of a different magnitude regime.
+    tier[0] = -0.0
+    tier[-1] *= 2. ** 12
+    shared = torch.randn_like(tier) if has_shared else None
+    planes = [torch.full((rows * width * 2 + 512,), 0xA5, device="cuda", dtype=torch.uint8)
+              for _ in range(ranks)]
+    views = [p[256:-256] for p in planes]
+    guards = [torch.full_like(planes[0], 0x5A) for _ in range(2)]
+    with_tier, without = (g[256:-256].view(torch.bfloat16).view(rows, width) for g in guards)
+    mode = torch.zeros(1, device="cuda", dtype=torch.uint32)
+    pointers = views + [None] * (8 - ranks)
+
+    def oracle(format):
+        mode.fill_(format)
+        decoded = []
+        for x, plane in zip(inputs, views):
+            wire, restored = (x.view(torch.uint8), x) if format == 0 else reference(x, format)
+            plane[:wire.numel()].copy_(wire.flatten())
+            decoded.append(restored)
+        ranks_total = decoded[0].float()
+        for restored in decoded[1:]:
+            ranks_total = ranks_total + restored.float()
+        expected = ranks_total + tier.float()
+        if has_shared:
+            expected, ranks_total = expected + shared.float(), ranks_total + shared.float()
+        return expected.bfloat16(), ranks_total.bfloat16()
+
+    def launch():
+        tier_reduction.launch(*pointers, tier, shared, with_tier, mode,
+                              scalars=(rows, width, ranks, int(has_shared), -1))
+        reduction.launch(*pointers, shared, without, mode,
+                         scalars=(rows, width, ranks, int(has_shared), -1))
+
+    with kernel_resolution_guard("test_fused_reply_reduce_tier"):
+        oracle(1)
+        launch()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        for iteration, format in enumerate([1, 2, 0, 2, 1]):
+            for x in inputs:
+                x[1:].mul_(0.5 if iteration % 2 else -2.)
+            tier[1:].mul_(-1.)
+            expected, expected_without = oracle(format)
+            before = [p.clone() for p in planes]
+            tier_before = tier.clone()
+            for guard in guards:
+                guard.fill_(0x5A)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(with_tier.view(torch.int16), expected.view(torch.int16)), (width, ranks, format)
+            assert torch.equal(without.view(torch.int16), expected_without.view(torch.int16)), (width, ranks, format)
+            if format == 0 and not has_shared:
+                assert with_tier[0].signbit().all()
+            assert all((g[:256] == 0x5A).all() and (g[-256:] == 0x5A).all() for g in guards)
+            assert all(torch.equal(p, snapshot) for p, snapshot in zip(planes, before))
+            assert torch.equal(tier, tier_before)
 
 
 def test_fp8_reference_exact_power_of_two_boundary(programs):
