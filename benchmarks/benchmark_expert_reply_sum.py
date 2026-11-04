@@ -49,14 +49,23 @@ def capture(launch):
     return graph
 
 
-def elapsed(graph, iterations):
-    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-    start.record()
-    for _ in range(iterations):
+def elapsed(graph, iterations, scrub=None):
+    events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+              for _ in range(iterations)]
+    for start, end in events:
+        if scrub is not None:
+            scrub.fill_(0xA7)
+        start.record()
         graph.replay()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / iterations
+        end.record()
+    events[-1][1].synchronize()
+    return statistics.mean(start.elapsed_time(end) for start, end in events)
+
+
+def clock_snapshot():
+    result = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,clocks.mem,power.draw,power.limit",
+                             "--format=csv,noheader,nounits"], capture_output=True, text=True)
+    return dict(output=result.stdout.strip(), error=result.stderr.strip(), exit=result.returncode)
 
 
 def run(args):
@@ -65,6 +74,10 @@ def run(args):
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != (12, 1):
         raise RuntimeError("the Spark reply duel must run on SM121")
+    l2_bytes = int(props.L2_cache_size)
+    scrub_bytes = max(args.scrub_l2_bytes, 2 * l2_bytes) if args.scrub_l2 else 0
+    scrub = torch.empty(scrub_bytes, device="cuda", dtype=torch.uint8) if scrub_bytes else None
+    clocks_before = clock_snapshot()
     torch.manual_seed(args.seed)
     width, topk, experts, capacity = 6144, 8, 256, max(args.rows)
     options = dict(m=capacity, topk=topk, hidden_size=width,
@@ -111,7 +124,7 @@ def run(args):
         assert digest(bf16[:rows].view(torch.uint8)) == expected_bf16_hash, "sum capture did not replay"
         for _ in range(args.warmup):
             sum_graph.replay()
-        sum_ms = elapsed(sum_graph, args.iterations)
+        sum_ms = elapsed(sum_graph, args.iterations, scrub)
         if rows >= 2663 and sum_ms < 0.3:
             raise RuntimeError(f"invalid sum capture timing: {sum_ms:.6f} ms at {rows}x{width}; expected >=0.3 ms")
         for fmt in args.formats:
@@ -128,6 +141,9 @@ def run(args):
             torch.cuda.synchronize()
             oracle_hash = digest(expected)
             graph_base = capture(unfused)
+            codec_graph = capture(lambda: codec.launch(
+                bf16, expected, None, scalars=(rows, width, fmt), stream=cu_stream()))
+            codec_ms = elapsed(codec_graph, args.iterations, scrub)
             expected.fill_(0xD3)
             graph_base.replay()
             torch.cuda.synchronize()
@@ -174,14 +190,15 @@ def run(args):
                 if round_index % 2:
                     order.reverse()
                 for name, graph in order:
-                    samples[name].append(elapsed(graph, args.iterations))
+                    samples[name].append(elapsed(graph, args.iterations, scrub))
             sum_only(rows)
             torch.cuda.synchronize()
             assert digest(bf16[:rows].view(torch.uint8)) == expected_bf16_hash, "BF16 baseline changed"
             record = dict(rows=rows, width=width, topk=topk, experts=experts,
                           reply_format=fmt, exact=exact, oracle_sha256=oracle_hash,
                           bf16_sha256=expected_bf16_hash, bf16_sum_ms=sum_ms,
-                          samples_ms=samples,
+                          codec_only_ms=codec_ms, l2_bytes=l2_bytes, scrub_bytes=scrub_bytes,
+                          clocks=clock_snapshot(), samples_ms=samples,
                           medians_ms={k: statistics.median(v) for k, v in samples.items()})
             records.append(record)
             print(json.dumps(record), flush=True)
@@ -190,7 +207,9 @@ def run(args):
     report = dict(schema="expert-reply-sum-duel/1", revision=revision, dirty=dirty,
                   candidate=args.candidate, gpu=props.name, sms=props.multi_processor_count,
                   torch=torch.__version__, cuda=torch.version.cuda, seed=args.seed,
-                  iterations=args.iterations, rounds=args.rounds, records=records)
+                  iterations=args.iterations, rounds=args.rounds, l2_bytes=l2_bytes,
+                  scrub_bytes=scrub_bytes, clocks_before=clocks_before,
+                  clocks_after=clock_snapshot(), records=records)
     if args.output:
         args.output.write_text(json.dumps(report, indent=2) + "\n")
 
@@ -204,6 +223,9 @@ def main():
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--scrub-l2", action="store_true", help="write >=2x runtime L2 before each timed replay (scrub excluded)")
+    parser.add_argument("--scrub-l2-bytes", type=int, default=64 * 1024 * 1024,
+                        help="minimum scrub allocation; runtime 2xL2 is always enforced")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if min(args.rows + [args.warmup, args.iterations, args.rounds]) < 1 or min(args.rows) < 4:
