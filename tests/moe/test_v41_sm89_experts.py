@@ -3,9 +3,9 @@
 Runs only on an SM89 (Ada) GPU, where ``V41SlicePipeline`` selects the
 promoted-MMA kernels. Ordered route planes must match the FP32 oracle of the
 official BF16 -> MXFP8 -> BF16 recipe with V4.1 scale codes and raw UE8M0
-scale words, stay bit-identical across live-row counts, capacities and CUDA
-graph replay (``run_pipeline`` checks both), and zero routes to invalid
-experts without changing the others.
+scale words up to FP32 summation order (exact F16 MMA), stay bit-identical
+across live-row counts, capacities and CUDA graph replay (``run_pipeline``
+checks both), and zero routes to invalid experts without changing the others.
 """
 
 import pytest
@@ -50,11 +50,7 @@ def _resident(weights, scales, n, coded):
     return packed
 
 
-# TP2 halves (1152) and whole draft/backbone experts (2304); 16 rows fill two N tiles.
-@pytest.mark.parametrize("n,m,topk", [(1152, 1, 6), (1152, 16, 6), (2304, 7, 3), (2304, 16, 3)])
-@pytest.mark.parametrize("coded", [True, False])
-def test_sm89_slices_match_oracle(n, m, topk, coded):
-    require_sm89()
+def _oracle_error(n, m, topk, coded):
     x, ids, routing, weights, scales = _problem(n, m, topk, 8900 + n + m)
     routes = run_pipeline(x, ids, routing, _resident(weights, scales, n, coded), 192, False,
                           n=n, coded=coded, return_routes=True)
@@ -63,7 +59,27 @@ def test_sm89_slices_match_oracle(n, m, topk, coded):
                        {k: v.cuda() for k, v in scales.items()})
     rel = ((actual - oracle).norm() / oracle.norm()).item()
     cosine = torch.nn.functional.cosine_similarity(actual.flatten(), oracle.flatten(), dim=0).item()
-    assert torch.isfinite(routes).all() and rel < 0.01 and cosine > 0.9999, (rel, cosine)
+    assert torch.isfinite(routes).all()
+    return rel, cosine
+
+
+# TP2 halves (1152) and whole draft/backbone experts (2304); 16 rows fill two N tiles.
+# The exact F16 MMA reproduces the recipe up to FP32 summation order; Ada's FP8
+# MMA sat near 2e-3 here.
+@pytest.mark.parametrize("n,m,topk", [(1152, 1, 6), (1152, 16, 6), (2304, 7, 3), (2304, 16, 3)])
+@pytest.mark.parametrize("coded", [True, False])
+def test_sm89_slices_match_oracle(n, m, topk, coded):
+    require_sm89()
+    rel, cosine = _oracle_error(n, m, topk, coded)
+    assert rel < 3e-4 and cosine > 0.9999999, (rel, cosine)
+
+
+def test_sm89_fp8_mma_mode_keeps_its_bar(monkeypatch):
+    """The FP8 comparison mode still runs, within the bar it shipped with."""
+    require_sm89()
+    monkeypatch.setenv("B12X_SM89_V41_MMA", "fp8")
+    rel, cosine = _oracle_error(1152, 16, 6, True)
+    assert rel < 0.01 and cosine > 0.9999, (rel, cosine)
 
 
 def test_sm89_capacity_invariance_and_invalid_routes():

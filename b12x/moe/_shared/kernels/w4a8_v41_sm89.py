@@ -5,10 +5,14 @@ metadata, MXFP8 K32 activations, the N256/K128 lane-major resident weights
 with V4.1 scale codes or raw UE8M0 scale words, ordered FP32 route output) for
 GPUs without block-scaled MMA:
 
-* each K32 step runs a plain ``mma.m16n8k32.e4m3.e4m3.f32`` into a zero
-  accumulator and promotes it into FP32 with ``fma(d, s_w * s_a, acc)``. Both
-  scales are UE8M0, so their product is an exact power of two and each K32
-  step adds exactly one rounding;
+* each K32 step widens both operands exactly to F16 and runs two
+  ``mma.m16n8k16.f32.f16.f16.f32`` into a zero accumulator, then promotes it
+  into FP32 with ``fma(d, s_w * s_a, acc)``. Both scales are UE8M0, so their
+  product is an exact power of two and each K32 step adds exactly one
+  rounding. Ada's FP8 ``mma.m16n8k32.e4m3`` keeps too few bits when it sums a
+  block's 32 products: on real V4.1 experts a quarter of the BF16 outputs left
+  the official recipe, against 0.03% for the block-scaled SM121 path. It stays
+  selectable as ``mma="fp8"`` (``B12X_SM89_V41_MMA=fp8``) for comparisons;
 * E2M1 weights are relabelled to E4M3 bytes in registers (lossless) in the
   nibble-to-byte order the SM120 kernels give their QMMA E2M1 containers;
 * weights are the MMA A operand and live rows the B operand ("swap AB"): one
@@ -47,9 +51,11 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 from b12x._lib.intrinsics import (
     e2m1x8_to_e4m3x8,
+    f16_mma_m16n8k16_f32,
     fmax_f32,
     fmin_f32,
     fabs_f32,
+    fp8x4_e4m3_to_half2x2,
     get_ptr_as_int64,
     mma_m16n8k32_f32_e4m3,
     pow2_ceil_ue8m0,
@@ -208,6 +214,37 @@ def promoted_mma(acc, n, m, a, b0: Uint32, b1: Uint32,
     acc[n, m, 3] = ffma(d3, fmul_rn(s_hi, sa1), acc[n, m, 3])
 
 
+def promoted_mma_f16(acc, n, m, a, b0: Uint32, b1: Uint32,
+                     s_lo: Float32, s_hi: Float32, sa0: Float32, sa1: Float32):
+    """``promoted_mma`` as two exact F16 ``m16n8k16`` MMAs instead of one FP8 ``m16n8k32``.
+
+    Ada's FP8 MMA sums a K32 block's 32 products with limited internal
+    precision, which moves FC1 accumulators enough to flip the BF16 and MXFP8
+    rounding of the intermediate. E4M3 and relabelled E2M1 values widen
+    exactly to F16, the products are exact in FP32, and the F16 MMA accumulates
+    them like the SM120/SM121 block-scaled path. The thread's eight physical K
+    values 8c..8c+7 split into two k16 MMAs over the same registers: physical
+    (8c, 8c+1) and (8c+2, 8c+3) are logical (2c, 2c+1) and (2c+8, 2c+9) of the
+    first, (8c+4..8c+7) the same of the second; A and B use the same map.
+    """
+    a0l, a0h = fp8x4_e4m3_to_half2x2(a[0])
+    a1l, a1h = fp8x4_e4m3_to_half2x2(a[1])
+    a2l, a2h = fp8x4_e4m3_to_half2x2(a[2])
+    a3l, a3h = fp8x4_e4m3_to_half2x2(a[3])
+    b0l, b0h = fp8x4_e4m3_to_half2x2(b0)
+    b1l, b1h = fp8x4_e4m3_to_half2x2(b1)
+    zero = Float32(0)
+    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(zero, zero, zero, zero, a0l, a1l, a0h, a1h, b0l, b0h)
+    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(d0, d1, d2, d3, a2l, a3l, a2h, a3h, b1l, b1h)
+    acc[n, m, 0] = ffma(d0, fmul_rn(s_lo, sa0), acc[n, m, 0])
+    acc[n, m, 1] = ffma(d1, fmul_rn(s_lo, sa1), acc[n, m, 1])
+    acc[n, m, 2] = ffma(d2, fmul_rn(s_hi, sa0), acc[n, m, 2])
+    acc[n, m, 3] = ffma(d3, fmul_rn(s_hi, sa1), acc[n, m, 3])
+
+
+MMA_MODES = ("fp8", "f16")
+
+
 class _ResidentPlane:
     """Byte addressing of one projection in the N256/K128 lane-major layout.
 
@@ -298,9 +335,11 @@ class V41Sm89Fc1Kernel:
     """FC1, V4.1 activation and MXFP8 requantization into internal scratch."""
 
     def __init__(self, capacity, *, topk=6, intermediate=2304, hidden=5120,
-                 scale_codes=True, batch=4, warps=8):
+                 scale_codes=True, batch=4, warps=8, mma="f16"):
         assert capacity > 0 and topk > 0
         assert warps in (4, 8) and hidden % (128 * warps) == 0, "warps own whole K128 tiles"
+        assert mma in MMA_MODES
+        self.mma = mma
         self.warps = warps
         self.threads = 32 * warps
         assert intermediate % 128 == 0, "SM89 roles use 128-aligned resident widths"
@@ -386,6 +425,7 @@ class V41Sm89Fc1Kernel:
             acc = cute.make_rmem_tensor((2, 4, 4), Float32)
             acc.fill(0)
             tile_stride = Int64(plane.tile_stride)
+            tile_mma = promoted_mma_f16 if self.mma == "f16" else promoted_mma
             # One iteration per batch: all of its loads back to back, then its MMAs.
             for batch in range(self.batches):
                 block0 = k_block0 + batch * Int32(self.batch)
@@ -430,13 +470,13 @@ class V41Sm89Fc1Kernel:
                     sa = [ue8m0_byte_value(col_words[0, i], kb) for i in range(2)]
                     frags = [relabel_a(weights[u, 2 * m], weights[u, 2 * m + 1]) for m in range(4)]
                     for m in cutlass.range_constexpr(4):
-                        promoted_mma(acc, 0, m, frags[m], acts[u, 0, 0], acts[u, 0, 1],
-                                     s_rows[2 * m], s_rows[2 * m + 1], sa[0], sa[1])
+                        tile_mma(acc, 0, m, frags[m], acts[u, 0, 0], acts[u, 0, 1],
+                                 s_rows[2 * m], s_rows[2 * m + 1], sa[0], sa[1])
                     if two:
                         sb = [ue8m0_byte_value(col_words[1, i], kb) for i in range(2)]
                         for m in cutlass.range_constexpr(4):
-                            promoted_mma(acc, 1, m, frags[m], acts[u, 1, 0], acts[u, 1, 1],
-                                         s_rows[2 * m], s_rows[2 * m + 1], sb[0], sb[1])
+                            tile_mma(acc, 1, m, frags[m], acts[u, 1, 0], acts[u, 1, 1],
+                                     s_rows[2 * m], s_rows[2 * m + 1], sb[0], sb[1])
 
             # Ascending warp fold of the K parts.
             if warp > 0:
@@ -498,10 +538,12 @@ class V41Sm89Fc2Kernel:
     """FC2 into ordered FP32 route rows; invalid live routes are zeroed."""
 
     def __init__(self, capacity, *, topk=6, intermediate=2304, hidden=5120,
-                 scale_codes=True, batch=4, k_split=2):
+                 scale_codes=True, batch=4, k_split=2, mma="f16"):
         assert capacity > 0 and topk > 0
         assert hidden % 128 == 0 and intermediate % 128 == 0
         assert k_split in (1, 2, 4)
+        assert mma in MMA_MODES
+        self.mma = mma
         self.capacity = capacity
         self.topk = topk
         self.routes = capacity * topk
@@ -574,6 +616,7 @@ class V41Sm89Fc2Kernel:
             acc = cute.make_rmem_tensor((2, 2, 4), Float32)
             acc.fill(0)
             tile_stride = Int64(plane.tile_stride)
+            tile_mma = promoted_mma_f16 if self.mma == "f16" else promoted_mma
             # This warp's contiguous K tiles: part ``half`` of ``k_split``.
             longer = Int32(half < Int32(self.long_parts))
             first_tile = half * Int32(self.part_tiles) + cutlass.min(half, Int32(self.long_parts))
@@ -615,13 +658,13 @@ class V41Sm89Fc2Kernel:
                     sa = [ue8m0_byte_value(col_words[0, i], kb) for i in range(2)]
                     frags = [relabel_a(weights[u, 2 * m], weights[u, 2 * m + 1]) for m in range(2)]
                     for m in cutlass.range_constexpr(2):
-                        promoted_mma(acc, 0, m, frags[m], acts[u, 0, 0], acts[u, 0, 1],
-                                     s_rows[2 * m], s_rows[2 * m + 1], sa[0], sa[1])
+                        tile_mma(acc, 0, m, frags[m], acts[u, 0, 0], acts[u, 0, 1],
+                                 s_rows[2 * m], s_rows[2 * m + 1], sa[0], sa[1])
                     if two:
                         sb = [ue8m0_byte_value(col_words[1, i], kb) for i in range(2)]
                         for m in cutlass.range_constexpr(2):
-                            promoted_mma(acc, 1, m, frags[m], acts[u, 1, 0], acts[u, 1, 1],
-                                         s_rows[2 * m], s_rows[2 * m + 1], sb[0], sb[1])
+                            tile_mma(acc, 1, m, frags[m], acts[u, 1, 0], acts[u, 1, 1],
+                                     s_rows[2 * m], s_rows[2 * m + 1], sb[0], sb[1])
 
             if cutlass.const_expr(self.k_split > 1):
                 # Later K parts into shared memory; the first part adds them in order.
