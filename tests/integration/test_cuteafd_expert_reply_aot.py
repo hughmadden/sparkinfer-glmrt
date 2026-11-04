@@ -70,16 +70,28 @@ def mismatch_details(x, actual, expected, format):
     return result
 
 
+def require_reply_decoder():
+    """The reply reducers run on every coordinator: SM12x and SM89, which
+    decodes Spark replies but has no E2M1 conversion for the quantizer (the
+    `programs` fixture stays SM12x)."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for the reply reducers")
+    capability = torch.cuda.get_device_capability(torch.device("cuda"))
+    if capability not in ((12, 0), (12, 1), (8, 9)):
+        pytest.skip(f"SM12x or SM89 GPU required, found sm_{capability[0]}{capability[1]}")
+
+
 @pytest.fixture(scope="module")
 def reduction():
-    require_b12x()
+    require_reply_decoder()
     from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_reduce_aot
     return compile_expert_reply_reduce_aot()
 
 
 @pytest.fixture(scope="module")
 def tier_reduction():
-    require_b12x()
+    require_reply_decoder()
     from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_reduce_tier_aot
     return compile_expert_reply_reduce_tier_aot()
 
