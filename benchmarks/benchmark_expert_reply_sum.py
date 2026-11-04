@@ -35,6 +35,11 @@ def digest(tensor):
     return hashlib.sha256(tensor.cpu().numpy().tobytes()).hexdigest()
 
 
+def cu_stream():
+    # Capture switches PyTorch's current stream; never retain the setup stream.
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+
 def capture(launch):
     launch()
     torch.cuda.synchronize()
@@ -87,13 +92,12 @@ def run(args):
     fc2[topk:2 * topk].mul_(2 ** -12)
     fc2[2 * topk:3 * topk].mul_(128)
     bf16 = torch.empty(capacity, width, device="cuda", dtype=torch.bfloat16)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def sum_only(rows):
         baseline.compiled(pointer(cutlass.Float16, fc2), pointer(cutlass.BFloat16, bf16),
                           pointer(cutlass.Float32, weights, 4), pointer(cutlass.Int32, ids, 4),
                           pointer(cutlass.Int32, expert_map, 4), pointer(cutlass.Float16, svh),
-                          cutlass.Int32(experts), cutlass.Int32(experts), rows, stream)
+                          cutlass.Int32(experts), cutlass.Int32(experts), rows, cu_stream())
 
     records = []
     for rows in args.rows:
@@ -101,9 +105,15 @@ def run(args):
         torch.cuda.synchronize()
         expected_bf16_hash = digest(bf16[:rows].view(torch.uint8))
         sum_graph = capture(lambda: sum_only(rows))
+        bf16[:rows].zero_()
+        sum_graph.replay()
+        torch.cuda.synchronize()
+        assert digest(bf16[:rows].view(torch.uint8)) == expected_bf16_hash, "sum capture did not replay"
         for _ in range(args.warmup):
             sum_graph.replay()
         sum_ms = elapsed(sum_graph, args.iterations)
+        if rows >= 2663 and sum_ms < 0.3:
+            raise RuntimeError(f"invalid sum capture timing: {sum_ms:.6f} ms at {rows}x{width}; expected >=0.3 ms")
         for fmt in args.formats:
             stride = width + width // 32 if fmt == 1 else width // 2 + width // 16
             expected = torch.full((rows, stride), 0xA5, device="cuda", dtype=torch.uint8)
@@ -112,19 +122,23 @@ def run(args):
 
             def unfused():
                 sum_only(rows)
-                codec.launch(bf16, expected, None, scalars=(rows, width, fmt))
+                codec.launch(bf16, expected, None, scalars=(rows, width, fmt), stream=cu_stream())
 
             unfused()
             torch.cuda.synchronize()
             oracle_hash = digest(expected)
             graph_base = capture(unfused)
+            expected.fill_(0xD3)
+            graph_base.replay()
+            torch.cuda.synchronize()
+            assert digest(expected) == oracle_hash, "baseline capture did not replay"
             graphs = {"baseline": graph_base}
             exact = None
             if factory:
                 launch = candidates[fmt]
 
                 def fused():
-                    launch(fc2, actual, weights, ids, expert_map, svh, rows, stream)
+                    launch(fc2, actual, weights, ids, expert_map, svh, rows, cu_stream())
 
                 fused()
                 torch.cuda.synchronize()
