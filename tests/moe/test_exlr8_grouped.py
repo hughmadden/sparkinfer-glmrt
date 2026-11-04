@@ -344,14 +344,19 @@ def test_decode_core_reply_matches_opaque_bytes_and_graph(variant):
     state["output"] = bf16
 
 
-@pytest.mark.parametrize("hidden,group_rows,activations", [
-    (256, 16, "a16"), (256, 64, "a16"), (6144, 64, "a16"),
-    (256, 64, "a8"), (6144, 64, "a8"),
+@pytest.mark.parametrize("hidden,group_rows,activations,grouped_rows,fc2_partials", [
+    (256, 16, "a16", 4096, "f16"),
+    (256, 64, "a16", 4096, "f16"), (6144, 64, "a16", 4096, "f16"),
+    (256, 64, "a8", 4096, "f16"), (6144, 64, "a8", 4096, "f16"),
+    (256, 16, "a16", 64, "f32"), (6144, 16, "a16", 64, "f32"),
 ])
-def test_grouped_compressed_reply_matches_bf16_codec_and_graph(hidden, group_rows, activations):
-    """Exercise the real FC2 slice/reduce schedule, including H6144."""
+def test_grouped_compressed_reply_matches_bf16_codec_and_graph(
+        hidden, group_rows, activations, grouped_rows, fc2_partials):
+    """Exercise shipped F16/F32 schedules and assert H6144 really slices."""
     from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
-    units, topk, capacity, rows = 1, 2, 16, 65
+    from b12x.moe._shared.kernels.w4a16.exlr8_grouped import resolve_fc2_slice_geometry
+    from benchmarks.bench_exlr8_grouped_prefill import runtime_l2_bytes
+    units, topk, capacity, rows = 1, 2, 16, min(grouped_rows, 65)
     gen = torch.Generator(device="cuda").manual_seed(1166)
     owners = []
     pointers = torch.zeros((4, units, 3, 3), dtype=torch.int64)
@@ -374,10 +379,17 @@ def test_grouped_compressed_reply_matches_bf16_codec_and_graph(hidden, group_row
     weights = torch.rand(rows, topk, generator=gen, device="cuda") / topk
     options = dict(hidden=hidden, units=units, top_k=topk, max_groups=capacity,
                    group_rows=group_rows, grouped=True, device_count=True,
+                   grouped_rows=grouped_rows, fc2_partials=fc2_partials,
                    activations=activations)
     baseline = compile_exlr8_a16_aot(**options)
     group = compile_exlr8_group_aot(experts=4, top_k=topk, max_groups=capacity,
-                                    hidden=hidden, max_rows=4096, group_rows=group_rows)
+                                    hidden=hidden, max_rows=grouped_rows, group_rows=group_rows)
+    if hidden == 6144:
+        _, slice_blocks = resolve_fc2_slice_geometry(
+            rows, 48, state["compact"][2], runtime_l2_bytes(), top_k=topk,
+            fc2_half=fc2_partials == "f16", blocks=hidden // 128,
+            group_rows=group_rows)
+        assert slice_blocks < hidden // 128, "H6144 oracle must exercise scratch reuse"
     compressed = [compile_exlr8_a16_aot(reply_format=f, **options) for f in (1, 2)]
     quantize, decode = compile_expert_reply_aot(quantize=True), compile_expert_reply_aot()
     bf16 = state["output"]
