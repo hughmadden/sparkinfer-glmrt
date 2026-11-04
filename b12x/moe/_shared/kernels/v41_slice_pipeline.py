@@ -41,6 +41,23 @@ def sm89_expert_tuning():
     return (4, 4, 8, 2)
 
 
+def sm89_expert_mma():
+    """SM89 MMA per projection: (FC1, FC2), each "fp8" or "f16".
+
+    "f16" (the default) sums each K32 block in two exact F16 ``m16n8k16``,
+    "fp8" in one FP8 ``m16n8k32`` with Ada's limited internal accumulation.
+    B12X_SM89_V41_MMA=f16|fc1|fp8 selects both exact, an exact FC1 with an
+    FP8 FC2, or both FP8, for comparisons. Decode, verify and prefill rows
+    share the choice, so their routes stay bit-identical.
+    """
+    import os
+    raw = os.environ.get("B12X_SM89_V41_MMA", "f16")
+    modes = {"fp8": ("fp8", "fp8"), "fc1": ("f16", "fp8"), "f16": ("f16", "f16")}
+    if raw not in modes:
+        raise ValueError("B12X_SM89_V41_MMA takes fp8, fc1 or f16")
+    return modes[raw]
+
+
 class V41SlicePipeline:
     def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576,
                  hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False,
@@ -64,12 +81,13 @@ class V41SlicePipeline:
                 raise ValueError("SM89 V4.1 experts need a slice width that divides the intermediate")
             self.compute = None
             tune = sm89_expert_tuning()
+            mma = sm89_expert_mma()
             self.fc1 = V41Sm89Fc1Kernel(capacity, topk=topk, intermediate=intermediate,
                                         hidden=hidden, scale_codes=scale_codes,
-                                        batch=tune[0], warps=tune[2])
+                                        batch=tune[0], warps=tune[2], mma=mma[0])
             self.fc2 = V41Sm89Fc2Kernel(capacity, topk=topk, intermediate=intermediate,
                                         hidden=hidden, scale_codes=scale_codes,
-                                        batch=tune[1], k_split=tune[3])
+                                        batch=tune[1], k_split=tune[3], mma=mma[1])
         elif atomic_tokens:
             self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=True,
                                                intermediate=intermediate, hidden=hidden, exact_storage=exact_storage,
