@@ -197,6 +197,259 @@ def test_checkpoint_grouped_matches_chunks(group_rows, units):
                 assert_matches_decode(actual[first:first+live], base["output"][:live], weights[first:first+live])
 
 
+@pytest.mark.parametrize("hidden", [256, 6144])
+@pytest.mark.parametrize("format", [1, 2])
+def test_all_producer_adapters_store_identical_shared_input(hidden, format):
+    """Identical hidden-domain values produce identical payload and scale bytes."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd.pointwise import _view
+    from b12x.integration.cuteafd.expert_reply import compile_exlr8_reply_aot, compile_fp8_reply_aot
+    from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+    from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
+
+    class GroupedReduce:
+        def __init__(self):
+            self.core = Exlr8GroupedKernel(hidden, 1, 1, 1, 16,
+                                           fc2_f32=True, reply_format=format)
+
+        @cute.jit
+        def __call__(self, positions: cute.Pointer, weights: cute.Pointer,
+                     fc2: cute.Pointer, signs: cute.Pointer, output: cute.Pointer,
+                     count: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+            self.core.reduce_kernel(_view(positions), _view(weights), _view(fc2),
+                _view(signs), _view(output), rows, _view(count), Int32(0),
+                Int32(hidden // 128), Int32(0)).launch(
+                    grid=((rows * Int32(hidden // 128) + Int32(7)) // Int32(8), 1, 1),
+                    block=(256, 1, 1), stream=stream)
+
+    grouped = compile_program(GroupedReduce(), name="shared_reply_store_oracle",
+        operands=(Operand("positions", torch.int32, "[rows,1]"),
+                  Operand("weights", torch.float32, "[rows,1]"),
+                  Operand("fc2", torch.float32, "[16,hidden]"),
+                  Operand("signs", torch.int8, "[hidden]"),
+                  Operand("output", torch.uint8, "[wire]", "out"),
+                  Operand("count", torch.int32, "[1]")),
+        scalars=(Scalar("rows"),), key=(hidden, format))
+    rows = 3
+    positions = torch.arange(rows, device="cuda", dtype=torch.int32).view(rows, 1)
+    weights = torch.ones(rows, 1, device="cuda")
+    count = torch.ones(1, device="cuda", dtype=torch.int32)
+    signs = torch.ones(hidden, device="cuda", dtype=torch.int8)
+    signs[::3] = -1
+    fc2 = torch.zeros(16, hidden, device="cuda")
+    fc2[:rows, ::128] = torch.tensor([1., 8., 0.], device="cuda")[:, None]
+    bf16 = torch.empty(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    baseline = compile_exlr8_reply_aot(hidden=hidden, units=1, top_k=1,
+                                      max_groups=1, variant="baseline", format=0)
+    baseline.launch(positions, weights, fc2, signs, bf16, count, scalars=(rows, 48))
+    row_bytes = hidden + hidden // 32 if format == 1 else hidden // 2 + hidden // 16
+    outputs = [torch.empty(rows, row_bytes, device="cuda", dtype=torch.uint8) for _ in range(4)]
+    compile_expert_reply_aot(quantize=True).launch(bf16, outputs[0], None,
+                                                scalars=(rows, hidden, format))
+    compile_fp8_reply_aot(hidden=hidden, top_k=1, format=format).launch(
+        bf16, positions, weights, outputs[1], scalars=(rows,))
+    compile_exlr8_reply_aot(hidden=hidden, units=1, top_k=1,
+        max_groups=1, variant="baseline", format=format).launch(
+            positions, weights, fc2, signs, outputs[2], count, scalars=(rows, 48))
+    grouped.launch(positions, weights, fc2, signs, outputs[3], count, scalars=(rows,))
+    torch.cuda.synchronize()
+    for output in outputs[1:]:
+        assert torch.equal(output, outputs[0])
+    assert outputs[0][:2].count_nonzero() > 0
+    assert (outputs[0][2] == 0).all()
+
+
+@pytest.mark.parametrize("variant", ["baseline", "k1_k23_coalesced"])
+def test_decode_core_reply_matches_opaque_bytes_and_graph(variant):
+    from b12x.integration.cuteafd.expert_reply import compile_exlr8_reply_aot
+    from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
+    hidden, units, topk, capacity, rows = 256, 1, 2, 16, 17
+    owners = []
+    pointers = torch.zeros((4, units, 3, 3), dtype=torch.int64)
+    bits = torch.full((4, units, 3), 2, dtype=torch.int32)
+    bits[-1] = 0
+    for expert in range(3):
+        for projection in range(3):
+            tensors = (torch.randint(256, (hidden * 32,), dtype=torch.uint8, device="cuda"),
+                       torch.full((128,), .1, dtype=torch.float16, device="cuda"),
+                       torch.full((hidden // 128,), .1, dtype=torch.float16, device="cuda"))
+            owners.extend(tensors)
+            pointers[expert, 0, projection] = torch.tensor([t.data_ptr() for t in tensors])
+    pointers, bits = pointers.cuda(), bits.cuda()
+    state = buffers(rows, hidden, units, topk, capacity, 16)
+    signs = [torch.ones(hidden, dtype=torch.int8, device="cuda") for _ in range(2)]
+    signs[1][::3] = -1
+    wire, _ = make_wire(torch.randn(rows, hidden, device="cuda") * .02)
+    ids = torch.rand(rows, 4, device="cuda").topk(topk, -1).indices.int()
+    weights = torch.rand(rows, topk, device="cuda") / topk
+    original_weights = weights.clone()
+    options = dict(hidden=hidden, units=units, top_k=topk, max_groups=capacity,
+                   device_count=True, serving_variant=variant)
+    baseline = compile_exlr8_a16_aot(**options)
+    core = compile_exlr8_a16_aot(core_only=True, **options)
+    assert core.scratch_bytes(rows) == baseline.scratch_bytes(rows)
+    epilogues = [compile_exlr8_reply_aot(hidden=hidden, units=units, top_k=topk,
+                                        max_groups=capacity, variant=variant, format=f)
+                 for f in range(3)]
+    group = compile_exlr8_group_aot(experts=4, top_k=topk, max_groups=capacity,
+                                    hidden=hidden, max_rows=64)
+    quantize, decode = compile_expert_reply_aot(quantize=True), compile_expert_reply_aot()
+    bf16 = state["output"]
+    unused = torch.full_like(bf16, -123)
+    for format, epilogue in enumerate(epilogues):
+        row_bytes = hidden * 2 if format == 0 else hidden + hidden // 32 if format == 1 else hidden // 2 + hidden // 16
+        canary = torch.full((rows * row_bytes + 512,), 0xA5, device="cuda", dtype=torch.uint8)
+        output = canary[256:-256].view(rows, row_bytes)
+        expected = torch.empty_like(output)
+        restored, reference_restored = torch.empty_like(bf16), torch.empty_like(bf16)
+        for live in (1, rows):
+            def reference():
+                state["output"] = bf16
+                run((group, baseline), state, wire, ids, weights, pointers, bits, signs, live, 48)
+                if format:
+                    quantize.launch(bf16, expected, None, scalars=(live, hidden, format))
+                else:
+                    expected[:live].copy_(bf16[:live].view(torch.uint8))
+
+            def fused():
+                state["output"] = unused
+                run((group, core), state, wire, ids, weights, pointers, bits, signs, live, 48)
+                epilogue.launch(state["inverse"], weights, state["fc2"], signs[1], output,
+                                state["count"], scalars=(live, 48))
+
+            weights.copy_(original_weights)
+            assert weights[:live].count_nonzero().item() > 0
+            reference()
+            fused()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with kernel_resolution_guard("EXLR8 core+reply byte oracle"):
+                with torch.cuda.graph(graph):
+                    fused()
+                for factor in (1., .5, -1.):
+                    weights.copy_(original_weights * factor)
+                    assert weights[:live].count_nonzero().item() > 0
+                    reference()
+                    canary.fill_(0xA5)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert torch.equal(output[:live], expected[:live]), (variant, live, format)
+                    if format and factor == 1.:
+                        corrupted = output[:live].clone()
+                        corrupted[0, 0] ^= 1
+                        with pytest.raises(AssertionError, match="compressed byte oracle"):
+                            assert torch.equal(corrupted, expected[:live]), "compressed byte oracle"
+                    assert (unused == -123).all(), "core-only wrote opaque output"
+                    assert (canary[:256] == 0xA5).all() and (canary[-256:] == 0xA5).all()
+                    assert (output[live:] == 0xA5).all()
+                    if format:
+                        decode.launch(output, restored, None, scalars=(live, hidden, format))
+                        decode.launch(expected, reference_restored, None, scalars=(live, hidden, format))
+                        assert torch.equal(restored[:live].view(torch.int16), reference_restored[:live].view(torch.int16))
+    state["output"] = bf16
+
+
+@pytest.mark.parametrize("hidden,group_rows,activations,grouped_rows,fc2_partials", [
+    (256, 16, "a16", 4096, "f16"),
+    (256, 64, "a16", 4096, "f16"), (6144, 64, "a16", 4096, "f16"),
+    (256, 64, "a8", 4096, "f16"), (6144, 64, "a8", 4096, "f16"),
+    (256, 16, "a16", 64, "f32"), (6144, 16, "a16", 64, "f32"),
+])
+def test_grouped_compressed_reply_matches_bf16_codec_and_graph(
+        hidden, group_rows, activations, grouped_rows, fc2_partials):
+    """Exercise shipped F16/F32 schedules and assert H6144 really slices."""
+    from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
+    from b12x.moe._shared.kernels.w4a16.exlr8_grouped import resolve_fc2_slice_geometry
+    from benchmarks.bench_exlr8_grouped_prefill import runtime_l2_bytes
+    units, topk, capacity, rows = 1, 2, 16, min(grouped_rows, 65)
+    gen = torch.Generator(device="cuda").manual_seed(1166)
+    owners = []
+    pointers = torch.zeros((4, units, 3, 3), dtype=torch.int64)
+    bits = torch.full((4, units, 3), 2, dtype=torch.int32)
+    bits[-1] = 0
+    for expert in range(3):
+        for projection in range(3):
+            tensors = (torch.randint(256, (hidden * 32,), generator=gen, dtype=torch.uint8, device="cuda"),
+                       torch.full((128,), .1, dtype=torch.float16, device="cuda"),
+                       torch.full((hidden // 128,), .1, dtype=torch.float16, device="cuda"))
+            owners.extend(tensors)
+            pointers[expert, 0, projection] = torch.tensor([t.data_ptr() for t in tensors])
+    pointers, bits = pointers.cuda(), bits.cuda()
+    state = buffers(rows, hidden, units, topk, capacity, group_rows)
+    state["compact"] = compact_unit_descriptors(bits)
+    signs = [torch.ones(hidden, dtype=torch.int8, device="cuda") for _ in range(2)]
+    signs[1][::3] = -1
+    wire, _ = make_wire(torch.randn(rows, hidden, generator=gen, device="cuda") * .02)
+    ids = torch.rand(rows, 4, generator=gen, device="cuda").topk(topk, -1).indices.int()
+    weights = torch.rand(rows, topk, generator=gen, device="cuda") / topk
+    original_weights = weights.clone()
+    options = dict(hidden=hidden, units=units, top_k=topk, max_groups=capacity,
+                   group_rows=group_rows, grouped=True, device_count=True,
+                   grouped_rows=grouped_rows, fc2_partials=fc2_partials,
+                   activations=activations)
+    baseline = compile_exlr8_a16_aot(**options)
+    group = compile_exlr8_group_aot(experts=4, top_k=topk, max_groups=capacity,
+                                    hidden=hidden, max_rows=grouped_rows, group_rows=group_rows)
+    if hidden == 6144:
+        _, slice_blocks = resolve_fc2_slice_geometry(
+            rows, 48, state["compact"][2], runtime_l2_bytes(), top_k=topk,
+            fc2_half=fc2_partials == "f16", blocks=hidden // 128,
+            group_rows=group_rows)
+        assert slice_blocks < hidden // 128, "H6144 oracle must exercise scratch reuse"
+    compressed = [compile_exlr8_a16_aot(reply_format=f, **options) for f in (1, 2)]
+    quantize, decode = compile_expert_reply_aot(quantize=True), compile_expert_reply_aot()
+    bf16 = state["output"]
+    for format, candidate in enumerate(compressed, 1):
+        assert candidate.scratch_bytes(rows) == baseline.scratch_bytes(rows)
+        row_bytes = hidden + hidden // 32 if format == 1 else hidden // 2 + hidden // 16
+        canary = torch.full((rows * row_bytes + 512,), 0xA5, device="cuda", dtype=torch.uint8)
+        output = canary[256:-256].view(rows, row_bytes)
+        expected = torch.empty_like(output)
+        restored, reference_restored = torch.empty_like(bf16), torch.empty_like(bf16)
+        for live in (1, 17, rows):
+            def reference():
+                state["output"] = bf16
+                run((group, baseline), state, wire, ids, weights, pointers, bits, signs, live, 48)
+                quantize.launch(bf16, expected, None, scalars=(live, hidden, format))
+
+            def fused():
+                state["output"] = output
+                run((group, candidate), state, wire, ids, weights, pointers, bits, signs, live, 48)
+
+            weights.copy_(original_weights)
+            assert weights[:live].count_nonzero().item() > 0
+            reference()
+            fused()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with kernel_resolution_guard("EXLR8 grouped compressed wire byte oracle"):
+                with torch.cuda.graph(graph):
+                    fused()
+                for factor in (1., .5, -1.):
+                    weights.copy_(original_weights * factor)
+                    assert weights[:live].count_nonzero().item() > 0
+                    reference()
+                    canary.fill_(0xA5)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert torch.equal(output[:live], expected[:live]), (hidden, live, format)
+                    if factor == 1.:
+                        corrupted = output[:live].clone()
+                        corrupted[0, 0] ^= 1
+                        with pytest.raises(AssertionError, match="compressed byte oracle"):
+                            assert torch.equal(corrupted, expected[:live]), "compressed byte oracle"
+                    assert (canary[:256] == 0xA5).all() and (canary[-256:] == 0xA5).all()
+                    assert (output[live:] == 0xA5).all()
+                    decode.launch(output, restored, None, scalars=(live, hidden, format))
+                    decode.launch(expected, reference_restored, None, scalars=(live, hidden, format))
+                    assert torch.equal(restored[:live].view(torch.int16), reference_restored[:live].view(torch.int16))
+    state["output"] = bf16
+
+
 @pytest.mark.parametrize("units", [1, 16])
 def test_every_live_row_count_matches_decode(units):
     torch.cuda.set_per_process_memory_fraction(0.25)
