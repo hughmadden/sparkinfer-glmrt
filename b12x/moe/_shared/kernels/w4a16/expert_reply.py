@@ -15,7 +15,7 @@ from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
 from b12x.integration.cuteafd.pointwise import _view
 from .expert_partial import _fp4_pair, fp8_scale, decode_fp4
 from b12x.integration.cuteafd.muse_tp import _ue8m0_scale
-from b12x.integration.cuteafd.pointwise import _mul
+from b12x.integration.cuteafd.pointwise import _add, _mul
 
 
 class ExpertReply:
@@ -118,6 +118,78 @@ class ExpertReply:
                         scale = _ue8m0_scale(code)
                         value = _mul(cvt_e4m3_to_f32_via_f16(Uint32(source[base + c])), scale)
                     out[Int64(row) * h + c] = BFloat16(value)
+
+
+class ExpertReplyReduce:
+    """Decode rank-local wire values, BF16-round each, then add in rank order."""
+
+    @cute.jit
+    def __call__(self, p0: cute.Pointer, p1: cute.Pointer, p2: cute.Pointer,
+                 p3: cute.Pointer, p4: cute.Pointer, p5: cute.Pointer,
+                 p6: cute.Pointer, p7: cute.Pointer, shared: cute.Pointer,
+                 out: cute.Pointer, mode: cute.Pointer, rows: Int32,
+                 width: Int32, ranks: Int32, has_shared: Int32,
+                 format: Int32, stream: cuda.CUstream):
+        if rows > Int32(0):
+            self.kernel((p0, p1, p2, p3, p4, p5, p6, p7), shared, out,
+                        mode, rows, width, ranks, has_shared, format).launch(
+                grid=(rows, (width + Int32(255)) // Int32(256), 1),
+                block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, planes: tuple, shared: cute.Pointer, out: cute.Pointer,
+               mode: cute.Pointer, rows: Int32, width: Int32, ranks: Int32,
+               has_shared: Int32, format: Int32):
+        row, slab, _ = cute.arch.block_idx()
+        lane = Int32(cute.arch.thread_idx()[0])
+        h = Int64(width)
+        shared, out, mode = (_view(p) for p in (shared, out, mode))
+        selected = format
+        if format < Int32(0):
+            selected = Int32(mode[0])
+        for j in cutlass.range_constexpr(2):
+            col = Int64(slab) * Int64(256) + Int64(lane) + Int64(j * 128)
+            if col < h:
+                total = Float32(0.0)
+                for rank in cutlass.range_constexpr(8):
+                    if ranks > Int32(rank):
+                        source = _view(planes[rank])
+                        value = Float32(0.0)
+                        if selected == Int32(0):
+                            bf16 = _view(cute.make_ptr(BFloat16, planes[rank].toint(),
+                                cute.AddressSpace.gmem, assumed_align=16))
+                            value = Float32(bf16[Int64(row) * h + col])
+                        elif selected == Int32(2):
+                            base = Int64(row) * (h // Int64(2) + h // Int64(16))
+                            packed = Uint32(source[base + col // Int64(2)])
+                            code = (packed >> (Uint32(col % Int64(2)) * Uint32(4))) & Uint32(15)
+                            scale = cvt_e4m3_to_f32_via_f16(Uint32(
+                                source[base + h // Int64(2) + col // Int64(16)]))
+                            value = Float32(BFloat16(_mul(decode_fp4(code), scale)))
+                        else:
+                            base = Int64(row) * (h + h // Int64(32))
+                            scale = _ue8m0_scale(Uint32(source[base + h + col // Int64(32)]))
+                            value = Float32(BFloat16(_mul(cvt_e4m3_to_f32_via_f16(
+                                Uint32(source[base + col])), scale)))
+                        # Rank zero initializes the accumulator, preserving signed zero.
+                        if cutlass.const_expr(rank == 0):
+                            total = value
+                        else:
+                            total = _add(total, value)
+                if has_shared != Int32(0):
+                    total = _add(total, Float32(shared[Int64(row) * h + col]))
+                out[Int64(row) * h + col] = BFloat16(total)
+
+
+def compile_expert_reply_reduce_aot():
+    return compile_program(ExpertReplyReduce(), name="expert_reply_reduce",
+        operands=tuple(Operand(f"p{rank}", torch.uint8, "[rows,wire]") for rank in range(8)) + (
+            Operand("shared", torch.bfloat16, "[rows,width]"),
+            Operand("out", torch.bfloat16, "[rows,width]", "out"),
+            Operand("mode", torch.uint32, "[1]", align=4)),
+        scalars=tuple(Scalar(n) for n in ("rows", "width", "ranks", "has_shared", "format")),
+        key=(), geometry=dict(max_ranks=8, fp8_block=32, nvfp4_block=16,
+                             rank_rounding="bf16", accumulation="ordered_fp32"))
 
 
 def compile_expert_reply_aot(*, quantize=False, stage=False):
