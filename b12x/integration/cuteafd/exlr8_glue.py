@@ -463,10 +463,34 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
              max_groups=max_groups, device_count=True, grouped=True, group_rows=16,
              grouped_rows=64, fc2_partials="f32")),
     ]
+    from .expert_reply import compile_exlr8_reply_aot
+    replies = [
+        ("a16_serving_core", "exlr8_a16", {"max_rows": 64},
+         lambda: compile_exlr8_a16_aot(swiglu_limit=swiglu_limit, hidden=hidden,
+             units=units, top_k=top_k, max_groups=max_groups, device_count=True,
+             serving_variant=DEFAULT_SERVING_VARIANT, core_only=True)),
+    ]
+    for format in (1, 2):
+        replies.append((f"reply_{format}", "exlr8_reply", {"max_rows": 64},
+            lambda f=format: compile_exlr8_reply_aot(hidden=hidden, units=units,
+                top_k=top_k, max_groups=max_groups, variant=DEFAULT_SERVING_VARIANT,
+                format=f)))
+    for format in (1, 2):
+        for activation in ("a16", "a8"):
+            replies.append((f"{activation}_grouped_reply{format}", "exlr8_a16", {"max_rows": 4096},
+                lambda f=format, a=activation: compile_exlr8_a16_aot(
+                    swiglu_limit=swiglu_limit, hidden=hidden, units=units, top_k=top_k,
+                    max_groups=(4096 * top_k + 63)//64 + experts, device_count=True,
+                    grouped=True, activations=a, reply_format=f)))
+        replies.append((f"a16_grouped64_reply{format}", "exlr8_a16", {"max_rows": 64},
+            lambda f=format: compile_exlr8_a16_aot(swiglu_limit=swiglu_limit,
+                hidden=hidden, units=units, top_k=top_k, max_groups=max_groups,
+                device_count=True, grouped=True, group_rows=16, grouped_rows=64,
+                fc2_partials="f32", reply_format=f)))
     if role == "spark":
-        return result[1:3] + grouped
+        return result[1:3] + grouped + replies
     if role == "coordinator":
         # RTX-onboarded experts use the same FP8K32 ingress and BF16 partial
         # contract as Spark experts; every grid is bounded by runtime cta_limit.
-        return result[1:] + grouped
-    return result + grouped
+        return result[1:] + grouped + replies
+    return result + grouped + replies

@@ -13,6 +13,9 @@ POINTERS = ("x", "pointers", "bits", "group_expert", "route_slots",
 ROUTED = ("a16_serving", "group", "a16_grouped", "a8_grouped", "grouped_group",
           "a16_grouped64")
 SHARED = ("shared_a16_serving", "shared_group")
+REPLIES = ("a16_serving_core", "reply_1", "reply_2", "a16_grouped_reply1",
+           "a8_grouped_reply1", "a16_grouped64_reply1", "a16_grouped_reply2",
+           "a8_grouped_reply2", "a16_grouped64_reply2")
 
 
 class _WithoutImports(ast.NodeTransformer):
@@ -34,7 +37,7 @@ def contract():
                  compile_program=lambda wrapper, **kw: SimpleNamespace(**kw), __doc__="contract")
     for name in ("_Exlr8Pointers", "_Exlr8ServingPointers", "_Exlr8GroupedServingPointers",
                  "_Exlr8CompactServingPointers"):
-        scope[name] = lambda g: None
+        scope[name] = lambda g: SimpleNamespace(core=SimpleNamespace())
     grouped = ast.parse((ROOT / "b12x/moe/_shared/kernels/w4a16/exlr8_grouped.py").read_text())
     cls = next(n for n in grouped.body if isinstance(n, ast.ClassDef) and n.name == "Exlr8GroupedKernel")
     ctas = next(n.value.value for n in cls.body if isinstance(n, ast.Assign)
@@ -58,6 +61,11 @@ def contract():
                 node.body = [n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"]
                 nodes.append(node)
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), scope)
+    reply_tree = ast.parse((INTEGRATION / "expert_reply.py").read_text())
+    reply_compile = next(n for n in reply_tree.body if isinstance(n, ast.FunctionDef)
+                         and n.name == "compile_exlr8_reply_aot")
+    scope["_Exlr8Reply"] = lambda *args: None
+    exec(compile(ast.Module(body=[reply_compile], type_ignores=[]), "reply_contract", "exec"), scope)
     scope["_GroupPrefill"] = scope["_Group"]
     return SimpleNamespace(**scope)
 
@@ -70,10 +78,11 @@ def test_role_inventory(contract):
     spark = programs(contract, "spark")
     coordinator = programs(contract, "coordinator")
     all_programs = programs(contract, "all")
-    assert tuple(spark) == ROUTED
-    assert set(coordinator) == set(ROUTED + SHARED)
+    assert tuple(spark) == ROUTED + REPLIES
+    assert set(coordinator) == set(ROUTED + SHARED + REPLIES)
     assert set(all_programs) == set(coordinator) | {"a16_decode"}
-    assert len(coordinator) == 8
+    assert len(coordinator) == 17
+    assert "reply_0" not in all_programs, "BF16 standalone epilogue is oracle-only"
     with pytest.raises(ValueError, match="role"):
         contract.exlr8_export_programs("rtx")
 
@@ -223,10 +232,14 @@ def test_swiglu_limit_is_static_and_covers_every_expert_program(contract, role):
     for name, program in default.items():
         assert program.key == explicit_zero[name].key
         assert program.geometry == explicit_zero[name].geometry
-        if "group" not in name or name.startswith(("a16_", "a8_")):
+        if name.startswith("reply_"):
+            # The epilogue has no activation; the core applies the clamp.
+            assert "swiglu_limit" not in flash[name].geometry
+        elif "group" not in name or name.startswith(("a16_", "a8_")):
             assert "swiglu_limit" not in program.geometry
             assert flash[name].geometry["swiglu_limit"] == 10
-            assert flash[name].key[-2:] == ("swiglu_limit", 10.0)
+            index = flash[name].key.index("swiglu_limit")
+            assert flash[name].key[index + 1] == 10.0
         else:
             assert "swiglu_limit" not in flash[name].geometry
 

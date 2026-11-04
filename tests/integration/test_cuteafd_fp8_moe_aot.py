@@ -65,6 +65,114 @@ def _program(g, route, capacity, wire, prefill="auto"):
     return _PROGRAMS[key]
 
 
+@pytest.mark.parametrize("route,wire,prefill,segmented,weight_kind", [
+    ("decode", True, "auto", False, "fp8"),
+    ("decode", False, "auto", False, "fp8"),
+    ("prefill", False, "w8a16", False, "fp8"),
+    ("stream", True, "w8a8", False, "fp8"),
+    ("stream", False, "w8a8", False, "fp8"),
+    ("stream", True, "w8a16", True, "fp8"),
+    ("auto", True, "auto", False, "fp8"),
+    ("stream", True, "auto", False, "mxfp4"),
+    ("stream", True, "auto", True, "mxfp4"),
+    ("stream", False, "auto", False, "nvfp4"),
+    ("decode", False, "auto", False, "bf16"),
+    ("prefill", False, "auto", False, "bf16"),
+])
+def test_core_reply_matches_opaque_bytes_and_graph(route, wire, prefill, segmented, weight_kind):
+    require_b12x()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.fp8_moe import (
+        Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_reply_layout)
+    from b12x.integration.cuteafd.expert_reply import compile_fp8_reply_aot
+    from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
+    from .test_cuteafd_nvfp4_moe_aot import _weights as nvfp4_weights
+    from .test_cuteafd_mxfp4_moe_aot import _weights as mxfp4_weights
+
+    h, capacity = 1024, 129
+    g = Fp8MoeGeometry("reply_" + weight_kind, hidden=h, experts=4, top_k=2,
+                      intermediate=512, weights=weight_kind,
+                      activations="a4" if weight_kind == "nvfp4" else "a16")
+    operands = (nvfp4_weights(g, g.slice) if weight_kind == "nvfp4" else
+                mxfp4_weights(g, g.slice) if weight_kind == "mxfp4" else _weights(g))
+    options = dict(route=route, max_rows=capacity, wire=wire, prefill=prefill,
+                   row_addresses=segmented)
+    opaque = compile_fp8_moe_aot(g, **options)
+    core = compile_fp8_moe_aot(g, core_only=True, **options)
+    assert core.scratch_bytes(capacity) == opaque.scratch_bytes(capacity)
+    epilogues = [compile_fp8_reply_aot(hidden=h, top_k=g.top_k, format=f,
+                                     row_addresses=segmented) for f in range(3)]
+    quantize, decode = compile_expert_reply_aot(quantize=True), compile_expert_reply_aot()
+    torch.manual_seed(1166)
+    x = torch.randn(capacity, h, device="cuda").bfloat16()
+    input_rows = wire_rows(x)[0] if wire else x
+    source = input_rows
+    if segmented:
+        # Keep owners live and use the same row-address input ABI as serving.
+        source = torch.tensor([input_rows[r].data_ptr() for r in range(capacity)],
+                              device="cuda", dtype=torch.int64)
+    ids = torch.rand(capacity, g.experts, device="cuda").topk(g.top_k, -1).indices.int()
+    ids[-1] = -1
+    weights = torch.rand(capacity, g.top_k, device="cuda") / g.top_k
+    baseline = torch.empty_like(x)
+    baseline_ptrs = torch.tensor([baseline[r].data_ptr() for r in range(capacity)],
+                                device="cuda", dtype=torch.int64) if segmented else baseline
+    scratch = torch.empty(core.scratch_bytes(capacity)["scratch"], device="cuda", dtype=torch.uint8)
+    unused = torch.full_like(baseline, -123)
+
+    for rows in (1, 17, 129):
+        layout = fp8_moe_reply_layout(g, rows=rows, **options)
+        positions = scratch[layout["pair_pos_offset"]:].view(torch.int32)
+        down = scratch[layout["y_offset"]:].view(torch.bfloat16)
+        for format, epilogue in enumerate(epilogues):
+            row_bytes = h * 2 if format == 0 else h + h // 32 if format == 1 else h // 2 + h // 16
+            canary = torch.full((capacity, row_bytes + 512), 0xA5, device="cuda", dtype=torch.uint8)
+            if segmented:
+                out = torch.tensor([canary[r, 256:].data_ptr() for r in range(capacity)],
+                                   device="cuda", dtype=torch.int64)
+            else:
+                canary = torch.full((capacity * row_bytes + 512,), 0xA5, device="cuda", dtype=torch.uint8)
+                out = canary[256:-256].view(capacity, row_bytes)
+            expected = torch.empty((capacity, row_bytes), device="cuda", dtype=torch.uint8)
+            restored, reference_restored = torch.empty_like(x), torch.empty_like(x)
+
+            def reference():
+                opaque.launch(source, ids, weights, *operands, baseline_ptrs, scratch, scalars=(rows,))
+                if format:
+                    quantize.launch(baseline, expected, None, scalars=(rows, h, format))
+                else:
+                    expected[:rows].copy_(baseline[:rows].view(torch.uint8))
+
+            def fused():
+                core.launch(source, ids, weights, *operands, unused, scratch, scalars=(rows,))
+                epilogue.launch(down, positions, weights, out, scalars=(rows,))
+
+            reference()
+            fused()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with kernel_resolution_guard("FP8 core+reply byte oracle"):
+                with torch.cuda.graph(graph):
+                    fused()
+                for factor in (1., 0.5, 0.):
+                    weights.mul_(factor)
+                    reference()
+                    canary.fill_(0xA5)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    actual = canary[:rows, 256:256 + row_bytes] if segmented else out[:rows]
+                    assert torch.equal(actual, expected[:rows]), (route, rows, format)
+                    assert (unused == -123).all(), "core-only wrote opaque output"
+                    if segmented:
+                        assert (canary[:, :256] == 0xA5).all() and (canary[:, -256:] == 0xA5).all()
+                    else:
+                        assert (canary[:256] == 0xA5).all() and (canary[-256:] == 0xA5).all()
+                    if format:
+                        decode.launch(actual.contiguous(), restored, None, scalars=(rows, h, format))
+                        decode.launch(expected, reference_restored, None, scalars=(rows, h, format))
+                        assert torch.equal(restored[:rows].view(torch.int16), reference_restored[:rows].view(torch.int16))
+
+
 def _quantizes_input(g, route, rows, wire, prefill):
     """Whether a BF16-input program runs these rows through its wire quantizer."""
     from b12x.integration.cuteafd.fp8_moe import auto_large_rows
