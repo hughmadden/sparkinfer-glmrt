@@ -97,3 +97,30 @@ def test_dsv4_padding_guards_dominate_state_accesses():
     assert "_state_store" in ast.unparse(guards[0])
     assert any(isinstance(node, ast.FunctionDef) and node.name == "_state_store"
                for node in compressor.body), "state helpers must remain module-level"
+
+
+def test_reply_benchmark_geometry_options(monkeypatch):
+    """CLI geometry validation is testable without importing CUDA or Torch."""
+    import argparse
+    import ast
+    import sys
+    import pytest
+
+    path = Path(__file__).resolve().parents[2] / "benchmarks/benchmark_expert_reply_sum.py"
+    tree = ast.parse(path.read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    calls = []
+    namespace = {"argparse": argparse, "__doc__": "test", "Path": Path, "run": calls.append}
+    exec(compile(ast.Module(body=[main], type_ignores=[]), str(path), "exec"), namespace)
+    monkeypatch.setattr(sys, "argv", [str(path)])
+    namespace["main"]()
+    assert (calls[-1].hidden, calls[-1].topk, calls[-1].experts) == (6144, 8, 256)
+    monkeypatch.setattr(sys, "argv", [str(path), "--hidden", "3584", "--topk", "16", "--experts", "896"])
+    namespace["main"]()
+    assert (calls[-1].hidden, calls[-1].topk, calls[-1].experts) == (3584, 16, 896)
+    for flags in (["--hidden", "0"], ["--hidden", "129"], ["--topk", "0"],
+                  ["--topk", "257"], ["--experts", "0"]):
+        monkeypatch.setattr(sys, "argv", [str(path), *flags])
+        with pytest.raises(SystemExit) as error:
+            namespace["main"]()
+        assert error.value.code == 2

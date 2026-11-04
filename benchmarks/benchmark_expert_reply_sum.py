@@ -79,7 +79,7 @@ def run(args):
     scrub = torch.empty(scrub_bytes, device="cuda", dtype=torch.uint8) if scrub_bytes else None
     clocks_before = clock_snapshot()
     torch.manual_seed(args.seed)
-    width, topk, experts, capacity = 6144, 8, 256, max(args.rows)
+    width, topk, experts, capacity = args.hidden, args.topk, args.experts, max(args.rows)
     options = dict(m=capacity, topk=topk, hidden_size=width,
                    element_dtype="fp16", full_rotation=True,
                    full_rotation_output_dtype="bf16", num_experts=experts,
@@ -94,7 +94,7 @@ def run(args):
             raise ValueError("candidate must be MODULE:FACTORY")
         factory = getattr(importlib.import_module(module), symbol)
     candidates = {fmt: factory(**options, reply_format=fmt) for fmt in args.formats} if factory else {}
-    # Random top-k without repeats across all 256 real experts, not hot routes.
+    # Random distinct top-k across the configured expert pool, not hot routes.
     ids = torch.rand(capacity, experts, device="cuda").argsort(-1)[:, :topk].int().contiguous()
     expert_map = torch.randperm(experts, device="cuda", dtype=torch.int32)
     weights = torch.softmax(torch.randn(capacity, topk, device="cuda"), -1)
@@ -125,7 +125,7 @@ def run(args):
         for _ in range(args.warmup):
             sum_graph.replay()
         sum_ms = elapsed(sum_graph, args.iterations, scrub)
-        if rows >= 2663 and sum_ms < 0.3:
+        if (width, topk, experts) == (6144, 8, 256) and rows >= 2663 and sum_ms < 0.3:
             raise RuntimeError(f"invalid sum capture timing: {sum_ms:.6f} ms at {rows}x{width}; expected >=0.3 ms")
         for fmt in args.formats:
             stride = width + width // 32 if fmt == 1 else width // 2 + width // 16
@@ -217,6 +217,9 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", help="MODULE:FACTORY; omit to measure the unchanged oracle")
+    parser.add_argument("--hidden", type=int, default=6144)
+    parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument("--experts", type=int, default=256)
     parser.add_argument("--rows", nargs="+", type=int, default=[2752, 2663])
     parser.add_argument("--formats", nargs="+", type=int, choices=[1, 2], default=[1, 2])
     parser.add_argument("--seed", type=int, default=1166)
@@ -230,6 +233,8 @@ def main():
     args = parser.parse_args()
     if min(args.rows + [args.warmup, args.iterations, args.rounds]) < 1 or min(args.rows) < 4:
         parser.error("positive counts and at least four rows required")
+    if args.hidden <= 0 or args.hidden % 128 or not 0 < args.topk <= args.experts:
+        parser.error("hidden must be a positive multiple of 128 and 0 < topk <= experts")
     run(args)
 
 
