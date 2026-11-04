@@ -138,12 +138,12 @@ def run(args):
                 torch.cuda.synchronize()
                 assert torch.equal(actual, expected), "captured candidate differs"
                 assert bool((guarded[:256] == 0x5A).all() and (guarded[-256:] == 0x5A).all()), "candidate overwrote canary"
-                fc2[3 * topk:4 * topk].mul_(-.5)
+                fc2[3 * topk:4 * topk].neg_()
                 graph_base.replay()
                 graph_candidate.replay()
                 torch.cuda.synchronize()
                 assert torch.equal(actual, expected), "candidate ignores changed route values"
-                fc2[3 * topk:4 * topk].mul_(-2)
+                fc2[3 * topk:4 * topk].neg_()
                 graph_base.replay()
                 graph_candidate.replay()
                 torch.cuda.synchronize()
