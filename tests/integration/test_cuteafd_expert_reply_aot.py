@@ -71,11 +71,104 @@ def mismatch_details(x, actual, expected, format):
 
 
 @pytest.fixture(scope="module")
+def reduction():
+    require_b12x()
+    from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_reduce_aot
+    return compile_expert_reply_reduce_aot()
+
+
+@pytest.fixture(scope="module")
 def programs():
     require_b12x()
     from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
     return (compile_expert_reply_aot(quantize=True),
             compile_expert_reply_aot(stage=True), compile_expert_reply_aot())
+
+
+@pytest.mark.parametrize("width", [32, 160, 4096, 5120, 7168])
+@pytest.mark.parametrize("ranks", range(1, 9))
+@pytest.mark.parametrize("has_shared", [False, True])
+def test_fused_reply_reduce_rank_rounding_and_dynamic_graph(programs, reduction, width, ranks, has_shared):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    quantize, stage, decode = programs
+    rows = 65 if width < 4096 else 3
+    torch.manual_seed(width + ranks)
+    inputs = [(torch.randn(rows, width, device="cuda") * (2. ** (rank % 5 - 2))).bfloat16()
+              for rank in range(ranks)]
+    for x in inputs:
+        x[0] = -0.0
+        x[-1, ::32] *= 1e-5
+    shared = torch.randn_like(inputs[0]) if has_shared else None
+    planes = [torch.full((rows * width * 2 + 512,), 0xA5, device="cuda", dtype=torch.uint8)
+              for _ in range(ranks)]
+    views = [p[256:-256] for p in planes]
+    guarded = torch.full_like(planes[0], 0x5A)
+    output = guarded[256:-256].view(torch.bfloat16).view(rows, width)
+    decoded = [torch.empty_like(x) for x in inputs]
+    scratch = torch.empty((rows, width + width // 32), device="cuda", dtype=torch.uint8)
+    mode = torch.zeros(1, device="cuda", dtype=torch.uint32)
+    pointers = views + [None] * (8 - ranks)
+    import os
+    import ctypes as C
+    native_path = os.environ.get("CUTEAFD_NATIVE_LIBRARY")
+    native = C.CDLL(native_path) if native_path and width == 5120 else None
+    native_output = torch.empty_like(output) if native else None
+    if native:
+        native.cuteafd_set_expert_hidden.argtypes = [C.c_uint32]
+        native.cuteafd_set_expert_hidden.restype = C.c_int32
+        assert native.cuteafd_set_expert_hidden(width) == 0
+        native_reduce = native.cuteafd_reduce_compact_bf16_eight_planes_async
+        native_reduce.argtypes = [C.POINTER(C.c_void_p), C.c_void_p, C.c_void_p,
+                                 C.c_uint32, C.c_uint32, C.c_void_p]
+        native_reduce.restype = C.c_int32
+
+    def oracle(format):
+        mode.fill_(format)
+        for x, plane, restored in zip(inputs, views, decoded):
+            if format == 0:
+                plane.copy_(x.view(torch.uint8).flatten())
+                restored.copy_(x)
+            else:
+                quantize.launch(x, plane, mode, scalars=(rows, width, format))
+                stage.launch(plane, scratch, mode, scalars=(rows, width, -1))
+                decode.launch(scratch, restored, mode, scalars=(rows, width, -1))
+        expected = decoded[0].float()
+        for restored in decoded[1:]:
+            expected = expected + restored.float()
+        if has_shared:
+            expected = expected + shared.float()
+        expected = expected.bfloat16()
+        if native:
+            addresses = (C.c_void_p * 8)(*[x.data_ptr() for x in decoded], *([None] * (8 - ranks)))
+            assert native_reduce(addresses, shared.data_ptr() if has_shared else None,
+                native_output.data_ptr(), rows, ranks, torch.cuda.current_stream().cuda_stream) == 0
+            assert torch.equal(native_output.view(torch.int16), expected.view(torch.int16))
+            expected = native_output
+        return expected
+
+    # One compiled callable and graph handles both formats, BF16 fallback,
+    # and changed inputs; packed planes remain immutable throughout reduction.
+    with kernel_resolution_guard("test_fused_reply_reduce"):
+        expected = oracle(1)
+        reduction.launch(*pointers, shared, output, mode,
+                         scalars=(rows, width, ranks, int(has_shared), -1))
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            reduction.launch(*pointers, shared, output, mode,
+                             scalars=(rows, width, ranks, int(has_shared), -1))
+        for iteration, format in enumerate([1, 2, 0, 2, 1]):
+            for x in inputs:
+                x[1:].mul_(0.5 if iteration % 2 else -2.)
+            expected = oracle(format)
+            before = [p.clone() for p in planes]
+            guarded.fill_(0x5A)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(output.view(torch.int16), expected.view(torch.int16)), (width, ranks, format)
+            assert (guarded[:256] == 0x5A).all() and (guarded[-256:] == 0x5A).all()
+            assert all(torch.equal(p, snapshot) for p, snapshot in zip(planes, before))
+            assert all((p[:256] == 0xA5).all() and (p[-256:] == 0xA5).all() for p in planes)
 
 
 def test_fp8_reference_exact_power_of_two_boundary(programs):
