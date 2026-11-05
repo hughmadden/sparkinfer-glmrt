@@ -550,7 +550,7 @@ class _ContextPartial:
         self.forward = DenseMlaForwardKernel(
             layout=self.smem, page_size=g.page_rows, num_heads=heads,
             num_splits=splits, chunks_per_split=self.chunks_per_split,
-            query_tile=1, fp8=False, qk_dim=576, value_dim=512,
+            query_tile=1, fp8=False, qk_dim=576, value_dim=512, window_size=None,
             ds_mla_record=g.kv_cache == "fp8")
         self.merge = _PartialMerge(heads, splits)
 
