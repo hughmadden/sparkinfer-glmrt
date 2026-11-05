@@ -538,3 +538,154 @@ def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=
              smem.math_warps_per_query),
         scratch={"scratch": lambda rows: attention_layout(g, rows, max_context=max_context, mode=mode)["scratch_bytes"]},
         geometry={**vars(g), **layout, "mode": mode, "max_context": max_context})
+
+
+def kimi_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> int:
+    """Choose a launch scalar before capture, never a compilation/cache key."""
+    if owned_pages < 0 or rows <= 0 or sm_count <= 0:
+        raise ValueError("invalid Kimi context split work/device geometry")
+    # Six h8 tiles per row. Fill a device wave, but avoid splitting a short
+    # stream into less than eight pages per CTA just to fill idle SMs.
+    wave = (sm_count + rows * 6 - 1) // (rows * 6)
+    work = (owned_pages + 7) // 8
+    traversal = (owned_pages + 63) // 64
+    wanted = max(2, min(16, max(wave, traversal), work))
+    return next(bucket for bucket in (2, 4, 8, 16) if bucket >= wanted)
+
+
+class _ContextPartialMerge:
+    def __init__(self, heads, splits):
+        self.heads, self.splits = heads, splits
+
+    @cute.jit
+    def __call__(self, partial: cute.Tensor, partial_lse: cute.Tensor,
+                 out: cute.Pointer, lse: cute.Pointer, rows: Int32,
+                 active_splits: Int32, stream: cuda.CUstream):
+        self.kernel(partial, partial_lse, out, lse, active_splits).launch(
+            grid=(rows, self.heads, 1), block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, partial: cute.Tensor, partial_lse: cute.Tensor,
+               out: cute.Pointer, lse: cute.Pointer, active_splits: Int32):
+        row, head, _ = cute.arch.block_idx()
+        tid = Int32(cute.arch.thread_idx()[0])
+        weights = cute.make_rmem_tensor((self.splits,), Float32)
+        m = Float32(float("-inf"))
+        for s in cutlass.range_constexpr(self.splits):
+            weights[s] = Float32(float("-inf"))
+            if Int32(s) < active_splits:
+                weights[s] = Float32(partial_lse[row, head, s])
+            m = cute.math.max(m, weights[s])
+        d = Float32(0)
+        for s in cutlass.range_constexpr(self.splits):
+            w = Float32(0)
+            if weights[s] > Float32(float("-inf")):
+                w = cute.math.exp2(weights[s] - m, fastmath=True)
+            weights[s] = w
+            d += w
+        inv = Float32(0)
+        if d > Float32(0):
+            inv = cute.arch.rcp_approx(d)
+        for s in cutlass.range_constexpr(self.splits):
+            weights[s] *= inv
+        for part in cutlass.range_constexpr(4):
+            dim = tid + Int32(part * 128)
+            value = Float32(0)
+            for s in cutlass.range_constexpr(self.splits):
+                if weights[s] > Float32(0):
+                    value += weights[s] * Float32(partial[row, head, s, dim])
+            out[(Int64(row) * Int64(self.heads) + Int64(head)) * Int64(512) + Int64(dim)] = value.to(BFloat16)
+        if tid == Int32(0):
+            if d > Float32(0):
+                m += cute.math.log2(d, fastmath=True)
+            lse[Int64(row) * Int64(self.heads) + Int64(head)] = m
+
+
+class _ContextPartial:
+    def __init__(self, g, max_rows, max_context, begin, heads, splits):
+        self.g, self.begin, self.heads, self.splits = g, begin, heads, splits
+        self.smem = dense_mla_layout(g, max_rows, mode="decode")
+        chunks = (max_context + self.smem.candidates_per_chunk - 1) // self.smem.candidates_per_chunk
+        self.chunks_per_split = (chunks + splits - 1) // splits
+        self.forward = DenseMlaForwardKernel(
+            layout=self.smem, page_size=g.page_rows, num_heads=heads,
+            num_splits=splits, chunks_per_split=self.chunks_per_split,
+            query_tile=1, fp8=False, qk_dim=576, value_dim=512, window_size=None,
+            ds_mla_record=g.kv_cache == "fp8", dynamic_split_chunks=True)
+        self.merge = _ContextPartialMerge(heads, splits)
+
+    def scratch_bytes(self, rows):
+        n = int(rows) * self.heads * self.splits
+        return _align(n * 512 * 2) + n * 4
+
+    @cute.jit
+    def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
+                 cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
+                 lse: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
+        g, h, s = self.g, self.heads, self.splits
+        q = cute.make_tensor(cute.recast_ptr(query + Int64(self.begin * 576), dtype=cutlass.Uint8),
+                             cute.make_layout((1,)))
+        kv = cute.make_tensor(cute.recast_ptr(kv_cache, dtype=cutlass.Uint8), cute.make_layout((1,)))
+        table = cute.make_tensor(page_table, cute.make_layout((Int64(rows) * page_table_width,)))
+        lengths = cute.make_tensor(cache_seqlens, cute.make_layout((rows,)))
+        cu = cute.make_tensor(cu_seqlens_q, cute.make_layout((rows + Int32(1),)))
+        out = cute.make_tensor(attn, cute.make_layout((rows, h, 512), stride=(h * 512, 512, 1)))
+        lo = cute.make_tensor(lse, cute.make_layout((rows, h), stride=(h, 1)))
+        po = cute.make_tensor(cute.recast_ptr(scratch, dtype=BFloat16),
+            cute.make_layout((rows, h, s, 512), stride=(h * s * 512, s * 512, 512, 1)))
+        pl_ptr = cute.make_ptr(Float32,
+            Int64(scratch.toint()) + _offset(Int64(rows) * Int64(h * s * 512 * 2)),
+            cute.AddressSpace.gmem, assumed_align=16)
+        pl = cute.make_tensor(pl_ptr, cute.make_layout((rows, h, s), stride=(h * s, s, 1)))
+        # Always take the split-output branch: its LSE is base2. The ordinary
+        # dense final/merge ABI emits natural logs and cannot go on this wire.
+        self.forward(q, kv, table, lengths, cu, out, lo, po, pl, lo, lo,
+            Float32(g.softmax_scale * math.log2(math.e)), Int64(g.heads * 576 * 2), Int64(576 * 2),
+            Int64(g.page_rows * g.record_bytes), Int64(g.record_bytes), page_table_width,
+            rows, rows, active_splits, stream)
+        self.merge(po, pl, attn, lse, rows, active_splits, stream)
+
+
+def compile_kimi_mla_partial_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=1048576,
+                               head_begin=0, head_count=48, num_splits=16):
+    """Owned-page Kimi decode/verify: normalized BF16 partial and base2 FP32 LSE.
+
+    Query rows retain the full h96 stride; output is compact h48. Each row is
+    one already-causal request: cu_seqlens_q must be [0,1,...,rows], lengths
+    count only its owner's live tokens, and page_table contains compact local
+    physical page IDs. All rows execute in one forward grid plus one merge.
+    Empty shards emit zero and -inf without reading poisoned split vectors.
+    num_splits is the fixed scratch capacity (16). active_splits is a runtime
+    scalar in 2..16, chosen from live work/device SM count before graph capture.
+    This is not the gathered, multi-query-tiled prefill route.
+    """
+    if type(g) is not KimiMlaGeometry or g.heads != 96:
+        raise ValueError("Kimi context partial requires the h96 target geometry")
+    if not 1 <= max_rows <= 4096 or not 1 <= max_context <= 1048576:
+        raise ValueError("invalid planned row or owned-context capacity")
+    if head_begin not in (0, 48) or head_count != 48:
+        raise ValueError("Kimi context partial requires an aligned h48 range")
+    if num_splits != 16:
+        raise ValueError("Kimi context partial requires capacity for 16 splits")
+    launch = _ContextPartial(g, max_rows, max_context, head_begin, head_count, num_splits)
+    operands = (
+        Operand("query", torch.bfloat16, "[rows,96,576]"),
+        Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
+                "[pages,64,656]" if g.kv_cache == "fp8" else "[pages,64,576]"),
+        Operand("page_table", torch.int32, "[rows,page_table_width]", align=4),
+        Operand("cache_seqlens", torch.int32, "[rows]", align=4),
+        Operand("cu_seqlens_q", torch.int32, "[rows+1]", align=4),
+        Operand("attn", torch.bfloat16, "[rows,48,512]", "out"),
+        Operand("lse", torch.float32, "[rows,48]", "out", align=4),
+        Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"))
+    return compile_program(launch, name="kimi_mla_partial", operands=operands,
+        scalars=(Scalar("rows"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
+        key=(g, max_rows, max_context, head_begin, head_count, num_splits,
+             launch.smem.query_tile, launch.smem.kv_stages, launch.smem.heads_per_tile,
+             launch.smem.candidates_per_chunk, launch.smem.math_warps_per_query,
+             "base2"), scratch={"scratch": launch.scratch_bytes},
+        geometry={**vars(g), "head_begin": head_begin, "head_count": head_count,
+                  "max_rows": max_rows, "max_context": max_context,
+                  "num_splits": num_splits, "runtime_splits": True,
+                  "lse_base": 2}, doc=compile_kimi_mla_partial_aot.__doc__)
