@@ -11,17 +11,18 @@ from ..conftest import require_b12x
 
 
 @lru_cache(None)
-def programs(cache, begin, device_splits=False):
+def programs(cache, begin, device_splits=False, heads_per_tile=16):
     require_b12x()
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_mla_partial_aot
     with exportable_compilation():
         p = compile_kimi_mla_partial_aot(KimiMlaGeometry(kv_cache=cache), max_rows=16,
-                                       max_context=1024, head_begin=begin, device_splits=device_splits)
+                                       max_context=1024, head_begin=begin, device_splits=device_splits,
+                                       heads_per_tile=heads_per_tile)
     if os.environ.get("K1_EXPORT_DIR"):
         target = Path(os.environ["K1_EXPORT_DIR"])
         target.mkdir(parents=True, exist_ok=True)
-        stem = f"kimi_context_{cache}_h{begin}" + ("_device" if device_splits else "")
+        stem = f"kimi_context_{cache}_h{begin}_t{heads_per_tile}" + ("_device" if device_splits else "")
         p.export_to_c(str(target), stem, stem)
         validate_exported_header(p, target / f"{stem}.h", stem)
     return p
@@ -232,10 +233,12 @@ def test_high_pages_graph_and_frozen_resolution(cache):
 
 @pytest.mark.parametrize("cache", ["bf16", "fp8"])
 @pytest.mark.parametrize("begin", [0, 48])
-def test_device_splits_scalar_oracle_and_replay(cache, begin):
+@pytest.mark.parametrize("heads_per_tile", [8, 16])
+def test_device_splits_scalar_oracle_and_replay(cache, begin, heads_per_tile):
     require_b12x()
     from b12x._lib.runtime_control import kernel_resolution_guard
-    scalar, device = programs(cache, begin), programs(cache, begin, True)
+    scalar = programs(cache, begin, heads_per_tile=heads_per_tile)
+    device = programs(cache, begin, True, heads_per_tile=heads_per_tile)
     for rows in (1, 8, 16):
         pool, _ = records(cache, 1024)
         pool = pool.reshape(16, 64, -1)
