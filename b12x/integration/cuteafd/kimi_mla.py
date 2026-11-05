@@ -20,7 +20,7 @@ from b12x._lib.intrinsics import cvt_f32x4_to_e4m3x4, div_rn_f32, fabs_f32, fmax
 import torch
 
 from b12x.attention.dense_mla._forward import DenseMlaForwardKernel
-from b12x.attention.dense_mla._layout import choose_layout
+from b12x.attention.dense_mla._layout import choose_layout, make_smem_layout
 from b12x.attention.dense_mla._merge import DenseMlaMergeKernel
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import BatchedBf16Gemm, _bf16, _block_sum, _fp8_scale, _reduction_storage, _rsqrt, _warp_max, glm_projection
@@ -540,6 +540,16 @@ def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=
         geometry={**vars(g), **layout, "mode": mode, "max_context": max_context})
 
 
+KIMI_CONTEXT_H16_MIN_ROWS = 4
+
+
+def kimi_context_heads_per_tile(*, rows: int) -> int:
+    """Choose the compiled partial head tile for a graph row bucket before capture."""
+    if rows <= 0:
+        raise ValueError("invalid Kimi context row count")
+    return 8 if rows < KIMI_CONTEXT_H16_MIN_ROWS else 16
+
+
 def kimi_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> int:
     """Choose a launch scalar before capture, never a compilation/cache key."""
     if owned_pages < 0 or rows <= 0 or sm_count <= 0:
@@ -605,10 +615,11 @@ class _ContextPartialMerge:
 
 
 class _ContextPartial:
-    def __init__(self, g, max_rows, max_context, begin, heads, splits, device_splits=False):
+    def __init__(self, g, max_rows, max_context, begin, heads, splits,
+                 device_splits=False, heads_per_tile=16):
         self.g, self.begin, self.heads, self.splits = g, begin, heads, splits
         self.device_splits = device_splits
-        self.smem = dense_mla_layout(g, max_rows, mode="decode")
+        self.smem = make_smem_layout(query_tile=1, fp8=False, heads_per_tile=heads_per_tile)
         chunks = (max_context + self.smem.candidates_per_chunk - 1) // self.smem.candidates_per_chunk
         self.chunks_per_split = (chunks + splits - 1) // splits
         self.forward = DenseMlaForwardKernel(
@@ -665,7 +676,8 @@ class _ContextPartialDevice:
 
 
 def compile_kimi_mla_partial_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=1048576,
-                               head_begin=0, head_count=48, num_splits=16, device_splits=False):
+                               head_begin=0, head_count=48, num_splits=16,
+                               device_splits=False, heads_per_tile=16):
     """Owned-page Kimi decode/verify: normalized BF16 partial and base2 FP32 LSE.
 
     Query rows retain the full h96 stride; output is compact h48. Each row is
@@ -685,7 +697,10 @@ def compile_kimi_mla_partial_aot(g=KimiMlaGeometry(), *, max_rows=64, max_contex
         raise ValueError("Kimi context partial requires an aligned h48 range")
     if num_splits != 16:
         raise ValueError("Kimi context partial requires capacity for 16 splits")
-    launch = _ContextPartial(g, max_rows, max_context, head_begin, head_count, num_splits, device_splits)
+    if heads_per_tile not in (8, 16):
+        raise ValueError("Kimi context partial requires an 8- or 16-head tile")
+    launch = _ContextPartial(g, max_rows, max_context, head_begin, head_count, num_splits,
+                             device_splits, heads_per_tile)
     operands = (
         Operand("query", torch.bfloat16, "[rows,96,576]"),
         Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
@@ -707,6 +722,7 @@ def compile_kimi_mla_partial_aot(g=KimiMlaGeometry(), *, max_rows=64, max_contex
              launch.smem.candidates_per_chunk, launch.smem.math_warps_per_query,
              "base2", device_splits), scratch={"scratch": launch.scratch_bytes},
         geometry={**vars(g), "head_begin": head_begin, "head_count": head_count,
+                  "heads_per_tile": launch.smem.heads_per_tile,
                   "max_rows": max_rows, "max_context": max_context,
                   "num_splits": num_splits, "runtime_splits": True,
                   "device_splits": device_splits, "fixed_split_grid": num_splits if device_splits else 0,

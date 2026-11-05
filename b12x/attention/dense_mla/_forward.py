@@ -10,9 +10,13 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
-from b12x._lib.intrinsics import shared_ptr_to_u32
+from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
 
-from ._io import issue_dense_page_gather, issue_ds_mla_page_gather
+from ._io import (
+    issue_dense_page_gather,
+    issue_ds_mla_page_gather,
+    issue_ds_mla_page_gather_pipelined,
+)
 from ._layout import (
     SmemLayout,
     get_shared_storage_cls,
@@ -111,7 +115,9 @@ class DenseMlaForwardKernel:
         self.math_warps = self.math_warps_per_query * self.query_tile
         self.math_threads = self.math_warps * 32
         self.group_threads = self.math_warps_per_query * 32
-        self.block_threads = self.math_threads + 32
+        self.io_warps = 4 if self.ds_mla_record else 1
+        self.io_threads = self.io_warps * 32
+        self.block_threads = self.math_threads + self.io_threads
         self.value_tiles = self.value_dim // (16 * self.math_warps_per_query)
         self.accumulator_slots = (
             4 * self.value_tiles * self.head_tiles_per_row
@@ -606,40 +612,65 @@ class DenseMlaForwardKernel:
         if tid == Int32(0):
             for stage in cutlass.range_constexpr(self.kv_stages):
                 # Bulk copies complete on their byte total and one arrival;
-                # compact records publish synchronous stores from all 32 lanes.
-                cute.arch.mbarrier_init(mbar_base + stage, Int32(32 if self.ds_mla_record else 1))
+                # compact records publish synchronous stores from all producer lanes.
+                cute.arch.mbarrier_init(
+                    mbar_base + stage,
+                    Int32(self.io_threads if self.ds_mla_record else 1),
+                )
                 cute.arch.mbarrier_init(
                     mbar_base + Int32(self.kv_stages + stage),
                     Int32(self.query_tile),
                 )
         cute.arch.barrier()
 
-        if warp == Int32(self.math_warps):
+        if warp >= Int32(self.math_warps):
+            io_warp = warp - Int32(self.math_warps)
             io_lane = lane
             producer_phase = Int32(1)
             producer_index = Int32(0)
             kv_buffer_bytes = Int32(
                 self.candidates_per_chunk * self.layout.record_stride_bytes
             )
+            row_table_offset = Int64(0)
+            zero_source = Int64(0)
+            if cutlass.const_expr(self.ds_mla_record):
+                row_table_offset = request.to(Int64) * page_table_stride
+                zero_physical = Int32(page_table[row_table_offset])
+                zero_source = get_ptr_as_int64(
+                    cache_bytes, zero_physical.to(Int64) * page_stride_bytes
+                )
             for local_chunk in cutlass.range(active_chunks, unroll=1):
                 chunk = split_first_chunk + Int32(local_chunk)
                 token_begin = chunk * Int32(self.candidates_per_chunk)
                 buffer = Int32(0)
                 if cutlass.const_expr(self.kv_stages > 1):
                     buffer = Int32(local_chunk) % Int32(self.kv_stages)
-                cute.arch.mbarrier_wait(
-                    mbar_base + Int32(self.kv_stages) + producer_index,
-                    phase=producer_phase,
-                )
                 if cutlass.const_expr(self.ds_mla_record):
-                    issue_ds_mla_page_gather(
-                        cache_bytes, page_table, kv_smem_addr + buffer * kv_buffer_bytes,
-                        mbar_base + buffer, request, token_begin, cache_length, io_lane,
-                        page_stride_bytes, cache_record_stride_bytes, page_table_stride,
-                        page_size=self.page_size, record_stride_bytes=self.layout.record_stride_bytes,
+                    issue_ds_mla_page_gather_pipelined(
+                        cache_bytes,
+                        page_table,
+                        kv_smem_addr + buffer * kv_buffer_bytes,
+                        mbar_base + Int32(self.kv_stages) + producer_index,
+                        producer_phase,
+                        mbar_base + buffer,
+                        row_table_offset,
+                        zero_source,
+                        token_begin,
+                        cache_length,
+                        io_warp,
+                        io_lane,
+                        page_stride_bytes,
+                        cache_record_stride_bytes,
+                        page_size=self.page_size,
+                        record_stride_bytes=self.layout.record_stride_bytes,
                         candidates_per_chunk=self.candidates_per_chunk,
+                        io_warps=self.io_warps,
                     )
                 else:
+                    cute.arch.mbarrier_wait(
+                        mbar_base + Int32(self.kv_stages) + producer_index,
+                        phase=producer_phase,
+                    )
                     issue_dense_page_gather(
                         cache_bytes,
                         page_table,

@@ -55,7 +55,13 @@ def main():
             or max(args.rows) > 64 or any(x < 2 or x > 16 for x in args.splits)
             or args.iters <= 0):
         parser.error("positive page-aligned owned contexts <=524288, rows <=64 and splits 2..16 required")
-    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_dense_mla_aot, compile_kimi_mla_partial_aot, kimi_context_split_plan
+    from b12x.integration.cuteafd.kimi_mla import (
+        KimiMlaGeometry,
+        compile_kimi_dense_mla_aot,
+        compile_kimi_mla_partial_aot,
+        kimi_context_heads_per_tile,
+        kimi_context_split_plan,
+    )
     from b12x.integration.cuteafd.context_split import compile_lse_combine2_aot
     from b12x._lib.runtime_control import kernel_resolution_guard
     torch.manual_seed(42)
@@ -68,8 +74,11 @@ def main():
     pool[..., :512] = torch.randint(0, 16, (pages, 64, 512), device="cuda", dtype=torch.uint8)
     pool[..., 512:528] = torch.ones((pages, 64, 4), device="cuda").contiguous().view(torch.uint8)
     full = compile_kimi_dense_mla_aot(g, max_rows=max_rows, max_context=2*capacity)
-    pair = [compile_kimi_mla_partial_aot(g, max_rows=max_rows, max_context=capacity,
-            head_begin=begin) for begin in (0, 48)]
+    pairs = {
+        tile: [compile_kimi_mla_partial_aot(g, max_rows=max_rows, max_context=capacity,
+               head_begin=begin, heads_per_tile=tile) for begin in (0, 48)]
+        for tile in (8, 16)
+    }
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     combine = compile_lse_combine2_aot(heads=48)
     q = (torch.randn((max_rows, 96, 576), device="cuda") * .25).bfloat16()
@@ -78,7 +87,7 @@ def main():
     scratch = torch.empty(full.scratch_bytes(max_rows)["scratch"], device="cuda", dtype=torch.uint8)
     po = [torch.empty((max_rows, 48, 512), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
     pl = [torch.empty((max_rows, 48), device="cuda") for _ in range(2)]
-    ps = torch.empty(pair[0].scratch_bytes(max_rows)["scratch"],
+    ps = torch.empty(pairs[16][0].scratch_bytes(max_rows)["scratch"],
                      device="cuda", dtype=torch.uint8)
     co = torch.empty_like(po[0])
     cu = torch.arange(max_rows+1, device="cuda", dtype=torch.int32)
@@ -98,6 +107,7 @@ def main():
             torch.cuda.synchronize()
             with kernel_resolution_guard("Kimi context layers screen"):
                 base = timed(layers, args.iters)
+            pair = pairs[kimi_context_heads_per_tile(rows=rows)]
             planned = kimi_context_split_plan(owned_pages=count, rows=rows, sm_count=sm_count)
             for policy, splits in [("work_sm_rule", planned)] + [("fixed_diagnostic", s) for s in args.splits]:
                 def context():
