@@ -192,7 +192,7 @@ def test_split_plan_uses_live_work_and_device_width():
     assert kimi_context_split_plan(owned_pages=128, rows=1, sm_count=48) == 8
     for pages in (0, 1, 16, 128, 1024, 4096):
         for rows in (1, 16, 64):
-            assert 2 <= kimi_context_split_plan(owned_pages=pages, rows=rows, sm_count=170) <= 16
+            assert kimi_context_split_plan(owned_pages=pages, rows=rows, sm_count=170) in (2, 4, 8, 16)
 
 
 @pytest.mark.parametrize("cache", ["bf16", "fp8"])

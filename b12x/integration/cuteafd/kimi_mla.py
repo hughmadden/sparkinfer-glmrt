@@ -549,7 +549,8 @@ def kimi_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> in
     wave = (sm_count + rows * 6 - 1) // (rows * 6)
     work = (owned_pages + 7) // 8
     traversal = (owned_pages + 63) // 64
-    return max(2, min(16, max(wave, traversal), work))
+    wanted = max(2, min(16, max(wave, traversal), work))
+    return next(bucket for bucket in (2, 4, 8, 16) if bucket >= wanted)
 
 
 class _ContextPartialMerge:
