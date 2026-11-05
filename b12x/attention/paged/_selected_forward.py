@@ -217,9 +217,15 @@ class _SelectedPositionPagedForwardKernel:
         self.shared_cache_strides = tuple(map(int, key_strides)) == tuple(
             map(int, value_strides)
         )
-        self.qk_warps = 1 if self.heads_per_kv <= 16 else 2
+        self.slot_m = (
+            8
+            if self.heads_per_kv <= 8
+            else (16 if self.heads_per_kv <= 16 else 32)
+        )
+        self.qk_warps = 2
         self.pv_warps = self.qk_warps * 4
         self.tile_m = self.qk_warps * 16
+        self.rows_per_cta = self.tile_m // self.slot_m
         self.threads = self.pv_warps * 32
 
     def _tiled_mma_qk(self) -> cute.TiledMma:
@@ -369,6 +375,9 @@ class _SelectedPositionPagedForwardKernel:
         )
         tiled_mma_qk = self._tiled_mma_qk()
         tiled_mma_pv = self._tiled_mma_pv()
+        row_groups = (rows + Int32(self.rows_per_cta - 1)) // Int32(
+            self.rows_per_cta
+        )
         self.kernel(
             query,
             key_cache,
@@ -386,6 +395,7 @@ class _SelectedPositionPagedForwardKernel:
             table_batch,
             table_width,
             softmax_scale,
+            rows,
             splits,
             query_layout,
             key_layout,
@@ -394,7 +404,7 @@ class _SelectedPositionPagedForwardKernel:
             tiled_mma_qk,
             tiled_mma_pv,
         ).launch(
-            grid=(rows, self.kv_heads, splits),
+            grid=(row_groups, self.kv_heads, splits),
             block=(self.threads, 1, 1),
             cluster=(1, 1, 1),
             stream=stream,
@@ -667,6 +677,7 @@ class _SelectedPositionPagedForwardKernel:
     def _selected_qk_softmax(
         self,
         stage: Int32,
+        slots_per_pass: Int32,
         key_bases: cute.Tensor,
         shared_probability: cute.Tensor,
         shared_row_scale: cute.Tensor,
@@ -709,8 +720,13 @@ class _SelectedPositionPagedForwardKernel:
             for m in cutlass.range_constexpr(cute.size(score_mn.shape[0])):
                 for n in cutlass.range_constexpr(cute.size(score_mn.shape[1])):
                     coordinate = score_coordinates[m, n]
-                    if (coordinate[0] >= Int32(self.heads_per_kv)) | (
-                        Int64(key_bases[stage, coordinate[1]]) < Int64(0)
+                    m_row = coordinate[0]
+                    slot = m_row // Int32(self.slot_m)
+                    local_head = m_row - slot * Int32(self.slot_m)
+                    if (
+                        (slot >= slots_per_pass)
+                        | (local_head >= Int32(self.heads_per_kv))
+                        | (Int64(key_bases[stage, coordinate[1]]) < Int64(0))
                     ):
                         score_mn[m, n] = -Float32.inf
 
@@ -871,6 +887,7 @@ class _SelectedPositionPagedForwardKernel:
         table_batch: Int64,
         table_width: Int64,
         softmax_scale: Float32,
+        rows: Int32,
         splits: Int32,
         query_layout: cute.ComposedLayout,
         key_layout: cute.ComposedLayout,
@@ -879,21 +896,19 @@ class _SelectedPositionPagedForwardKernel:
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
     ) -> None:
-        row_idx, kv_head_idx, split_idx = cute.arch.block_idx()
+        row_group_idx, kv_head_idx, split_idx = cute.arch.block_idx()
         thread_idx, _, _ = cute.arch.thread_idx()
         thread = Int32(thread_idx)
         split = Int32(split_idx)
         kv_head = Int32(kv_head_idx)
-        row = Int32(row_idx)
-        request_id = request_ids[row].to(Int64)
-        query_position = query_positions[row].to(Int64)
-        request_valid = (request_id >= Int64(0)) & (request_id < table_batch)
+        row_base = Int32(row_group_idx) * Int32(self.rows_per_cta)
+        remaining_rows = rows - row_base
+        active_rows = cutlass.select_(
+            remaining_rows < Int32(self.rows_per_cta),
+            remaining_rows,
+            Int32(self.rows_per_cta),
+        )
         selection_group = kv_head // Int32(self.kv_heads // self.selection_groups)
-        position_base = (
-            row.to(Int64) * Int64(self.selection_groups)
-            + selection_group.to(Int64)
-        ) * Int64(self.selection_width)
-        table_row_base = request_id * table_width
 
         k_scale = Float32(1.0)
         v_scale = Float32(1.0)
@@ -952,49 +967,137 @@ class _SelectedPositionPagedForwardKernel:
             layout=cute.make_layout((1,), stride=(1,)),
             byte_alignment=4,
         )
+        shared_warp_mismatch = allocator.allocate_tensor(
+            element_type=Int32,
+            layout=cute.make_layout((self.pv_warps,), stride=(1,)),
+            byte_alignment=16,
+        )
 
         tile_count = Int32(self.tile_count)
         tiles_per_split = (tile_count - split + splits - Int32(1)) // splits
-        flag_element = thread
-        while flag_element < tiles_per_split:
-            tile_flags[flag_element] = Int32(0)
-            flag_element += Int32(self.threads)
-        if thread == Int32(0):
-            shared_num_extra[0] = Int32(0)
-
-        query_element = thread
-        first_query_head = kv_head * Int32(self.heads_per_kv)
-        while query_element < Int32(self.tile_m * self.head_dim):
-            local_head = query_element // Int32(self.head_dim)
-            dimension = query_element - local_head * Int32(self.head_dim)
-            query_value = Float32(0.0)
-            if local_head < Int32(self.heads_per_kv):
-                query_head = first_query_head + local_head
-                query_offset = (
-                    row.to(Int64) * Int64(self.q_heads) + query_head.to(Int64)
-                ) * Int64(self.head_dim) + dimension.to(Int64)
-                query_value = Float32(query[query_offset])
-            shared_query[local_head, dimension] = BFloat16(query_value)
-            query_element += Int32(self.threads)
-
-        if thread < Int32(32):
-            self._resolve_selected_bases_warp(
-                split,
-                Int32(0),
-                kv_head,
-                position_base,
-                table_row_base,
-                request_valid,
-                query_position,
-                block_table,
-                selected_positions,
-                key_bases,
-                value_bases,
-                num_cache_pages,
-                table_width,
-                thread,
-            )
-        cute.arch.sync_threads()
+        pass_count = cutlass.select_(
+            active_rows > Int32(0), Int32(1), Int32(0)
+        )
+        slots_per_pass = active_rows
+        if const_expr(self.rows_per_cta > 1):
+            if active_rows > Int32(1):
+                req0 = request_ids[row_base].to(Int64)
+                qpos0 = query_positions[row_base].to(Int64)
+                pos_base0 = (
+                    row_base.to(Int64) * Int64(self.selection_groups)
+                    + selection_group.to(Int64)
+                ) * Int64(self.selection_width)
+                local_mismatch = Int32(0)
+                for s_idx in cutlass.range_constexpr(self.rows_per_cta - 1):
+                    s = s_idx + 1
+                    if Int32(s) < active_rows:
+                        row_s = row_base + Int32(s)
+                        if (request_ids[row_s].to(Int64) != req0) | (
+                            query_positions[row_s].to(Int64) != qpos0
+                        ):
+                            local_mismatch = Int32(1)
+                if local_mismatch == Int32(0):
+                    if const_expr(self.selection_width % 4 == 0):
+                        groups_per_tile = self.tile_n // 4
+                        check_total = tiles_per_split * Int32(groups_per_tile)
+                        for check_iter in cutlass.range(
+                            (check_total + Int32(self.threads) - 1)
+                            // Int32(self.threads),
+                            unroll=1,
+                        ):
+                            linear = thread + Int32(check_iter * self.threads)
+                            if linear < check_total:
+                                local_tile = linear // Int32(groups_per_tile)
+                                column_group = linear % Int32(groups_per_tile)
+                                tile = split + local_tile * splits
+                                selected_column = (
+                                    tile * Int32(self.tile_n)
+                                    + column_group * Int32(4)
+                                )
+                                if selected_column < Int32(self.selection_width):
+                                    w0, w1, w2, w3 = ld_global_nc_v4_u32(
+                                        _pointer_as_int64(
+                                            selected_positions,
+                                            pos_base0 + selected_column.to(Int64),
+                                        )
+                                    )
+                                    for s_idx in cutlass.range_constexpr(
+                                        self.rows_per_cta - 1
+                                    ):
+                                        s = s_idx + 1
+                                        if Int32(s) < active_rows:
+                                            pos_base_s = (
+                                                pos_base0
+                                                + Int64(s)
+                                                * Int64(self.selection_groups)
+                                                * Int64(self.selection_width)
+                                            )
+                                            u0, u1, u2, u3 = ld_global_nc_v4_u32(
+                                                _pointer_as_int64(
+                                                    selected_positions,
+                                                    pos_base_s
+                                                    + selected_column.to(Int64),
+                                                )
+                                            )
+                                            if (
+                                                (u0.to(Int32) != w0.to(Int32))
+                                                | (u1.to(Int32) != w1.to(Int32))
+                                                | (u2.to(Int32) != w2.to(Int32))
+                                                | (u3.to(Int32) != w3.to(Int32))
+                                            ):
+                                                local_mismatch = Int32(1)
+                    else:
+                        check_total = tiles_per_split * Int32(self.tile_n)
+                        for check_iter in cutlass.range(
+                            (check_total + Int32(self.threads) - 1)
+                            // Int32(self.threads),
+                            unroll=1,
+                        ):
+                            linear = thread + Int32(check_iter * self.threads)
+                            if linear < check_total:
+                                local_tile = linear // Int32(self.tile_n)
+                                column = linear % Int32(self.tile_n)
+                                tile = split + local_tile * splits
+                                selected_column = (
+                                    tile * Int32(self.tile_n) + column
+                                )
+                                if selected_column < Int32(self.selection_width):
+                                    val0 = Int32(
+                                        selected_positions[
+                                            pos_base0 + selected_column.to(Int64)
+                                        ]
+                                    )
+                                    for s_idx in cutlass.range_constexpr(
+                                        self.rows_per_cta - 1
+                                    ):
+                                        s = s_idx + 1
+                                        if Int32(s) < active_rows:
+                                            pos_base_s = (
+                                                pos_base0
+                                                + Int64(s)
+                                                * Int64(self.selection_groups)
+                                                * Int64(self.selection_width)
+                                            )
+                                            vals = Int32(
+                                                selected_positions[
+                                                    pos_base_s
+                                                    + selected_column.to(Int64)
+                                                ]
+                                            )
+                                            if vals != val0:
+                                                local_mismatch = Int32(1)
+                warp_id = thread // Int32(32)
+                lane = thread % Int32(32)
+                mismatch_ballot = _vote_ballot_sync(local_mismatch)
+                if lane == Int32(0):
+                    shared_warp_mismatch[warp_id] = _popc_u32(mismatch_ballot)
+                cute.arch.sync_threads()
+                any_mismatch = Int32(0)
+                for w in cutlass.range_constexpr(self.pv_warps):
+                    any_mismatch = any_mismatch | Int32(shared_warp_mismatch[w])
+                if any_mismatch != Int32(0):
+                    pass_count = active_rows
+                    slots_per_pass = Int32(1)
 
         qk_thread = thread % Int32(self.qk_warps * 32)
         thread_mma_qk = tiled_mma_qk.get_slice(qk_thread)
@@ -1040,7 +1143,6 @@ class _SelectedPositionPagedForwardKernel:
             thread_mma_pv.partition_shape_C((self.tile_m, self.head_dim)),
             Float32,
         )
-        accumulator_output.fill(0.0)
         score_layout = thread_mma_qk.partition_C(
             cute.make_identity_tensor((self.tile_m, self.tile_n))
         ).layout
@@ -1053,131 +1155,80 @@ class _SelectedPositionPagedForwardKernel:
             cute.size(score_mn_layout.shape[0]),
             arch=120,
         )
-        softmax.reset()
+        first_query_head = kv_head * Int32(self.heads_per_kv)
 
-        self._issue_key_load(
-            Int32(0),
-            kv_head,
-            key_cache,
-            key_bases,
-            shared_key,
-            thread,
-        )
-        self._issue_value_load(
-            Int32(0),
-            kv_head,
-            value_cache,
-            key_bases,
-            value_bases,
-            shared_value,
-            thread,
-        )
-        if tiles_per_split > Int32(1):
-            self._scan_selected_flags(
-                split,
-                position_base,
-                request_valid,
-                query_position,
-                selected_positions,
-                tile_flags,
-                tiles_per_split,
-                splits,
-                thread,
-            )
-        if const_expr(not self.kv_is_fp8):
-            cute.arch.cp_async_wait_group(1)
-        cute.arch.sync_threads()
+        for pass_idx in cutlass.range(pass_count, unroll=1):
+            if pass_idx > Int32(0):
+                cute.arch.sync_threads()
+            pass_row = row_base + pass_idx
+            request_id = request_ids[pass_row].to(Int64)
+            query_position = query_positions[pass_row].to(Int64)
+            request_valid = (request_id >= Int64(0)) & (request_id < table_batch)
+            position_base = (
+                pass_row.to(Int64) * Int64(self.selection_groups)
+                + selection_group.to(Int64)
+            ) * Int64(self.selection_width)
+            table_row_base = request_id * table_width
 
-        self._selected_qk_softmax(
-            Int32(0),
-            key_bases,
-            shared_probability,
-            shared_row_scale,
-            thread,
-            tiled_mma_qk,
-            register_query,
-            register_key,
-            copy_query,
-            copy_key,
-            copy_source_query,
-            copy_source_key,
-            softmax,
-            is_first=True,
-        )
-        if (thread >= Int32(self.qk_warps * 32)) & (
-            thread < Int32((self.qk_warps + 1) * 32)
-        ):
-            if tiles_per_split > Int32(1):
-                resolver_lane = thread - Int32(self.qk_warps * 32)
-                num_extra = Int32(0)
-                lane_mask = (Uint32(1) << Uint32(resolver_lane)) - Uint32(1)
-                chunk_count = (tiles_per_split + Int32(30)) // Int32(32)
-                for chunk in cutlass.range(chunk_count, unroll=1):
-                    local_tile = Int32(1) + chunk * Int32(32) + resolver_lane
-                    hit = Int32(0)
-                    if local_tile < tiles_per_split:
-                        if tile_flags[local_tile] != Int32(0):
-                            hit = Int32(1)
-                    ballot = _vote_ballot_sync(hit)
-                    if hit != Int32(0):
-                        active_tiles[
-                            num_extra + _popc_u32(ballot & lane_mask)
-                        ] = split + local_tile * splits
-                    num_extra += _popc_u32(ballot)
-                if resolver_lane == Int32(0):
-                    shared_num_extra[0] = num_extra
-                if num_extra > Int32(0):
-                    cute.arch.sync_warp()
-                    self._resolve_selected_bases_warp(
-                        Int32(active_tiles[0]),
-                        Int32(1),
-                        kv_head,
-                        position_base,
-                        table_row_base,
-                        request_valid,
-                        query_position,
-                        block_table,
-                        selected_positions,
-                        key_bases,
-                        value_bases,
-                        num_cache_pages,
-                        table_width,
-                        resolver_lane,
-                    )
-        if const_expr(not self.kv_is_fp8):
-            cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
+            flag_element = thread
+            while flag_element < tiles_per_split:
+                tile_flags[flag_element] = Int32(0)
+                flag_element += Int32(self.threads)
+            if thread == Int32(0):
+                shared_num_extra[0] = Int32(0)
 
-        num_extra = Int32(shared_num_extra[0])
-        if num_extra > Int32(0):
+            query_element = thread
+            while query_element < Int32(self.tile_m * self.head_dim):
+                m_row = query_element // Int32(self.head_dim)
+                dimension = query_element - m_row * Int32(self.head_dim)
+                slot = m_row // Int32(self.slot_m)
+                local_head = m_row - slot * Int32(self.slot_m)
+                query_value = Float32(0.0)
+                if (slot < slots_per_pass) & (
+                    local_head < Int32(self.heads_per_kv)
+                ):
+                    query_row = pass_row + slot
+                    query_head = first_query_head + local_head
+                    query_offset = (
+                        query_row.to(Int64) * Int64(self.q_heads)
+                        + query_head.to(Int64)
+                    ) * Int64(self.head_dim) + dimension.to(Int64)
+                    query_value = Float32(query[query_offset])
+                shared_query[m_row, dimension] = BFloat16(query_value)
+                query_element += Int32(self.threads)
+
+            if thread < Int32(32):
+                self._resolve_selected_bases_warp(
+                    split,
+                    Int32(0),
+                    kv_head,
+                    position_base,
+                    table_row_base,
+                    request_valid,
+                    query_position,
+                    block_table,
+                    selected_positions,
+                    key_bases,
+                    value_bases,
+                    num_cache_pages,
+                    table_width,
+                    thread,
+                )
+            cute.arch.sync_threads()
+
+            accumulator_output.fill(0.0)
+            softmax.reset()
+
             self._issue_key_load(
-                Int32(1),
+                Int32(0),
                 kv_head,
                 key_cache,
                 key_bases,
                 shared_key,
                 thread,
             )
-        self._selected_pv_mma(
-            shared_row_scale,
-            thread,
-            tiled_mma_pv,
-            register_probability,
-            register_value,
-            copy_probability,
-            copy_value,
-            copy_source_probability,
-            copy_source_value,
-            accumulator_output,
-            is_first=True,
-        )
-
-        for extra_idx in cutlass.range(num_extra, unroll=1):
-            stage = (extra_idx + Int32(1)) & Int32(1)
-            next_stage = extra_idx & Int32(1)
-            cute.arch.sync_threads()
             self._issue_value_load(
-                stage,
+                Int32(0),
                 kv_head,
                 value_cache,
                 key_bases,
@@ -1185,12 +1236,25 @@ class _SelectedPositionPagedForwardKernel:
                 shared_value,
                 thread,
             )
+            if tiles_per_split > Int32(1):
+                self._scan_selected_flags(
+                    split,
+                    position_base,
+                    request_valid,
+                    query_position,
+                    selected_positions,
+                    tile_flags,
+                    tiles_per_split,
+                    splits,
+                    thread,
+                )
             if const_expr(not self.kv_is_fp8):
                 cute.arch.cp_async_wait_group(1)
             cute.arch.sync_threads()
 
             self._selected_qk_softmax(
-                stage,
+                Int32(0),
+                slots_per_pass,
                 key_bases,
                 shared_probability,
                 shared_row_scale,
@@ -1203,36 +1267,56 @@ class _SelectedPositionPagedForwardKernel:
                 copy_source_query,
                 copy_source_key,
                 softmax,
-                is_first=False,
+                is_first=True,
             )
             if (thread >= Int32(self.qk_warps * 32)) & (
                 thread < Int32((self.qk_warps + 1) * 32)
             ):
-                if extra_idx + Int32(1) < num_extra:
+                if tiles_per_split > Int32(1):
                     resolver_lane = thread - Int32(self.qk_warps * 32)
-                    self._resolve_selected_bases_warp(
-                        Int32(active_tiles[extra_idx + Int32(1)]),
-                        next_stage,
-                        kv_head,
-                        position_base,
-                        table_row_base,
-                        request_valid,
-                        query_position,
-                        block_table,
-                        selected_positions,
-                        key_bases,
-                        value_bases,
-                        num_cache_pages,
-                        table_width,
-                        resolver_lane,
-                    )
+                    num_extra = Int32(0)
+                    lane_mask = (Uint32(1) << Uint32(resolver_lane)) - Uint32(1)
+                    chunk_count = (tiles_per_split + Int32(30)) // Int32(32)
+                    for chunk in cutlass.range(chunk_count, unroll=1):
+                        local_tile = Int32(1) + chunk * Int32(32) + resolver_lane
+                        hit = Int32(0)
+                        if local_tile < tiles_per_split:
+                            if tile_flags[local_tile] != Int32(0):
+                                hit = Int32(1)
+                        ballot = _vote_ballot_sync(hit)
+                        if hit != Int32(0):
+                            active_tiles[
+                                num_extra + _popc_u32(ballot & lane_mask)
+                            ] = split + local_tile * splits
+                        num_extra += _popc_u32(ballot)
+                    if resolver_lane == Int32(0):
+                        shared_num_extra[0] = num_extra
+                    if num_extra > Int32(0):
+                        cute.arch.sync_warp()
+                        self._resolve_selected_bases_warp(
+                            Int32(active_tiles[0]),
+                            Int32(1),
+                            kv_head,
+                            position_base,
+                            table_row_base,
+                            request_valid,
+                            query_position,
+                            block_table,
+                            selected_positions,
+                            key_bases,
+                            value_bases,
+                            num_cache_pages,
+                            table_width,
+                            resolver_lane,
+                        )
             if const_expr(not self.kv_is_fp8):
                 cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
-            if extra_idx + Int32(1) < num_extra:
+            num_extra = Int32(shared_num_extra[0])
+            if num_extra > Int32(0):
                 self._issue_key_load(
-                    next_stage,
+                    Int32(1),
                     kv_head,
                     key_cache,
                     key_bases,
@@ -1250,62 +1334,156 @@ class _SelectedPositionPagedForwardKernel:
                 copy_source_probability,
                 copy_source_value,
                 accumulator_output,
-                is_first=False,
+                is_first=True,
             )
-        cute.arch.sync_threads()
 
-        if thread < Int32(self.qk_warps * 32):
-            output_scale = softmax.finalize()
-            score_coordinates = layout_utils.reshape_acc_to_mn(
-                tiled_mma_qk.get_slice(qk_thread).partition_C(
-                    cute.make_identity_tensor((self.tile_m, self.tile_n))
+            for extra_idx in cutlass.range(num_extra, unroll=1):
+                stage = (extra_idx + Int32(1)) & Int32(1)
+                next_stage = extra_idx & Int32(1)
+                cute.arch.sync_threads()
+                self._issue_value_load(
+                    stage,
+                    kv_head,
+                    value_cache,
+                    key_bases,
+                    value_bases,
+                    shared_value,
+                    thread,
+                )
+                if const_expr(not self.kv_is_fp8):
+                    cute.arch.cp_async_wait_group(1)
+                cute.arch.sync_threads()
+
+                self._selected_qk_softmax(
+                    stage,
+                    slots_per_pass,
+                    key_bases,
+                    shared_probability,
+                    shared_row_scale,
+                    thread,
+                    tiled_mma_qk,
+                    register_query,
+                    register_key,
+                    copy_query,
+                    copy_key,
+                    copy_source_query,
+                    copy_source_key,
+                    softmax,
+                    is_first=False,
+                )
+                if (thread >= Int32(self.qk_warps * 32)) & (
+                    thread < Int32((self.qk_warps + 1) * 32)
+                ):
+                    if extra_idx + Int32(1) < num_extra:
+                        resolver_lane = thread - Int32(self.qk_warps * 32)
+                        self._resolve_selected_bases_warp(
+                            Int32(active_tiles[extra_idx + Int32(1)]),
+                            next_stage,
+                            kv_head,
+                            position_base,
+                            table_row_base,
+                            request_valid,
+                            query_position,
+                            block_table,
+                            selected_positions,
+                            key_bases,
+                            value_bases,
+                            num_cache_pages,
+                            table_width,
+                            resolver_lane,
+                        )
+                if const_expr(not self.kv_is_fp8):
+                    cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+
+                if extra_idx + Int32(1) < num_extra:
+                    self._issue_key_load(
+                        next_stage,
+                        kv_head,
+                        key_cache,
+                        key_bases,
+                        shared_key,
+                        thread,
+                    )
+                self._selected_pv_mma(
+                    shared_row_scale,
+                    thread,
+                    tiled_mma_pv,
+                    register_probability,
+                    register_value,
+                    copy_probability,
+                    copy_value,
+                    copy_source_probability,
+                    copy_source_value,
+                    accumulator_output,
+                    is_first=False,
+                )
+            cute.arch.sync_threads()
+
+            if thread < Int32(self.qk_warps * 32):
+                output_scale = softmax.finalize()
+                score_coordinates = layout_utils.reshape_acc_to_mn(
+                    tiled_mma_qk.get_slice(qk_thread).partition_C(
+                        cute.make_identity_tensor((self.tile_m, self.tile_n))
+                    )
+                )
+                if score_coordinates[0, 0][1] == Int32(0):
+                    for m in cutlass.range_constexpr(cute.size(softmax.row_sum)):
+                        m_row = score_coordinates[m, 0][0]
+                        slot = m_row // Int32(self.slot_m)
+                        local_head = m_row - slot * Int32(self.slot_m)
+                        scale = output_scale[m]
+                        if const_expr(self.kv_is_fp8):
+                            scale *= v_scale
+                        shared_row_scale[m_row] = scale
+                        if const_expr(not self.direct_output) and (
+                            (slot < slots_per_pass)
+                            & (local_head < Int32(self.heads_per_kv))
+                        ):
+                            query_row = pass_row + slot
+                            query_head = first_query_head + local_head
+                            lse_offset = (
+                                query_row.to(Int64) * splits.to(Int64)
+                                + split.to(Int64)
+                            ) * Int64(self.q_heads) + query_head.to(Int64)
+                            partial_lse[lse_offset] = Float32(softmax.row_sum[m])
+            cute.arch.sync_threads()
+
+            output_mn = layout_utils.reshape_acc_to_mn(accumulator_output)
+            output_coordinates = layout_utils.reshape_acc_to_mn(
+                tiled_mma_pv.get_slice(thread).partition_C(
+                    cute.make_identity_tensor((self.tile_m, self.head_dim))
                 )
             )
-            if score_coordinates[0, 0][1] == Int32(0):
-                for m in cutlass.range_constexpr(cute.size(softmax.row_sum)):
-                    local_head = score_coordinates[m, 0][0]
-                    scale = output_scale[m]
-                    if const_expr(self.kv_is_fp8):
-                        scale *= v_scale
-                    shared_row_scale[local_head] = scale
-                    if const_expr(not self.direct_output) and local_head < Int32(
-                        self.heads_per_kv
-                    ):
-                        query_head = first_query_head + local_head
-                        lse_offset = (
-                            row.to(Int64) * splits.to(Int64) + split.to(Int64)
-                        ) * Int64(self.q_heads) + query_head.to(Int64)
-                        partial_lse[lse_offset] = Float32(softmax.row_sum[m])
-        cute.arch.sync_threads()
-
-        output_mn = layout_utils.reshape_acc_to_mn(accumulator_output)
-        output_coordinates = layout_utils.reshape_acc_to_mn(
-            tiled_mma_pv.get_slice(thread).partition_C(
-                cute.make_identity_tensor((self.tile_m, self.head_dim))
-            )
-        )
-        output_base = (
-            row.to(Int64) * Int64(self.q_heads)
-            if const_expr(self.direct_output)
-            else (row.to(Int64) * splits.to(Int64) + split.to(Int64))
-            * Int64(self.q_heads)
-        ) * Int64(self.head_dim)
-        for m in cutlass.range_constexpr(cute.size(output_mn.shape[0])):
-            scale = Float32(shared_row_scale[output_coordinates[m, 0][0]])
-            output_mn[m, None].store(output_mn[m, None].load() * scale)
-            for n in cutlass.range_constexpr(cute.size(output_mn.shape[1])):
-                coordinate = output_coordinates[m, n]
-                if coordinate[0] < Int32(self.heads_per_kv):
-                    query_head = first_query_head + coordinate[0]
-                    offset = (
-                        output_base
-                        + query_head.to(Int64) * Int64(self.head_dim)
-                        + coordinate[1].to(Int64)
+            for m in cutlass.range_constexpr(cute.size(output_mn.shape[0])):
+                m_row = output_coordinates[m, 0][0]
+                slot = m_row // Int32(self.slot_m)
+                local_head = m_row - slot * Int32(self.slot_m)
+                scale = Float32(shared_row_scale[m_row])
+                output_mn[m, None].store(output_mn[m, None].load() * scale)
+                if (slot < slots_per_pass) & (
+                    local_head < Int32(self.heads_per_kv)
+                ):
+                    query_row = pass_row + slot
+                    query_head = first_query_head + local_head
+                    output_base = (
+                        query_row.to(Int64) * Int64(self.q_heads)
+                        if const_expr(self.direct_output)
+                        else (
+                            query_row.to(Int64) * splits.to(Int64)
+                            + split.to(Int64)
+                        )
+                        * Int64(self.q_heads)
+                    ) * Int64(self.head_dim) + query_head.to(Int64) * Int64(
+                        self.head_dim
                     )
-                    if const_expr(self.direct_output):
-                        output[offset] = BFloat16(output_mn[m, n])
-                    else:
-                        partial_output[offset] = Float32(output_mn[m, n])
+                    for n in cutlass.range_constexpr(cute.size(output_mn.shape[1])):
+                        coordinate = output_coordinates[m, n]
+                        offset = output_base + coordinate[1].to(Int64)
+                        if const_expr(self.direct_output):
+                            output[offset] = BFloat16(output_mn[m, n])
+                        else:
+                            partial_output[offset] = Float32(output_mn[m, n])
 
 
 class _SparseGqaMergeKernel:
@@ -1708,7 +1886,7 @@ def _compile(
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.paged.selected_forward",
-                    4,
+                    5,
                     (
                         q_heads,
                         kv_heads,
