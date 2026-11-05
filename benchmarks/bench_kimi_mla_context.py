@@ -13,6 +13,7 @@ import argparse
 import json
 import statistics
 import subprocess
+from pathlib import Path
 
 import torch
 
@@ -43,7 +44,10 @@ def main():
     parser.add_argument("--splits", type=int, nargs="+", default=[2, 16])
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--source-revision", help="Pinned fork SHA when Git metadata is not container-mounted")
     args = parser.parse_args()
+    revision = args.source_revision or subprocess.check_output(
+        ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True).strip()
     if (min(args.owned_contexts) <= 0 or max(args.owned_contexts) > 524288
             or any(x % 64 for x in args.owned_contexts) or min(args.rows) <= 0
             or max(args.rows) > 64 or any(x < 2 or x > 16 for x in args.splits)
@@ -109,8 +113,7 @@ def main():
                 results.append(row)
                 print(json.dumps(row), flush=True)
     props = torch.cuda.get_device_properties(0)
-    result = dict(scope=__doc__, source_revision=subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], text=True).strip(), device=str(props),
+    result = dict(scope=__doc__, source_revision=revision, device=str(props),
         sm_count=props.multi_processor_count, torch=torch.__version__, results=results)
     with open(args.output, "w") as f:
         json.dump(result, f, indent=2)
