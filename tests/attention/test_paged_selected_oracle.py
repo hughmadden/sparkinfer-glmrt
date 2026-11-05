@@ -274,6 +274,7 @@ def _reference(family: str, case: dict, rows: int) -> torch.Tensor:
     groups = geometry["selection_groups"]
     page_rows = geometry["page_rows"]
     pairs = q_heads // kv_heads
+    device = case["output"].device
     reference = torch.empty((1, q_heads, head_dim), dtype=torch.float64, device=device)
     live = int((case["selected_positions"][0, 0] >= 0).sum().item())
     for kv_head in range(kv_heads):
