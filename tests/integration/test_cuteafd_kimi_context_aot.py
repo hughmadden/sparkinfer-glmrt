@@ -59,6 +59,43 @@ def test_partial_compile_contract(monkeypatch):
         k.compile_kimi_mla_partial_aot(k.MlaDraftGeometry())
 
 
+def test_k6_decode_buckets_derive_from_native_dispatch_constants():
+    import ast
+    source = Path(__file__).resolve().parents[2] / "b12x/gemm/trellis_linear/_native.py"
+    tree = ast.parse(source.read_text())
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = node.value.value
+    routes = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "K6_DECODE_ROUTE_THRESHOLDS" for t in node.targets))
+    names = {node.id for node in routes.elts}
+    thresholds = sorted(constants[name] for name in names)
+    used = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name not in ("_launch_k6_opt", "_decode_k6"):
+            continue
+        for branch in ast.walk(node):
+            if not isinstance(branch, ast.Compare) or not isinstance(branch.left, ast.Name) or branch.left.id != "rows":
+                continue
+            for call in branch.comparators:
+                assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "Int32"
+                assert len(call.args) == 1 and isinstance(call.args[0], ast.Name)
+                used.add(call.args[0].id)
+    assert used == names
+    buckets = sorted({1, 4, 64, *thresholds})
+    assert buckets == [1, 4, 8, 16, 32, 48, 64]
+    for rows in range(1, 65):
+        bucket = next(b for b in buckets if b >= rows)
+        assert all((rows <= edge) == (bucket <= edge) for edge in thresholds)
+    integration = source.parents[2] / "integration/cuteafd/trellis_linear.py"
+    text = integration.read_text()
+    assert '"decode_route_thresholds": routes' in text
+    assert "list(K6_DECODE_ROUTE_THRESHOLDS)" in text
+
+
 def reference_merge(p, scratch, out, lse, rows, active_splits):
     """Independent invocation of the declared reference split reduction."""
     import cutlass.cute as cute
