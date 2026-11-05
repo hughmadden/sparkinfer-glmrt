@@ -46,15 +46,24 @@ def test_partial_compile_contract(monkeypatch):
     monkeypatch.setattr(k, "compile_program", lambda launch, **kw: calls.append((launch, kw)) or kw)
     g = k.KimiMlaGeometry()
     p = k.compile_kimi_mla_partial_aot(g, max_rows=16, max_context=1024)
+    p8 = k.compile_kimi_mla_partial_aot(g, max_rows=16, max_context=1024, heads_per_tile=8)
     assert [(s.name, s.ctype) for s in p["scalars"]] == [("rows", "int32"), ("page_table_width", "int64"), ("active_splits", "int32")]
     assert p["geometry"]["lse_base"] == 2
+    assert p["geometry"]["heads_per_tile"] == 16 and p8["geometry"]["heads_per_tile"] == 8
+    assert p["key"] != p8["key"]
+    assert k.kimi_context_heads_per_tile(rows=1) == 8
+    assert k.kimi_context_heads_per_tile(rows=4) == 16
+    assert k.kimi_context_heads_per_tile(rows=16) == 16
     launch = calls[0][0]
     assert launch.forward.query_tile == 1 and launch.forward.num_heads == 48
+    assert launch.smem.heads_per_tile == 16 and calls[1][0].smem.heads_per_tile == 8
     assert p["scratch"]["scratch"](3) == 3 * 48 * 16 * (512 * 2 + 4)
     for args in ({"num_splits": 1}, {"head_begin": 1}, {"head_count": 96},
-                 {"max_rows": 0}, {"max_context": 1048577}):
+                 {"max_rows": 0}, {"max_context": 1048577}, {"heads_per_tile": 4}):
         with pytest.raises(ValueError):
             k.compile_kimi_mla_partial_aot(g, **args)
+    with pytest.raises(ValueError):
+        k.kimi_context_heads_per_tile(rows=0)
     with pytest.raises(ValueError):
         k.compile_kimi_mla_partial_aot(k.MlaDraftGeometry())
 
