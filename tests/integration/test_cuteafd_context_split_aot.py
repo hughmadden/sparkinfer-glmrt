@@ -204,7 +204,7 @@ def test_combine_fp64_and_existing_merge(heads,sink):
 
 
 @pytest.mark.parametrize(("row_bytes","page_rows","page_bytes"),[
-    (656,64,41984),(528,64,33792),(584,64,37440),(584,256,149760),(128,64,8448),(4,64,8448),
+    (656,64,41984),(1152,64,73728),(528,64,33792),(584,64,37440),(584,256,149760),(128,64,8448),(4,64,8448),
 ])
 def test_gather_byte_exact_high_pages(row_bytes,page_rows,page_bytes):
     p = program("paged_staging_gather",row_bytes=row_bytes,page_rows=page_rows,page_bytes=page_bytes)
