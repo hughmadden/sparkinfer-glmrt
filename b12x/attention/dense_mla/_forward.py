@@ -64,6 +64,7 @@ class DenseMlaForwardKernel:
         ds_mla_record: bool = False,
         block_window: bool = False,
         dynamic_split_chunks: bool = False,
+        device_splits: bool = False,
     ):
         self.layout = layout
         self.page_size = int(page_size)
@@ -78,6 +79,9 @@ class DenseMlaForwardKernel:
         self.num_splits = int(num_splits)
         self.chunks_per_split = int(chunks_per_split)
         self.dynamic_split_chunks = bool(dynamic_split_chunks)
+        self.device_splits = bool(device_splits)
+        if self.device_splits and not self.dynamic_split_chunks:
+            raise ValueError("device splits require dynamic split chunks")
         self.query_tile = int(query_tile)
         if self.query_tile != int(layout.query_tile):
             raise ValueError("dense MLA query_tile must match the SMEM layout")
@@ -136,7 +140,7 @@ class DenseMlaForwardKernel:
         page_table_stride: Int64,
         total_q: Int32,
         batch: Int32,
-        active_splits: Int32,
+        active_splits,
         stream: cuda.CUstream,
     ):
         query_tiles = (total_q + Int32(self.query_tile - 1)) // Int32(self.query_tile)
@@ -167,7 +171,7 @@ class DenseMlaForwardKernel:
             batch,
             active_splits,
         ).launch(
-            grid=(query_tiles, self.head_tiles, active_splits),
+            grid=(query_tiles, self.head_tiles, self.num_splits if self.device_splits else active_splits),
             block=[self.block_threads, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
@@ -449,7 +453,7 @@ class DenseMlaForwardKernel:
         page_table_stride: Int64,
         total_q: Int32,
         batch: Int32,
-        active_splits: Int32,
+        active_splits,
     ):
         tid = Int32(cute.arch.thread_idx()[0])
         lane = cute.arch.lane_idx()
@@ -458,6 +462,11 @@ class DenseMlaForwardKernel:
         query_tile_index = Int32(query_tile_index)
         head_tile = Int32(head_tile)
         split = Int32(split)
+        if cutlass.const_expr(self.device_splits):
+            active_splits = Int32(active_splits[0])
+            # Uniform CTA exit precedes metadata, scratch and barrier accesses.
+            if active_splits < Int32(2) or active_splits > Int32(self.num_splits) or split >= active_splits:
+                _exit_thread()
         head_base = head_tile * Int32(self.heads_per_tile)
 
         request = Int32(0)
