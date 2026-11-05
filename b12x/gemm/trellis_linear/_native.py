@@ -48,6 +48,11 @@ _PREFILL_MIN_ROWS = 130
 _E4M3_DECODE_ROWS = 64
 _FOLDED_DECODE_ROWS = 16
 _GEMINI_NARROW_ROWS = 8
+_K6_NARROW_ROWS = 8
+_K6_DECODE_ROWS = 16
+_K6_WIDE2_ROWS = 32
+_K6_WIDE3_ROWS = 48
+K6_DECODE_ROUTE_THRESHOLDS = (_K6_NARROW_ROWS, _K6_DECODE_ROWS, _K6_WIDE2_ROWS, _K6_WIDE3_ROWS)
 _PREFILL_STAGES = 2
 _PREFILL_PRODUCER_REGS = 104
 _PREFILL_CONSUMER_REGS = 192
@@ -3779,7 +3784,7 @@ class NativeTrellisLinear:
                        n16_narrow: cutlass.Constexpr, fuse_narrow: cutlass.Constexpr, b_sub_narrow: cutlass.Constexpr,
                        n16_16: cutlass.Constexpr, fuse_16: cutlass.Constexpr, b_sub_16: cutlass.Constexpr,
                        ):
-        if rows <= Int32(8):
+        if rows <= Int32(_K6_NARROW_ROWS):
             n_tiles = self.n // (16 * n16_narrow)
             tiles = Int32(n_tiles) if cutlass.const_expr(fuse_narrow) else Int32(n_tiles * self.splits)
             warps = n16_narrow * (self.splits if fuse_narrow else 1) * b_sub_narrow
@@ -3831,7 +3836,7 @@ class NativeTrellisLinear:
     def _decode_k6(self, inputs: cute.Tensor, payload: cute.Tensor,
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
-        if rows <= Int32(16):
+        if rows <= Int32(_K6_DECODE_ROWS):
             if cutlass.const_expr((self.k & (self.k - 1)) != 0 and
                                   ((2 < self.splits <= 6 and self.n <= 4096) or
                                    (2 < self.splits <= 8 and self.n <= 1536))):
@@ -3858,7 +3863,7 @@ class NativeTrellisLinear:
                     else:
                         self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
                 elif cutlass.const_expr((self.splits == 4 and self.n <= 8192) or (8 < self.splits <= 12 and self.n <= 4096)):
-                    if rows <= Int32(8):
+                    if rows <= Int32(_K6_NARROW_ROWS):
                         self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2 if self.splits == 4 else 1, 1, True, 1)
                     else:
                         self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
@@ -3866,27 +3871,27 @@ class NativeTrellisLinear:
                     self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             elif cutlass.const_expr(self.splits == 2):
                 if cutlass.const_expr(self.n > 8192):
-                    if rows <= Int32(8):
+                    if rows <= Int32(_K6_NARROW_ROWS):
                         self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
                     else:
                         self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
                 else:
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
             elif cutlass.const_expr(self.splits == 4 and self.n > 1536):
-                if rows <= Int32(8):
+                if rows <= Int32(_K6_NARROW_ROWS):
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1)
                 else:
                     self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             elif cutlass.const_expr(self.splits == 4):
                 self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1)
             elif cutlass.const_expr(self.splits == 8):
-                if rows <= Int32(8):
+                if rows <= Int32(_K6_NARROW_ROWS):
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 1, 1, True, 1)
                 else:
                     self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             else:
                 self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
-        elif rows <= Int32(32):
+        elif rows <= Int32(_K6_WIDE2_ROWS):
             if cutlass.const_expr(self.n > 65536 or self.splits == 1):
                 self._decode_existing(inputs, payload, scales, partial, output,
                                       rows, rotation_id, cta_limit, stream)
@@ -3898,7 +3903,7 @@ class NativeTrellisLinear:
                 self.reduce(partial, output, rows).launch(
                     grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
                     block=(128, 1, 1), stream=stream)
-        elif rows <= Int32(48):
+        elif rows <= Int32(_K6_WIDE3_ROWS):
             tiles = Int32(self.n // 128 * self.splits)
             self.multiply_k6_wide(inputs, payload, scales, partial, output, rows, rotation_id, 3, 8).launch(
                 grid=(min(tiles, cta_limit), 1, 1),

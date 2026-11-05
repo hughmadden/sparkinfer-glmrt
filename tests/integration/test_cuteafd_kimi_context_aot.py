@@ -11,17 +11,17 @@ from ..conftest import require_b12x
 
 
 @lru_cache(None)
-def programs(cache, begin):
+def programs(cache, begin, device_splits=False):
     require_b12x()
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_mla_partial_aot
     with exportable_compilation():
         p = compile_kimi_mla_partial_aot(KimiMlaGeometry(kv_cache=cache), max_rows=16,
-                                       max_context=1024, head_begin=begin)
+                                       max_context=1024, head_begin=begin, device_splits=device_splits)
     if os.environ.get("K1_EXPORT_DIR"):
         target = Path(os.environ["K1_EXPORT_DIR"])
         target.mkdir(parents=True, exist_ok=True)
-        stem = f"kimi_context_{cache}_h{begin}"
+        stem = f"kimi_context_{cache}_h{begin}" + ("_device" if device_splits else "")
         p.export_to_c(str(target), stem, stem)
         validate_exported_header(p, target / f"{stem}.h", stem)
     return p
@@ -57,6 +57,43 @@ def test_partial_compile_contract(monkeypatch):
             k.compile_kimi_mla_partial_aot(g, **args)
     with pytest.raises(ValueError):
         k.compile_kimi_mla_partial_aot(k.MlaDraftGeometry())
+
+
+def test_k6_decode_buckets_derive_from_native_dispatch_constants():
+    import ast
+    source = Path(__file__).resolve().parents[2] / "b12x/gemm/trellis_linear/_native.py"
+    tree = ast.parse(source.read_text())
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = node.value.value
+    routes = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "K6_DECODE_ROUTE_THRESHOLDS" for t in node.targets))
+    names = {node.id for node in routes.elts}
+    thresholds = sorted(constants[name] for name in names)
+    used = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name not in ("_launch_k6_opt", "_decode_k6"):
+            continue
+        for branch in ast.walk(node):
+            if not isinstance(branch, ast.Compare) or not isinstance(branch.left, ast.Name) or branch.left.id != "rows":
+                continue
+            for call in branch.comparators:
+                assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "Int32"
+                assert len(call.args) == 1 and isinstance(call.args[0], ast.Name)
+                used.add(call.args[0].id)
+    assert used == names
+    buckets = sorted({1, 4, 64, *thresholds})
+    assert buckets == [1, 4, 8, 16, 32, 48, 64]
+    for rows in range(1, 65):
+        bucket = next(b for b in buckets if b >= rows)
+        assert all((rows <= edge) == (bucket <= edge) for edge in thresholds)
+    integration = source.parents[2] / "integration/cuteafd/trellis_linear.py"
+    text = integration.read_text()
+    assert '"decode_route_thresholds": routes' in text
+    assert "list(K6_DECODE_ROUTE_THRESHOLDS)" in text
 
 
 def reference_merge(p, scratch, out, lse, rows, active_splits):
@@ -182,6 +219,96 @@ def test_high_pages_graph_and_frozen_resolution(cache):
             assert torch.equal(out[:n].view(torch.uint8), expected[:n].view(torch.uint8))
             assert torch.equal(lse[:n].view(torch.uint8), expected_lse[:n].view(torch.uint8))
     assert addresses == [x.data_ptr() for x in (q, pool, table, lengths, cu, out, lse, scratch)]
+
+
+@pytest.mark.parametrize("cache", ["bf16", "fp8"])
+@pytest.mark.parametrize("begin", [0, 48])
+def test_device_splits_scalar_oracle_and_replay(cache, begin):
+    require_b12x()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    scalar, device = programs(cache, begin), programs(cache, begin, True)
+    for rows in (1, 8, 16):
+        pool, _ = records(cache, 1024)
+        pool = pool.reshape(16, 64, -1)
+        q = (torch.randn((rows, 96, 576), device="cuda") * .25).bfloat16()
+        table = torch.arange(16, device="cuda", dtype=torch.int32)[None].repeat(rows, 1)
+        lengths = torch.tensor(([1024, 0, 1, 63, 64, 65, 513, 1023] * 2)[:rows],
+                               device="cuda", dtype=torch.int32)
+        cu = torch.arange(rows + 1, device="cuda", dtype=torch.int32)
+        active = torch.tensor([2], device="cuda", dtype=torch.int32)
+        expected = torch.empty((rows, 48, 512), device="cuda", dtype=torch.bfloat16)
+        expected_lse = torch.empty((rows, 48), device="cuda")
+        out, lse = torch.empty_like(expected), torch.empty_like(expected_lse)
+        scratch = torch.empty(device.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
+        reference_scratch = torch.empty_like(scratch)
+
+        def launch():
+            device.launch(q, pool, table, lengths, cu, out, lse, scratch, active,
+                          scalars=(rows, 16))
+
+        launch()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with kernel_resolution_guard("Kimi device split graph gate"):
+            with torch.cuda.graph(graph):
+                launch()
+            # One executable must reread the scalar, including decreasing split counts.
+            for splits in (2, 4, 8, 16, 4, 2):
+                active.fill_(splits)
+                scratch.fill_(0xFF)
+                reference_scratch.fill_(0xFF)
+                scalar.launch(q, pool, table, lengths, cu, expected, expected_lse,
+                              reference_scratch, scalars=(rows, 16, splits))
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
+                assert torch.equal(lse.view(torch.uint8), expected_lse.view(torch.uint8))
+                # Inactive CTAs must not touch their poisoned scratch lanes.
+                size = rows * 48 * 16 * 512 * 2
+                partial = scratch[:size].view(rows, 48, 16, 1024)
+                assert (partial[:, :, splits:] == 0xFF).all()
+
+
+@pytest.mark.parametrize("cache", ["bf16", "fp8"])
+@pytest.mark.parametrize("begin", [0, 48])
+def test_device_splits_short_history_timing(cache, begin):
+    require_b12x()
+    scalar, device = programs(cache, begin), programs(cache, begin, True)
+    pool, _ = records(cache, 128)
+    pool = pool.reshape(2, 64, -1)
+    q = (torch.randn((1, 96, 576), device="cuda") * .25).bfloat16()
+    table = torch.arange(2, device="cuda", dtype=torch.int32)[None]
+    lengths = torch.tensor([128], device="cuda", dtype=torch.int32)
+    cu = torch.arange(2, device="cuda", dtype=torch.int32)
+    active = torch.tensor([2], device="cuda", dtype=torch.int32)
+    out = torch.empty((1, 48, 512), device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty((1, 48), device="cuda")
+    scratch = torch.empty(device.scratch_bytes(1)["scratch"], device="cuda", dtype=torch.uint8)
+    common = (q, pool, table, lengths, cu, out, lse, scratch)
+    graphs = []
+    for p, operands, scalars in ((scalar, common, (1, 2, 2)),
+                                 (device, (*common, active), (1, 2))):
+        p.launch(*operands, scalars=scalars)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(128):
+                p.launch(*operands, scalars=scalars)
+        graph.replay()
+        torch.cuda.synchronize()
+        graphs.append(graph)
+    times = []
+    for graph in graphs:
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(16):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end) * 1000 / (128 * 16))
+    print(f"device_split_short cache={cache} h={begin} scalar_us={times[0]:.4f} "
+          f"device_us={times[1]:.4f} ratio={times[1]/times[0]:.4f}")
+    assert times[1] <= times[0] * 1.10, "fixed-grid overhead exceeds the 10% stop bar"
 
 
 def test_split_plan_uses_live_work_and_device_width():

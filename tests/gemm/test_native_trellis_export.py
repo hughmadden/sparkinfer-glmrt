@@ -34,6 +34,30 @@ def test_native_trellis_export(bits, codebook, side, tmp_path):
     program.export_to_c(str(destination), stem, "cuteafd_" + stem)
     checked = validate_exported_header(program, destination / f"{stem}.h", "cuteafd_" + stem)
     assert checked["argument_count"] == 9
+    if bits == 6 and codebook in ("mcg", "mul1"):
+        from b12x.gemm.trellis_linear._native import K6_DECODE_ROUTE_THRESHOLDS
+        assert program.geometry["decode_route_thresholds"] == list(K6_DECODE_ROUTE_THRESHOLDS)
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("cache", ["bf16", "fp8"])
+@pytest.mark.parametrize("begin", [0, 48])
+def test_kimi_device_split_partial_export(cache, begin, tmp_path):
+    import torch
+    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
+    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_mla_partial_aot
+    destination = Path(os.environ.get("TRELLIS_EXPORT_DIR", str(tmp_path)))
+    destination.mkdir(parents=True, exist_ok=True)
+    stem = f"kimi_device_partial_{cache}_h{begin}"
+    with exportable_compilation():
+        program = compile_kimi_mla_partial_aot(KimiMlaGeometry(kv_cache=cache),
+            max_rows=64, max_context=1048576, head_begin=begin, device_splits=True)
+    program.export_to_c(str(destination), stem, "cuteafd_" + stem)
+    checked = validate_exported_header(program, destination / f"{stem}.h", "cuteafd_" + stem)
+    assert checked["argument_count"] == 12
+    assert program.geometry["device_splits"] is True
+    assert program.geometry["fixed_split_grid"] == 16
+    assert [name for name, _ in program.abi["scalars"]] == ["rows", "page_table_width"]
     assert not torch.cuda.is_initialized()
 
 

@@ -554,19 +554,22 @@ def kimi_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> in
 
 
 class _ContextPartialMerge:
-    def __init__(self, heads, splits):
+    def __init__(self, heads, splits, device_splits=False):
         self.heads, self.splits = heads, splits
+        self.device_splits = device_splits
 
     @cute.jit
     def __call__(self, partial: cute.Tensor, partial_lse: cute.Tensor,
                  out: cute.Pointer, lse: cute.Pointer, rows: Int32,
-                 active_splits: Int32, stream: cuda.CUstream):
+                 active_splits, stream: cuda.CUstream):
         self.kernel(partial, partial_lse, out, lse, active_splits).launch(
             grid=(rows, self.heads, 1), block=(128, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, partial: cute.Tensor, partial_lse: cute.Tensor,
-               out: cute.Pointer, lse: cute.Pointer, active_splits: Int32):
+               out: cute.Pointer, lse: cute.Pointer, active_splits):
+        if cutlass.const_expr(self.device_splits):
+            active_splits = Int32(active_splits[0])
         row, head, _ = cute.arch.block_idx()
         tid = Int32(cute.arch.thread_idx()[0])
         weights = cute.make_rmem_tensor((self.splits,), Float32)
@@ -602,8 +605,9 @@ class _ContextPartialMerge:
 
 
 class _ContextPartial:
-    def __init__(self, g, max_rows, max_context, begin, heads, splits):
+    def __init__(self, g, max_rows, max_context, begin, heads, splits, device_splits=False):
         self.g, self.begin, self.heads, self.splits = g, begin, heads, splits
+        self.device_splits = device_splits
         self.smem = dense_mla_layout(g, max_rows, mode="decode")
         chunks = (max_context + self.smem.candidates_per_chunk - 1) // self.smem.candidates_per_chunk
         self.chunks_per_split = (chunks + splits - 1) // splits
@@ -611,8 +615,8 @@ class _ContextPartial:
             layout=self.smem, page_size=g.page_rows, num_heads=heads,
             num_splits=splits, chunks_per_split=self.chunks_per_split,
             query_tile=1, fp8=False, qk_dim=576, value_dim=512, window_size=None,
-            ds_mla_record=g.kv_cache == "fp8", dynamic_split_chunks=True)
-        self.merge = _ContextPartialMerge(heads, splits)
+            ds_mla_record=g.kv_cache == "fp8", dynamic_split_chunks=True, device_splits=device_splits)
+        self.merge = _ContextPartialMerge(heads, splits, device_splits)
 
     def scratch_bytes(self, rows):
         n = int(rows) * self.heads * self.splits
@@ -622,7 +626,7 @@ class _ContextPartial:
     def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
                  cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
                  lse: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-                 page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
+                 page_table_width: Int64, active_splits, stream: cuda.CUstream):
         g, h, s = self.g, self.heads, self.splits
         q = cute.make_tensor(cute.recast_ptr(query + Int64(self.begin * 576), dtype=cutlass.Uint8),
                              cute.make_layout((1,)))
@@ -647,8 +651,21 @@ class _ContextPartial:
         self.merge(po, pl, attn, lse, rows, active_splits, stream)
 
 
+class _ContextPartialDevice:
+    def __init__(self, core):
+        self.core = core
+
+    @cute.jit
+    def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
+                 cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
+                 lse: cute.Pointer, scratch: cute.Pointer, active_splits: cute.Pointer,
+                 rows: Int32, page_table_width: Int64, stream: cuda.CUstream):
+        self.core(query, kv_cache, page_table, cache_seqlens, cu_seqlens_q, attn, lse,
+                  scratch, rows, page_table_width, active_splits, stream)
+
+
 def compile_kimi_mla_partial_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=1048576,
-                               head_begin=0, head_count=48, num_splits=16):
+                               head_begin=0, head_count=48, num_splits=16, device_splits=False):
     """Owned-page Kimi decode/verify: normalized BF16 partial and base2 FP32 LSE.
 
     Query rows retain the full h96 stride; output is compact h48. Each row is
@@ -668,7 +685,7 @@ def compile_kimi_mla_partial_aot(g=KimiMlaGeometry(), *, max_rows=64, max_contex
         raise ValueError("Kimi context partial requires an aligned h48 range")
     if num_splits != 16:
         raise ValueError("Kimi context partial requires capacity for 16 splits")
-    launch = _ContextPartial(g, max_rows, max_context, head_begin, head_count, num_splits)
+    launch = _ContextPartial(g, max_rows, max_context, head_begin, head_count, num_splits, device_splits)
     operands = (
         Operand("query", torch.bfloat16, "[rows,96,576]"),
         Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
@@ -679,13 +696,18 @@ def compile_kimi_mla_partial_aot(g=KimiMlaGeometry(), *, max_rows=64, max_contex
         Operand("attn", torch.bfloat16, "[rows,48,512]", "out"),
         Operand("lse", torch.float32, "[rows,48]", "out", align=4),
         Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"))
-    return compile_program(launch, name="kimi_mla_partial", operands=operands,
-        scalars=(Scalar("rows"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
+    if device_splits:
+        operands += (Operand("active_splits", torch.int32, "[1]", align=4),)
+    return compile_program(_ContextPartialDevice(launch) if device_splits else launch,
+        name="kimi_mla_partial", operands=operands,
+        scalars=(Scalar("rows"), Scalar("page_table_width", "int64"))
+            + (() if device_splits else (Scalar("active_splits"),)),
         key=(g, max_rows, max_context, head_begin, head_count, num_splits,
              launch.smem.query_tile, launch.smem.kv_stages, launch.smem.heads_per_tile,
              launch.smem.candidates_per_chunk, launch.smem.math_warps_per_query,
-             "base2"), scratch={"scratch": launch.scratch_bytes},
+             "base2", device_splits), scratch={"scratch": launch.scratch_bytes},
         geometry={**vars(g), "head_begin": head_begin, "head_count": head_count,
                   "max_rows": max_rows, "max_context": max_context,
                   "num_splits": num_splits, "runtime_splits": True,
+                  "device_splits": device_splits, "fixed_split_grid": num_splits if device_splits else 0,
                   "lse_base": 2}, doc=compile_kimi_mla_partial_aot.__doc__)
