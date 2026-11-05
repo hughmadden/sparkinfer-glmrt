@@ -63,6 +63,7 @@ class DenseMlaForwardKernel:
         noncausal_block: bool = False,
         ds_mla_record: bool = False,
         block_window: bool = False,
+        dynamic_split_chunks: bool = False,
     ):
         self.layout = layout
         self.page_size = int(page_size)
@@ -76,6 +77,7 @@ class DenseMlaForwardKernel:
         )
         self.num_splits = int(num_splits)
         self.chunks_per_split = int(chunks_per_split)
+        self.dynamic_split_chunks = bool(dynamic_split_chunks)
         self.query_tile = int(query_tile)
         if self.query_tile != int(layout.query_tile):
             raise ValueError("dense MLA query_tile must match the SMEM layout")
@@ -536,8 +538,15 @@ class DenseMlaForwardKernel:
         valid_chunks = (
             visible_chunks_end + Int32(self.candidates_per_chunk - 1)
         ) // Int32(self.candidates_per_chunk)
-        split_first_chunk = first_valid_chunk + split * Int32(self.chunks_per_split)
-        split_last_chunk = split_first_chunk + Int32(self.chunks_per_split)
+        if cutlass.const_expr(self.dynamic_split_chunks):
+            # Owned-page context may vary the grid without changing its compiled
+            # scratch capacity. Partition every row's live history completely.
+            chunks_per_split = (valid_chunks - first_valid_chunk + active_splits - Int32(1)) // active_splits
+            split_first_chunk = first_valid_chunk + split * chunks_per_split
+            split_last_chunk = split_first_chunk + chunks_per_split
+        else:
+            split_first_chunk = first_valid_chunk + split * Int32(self.chunks_per_split)
+            split_last_chunk = split_first_chunk + Int32(self.chunks_per_split)
         if split_last_chunk > valid_chunks:
             split_last_chunk = valid_chunks
         active_chunks = split_last_chunk - split_first_chunk

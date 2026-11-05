@@ -4,7 +4,8 @@
 Context estimate is one owner's two h48 partial passes plus one h48 combine,
 assuming balanced concurrent owners. It EXCLUDES peer exchange/projection and
 is not a two-GPU engine benchmark or an auto-placement decision. Histories
-are OWNED rows: 1K, 8K and 128K correspond to 2K, 16K and 256K logical rows.
+are OWNED rows: defaults 512, 4K, 32K and 128K correspond to 1K, 8K,
+64K and 256K logical rows. The baseline is the runtime work/SM split rule.
 Run kernel oracles first. All timings replay graphs under frozen resolution.
 """
 from __future__ import annotations
@@ -39,9 +40,10 @@ def timed(fn, iterations):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--owned-contexts", type=int, nargs="+", default=[1024, 8192, 131072])
+    parser.add_argument("--owned-contexts", type=int, nargs="+", default=[512, 4096, 32768, 131072])
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 16])
-    parser.add_argument("--splits", type=int, nargs="+", default=[2, 16])
+    parser.add_argument("--splits", type=int, nargs="*", default=[],
+                        help="Optional diagnostic active split counts; the tuned rule always runs first")
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--output", required=True)
     parser.add_argument("--source-revision", help="Pinned fork SHA when Git metadata is not container-mounted")
@@ -53,7 +55,7 @@ def main():
             or max(args.rows) > 64 or any(x < 2 or x > 16 for x in args.splits)
             or args.iters <= 0):
         parser.error("positive page-aligned owned contexts <=524288, rows <=64 and splits 2..16 required")
-    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_dense_mla_aot, compile_kimi_mla_partial_aot
+    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_dense_mla_aot, compile_kimi_mla_partial_aot, kimi_context_split_plan
     from b12x.integration.cuteafd.context_split import compile_lse_combine2_aot
     from b12x._lib.runtime_control import kernel_resolution_guard
     torch.manual_seed(42)
@@ -66,8 +68,9 @@ def main():
     pool[..., :512] = torch.randint(0, 16, (pages, 64, 512), device="cuda", dtype=torch.uint8)
     pool[..., 512:528] = torch.ones((pages, 64, 4), device="cuda").contiguous().view(torch.uint8)
     full = compile_kimi_dense_mla_aot(g, max_rows=max_rows, max_context=2*capacity)
-    partials = {s: [compile_kimi_mla_partial_aot(g, max_rows=max_rows, max_context=capacity,
-                head_begin=begin, num_splits=s) for begin in (0, 48)] for s in args.splits}
+    pair = [compile_kimi_mla_partial_aot(g, max_rows=max_rows, max_context=capacity,
+            head_begin=begin) for begin in (0, 48)]
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     combine = compile_lse_combine2_aot(heads=48)
     q = (torch.randn((max_rows, 96, 576), device="cuda") * .25).bfloat16()
     out = torch.empty((max_rows, 96, 512), device="cuda", dtype=torch.bfloat16)
@@ -75,7 +78,7 @@ def main():
     scratch = torch.empty(full.scratch_bytes(max_rows)["scratch"], device="cuda", dtype=torch.uint8)
     po = [torch.empty((max_rows, 48, 512), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
     pl = [torch.empty((max_rows, 48), device="cuda") for _ in range(2)]
-    ps = torch.empty(max(p[0].scratch_bytes(max_rows)["scratch"] for p in partials.values()),
+    ps = torch.empty(pair[0].scratch_bytes(max_rows)["scratch"],
                      device="cuda", dtype=torch.uint8)
     co = torch.empty_like(po[0])
     cu = torch.arange(max_rows+1, device="cuda", dtype=torch.int32)
@@ -95,10 +98,11 @@ def main():
             torch.cuda.synchronize()
             with kernel_resolution_guard("Kimi context layers screen"):
                 base = timed(layers, args.iters)
-            for splits, pair in partials.items():
+            planned = kimi_context_split_plan(owned_pages=count, rows=rows, sm_count=sm_count)
+            for policy, splits in [("work_sm_rule", planned)] + [("fixed_diagnostic", s) for s in args.splits]:
                 def context():
                     for h, p in enumerate(pair):
-                        p.launch(q, local, pt, ll, cu, po[h], pl[h], ps, scalars=(rows, count))
+                        p.launch(q, local, pt, ll, cu, po[h], pl[h], ps, scalars=(rows, count, splits))
                     # Same shard twice is only a compute-cost stand-in for the
                     # received peer partial; no network or multi-GPU claim.
                     combine.launch(po[0], pl[0], po[0], pl[0], None, co, scalars=(rows,))
@@ -107,7 +111,7 @@ def main():
                 assert torch.isfinite(co[:rows]).all() and co[:rows].abs().max() > 0
                 with kernel_resolution_guard("Kimi context partial screen"):
                     candidate = timed(context, args.iters)
-                row = dict(owned_context=owned, logical_context=owned*2, rows=rows, splits=splits,
+                row = dict(owned_context=owned, logical_context=owned*2, rows=rows, splits=splits, policy=policy,
                            layers=base, context_compute_estimate=candidate,
                            layers_over_context_compute=base["median_us"]/candidate["median_us"])
                 results.append(row)
