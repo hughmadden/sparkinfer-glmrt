@@ -274,7 +274,7 @@ def _reference(family: str, case: dict, rows: int) -> torch.Tensor:
     groups = geometry["selection_groups"]
     page_rows = geometry["page_rows"]
     pairs = q_heads // kv_heads
-    reference = torch.empty((1, q_heads, head_dim), dtype=torch.float64)
+    reference = torch.empty((1, q_heads, head_dim), dtype=torch.float64, device=device)
     live = int((case["selected_positions"][0, 0] >= 0).sum().item())
     for kv_head in range(kv_heads):
         group = kv_head // (kv_heads // groups)
@@ -368,8 +368,10 @@ def test_cell_matches_baseline(label: str):
     if rows == 1:
         reference = _reference(family, case, rows)
         assert torch.isfinite(case["output"]).all()
+        delta = (case["output"][:1].double() - reference).abs().max().item()
         torch.testing.assert_close(
             case["output"][:1].double(), reference, atol=0.02, rtol=0.02,
-            msg=f"{label}: kernel disagrees with the FP64 selected-softmax reference",
+            msg=f"{label}: kernel disagrees with the FP64 selected-softmax reference "
+                f"(max |delta| {delta:.6f})",
         )
     impl.clear_caches()
