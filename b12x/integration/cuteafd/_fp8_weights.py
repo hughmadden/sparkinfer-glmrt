@@ -382,6 +382,8 @@ FP8_GEMV_CONFIG = {
     (24896, 4096): (8, 1), (4096, 8192): (8, 1), (4096, 16384): (4, 1), (16384, 1536): (2, 1),
     (2048, 4096): (8, 1), (4096, 4096): (8, 1), (4096, 2048): (2, 1), (24576, 4096): (8, 1),
     (4096, 12288): (8, 1), (154880, 4096): (8, 1),
+    # Flash TP2 q_b keeps its original four-way K split, not full q_b's two.
+    (8192, 1536): (4, 1),
     # MiMo V2 Flash, per-row scales: full qkv 13568x4096 43.0/47.1 -> 38.9/43.0, SWA qkv
     # 14848x4096 45.1/50.2 -> 43.0/47.1, dense gate_up 32768x4096 88.1/90.1 -> 88.1/90.1,
     # LM head 152576x4096 386.0/388.1 -> 385.0/387.1.
@@ -427,6 +429,8 @@ FP8_GEMV_GROUPS_DEFAULT = 4
 # warps: ``groups`` and ``cta_tiles`` only partition the launch grid, so the rows 16 -> 17
 # program switch is still one bitwise K order.
 FP8_GEMV_WIDE = {
+    # The thin TP2 q_b tile changes column groups; preserve the shipped wide tile.
+    (8192, 1536): (4, 4, 4),
     (34816, 5120): (4, 2, 4), (5120, 17408): (4, 1, 1),
     (4096, 16384): (4, 2, 2), (2048, 4096): (8, 1, 1), (4096, 4096): (8, 2, 4),
     (4096, 2048): (2, 1, 1),
