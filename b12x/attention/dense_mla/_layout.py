@@ -68,7 +68,11 @@ def make_smem_layout(
         raise ValueError("dense MLA candidates_per_chunk must be 32 or 64")
     if math_warps_per_query not in (1, 2, 4):
         raise ValueError("dense MLA math_warps_per_query must be 1, 2 or 4")
-    if candidates_per_chunk != 16 * math_warps_per_query:
+    if candidates_per_chunk != 16 * math_warps_per_query and not (
+        heads_per_tile == 16
+        and candidates_per_chunk == 32
+        and math_warps_per_query == 4
+    ):
         # Each math warp owns sixteen consecutive cache records.
         raise ValueError(
             "dense MLA candidates_per_chunk must equal 16 * math_warps_per_query"
