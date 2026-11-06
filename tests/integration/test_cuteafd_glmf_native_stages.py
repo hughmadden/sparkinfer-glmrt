@@ -283,3 +283,60 @@ def test_flash_ffn_clamped_stage_bitwise(inter):
     stage.launch(gate, up, hidden, ss, scalars=(rows,))
     down.launch(hidden, wd, out, scalars=(rows,))
     same(out, ref)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("mode,rows,flag", [("decode", 1, 64), ("decode", 17, 64),
+    ("decode", 64, 64), ("prefill", 129, 0), ("prefill", 129, 1)])
+def test_flash_standalone_block_fp8_matches_fused(heads, mode, rows, flag):
+    """Use the fused producers' own projected rows, not a different GEMM oracle."""
+    from b12x.integration.cuteafd._common import GLM53_FLASH
+    from b12x.integration.cuteafd.glmf import compile_glmf_mla_producer_aot, compile_glmf_o_aot
+    from b12x.integration.cuteafd.glmf_split import compile_glmf_fp8_linear_aot
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    g = replace(GLM53_FLASH, heads=heads)
+    cap = 64 if mode == "decode" else 4096
+    producer = compile_glmf_mla_producer_aot(g, max_rows=cap, fp8_only=mode)
+    output = compile_glmf_o_aot(g, max_rows=cap, fp8_only=mode)
+    qb = compile_glmf_fp8_linear_aot(input_features=g.q_lora_rank,
+        output_features=heads*g.qk_nope_dim, max_rows=cap, decode=mode == "decode")
+    op = compile_glmf_fp8_linear_aot(input_features=heads*g.v_head_dim,
+        output_features=g.hidden, max_rows=cap, decode=mode == "decode")
+    def weight(n, k):
+        q = rand(n, k, scale=.1).to(torch.float8_e4m3fn)
+        s = torch.rand(n//128, k//128, device="cuda")*.3 + .05
+        return q, s
+    wa, sa = weight(g.qkv_a_width, g.hidden)
+    wb, sb = weight(heads*g.qk_nope_dim, g.q_lora_rank)
+    wo, so = weight(g.hidden, heads*g.v_head_dim)
+    x, uk = rand(rows, g.hidden), rand(heads, 512, 256)
+    qn, kn = rand(g.q_lora_rank, scale=1), rand(512, scale=1)
+    slots = torch.arange(rows, device="cuda", dtype=torch.int64)
+    cache = torch.zeros(rows, 528, device="cuda", dtype=torch.uint8)
+    query, resid = empty(rows, heads, 512), empty(rows, g.q_lora_rank)
+    ps, os = scratch(producer, cap), scratch(output, cap)
+    bs, ops = scratch(qb, cap), scratch(op, cap)
+    attn, uv = rand(rows, heads, 512), rand(heads, 256, 512)
+    expected, actual = empty(rows, g.hidden), empty(rows, g.hidden)
+    projected = empty(rows, heads*g.qk_nope_dim)
+    def run():
+        producer.launch(x, slots, wa, sa, qn, kn, wb, sb, uk, cache, query,
+                        resid, ps, scalars=(rows, flag))
+        qb.launch(resid, wb, sb, projected, bs, scalars=(rows, flag))
+        # Fused scratch starts with qkv_a followed by exactly these q_b rows.
+        offset = ((rows*g.qkv_a_width*2 + 1023)//1024)*1024
+        fused_q = ps[offset:offset+projected.numel()*2].view(torch.bfloat16).view_as(projected)
+        output.launch(attn, uv, wo, so, expected, os, scalars=(rows, flag))
+        fused_values = os[:rows*heads*g.v_head_dim*2].view(torch.bfloat16)
+        op.launch(fused_values, wo, so, actual, ops, scalars=(rows, flag))
+        return fused_q
+    reference = run()
+    same(projected, reference); same(actual, expected)
+    torch.cuda.synchronize()
+    with kernel_resolution_guard("standalone Flash FP8 precompiled"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay(); graph.replay()
+        same(projected, reference); same(actual, expected)
