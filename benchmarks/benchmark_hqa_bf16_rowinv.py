@@ -65,7 +65,7 @@ def main():
         conditions='Alternating arm order; batched warm graph replay then timed batched replay divided by launch count; cold flush then single timed replay. 1.8 TB/s theoretical compulsory weight/input/output floor. No TF32 oracle. Nonempty poisoned graphs and 11-offset row invariance.')
 
     def arm_snapshot():
-        query = subprocess.run(['nvidia-smi', '-i', str(prop.uuid),
+        query = subprocess.run(['nvidia-smi', '-i', 'GPU-' + str(prop.uuid).removeprefix('GPU-'),
             '--query-gpu=clocks_event_reasons.active,clocks.sm,temperature.gpu,power.draw,power.limit',
             '--format=csv,noheader'], capture_output=True, text=True, check=True)
         return query.stdout.strip()
