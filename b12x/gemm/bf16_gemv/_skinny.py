@@ -314,11 +314,14 @@ WIDE_PREFILL_MIN_ROWS = 512
 # the same uncompensated m16n8k16 MMA K-reduction as prefill_config and produces
 # bitwise-identical outputs at every decode/verify width.
 DECODE_TMA_TILES = {
-    # HQA O projections: expose N parallelism at verify widths without
-    # changing the ordered K16 accumulation or the <=16-row decode tile.
-    (4096, 4096): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10), (64, 4, 1, 64, 32, 8)),
-    (4096, 8192): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10), (64, 4, 1, 64, 32, 8)),
-    (4096, 16384): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10), (64, 4, 1, 64, 32, 8)),
+    # HQA O: expose N parallelism at verify widths, preserving ordered K16.
+    # M64 uses one weight pass. Raptor SM120 cold us at M32/M64:
+    # K4096 30.72/30.72 -> 26.62/28.67; K8192 59.39/59.39 -> 49.15/49.15;
+    # K16384 112.67/112.64 -> 88.06/90.11. Stage8 tied stage7 cold but
+    # used 12 KiB more shared memory. Keep the existing HQA <=16 tile.
+    (4096, 4096): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10), (64, 4, 1, 64, 32, 7)),
+    (4096, 8192): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10), (64, 4, 1, 64, 32, 7)),
+    (4096, 16384): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10), (64, 4, 1, 64, 32, 7)),
     (2560, 6144): ((32, 1, 2, 32, 7), (64, 1, 4, 64, 6)),
     (16480, 2560): ((32, 1, 4, 64, 6),),
     (13952, 2560): ((16, 1, 4, 128, 4), (32, 1, 4, 64, 5)),
