@@ -161,11 +161,11 @@ def draft_screen(args, sm_count):
             window_size = None if window == 0 else window
             # One program per compiled split capacity; each bucket's rows never
             # exceed its own max_rows, so the doubled-capacity scratch stays small.
-            capacities = sorted({draft_context_split_capacity(rows=r) for r in args.draft_rows})
+            capacities = sorted({draft_context_split_capacity(rows=r, sm_count=sm_count) for r in args.draft_rows})
             programs = {}
             for capacity in capacities:
                 bucket_rows = max(r for r in args.draft_rows
-                                  if draft_context_split_capacity(rows=r) == capacity)
+                                  if draft_context_split_capacity(rows=r, sm_count=sm_count) == capacity)
                 program = compile_mla_draft_partial_aot(
                     MlaDraftGeometry(kv_cache=cache, window_size=window_size),
                     max_rows=bucket_rows, max_context=max_owned, num_splits=capacity)
@@ -181,7 +181,7 @@ def draft_screen(args, sm_count):
                 intervals = torch.tensor([0, owned] * max_rows, device="cuda",
                                          dtype=torch.int32).view(max_rows, 2)
                 for rows in args.draft_rows:
-                    capacity = draft_context_split_capacity(rows=rows)
+                    capacity = draft_context_split_capacity(rows=rows, sm_count=sm_count)
                     program, scratch = programs[capacity]
                     planned = draft_context_split_plan(owned_pages=count, rows=rows, sm_count=sm_count)
                     for policy, splits in ([("draft_work_sm_rule", planned)]

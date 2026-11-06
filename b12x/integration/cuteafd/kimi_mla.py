@@ -566,22 +566,26 @@ def kimi_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> in
 DRAFT_CONTEXT_HEAD_TILES = 4
 DRAFT_CONTEXT_SPLIT_CAPACITY = 16
 DRAFT_CONTEXT_STARVED_SPLIT_CAPACITY = 32
-DRAFT_CONTEXT_STARVED_MAX_ROWS = 4
+DRAFT_CONTEXT_WIDE_ROW_PAGES = 32
+DRAFT_CONTEXT_SHORT_PAGES = 8
 
 
-def draft_context_split_capacity(*, rows: int) -> int:
+def draft_context_split_capacity(*, rows: int, sm_count: int) -> int:
     """Compiled split capacity for a graph row bucket.
 
     A CTA opts into 96 KB of SMEM, so one CTA lands per SM and a starved row
-    bucket cannot use more than one machine wave however it splits. Below a
-    handful of rows even 16 splits leaves most SMs idle, and the extra splits
-    cost only query reloads plus partial traffic (each split still reads its
-    own page slice). Those buckets compile the doubled capacity; the scratch
-    for it stays small because it scales with rows.
+    bucket cannot use more than one machine wave however it splits. The extra
+    splits cost only query reloads plus partial traffic (each split still reads
+    its own page slice), so a starved bucket wants as many as it can launch in
+    one wave: it compiles the doubled capacity when one full 32-split wave of
+    `rows*4` CTA tiles still fits the device's SM count (one and two rows do on
+    both 188 and 170 SMs; from two rows on the unstarved waves are past it and
+    a second wave of mostly idle CTAs measured 7-33% slower). The scratch for
+    the doubled capacity stays small because it scales with rows.
     """
-    if rows <= 0:
-        raise ValueError("invalid draft Context row count")
-    if rows <= DRAFT_CONTEXT_STARVED_MAX_ROWS:
+    if rows <= 0 or sm_count <= 0:
+        raise ValueError("invalid draft Context row/device geometry")
+    if rows * DRAFT_CONTEXT_HEAD_TILES * DRAFT_CONTEXT_STARVED_SPLIT_CAPACITY <= sm_count:
         return DRAFT_CONTEXT_STARVED_SPLIT_CAPACITY
     return DRAFT_CONTEXT_SPLIT_CAPACITY
 
@@ -589,27 +593,32 @@ def draft_context_split_capacity(*, rows: int) -> int:
 def draft_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> int:
     """Choose the draft partial's launch split scalar before capture.
 
-    The draft serves h64 as four h16 tiles, so a wave of the device needs
-    `rows*4` CTAs per split. A short history is cheap enough that splitting it
-    below eight pages per CTA is still worth it, but only while the row tiles
-    leave the device starved: once the tiles feed at least half a wave, each
-    further split re-reads every query tile and re-writes a full partial for
-    little parallel gain, which measured slower at 16 rows. Starved shapes fill
-    the wave up to their compiled capacity because there the split is nearly
-    free.
+    Fitted to the 2026-11-06 sweep (fp8 and bf16, 512/2048/4096 owned tokens,
+    rows 1-64, private page streams). With one or two rows a split per owned
+    page is the best use of the machine and the capacity bounds it; while eight
+    splits still fill only one wave of CTA tiles the machine absorbs them and
+    they win (three to five rows); beyond that the partial traffic is what
+    limits a split, so a long history (more than 32 pages) takes 16 and a short
+    one 4; at sixteen rows 16 splits already costs more than it earns except on
+    long histories, which take 8 and short ones 2; from 32 rows the row tiles
+    fill the device alone and 2 wins. Every threshold here is traffic (owned
+    pages) or wave fill derived from the runtime SM count, never a fixed SM
+    count.
     """
     if owned_pages < 0 or rows <= 0 or sm_count <= 0:
         raise ValueError("invalid draft context split work/device geometry")
-    capacity = draft_context_split_capacity(rows=rows)
-    buckets = (2, 4, 8, 16, 32)
-    tiles = rows * DRAFT_CONTEXT_HEAD_TILES
-    wave = (sm_count + tiles - 1) // tiles
-    work = (owned_pages + 7) // 8
-    traversal = (owned_pages + 63) // 64
-    wanted = max(2, min(capacity, max(wave, traversal), work))
-    if tiles * 2 < sm_count // 2:
-        wanted = max(wanted, min(capacity, wave))
-    return next(bucket for bucket in buckets if bucket >= wanted and bucket <= capacity)
+    capacity = draft_context_split_capacity(rows=rows, sm_count=sm_count)
+    if rows <= 2:
+        wanted = owned_pages
+    elif rows * DRAFT_CONTEXT_HEAD_TILES * 8 <= sm_count:
+        wanted = 8
+    elif rows <= 8:
+        wanted = 16 if owned_pages > DRAFT_CONTEXT_WIDE_ROW_PAGES else 4
+    elif rows <= 16:
+        wanted = 8 if owned_pages > DRAFT_CONTEXT_SHORT_PAGES else 2
+    else:
+        wanted = 2
+    return max(2, min(capacity, wanted))
 
 
 class _ContextPartialMerge:

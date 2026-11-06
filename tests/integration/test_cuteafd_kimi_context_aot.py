@@ -417,34 +417,46 @@ def test_split_plan_uses_live_work_and_device_width():
 
 
 def test_draft_split_plan_fills_starved_rows_only():
-    """A few row tiles leave the device idle, so the draft splits below the
-    eight-pages-per-CTA floor; once the tiles feed half a wave the plan keeps
-    the target rule's floor instead of re-reading every query tile. Only the
-    starved row buckets compile the doubled split capacity."""
+    """The draft plan is a measured table: one split per owned page until the
+    capacity bounds it, eight splits while one wave of CTA tiles still absorbs
+    them, then page-density steps. Only the one-row bucket compiles the doubled
+    split capacity, and that decision follows the runtime SM count: a full
+    32-split wave of one row (128 CTAs) fits both 188 and 170 SMs, two rows
+    (256) fit neither."""
     from b12x.integration.cuteafd.kimi_mla import (
         draft_context_split_capacity, draft_context_split_plan, kimi_context_split_plan)
-    assert draft_context_split_capacity(rows=1) == 32
-    assert draft_context_split_capacity(rows=4) == 32
-    assert draft_context_split_capacity(rows=8) == 16
-    assert draft_context_split_capacity(rows=64) == 16
-    assert draft_context_split_plan(owned_pages=8, rows=1, sm_count=188) == 32
-    assert draft_context_split_plan(owned_pages=64, rows=1, sm_count=188) == 32
-    assert draft_context_split_plan(owned_pages=64, rows=4, sm_count=188) == 16
-    assert draft_context_split_plan(owned_pages=8, rows=16, sm_count=188) == 2
-    assert draft_context_split_plan(owned_pages=64, rows=16, sm_count=188) == 4
-    assert draft_context_split_plan(owned_pages=64, rows=64, sm_count=188) == 2
-    # Four head tiles per row share less of a wave than the target's six, so
-    # the draft bucket can sit one step above the h48 plan at the same shape.
-    assert (draft_context_split_plan(owned_pages=64, rows=16, sm_count=188)
-            >= kimi_context_split_plan(owned_pages=64, rows=16, sm_count=188))
+    for sm in (188, 170):
+        assert draft_context_split_capacity(rows=1, sm_count=sm) == 32
+        assert draft_context_split_capacity(rows=2, sm_count=sm) == 16
+        assert draft_context_split_capacity(rows=8, sm_count=sm) == 16
+        assert draft_context_split_capacity(rows=64, sm_count=sm) == 16
+    # The measured fp8/bf16 sweep cells, identical on both RTX SM counts.
+    measured = {
+        (8, 1): 8, (32, 1): 32, (64, 1): 32,
+        (8, 2): 8, (32, 2): 16, (64, 2): 16,
+        (8, 4): 8, (32, 4): 8, (64, 4): 8,
+        (8, 8): 4, (32, 8): 4, (64, 8): 16,
+        (8, 16): 2, (32, 16): 8, (64, 16): 8,
+        (8, 64): 2, (32, 64): 2, (64, 64): 2,
+    }
+    for sm in (188, 170):
+        for (pages, rows), splits in measured.items():
+            assert draft_context_split_plan(owned_pages=pages, rows=rows,
+                                            sm_count=sm) == splits
     with pytest.raises(ValueError):
         draft_context_split_plan(owned_pages=64, rows=0, sm_count=188)
+    with pytest.raises(ValueError):
+        draft_context_split_capacity(rows=1, sm_count=0)
     for pages in (0, 1, 16, 128, 1024, 4096):
-        for rows in (1, 2, 4, 8, 16, 32, 64):
-            capacity = draft_context_split_capacity(rows=rows)
+        for rows in (1, 2, 3, 4, 5, 8, 16, 32, 64):
             for sm in (48, 170, 188):
+                capacity = draft_context_split_capacity(rows=rows, sm_count=sm)
                 splits = draft_context_split_plan(owned_pages=pages, rows=rows, sm_count=sm)
                 assert splits in (2, 4, 8, 16, 32) and splits <= capacity
+    # The plan holds on the 170-SM card because the only SM-keyed branch is the
+    # capacity test, and 128 CTAs fit there too.
+    assert (draft_context_split_plan(owned_pages=64, rows=16, sm_count=188)
+            >= kimi_context_split_plan(owned_pages=64, rows=16, sm_count=188))
 
 
 @pytest.mark.parametrize("cache", ["bf16", "fp8"])
