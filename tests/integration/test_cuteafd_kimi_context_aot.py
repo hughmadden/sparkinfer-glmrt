@@ -416,6 +416,49 @@ def test_split_plan_uses_live_work_and_device_width():
             assert kimi_context_split_plan(owned_pages=pages, rows=rows, sm_count=170) in (2, 4, 8, 16)
 
 
+def test_draft_split_plan_fills_starved_rows_only():
+    """The draft plan is a measured table: one split per owned page until the
+    capacity bounds it, eight splits while one wave of CTA tiles still absorbs
+    them, then page-density steps. Only the one-row bucket compiles the doubled
+    split capacity, and that decision follows the runtime SM count: a full
+    32-split wave of one row (128 CTAs) fits both 188 and 170 SMs, two rows
+    (256) fit neither."""
+    from b12x.integration.cuteafd.kimi_mla import (
+        draft_context_split_capacity, draft_context_split_plan, kimi_context_split_plan)
+    for sm in (188, 170):
+        assert draft_context_split_capacity(rows=1, sm_count=sm) == 32
+        assert draft_context_split_capacity(rows=2, sm_count=sm) == 16
+        assert draft_context_split_capacity(rows=8, sm_count=sm) == 16
+        assert draft_context_split_capacity(rows=64, sm_count=sm) == 16
+    # The measured fp8/bf16 sweep cells, identical on both RTX SM counts.
+    measured = {
+        (8, 1): 8, (32, 1): 32, (64, 1): 32,
+        (8, 2): 8, (32, 2): 16, (64, 2): 16,
+        (8, 4): 8, (32, 4): 8, (64, 4): 8,
+        (8, 8): 4, (32, 8): 4, (64, 8): 16,
+        (8, 16): 2, (32, 16): 8, (64, 16): 8,
+        (8, 64): 2, (32, 64): 2, (64, 64): 2,
+    }
+    for sm in (188, 170):
+        for (pages, rows), splits in measured.items():
+            assert draft_context_split_plan(owned_pages=pages, rows=rows,
+                                            sm_count=sm) == splits
+    with pytest.raises(ValueError):
+        draft_context_split_plan(owned_pages=64, rows=0, sm_count=188)
+    with pytest.raises(ValueError):
+        draft_context_split_capacity(rows=1, sm_count=0)
+    for pages in (0, 1, 16, 128, 1024, 4096):
+        for rows in (1, 2, 3, 4, 5, 8, 16, 32, 64):
+            for sm in (48, 170, 188):
+                capacity = draft_context_split_capacity(rows=rows, sm_count=sm)
+                splits = draft_context_split_plan(owned_pages=pages, rows=rows, sm_count=sm)
+                assert splits in (2, 4, 8, 16, 32) and splits <= capacity
+    # The plan holds on the 170-SM card because the only SM-keyed branch is the
+    # capacity test, and 128 CTAs fit there too.
+    assert (draft_context_split_plan(owned_pages=64, rows=16, sm_count=188)
+            >= kimi_context_split_plan(owned_pages=64, rows=16, sm_count=188))
+
+
 @pytest.mark.parametrize("cache", ["bf16", "fp8"])
 def test_existing_fixed_chunk_path_is_byte_identical(cache, monkeypatch):
     """Compare the default compiler with the pre-change forward source, not a numerical tolerance."""
