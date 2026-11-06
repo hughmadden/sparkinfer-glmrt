@@ -241,3 +241,33 @@ def test_fully_projected_kda_abi(heads, decode):
     assert p["scratch"]["scratch"](17) == 17*g.kda_in_width*2+1024
     with pytest.raises(ValueError, match="requires"):
         ns["compile_projected_kda_core_aot"](object())
+
+
+@pytest.mark.parametrize("decode,capacity", [(True, 64), (True, 128), (False, 4096)])
+def test_block_fp8_projection_abi(decode, capacity):
+    class Projection:
+        def key(self):
+            return ("original-fp8-projection",)
+
+        def prefill_scratch_bytes(self, rows):
+            return rows * 256 if not decode else 0
+
+    ns = extracted(ROOT / "b12x/integration/cuteafd/glmf_split.py",
+        {"compile_glmf_fp8_linear_aot"}, dict(
+            _Fp8Linear=lambda n, k, cap, dec: SimpleNamespace(projection=Projection()),
+            _check_rows=int, Operand=Operand, Scalar=lambda name: name,
+            torch=SimpleNamespace(bfloat16="bf16", uint8="u8", float32="f32"),
+            compile_program=lambda launch, **kw: dict(launch=launch, **kw)))
+    compile_projection = ns["compile_glmf_fp8_linear_aot"]
+    p = compile_projection(input_features=1536, output_features=8192,
+                           max_rows=capacity, decode=decode)
+    assert [(o.name, o.dtype, o.shape) for o in p["operands"][:4]] == [
+        ("x", "bf16", "[rows,1536]"), ("weight", "u8", "[8192,1536]"),
+        ("scales", "f32", "[64,12]"), ("out", "bf16", "[rows,8192]")]
+    assert p["scalars"] == ("rows", "fp8_rows")
+    assert p["scratch"]["scratch"](17) == (256 if decode else 17*256)
+    assert p["geometry"]["storage"] == "row_major_e4m3"
+    assert p["geometry"]["scale_block"] == 128
+    for bad in (0, -128, 129, True):
+        with pytest.raises(ValueError, match="H128"):
+            compile_projection(input_features=bad, output_features=8192)
