@@ -49,22 +49,6 @@ def timed(fn, iterations):
     return dict(median_us=statistics.median(samples), samples_us=samples)
 
 
-def draft_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> int:
-    """Draft mirror of the target work/SM split rule for four h16 head tiles.
-
-    The target rule assumes six h8 tiles per row (h48); the draft serves h64 as
-    four h16 tiles, so filling a device wave needs fewer rows' worth of splits.
-    """
-    if owned_pages < 0 or rows <= 0 or sm_count <= 0:
-        raise ValueError("invalid draft split work/device geometry")
-    tiles = (DRAFT_HEADS + DRAFT_HEAD_TILE - 1) // DRAFT_HEAD_TILE
-    wave = (sm_count + rows * tiles - 1) // (rows * tiles)
-    work = (owned_pages + 7) // 8
-    traversal = (owned_pages + 63) // 64
-    wanted = max(2, min(16, max(wave, traversal), work))
-    return next(bucket for bucket in (2, 4, 8, 16) if bucket >= wanted)
-
-
 def draft_records(cache: str, pages: int):
     """Finite, exactly representable records; layout matches the draft reader."""
     if cache == "fp8":
@@ -153,6 +137,7 @@ def draft_screen(args, sm_count):
     from b12x.integration.cuteafd.kimi_mla import (
         MlaDraftGeometry,
         compile_mla_draft_partial_aot,
+        draft_context_split_plan,
     )
     from b12x.integration.cuteafd.context_split import compile_lse_combine2_aot
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -184,7 +169,7 @@ def draft_screen(args, sm_count):
                 intervals = torch.tensor([0, owned] * max_rows, device="cuda",
                                          dtype=torch.int32).view(max_rows, 2)
                 for rows in args.draft_rows:
-                    planned = draft_split_plan(owned_pages=count, rows=rows, sm_count=sm_count)
+                    planned = draft_context_split_plan(owned_pages=count, rows=rows, sm_count=sm_count)
                     for policy, splits in ([("draft_work_sm_rule", planned)]
                                            + [("fixed_diagnostic", s) for s in args.draft_splits]):
                         def partial(dst=0):

@@ -563,6 +563,33 @@ def kimi_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> in
     return next(bucket for bucket in (2, 4, 8, 16) if bucket >= wanted)
 
 
+DRAFT_CONTEXT_HEAD_TILES = 4
+
+
+def draft_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> int:
+    """Choose the draft partial's launch split scalar before capture.
+
+    The draft serves h64 as four h16 tiles, so a wave of the device needs
+    `rows*4` CTAs per split. A short history is cheap enough that splitting it
+    below eight pages per CTA is still worth it, but only while the row tiles
+    leave the device starved: once the tiles feed at least half a wave, each
+    further split re-reads every query tile and re-writes a full partial for
+    little parallel gain, which measured slower at 16 rows. Starved shapes fill
+    the wave (up to the compiled capacity of 16 splits) because there the split
+    is nearly free.
+    """
+    if owned_pages < 0 or rows <= 0 or sm_count <= 0:
+        raise ValueError("invalid draft context split work/device geometry")
+    tiles = rows * DRAFT_CONTEXT_HEAD_TILES
+    wave = (sm_count + tiles - 1) // tiles
+    work = (owned_pages + 7) // 8
+    traversal = (owned_pages + 63) // 64
+    wanted = max(2, min(16, max(wave, traversal), work))
+    if tiles * 2 < sm_count // 2:
+        wanted = max(wanted, min(16, wave))
+    return next(bucket for bucket in (2, 4, 8, 16) if bucket >= wanted)
+
+
 class _ContextPartialMerge:
     def __init__(self, heads, splits, device_splits=False):
         self.heads, self.splits = heads, splits
