@@ -1,4 +1,5 @@
 """CPU contracts for the existing batched HQA timing harness."""
+import ast
 import importlib.util
 from pathlib import Path
 
@@ -33,6 +34,20 @@ def test_explicit_shapes_use_actual_default_and_f32_output(harness, tmp_path):
     assert args.shapes == ((6144, 7168), (4096, 8192))
     assert harness.baseline_kwargs(args) == {}
     assert not args.cublas
+
+
+def test_native_tiles_select_only_cold_winning_bands():
+    source = Path(__file__).resolve().parents[2] / 'b12x/gemm/bf16_gemv/_skinny.py'
+    tree = ast.parse(source.read_text())
+    assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == 'DECODE_TMA_TILES' for t in node.targets))
+    tiles = ast.literal_eval(assignment.value)
+    expected_limits = {(16384,2048):(16,32), (8192,2048):(16,), (6144,16384):(16,),
+        (6144,8192):(8,), (18432,1536):(16,), (9216,1536):(2,16,32),
+        (7168,12288):(16,32), (7168,6144):(16,32), (8192,8192):(16,), (8192,4096):(16,)}
+    assert {shape:tuple(tile[0] for tile in tiles[shape]) for shape in expected_limits} == expected_limits
+    # q_b TP2 ties at M1/M2: explicitly retain the existing default tile there.
+    assert tiles[9216,1536][0] == (2,4,128,3)
 
 
 @pytest.mark.parametrize('shapes', ['1,2', '4096', '4096,8192,128', '4096,8192;4096,8192', ''])

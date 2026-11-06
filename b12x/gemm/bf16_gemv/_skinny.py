@@ -314,6 +314,18 @@ WIDE_PREFILL_MIN_ROWS = 512
 # the same uncompensated m16n8k16 MMA K-reduction as prefill_config and produces
 # bitwise-identical outputs at every decode/verify width.
 DECODE_TMA_TILES = {
+    # Native HQA: one alternating SM120 cold sweep per shape. Only strict
+    # cold winners replace prefill_config; omitted bands keep its K16 route.
+    (16384, 2048): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
+    (8192, 2048): ((16, 1, 4, 16, 64, 6),),
+    (6144, 16384): ((16, 1, 4, 16, 64, 6),),
+    (6144, 8192): ((8, 1, 4, 16, 64, 6),),
+    (18432, 1536): ((16, 1, 4, 16, 64, 6),),
+    (9216, 1536): ((2, 4, 128, 3), (16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
+    (7168, 12288): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
+    (7168, 6144): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
+    (8192, 8192): ((16, 1, 4, 16, 64, 6),),
+    (8192, 4096): ((16, 1, 4, 16, 64, 6),),
     # HQA O: expose N parallelism at verify widths, preserving ordered K16.
     # M64 uses one weight pass. Raptor SM120 cold us at M32/M64:
     # K4096 30.72/30.72 -> 26.62/28.67; K8192 59.39/59.39 -> 49.15/49.15;
