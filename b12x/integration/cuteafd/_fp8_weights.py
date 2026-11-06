@@ -195,7 +195,7 @@ class Fp8Projection:
         self.kmajor = bool(kmajor) or (self.row_scales and prefill_rows is not None)
         self.prefill_mask = int(prefill_mask)
         self.prefill = prefill_rows is not None
-        self.gemv = self.gemv_wide = self.gemv_m16 = self.w8a8 = None
+        self.gemv = self.gemv_wide = self.gemv_m16 = self.gemv_m64 = self.w8a8 = None
         if self.prefill:
             from ._glmf_fp8 import BlockFp8Projection
 
@@ -235,9 +235,16 @@ class Fp8Projection:
                                       out_dtype=out_dtype) if cap > int(gemv_rows) else None
             # HQA block-scale o projections: only M16 won the direct-widen screen.
             if (self.n, self.k, warps) in ((4096, 16384, 4), (4096, 8192, 8)) \
-                    and not self.row_scales and int(gemv_rows) >= 16 and cap > int(gemv_rows):
+                    and not self.row_scales and out_dtype == cutlass.BFloat16 \
+                    and groups == 1 and int(gemv_rows) == 16 and cap > 16:
                 self.gemv_m16 = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows),
                     warps=warps, groups=groups, out_dtype=out_dtype, direct_widen=True)
+            # TP2 q_b: two row tiles reduce registers at exactly the measured M64.
+            if (self.n, self.k, warps) == (8192, 1536, 4) and not self.row_scales \
+                    and out_dtype == cutlass.BFloat16 and groups == 1 \
+                    and int(gemv_rows) == 16 and cap >= 64 and wide_groups is None:
+                self.gemv_m64 = MmaFp8Gemv(self.n, self.k, max_rows=64, warps=warps,
+                    groups=2, cta_tiles=2, out_dtype=out_dtype)
             self.gemv_rows = int(gemv_rows)
             self.max_gemv_rows = cap if self.gemv_wide is not None else int(gemv_rows)
             tile_n = decode_tile_n(self.n)
@@ -250,6 +257,7 @@ class Fp8Projection:
                 None if self.gemv is None else self.gemv.key(),
                 None if self.gemv_wide is None else self.gemv_wide.key(),
                 None if self.gemv_m16 is None else self.gemv_m16.key(),
+                None if self.gemv_m64 is None else self.gemv_m64.key(),
                 None if self.w8a8 is None else self.w8a8.key(), self.w8a16.key())
 
     @property
@@ -282,6 +290,13 @@ class Fp8Projection:
                 if cutlass.const_expr(self.gemv_m16 is not None):
                     if rows == Int32(16):
                         self.gemv_m16(x, w_fp8, scale, out, rows, stream)
+                    elif rows <= Int32(self.gemv_rows):
+                        self.gemv(x, w_fp8, scale, out, rows, stream)
+                    else:
+                        self.gemv_wide(x, w_fp8, scale, out, rows, stream)
+                elif cutlass.const_expr(self.gemv_m64 is not None):
+                    if rows == Int32(64):
+                        self.gemv_m64(x, w_fp8, scale, out, rows, stream)
                     elif rows <= Int32(self.gemv_rows):
                         self.gemv(x, w_fp8, scale, out, rows, stream)
                     else:

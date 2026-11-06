@@ -20,7 +20,7 @@ def main():
     if args.preflight:
         import ast
         ast.parse(Path(__file__).read_text())
-        print('HQA round-1 preflight passed')
+        print('HQA winner gate preflight passed')
         return
     import torch
     from benchmarks.common import make_l2_flush_fn
@@ -46,9 +46,9 @@ def main():
     programs = {'base':base, 'candidate':candidate}
     flush = make_l2_flush_fn(True)
     result = {'shape':[n,k], 'hardware_before':snapshot(), 'results':[],
-              'conditions':'Same-process alternating L2-cold graph single launches; fixed K-splitting warps=4; candidate groups=1 for M<=16; wide tile unchanged groups=4/cta_tiles=4.'}
+              'conditions':'Same-process alternating L2-cold graph single launches; fixed K-splitting warps=4; candidate groups=1 for M<=16; only M64 uses groups2/tiles2; other wide rows retain groups4/tiles4.'}
     row_zero = None
-    for m in (1,4,16,17,64):
+    for m in (1,4,16,17,63,64):
         graphs={}
         for arm,program in programs.items():
             out[arm].fill_(float('nan'))
@@ -83,13 +83,14 @@ def main():
         print(json.dumps({k:v for k,v in item.items() if k!='samples_us'}),flush=True)
         args.output.write_text(json.dumps(result,indent=2)+'\n')
     result['fused_oracles']=[]
-    for m in (1,4,16,17,64):
-        test_flash_standalone_block_fp8_matches_fused(32,'decode',m,64)
-        result['fused_oracles'].append(m)
+    for heads in (32,64):
+        for m in (1,4,16,17,63,64):
+            test_flash_standalone_block_fp8_matches_fused(heads,'decode',m,64)
+            result['fused_oracles'].append({'heads':heads,'m':m})
     result['hardware_after']=snapshot()
     result['complete']=True
     args.output.write_text(json.dumps(result,indent=2)+'\n')
-    print('HQA round-1 complete; five old/new byte+row+tail checks and five fused oracles passed',flush=True)
+    print('HQA winner gate complete; six old/new byte+row+tail checks and twelve fused oracles passed',flush=True)
 
 
 if __name__=='__main__':
