@@ -564,6 +564,26 @@ def kimi_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> in
 
 
 DRAFT_CONTEXT_HEAD_TILES = 4
+DRAFT_CONTEXT_SPLIT_CAPACITY = 16
+DRAFT_CONTEXT_STARVED_SPLIT_CAPACITY = 32
+DRAFT_CONTEXT_STARVED_MAX_ROWS = 4
+
+
+def draft_context_split_capacity(*, rows: int) -> int:
+    """Compiled split capacity for a graph row bucket.
+
+    A CTA opts into 96 KB of SMEM, so one CTA lands per SM and a starved row
+    bucket cannot use more than one machine wave however it splits. Below a
+    handful of rows even 16 splits leaves most SMs idle, and the extra splits
+    cost only query reloads plus partial traffic (each split still reads its
+    own page slice). Those buckets compile the doubled capacity; the scratch
+    for it stays small because it scales with rows.
+    """
+    if rows <= 0:
+        raise ValueError("invalid draft Context row count")
+    if rows <= DRAFT_CONTEXT_STARVED_MAX_ROWS:
+        return DRAFT_CONTEXT_STARVED_SPLIT_CAPACITY
+    return DRAFT_CONTEXT_SPLIT_CAPACITY
 
 
 def draft_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> int:
@@ -575,19 +595,21 @@ def draft_context_split_plan(*, owned_pages: int, rows: int, sm_count: int) -> i
     leave the device starved: once the tiles feed at least half a wave, each
     further split re-reads every query tile and re-writes a full partial for
     little parallel gain, which measured slower at 16 rows. Starved shapes fill
-    the wave (up to the compiled capacity of 16 splits) because there the split
-    is nearly free.
+    the wave up to their compiled capacity because there the split is nearly
+    free.
     """
     if owned_pages < 0 or rows <= 0 or sm_count <= 0:
         raise ValueError("invalid draft context split work/device geometry")
+    capacity = draft_context_split_capacity(rows=rows)
+    buckets = (2, 4, 8, 16, 32)
     tiles = rows * DRAFT_CONTEXT_HEAD_TILES
     wave = (sm_count + tiles - 1) // tiles
     work = (owned_pages + 7) // 8
     traversal = (owned_pages + 63) // 64
-    wanted = max(2, min(16, max(wave, traversal), work))
+    wanted = max(2, min(capacity, max(wave, traversal), work))
     if tiles * 2 < sm_count // 2:
-        wanted = max(wanted, min(16, wave))
-    return next(bucket for bucket in (2, 4, 8, 16) if bucket >= wanted)
+        wanted = max(wanted, min(capacity, wave))
+    return next(bucket for bucket in buckets if bucket >= wanted and bucket <= capacity)
 
 
 class _ContextPartialMerge:
@@ -801,8 +823,8 @@ def compile_mla_draft_partial_aot(g: MlaDraftGeometry, *, max_rows=64, max_conte
         raise ValueError("draft Context partial requires h64 MlaDraftGeometry")
     if not 1 <= max_rows <= 4096 or not 1 <= max_context <= 1048576:
         raise ValueError("invalid planned row or owned-context capacity")
-    if num_splits != 16:
-        raise ValueError("draft Context partial requires capacity for 16 splits")
+    if num_splits not in (DRAFT_CONTEXT_SPLIT_CAPACITY, DRAFT_CONTEXT_STARVED_SPLIT_CAPACITY):
+        raise ValueError("draft Context partial requires capacity for 16 or 32 splits")
     launch = _DraftContextPartial(g, max_rows, max_context, 0, g.heads, num_splits,
                                   explicit_intervals=True)
     operands = (

@@ -28,6 +28,7 @@ import torch
 DRAFT_RECORD_BYTES = {"fp8": 656, "bf16": 1152}
 DRAFT_HEADS = 64
 DRAFT_HEAD_TILE = 16
+DRAFT_SPLIT_CAPACITY_LIMIT = 32
 
 
 def timed(fn, iterations):
@@ -135,8 +136,10 @@ def target_screen(args, sm_count):
 def draft_screen(args, sm_count):
     """h64 draft Context partials: two owner passes plus the standalone h64 combine."""
     from b12x.integration.cuteafd.kimi_mla import (
+        DRAFT_CONTEXT_STARVED_SPLIT_CAPACITY,
         MlaDraftGeometry,
         compile_mla_draft_partial_aot,
+        draft_context_split_capacity,
         draft_context_split_plan,
     )
     from b12x.integration.cuteafd.context_split import compile_lse_combine2_aot
@@ -156,11 +159,20 @@ def draft_screen(args, sm_count):
         pool = draft_records(cache, pages)
         for window in args.draft_windows:
             window_size = None if window == 0 else window
-            program = compile_mla_draft_partial_aot(
-                MlaDraftGeometry(kv_cache=cache, window_size=window_size),
-                max_rows=max_rows, max_context=max_owned)
-            scratch = torch.empty(program.scratch_bytes(max_rows)["scratch"],
-                                  device="cuda", dtype=torch.uint8)
+            # One program per compiled split capacity; each bucket's rows never
+            # exceed its own max_rows, so the doubled-capacity scratch stays small.
+            capacities = sorted({draft_context_split_capacity(rows=r) for r in args.draft_rows})
+            programs = {}
+            for capacity in capacities:
+                bucket_rows = max(r for r in args.draft_rows
+                                  if draft_context_split_capacity(rows=r) == capacity)
+                program = compile_mla_draft_partial_aot(
+                    MlaDraftGeometry(kv_cache=cache, window_size=window_size),
+                    max_rows=bucket_rows, max_context=max_owned, num_splits=capacity)
+                programs[capacity] = (
+                    program,
+                    torch.empty(program.scratch_bytes(bucket_rows)["scratch"],
+                                device="cuda", dtype=torch.uint8))
             for owned in args.draft_owned_contexts:
                 count = owned // 64
                 local = pool[:count].contiguous()
@@ -169,9 +181,12 @@ def draft_screen(args, sm_count):
                 intervals = torch.tensor([0, owned] * max_rows, device="cuda",
                                          dtype=torch.int32).view(max_rows, 2)
                 for rows in args.draft_rows:
+                    capacity = draft_context_split_capacity(rows=rows)
+                    program, scratch = programs[capacity]
                     planned = draft_context_split_plan(owned_pages=count, rows=rows, sm_count=sm_count)
                     for policy, splits in ([("draft_work_sm_rule", planned)]
-                                           + [("fixed_diagnostic", s) for s in args.draft_splits]):
+                                           + [("fixed_diagnostic", s) for s in args.draft_splits
+                                              if s <= capacity]):
                         def partial(dst=0):
                             program.launch(q, local, table, intervals, cu, po[dst], pl[dst],
                                            scratch, scalars=(rows, count, splits, scale))
@@ -197,6 +212,7 @@ def draft_screen(args, sm_count):
                         row = dict(mode="draft", kv_cache=cache, window=window_size,
                                    owned_context=owned, logical_context=owned*2, rows=rows,
                                    splits=splits, policy=policy, head_tile=DRAFT_HEAD_TILE,
+                                   split_capacity=capacity,
                                    ctas=ctas, record_bytes=DRAFT_RECORD_BYTES[cache],
                                    partial=dict(single, value_bytes=value_bytes,
                                                 roofline_us=single_roofline,
@@ -243,11 +259,11 @@ def main():
         parser.error("positive page-aligned owned contexts <=524288, rows <=64 and splits 2..16 required")
     if (min(args.draft_owned_contexts) <= 0 or max(args.draft_owned_contexts) > 524288
             or any(x % 64 for x in args.draft_owned_contexts) or min(args.draft_rows) <= 0
-            or max(args.draft_rows) > 64 or any(x < 2 or x > 16 for x in args.draft_splits)
+            or max(args.draft_rows) > 64 or any(x < 2 or x > DRAFT_SPLIT_CAPACITY_LIMIT for x in args.draft_splits)
             or any(x not in (0, 4096) for x in args.draft_windows)
             or any(x not in DRAFT_RECORD_BYTES for x in args.draft_caches)
             or args.bandwidth_gbs <= 0):
-        parser.error("draft: page-aligned owned contexts <=524288, rows <=64, splits 2..16, "
+        parser.error("draft: page-aligned owned contexts <=524288, rows <=64, splits 2..32, "
                      "windows 0/4096, caches fp8/bf16 and a positive bandwidth required")
     torch.manual_seed(42)
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count

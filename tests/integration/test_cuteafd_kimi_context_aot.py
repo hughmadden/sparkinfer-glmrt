@@ -419,10 +419,17 @@ def test_split_plan_uses_live_work_and_device_width():
 def test_draft_split_plan_fills_starved_rows_only():
     """A few row tiles leave the device idle, so the draft splits below the
     eight-pages-per-CTA floor; once the tiles feed half a wave the plan keeps
-    the target rule's floor instead of re-reading every query tile."""
-    from b12x.integration.cuteafd.kimi_mla import draft_context_split_plan, kimi_context_split_plan
-    assert draft_context_split_plan(owned_pages=8, rows=1, sm_count=188) == 16
-    assert draft_context_split_plan(owned_pages=64, rows=1, sm_count=188) == 16
+    the target rule's floor instead of re-reading every query tile. Only the
+    starved row buckets compile the doubled split capacity."""
+    from b12x.integration.cuteafd.kimi_mla import (
+        draft_context_split_capacity, draft_context_split_plan, kimi_context_split_plan)
+    assert draft_context_split_capacity(rows=1) == 32
+    assert draft_context_split_capacity(rows=4) == 32
+    assert draft_context_split_capacity(rows=8) == 16
+    assert draft_context_split_capacity(rows=64) == 16
+    assert draft_context_split_plan(owned_pages=8, rows=1, sm_count=188) == 32
+    assert draft_context_split_plan(owned_pages=64, rows=1, sm_count=188) == 32
+    assert draft_context_split_plan(owned_pages=64, rows=4, sm_count=188) == 16
     assert draft_context_split_plan(owned_pages=8, rows=16, sm_count=188) == 2
     assert draft_context_split_plan(owned_pages=64, rows=16, sm_count=188) == 4
     assert draft_context_split_plan(owned_pages=64, rows=64, sm_count=188) == 2
@@ -434,8 +441,10 @@ def test_draft_split_plan_fills_starved_rows_only():
         draft_context_split_plan(owned_pages=64, rows=0, sm_count=188)
     for pages in (0, 1, 16, 128, 1024, 4096):
         for rows in (1, 2, 4, 8, 16, 32, 64):
+            capacity = draft_context_split_capacity(rows=rows)
             for sm in (48, 170, 188):
-                assert draft_context_split_plan(owned_pages=pages, rows=rows, sm_count=sm) in (2, 4, 8, 16)
+                splits = draft_context_split_plan(owned_pages=pages, rows=rows, sm_count=sm)
+                assert splits in (2, 4, 8, 16, 32) and splits <= capacity
 
 
 @pytest.mark.parametrize("cache", ["bf16", "fp8"])
