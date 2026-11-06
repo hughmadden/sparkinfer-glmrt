@@ -217,7 +217,10 @@ def draft_screen(args, sm_count):
                                                 roofline_us=single_roofline,
                                                 over_roofline=single["median_us"]/single_roofline),
                                    merge=merged, context_compute_estimate=estimate,
-                                   us_per_head=estimate["median_us"]/DRAFT_HEADS,
+                                   # Two owner passes cover 2*64 head-halves; the h96 target's
+                                   # two h48 passes cover 96, so compare per head-half.
+                                   us_per_head_half=estimate["median_us"]/(2*DRAFT_HEADS),
+                                   us_per_head_pass=single["median_us"]/DRAFT_HEADS,
                                    estimate_over_roofline=estimate["median_us"]/(2*single_roofline))
                         results.append(row)
                         print(json.dumps(row), flush=True)
