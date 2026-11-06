@@ -86,12 +86,20 @@ def nc_gemv_cta_tiles(n: int, k: int, *, groups: int, warps: int) -> int:
 
 
 @dsl_user_op
+def _opaque_i32(v, *, loc=None, ip=None) -> Int32:
+    return Int32(llvm.inline_asm(
+        T.i32(), [Int32(v).ir_value(loc=loc, ip=ip)], "mov.b32 $0, $1;", "=r,r",
+        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip))
+
+
+@dsl_user_op
 def _ld_stream_v4(address, *, loc=None, ip=None):
-    """16-byte streaming weight load with side effects to preserve software-pipelined schedule."""
+    """16-byte streaming weight load with L1::no_allocate to preserve L1-cached activations."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
         [Int64(address).ir_value(loc=loc, ip=ip)],
-        "ld.global.nc.L1::evict_first.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "ld.global.nc.L1::no_allocate.v4.u32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,l",
         has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc, ip=ip)
@@ -106,6 +114,34 @@ def _ld_cached_v4(address, *, loc=None, ip=None):
         [Int64(address).ir_value(loc=loc, ip=ip)],
         "ld.global.nc.L1::evict_last.v4.u32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,l",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _ld_cached_v4_u32off0(x_k_ptr, byte_off_u32, *, loc=None, ip=None):
+    """16-byte L1-cached activation load at x_k_ptr + (u64)byte_off_u32 without 64-bit offset hoisting."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(x_k_ptr).ir_value(loc=loc, ip=ip),
+         Int32(byte_off_u32).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .u32 lo, hi;\n\t.reg .b64 addr;\n\tmov.b64 {lo, hi}, $4;\n\tadd.cc.u32 lo, lo, $5;\n\taddc.u32 hi, hi, 0;\n\tmov.b64 addr, {lo, hi};\n\tld.global.nc.L1::evict_last.v4.u32 {$0, $1, $2, $3}, [addr];\n}",
+        "=r,=r,=r,=r,l,r",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _ld_cached_v4_u32off16(x_k_ptr, byte_off_u32, *, loc=None, ip=None):
+    """16-byte L1-cached activation load at x_k_ptr + (u64)byte_off_u32 + 16 without 64-bit offset hoisting."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(x_k_ptr).ir_value(loc=loc, ip=ip),
+         Int32(byte_off_u32).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .u32 lo, hi;\n\t.reg .b64 addr;\n\tmov.b64 {lo, hi}, $4;\n\tadd.cc.u32 lo, lo, $5;\n\taddc.u32 hi, hi, 0;\n\tmov.b64 addr, {lo, hi};\n\tld.global.nc.L1::evict_last.v4.u32 {$0, $1, $2, $3}, [addr + 16];\n}",
+        "=r,=r,=r,=r,l,r",
         has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc, ip=ip)
     return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
@@ -242,16 +278,16 @@ def _e4m3x4_scaled_bf16x2x2_fast(word, s, *, loc=None, ip=None):
         }
         """,
         "=r,=r,r,f",
-        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc, ip=ip)
     return (Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
             Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)))
 
 
 class NcMmaFp8Gemv(MmaFp8Gemv):
-    """Bit-identical ``MmaFp8Gemv`` with 4-chunk rotating ping-pong pipeline (zero MOV copies,
-    3 chunks continuously in flight), immediate per-group weight reload, SM120 direct
-    ``cvt.rn.bf16x2.e4m3x2`` dequant, clamped/prefetched activation loads, and vectorized
+    """Bit-identical ``MmaFp8Gemv`` with 2-chunk rotating weight pipeline, 8-register half-chunk
+    ping-pong activation prefetching, 32-bit clamped row byte offsets (no 64-bit offset hoisting),
+    SM120 direct ``cvt.rn.bf16x2.e4m3x2`` dequant, M-band-first grid ordering, and vectorized
     ``v2.f32`` shared fold + packed ``bf16x2`` stores."""
 
     def __init__(self, n: int, k: int, *, max_rows: int = 64, warps: int = 4, groups: int = 4,
@@ -271,6 +307,18 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
         return ("nc_mma_fp8_gemv", super().key(), self.smem_frags)
 
     @cute.jit
+    def __call__(self, x: cute.Pointer, w: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        if const_expr(self.multi_m_grid):
+            cta_rows = 16 * self.m_tiles
+            grid_m = (rows + Int32(cta_rows - 1)) // Int32(cta_rows)
+            self.kernel(x, w, scale, out, rows).launch(
+                grid=(grid_m, self.n // self.cols, 1), block=(32 * self.warps, 1, 1), stream=stream)
+        else:
+            self.kernel(x, w, scale, out, rows).launch(
+                grid=(self.n // self.cols, 1, 1), block=(32 * self.warps, 1, 1), stream=stream)
+
+    @cute.jit
     def _load_chunk_v4(self, dest: cute.Tensor, w_row: Int64, k_off: Int64):
         for gi in cutlass.range_constexpr(self.groups):
             w0, w1, w2, w3 = _ld_stream_v4(w_row + Int64(gi * 8 * self.k) + k_off)
@@ -288,87 +336,70 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
 
     @cute.jit
     def _consume_chunk(self, acc: cute.Tensor, c_buf: cute.Tensor, s_buf: cute.Tensor,
-                       x_lo_base: cute.Tensor, x_hi_base: cute.Tensor,
+                       x_row0: Int64, d_lo: cute.Tensor, d_hi: cute.Tensor,
                        w_row: Int64, s_row: Int64, s_gi: Int64, s_kb: Int64,
-                       m0: Int32, rows: Int32, live_tiles: Int32,
                        k_off: Int64, next_k_off: Int64, next_block_idx: Int64,
                        reload_w: cutlass.Constexpr, reload_s: cutlass.Constexpr):
-        x_byte_off = k_off * Int64(2)
-        if const_expr(self.m_tiles == 1):
-            lo0, lo1, lo2, lo3 = _ld_cached_v4(x_lo_base[0] + x_byte_off)
-            lo4, lo5, lo6, lo7 = _ld_cached_v4(x_lo_base[0] + x_byte_off + Int64(16))
-            hi0, hi1, hi2, hi3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-            hi4, hi5, hi6, hi7 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-            if m0 + Int32(8) < rows:
-                hi0, hi1, hi2, hi3 = _ld_cached_v4(x_hi_base[0] + x_byte_off)
-                hi4, hi5, hi6, hi7 = _ld_cached_v4(x_hi_base[0] + x_byte_off + Int64(16))
-            xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
-            xa[0], xa[1], xa[2], xa[3] = lo0, lo1, lo2, lo3
-            xa[4], xa[5], xa[6], xa[7] = lo4, lo5, lo6, lo7
-            xa[8], xa[9], xa[10], xa[11] = hi0, hi1, hi2, hi3
-            xa[12], xa[13], xa[14], xa[15] = hi4, hi5, hi6, hi7
-            for gi in cutlass.range_constexpr(self.groups):
-                s_val = s_buf[gi if self.row_scales else 0]
-                f = 4 * gi
-                for t in cutlass.range_constexpr(4):
-                    b0, b1 = _e4m3x4_scaled_bf16x2x2_fast(c_buf[gi * 4 + t], s_val)
+        x_k_ptr = x_row0 + k_off * Int64(2)
+        xa_a = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+        xa_b = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+        lo0, lo1, lo2, lo3 = _ld_cached_v4(x_k_ptr)
+        hi0, hi1, hi2, hi3 = _ld_cached_v4_u32off0(x_k_ptr, d_hi[0])
+        xa_a[0], xa_a[1], xa_a[2], xa_a[3] = lo0, lo1, lo2, lo3
+        xa_a[4], xa_a[5], xa_a[6], xa_a[7] = hi0, hi1, hi2, hi3
+        lo4, lo5, lo6, lo7 = _ld_cached_v4(x_k_ptr + Int64(16))
+        hi4, hi5, hi6, hi7 = _ld_cached_v4_u32off16(x_k_ptr, d_hi[0])
+        xa_b[0], xa_b[1], xa_b[2], xa_b[3] = lo4, lo5, lo6, lo7
+        xa_b[4], xa_b[5], xa_b[6], xa_b[7] = hi4, hi5, hi6, hi7
+        bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
+        for gi in cutlass.range_constexpr(self.groups):
+            s_val = s_buf[gi if self.row_scales else 0]
+            for t in cutlass.range_constexpr(4):
+                b0, b1 = _e4m3x4_scaled_bf16x2x2_fast(c_buf[gi * 4 + t], s_val)
+                bw[8 * gi + 2 * t] = b0
+                bw[8 * gi + 2 * t + 1] = b1
+            if const_expr(reload_w):
+                w0, w1, w2, w3 = _ld_stream_v4(w_row + Int64(gi * 8 * self.k) + next_k_off)
+                c_buf[gi * 4 + 0] = w0
+                c_buf[gi * 4 + 1] = w1
+                c_buf[gi * 4 + 2] = w2
+                c_buf[gi * 4 + 3] = w3
+        if const_expr(reload_s):
+            self._load_scale_se(s_buf, s_row, next_block_idx, s_gi, s_kb)
+        for mt in cutlass.range_constexpr(self.m_tiles):
+            for t in cutlass.range_constexpr(2):
+                for gi in cutlass.range_constexpr(self.groups):
+                    f = 4 * (mt * self.groups + gi)
                     d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
                         acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                        xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
-                        b0, b1)
+                        xa_a[2 * t], xa_a[4 + 2 * t], xa_a[2 * t + 1], xa_a[4 + 2 * t + 1],
+                        bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
                     acc[f] = d0
                     acc[f + 1] = d1
                     acc[f + 2] = d2
                     acc[f + 3] = d3
-                if const_expr(reload_w):
-                    w0, w1, w2, w3 = _ld_stream_v4(w_row + Int64(gi * 8 * self.k) + next_k_off)
-                    c_buf[gi * 4 + 0] = w0
-                    c_buf[gi * 4 + 1] = w1
-                    c_buf[gi * 4 + 2] = w2
-                    c_buf[gi * 4 + 3] = w3
-            if const_expr(reload_s):
-                self._load_scale_se(s_buf, s_row, next_block_idx, s_gi, s_kb)
-        else:
-            bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
-            for gi in cutlass.range_constexpr(self.groups):
-                s_val = s_buf[gi if self.row_scales else 0]
-                for t in cutlass.range_constexpr(4):
-                    b0, b1 = _e4m3x4_scaled_bf16x2x2_fast(c_buf[gi * 4 + t], s_val)
-                    bw[8 * gi + 2 * t] = b0
-                    bw[8 * gi + 2 * t + 1] = b1
-                if const_expr(reload_w):
-                    w0, w1, w2, w3 = _ld_stream_v4(w_row + Int64(gi * 8 * self.k) + next_k_off)
-                    c_buf[gi * 4 + 0] = w0
-                    c_buf[gi * 4 + 1] = w1
-                    c_buf[gi * 4 + 2] = w2
-                    c_buf[gi * 4 + 3] = w3
-            if const_expr(reload_s):
-                self._load_scale_se(s_buf, s_row, next_block_idx, s_gi, s_kb)
-            for mt in cutlass.range_constexpr(self.m_tiles):
-                if Int32(mt) < live_tiles:
-                    lo0, lo1, lo2, lo3 = _ld_cached_v4(x_lo_base[mt] + x_byte_off)
-                    lo4, lo5, lo6, lo7 = _ld_cached_v4(x_lo_base[mt] + x_byte_off + Int64(16))
-                    hi0, hi1, hi2, hi3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                    hi4, hi5, hi6, hi7 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                    if m0 + Int32(16 * mt + 8) < rows:
-                        hi0, hi1, hi2, hi3 = _ld_cached_v4(x_hi_base[mt] + x_byte_off)
-                        hi4, hi5, hi6, hi7 = _ld_cached_v4(x_hi_base[mt] + x_byte_off + Int64(16))
-                    xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
-                    xa[0], xa[1], xa[2], xa[3] = lo0, lo1, lo2, lo3
-                    xa[4], xa[5], xa[6], xa[7] = lo4, lo5, lo6, lo7
-                    xa[8], xa[9], xa[10], xa[11] = hi0, hi1, hi2, hi3
-                    xa[12], xa[13], xa[14], xa[15] = hi4, hi5, hi6, hi7
-                    for gi in cutlass.range_constexpr(self.groups):
-                        f = 4 * (mt * self.groups + gi)
-                        for t in cutlass.range_constexpr(4):
-                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                                xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
-                                bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
-                            acc[f] = d0
-                            acc[f + 1] = d1
-                            acc[f + 2] = d2
-                            acc[f + 3] = d3
+            if const_expr(mt + 1 < self.m_tiles):
+                nlo0, nlo1, nlo2, nlo3 = _ld_cached_v4_u32off0(x_k_ptr, d_lo[mt + 1])
+                nhi0, nhi1, nhi2, nhi3 = _ld_cached_v4_u32off0(x_k_ptr, d_hi[mt + 1])
+                xa_a[0], xa_a[1], xa_a[2], xa_a[3] = nlo0, nlo1, nlo2, nlo3
+                xa_a[4], xa_a[5], xa_a[6], xa_a[7] = nhi0, nhi1, nhi2, nhi3
+            for t in cutlass.range_constexpr(2):
+                t_idx = t + 2
+                for gi in cutlass.range_constexpr(self.groups):
+                    f = 4 * (mt * self.groups + gi)
+                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                        xa_b[2 * t], xa_b[4 + 2 * t], xa_b[2 * t + 1], xa_b[4 + 2 * t + 1],
+                        bw[8 * gi + 2 * t_idx], bw[8 * gi + 2 * t_idx + 1])
+                    acc[f] = d0
+                    acc[f + 1] = d1
+                    acc[f + 2] = d2
+                    acc[f + 3] = d3
+            if const_expr(mt + 1 < self.m_tiles):
+                nlo4, nlo5, nlo6, nlo7 = _ld_cached_v4_u32off16(x_k_ptr, d_lo[mt + 1])
+                nhi4, nhi5, nhi6, nhi7 = _ld_cached_v4_u32off16(x_k_ptr, d_hi[mt + 1])
+                xa_b[0], xa_b[1], xa_b[2], xa_b[3] = nlo4, nlo5, nlo6, nlo7
+                xa_b[4], xa_b[5], xa_b[6], xa_b[7] = nhi4, nhi5, nhi6, nhi7
 
     @cute.kernel
     def kernel(self, x: cute.Pointer, w: cute.Pointer, scale: cute.Pointer, out: cute.Pointer, rows: Int32):
@@ -377,8 +408,10 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
         lane = tidx % Int32(32)
         g = lane // Int32(4)
         j = lane % Int32(4)
-        n0 = Int64(cute.arch.block_idx()[0]) * Int64(self.cols)
-        m0 = (Int32(cute.arch.block_idx()[1]) * Int32(16 * self.m_tiles)
+        n0 = (Int64(cute.arch.block_idx()[1]) * Int64(self.cols)
+              if const_expr(self.multi_m_grid)
+              else Int64(cute.arch.block_idx()[0]) * Int64(self.cols))
+        m0 = (Int32(cute.arch.block_idx()[0]) * Int32(16 * self.m_tiles)
               if const_expr(self.multi_m_grid) else Int32(0))
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
@@ -400,8 +433,12 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
         max_row = rows - Int32(1)
         if max_row < Int32(0):
             max_row = Int32(0)
-        x_lo_base = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int64)
-        x_hi_base = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int64)
+        r0 = m0 + g
+        if r0 > max_row:
+            r0 = max_row
+        x_row0 = x_base + Int64(r0) * Int64(self.k * 2)
+        d_lo = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
+        d_hi = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
         for mt in cutlass.range_constexpr(self.m_tiles):
             r_lo = m0 + Int32(16 * mt) + g
             if r_lo > max_row:
@@ -409,74 +446,36 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
             r_hi = m0 + Int32(16 * mt) + g + Int32(8)
             if r_hi > max_row:
                 r_hi = max_row
-            x_lo_base[mt] = x_base + Int64(r_lo) * Int64(self.k * 2)
-            x_hi_base[mt] = x_base + Int64(r_hi) * Int64(self.k * 2)
+            d_lo[mt] = _opaque_i32((r_lo - r0) * Int32(self.k * 2)) if const_expr(mt > 0) else Int32(0)
+            d_hi[mt] = _opaque_i32((r_hi - r0) * Int32(self.k * 2))
 
         chunk_words = 4 * self.groups
-        b0_c0 = cute.make_rmem_tensor(cute.make_layout((chunk_words,), stride=(1,)), Uint32)
-        b0_c1 = cute.make_rmem_tensor(cute.make_layout((chunk_words,), stride=(1,)), Uint32)
-        b1_c0 = cute.make_rmem_tensor(cute.make_layout((chunk_words,), stride=(1,)), Uint32)
-        b1_c1 = cute.make_rmem_tensor(cute.make_layout((chunk_words,), stride=(1,)), Uint32)
+        c0 = cute.make_rmem_tensor(cute.make_layout((chunk_words,), stride=(1,)), Uint32)
+        c1 = cute.make_rmem_tensor(cute.make_layout((chunk_words,), stride=(1,)), Uint32)
         s0 = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
-        s1 = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
 
-        if const_expr(self.blocks == 1):
-            self._load_chunk_v4(b0_c0, w_row, Int64(0))
-            self._load_chunk_v4(b0_c1, w_row, Int64(64))
-            self._load_scale_se(s0, s_row, Int64(0), s_gi, s_kb)
-            self._consume_chunk(acc, b0_c0, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                m0, rows, live_tiles, Int64(0), Int64(0), Int64(0), False, False)
-            self._consume_chunk(acc, b0_c1, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                m0, rows, live_tiles, Int64(64), Int64(0), Int64(0), False, False)
+        self._load_chunk_v4(c0, w_row, Int64(0))
+        self._load_chunk_v4(c1, w_row, Int64(64))
+        self._load_scale_se(s0, s_row, Int64(0), s_gi, s_kb)
+        if const_expr(self.blocks > 1):
+            for blk in cutlass.range(self.blocks - 1, unroll=1):
+                b = Int64(blk)
+                self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                    b * Int64(128), (b + Int64(1)) * Int64(128),
+                                    b + Int64(1), True, False)
+                self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                    b * Int64(128) + Int64(64),
+                                    (b + Int64(1)) * Int64(128) + Int64(64), b + Int64(1), True, True)
+            b_last = Int64(self.blocks - 1)
+            self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                b_last * Int64(128), Int64(0), Int64(0), False, False)
+            self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                b_last * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
         else:
-            self._load_chunk_v4(b0_c0, w_row, Int64(0))
-            self._load_chunk_v4(b0_c1, w_row, Int64(64))
-            self._load_scale_se(s0, s_row, Int64(0), s_gi, s_kb)
-            self._load_chunk_v4(b1_c0, w_row, Int64(128))
-            self._load_chunk_v4(b1_c1, w_row, Int64(192))
-            self._load_scale_se(s1, s_row, Int64(1), s_gi, s_kb)
-            tail_blocks = 2 if (self.blocks % 2 == 0) else 3
-            main_pairs = (self.blocks - tail_blocks) // 2
-            if const_expr(main_pairs > 0):
-                for pair in cutlass.range(main_pairs, unroll=1):
-                    b = Int64(pair) * Int64(2)
-                    self._consume_chunk(acc, b0_c0, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                        m0, rows, live_tiles, b * Int64(128), (b + Int64(2)) * Int64(128),
-                                        b + Int64(2), True, False)
-                    self._consume_chunk(acc, b0_c1, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                        m0, rows, live_tiles, b * Int64(128) + Int64(64),
-                                        (b + Int64(2)) * Int64(128) + Int64(64), b + Int64(2), True, True)
-                    self._consume_chunk(acc, b1_c0, s1, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                        m0, rows, live_tiles, (b + Int64(1)) * Int64(128),
-                                        (b + Int64(3)) * Int64(128), b + Int64(3), True, False)
-                    self._consume_chunk(acc, b1_c1, s1, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                        m0, rows, live_tiles, (b + Int64(1)) * Int64(128) + Int64(64),
-                                        (b + Int64(3)) * Int64(128) + Int64(64), b + Int64(3), True, True)
-            b_tail = Int64(2 * main_pairs)
-            if const_expr(tail_blocks == 2):
-                self._consume_chunk(acc, b0_c0, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, b_tail * Int64(128), Int64(0), Int64(0), False, False)
-                self._consume_chunk(acc, b0_c1, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, b_tail * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
-                self._consume_chunk(acc, b1_c0, s1, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, (b_tail + Int64(1)) * Int64(128), Int64(0), Int64(0), False, False)
-                self._consume_chunk(acc, b1_c1, s1, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, (b_tail + Int64(1)) * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
-            else:
-                self._consume_chunk(acc, b0_c0, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, b_tail * Int64(128), (b_tail + Int64(2)) * Int64(128),
-                                    b_tail + Int64(2), True, False)
-                self._consume_chunk(acc, b0_c1, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, b_tail * Int64(128) + Int64(64),
-                                    (b_tail + Int64(2)) * Int64(128) + Int64(64), b_tail + Int64(2), True, True)
-                self._consume_chunk(acc, b1_c0, s1, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, (b_tail + Int64(1)) * Int64(128), Int64(0), Int64(0), False, False)
-                self._consume_chunk(acc, b1_c1, s1, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, (b_tail + Int64(1)) * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
-                self._consume_chunk(acc, b0_c0, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, (b_tail + Int64(2)) * Int64(128), Int64(0), Int64(0), False, False)
-                self._consume_chunk(acc, b0_c1, s0, x_lo_base, x_hi_base, w_row, s_row, s_gi, s_kb,
-                                    m0, rows, live_tiles, (b_tail + Int64(2)) * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
+            self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                Int64(0), Int64(0), Int64(0), False, False)
+            self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                Int64(64), Int64(0), Int64(0), False, False)
 
         if const_expr(self.smem_frags == self.frags):
             pairs = self.frags // 2
@@ -484,19 +483,21 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
                 addr = smem_base + ((warp_id * Int32(pairs) + Int32(p)) * Int32(32) + lane) * Int32(8)
                 _st_shared_v2_f32(addr, acc[2 * p], acc[2 * p + 1])
             cute.arch.sync_threads()
-            for p in cutlass.range_constexpr(pairs):
-                if Int32(p % self.warps) == warp_id:
+            steps = (pairs + self.warps - 1) // self.warps
+            for step in cutlass.range_constexpr(steps):
+                p = warp_id + Int32(step * self.warps)
+                if const_expr(pairs % self.warps == 0) or p < Int32(pairs):
                     total0 = Float32(0.0)
                     total1 = Float32(0.0)
                     for src in cutlass.range_constexpr(self.warps):
-                        addr = smem_base + (Int32(src * pairs + p) * Int32(32) + lane) * Int32(8)
+                        addr = smem_base + ((Int32(src * pairs) + p) * Int32(32) + lane) * Int32(8)
                         v0, v1 = _ld_shared_v2_f32(addr)
                         total0 = total0 + v0
                         total1 = total1 + v1
-                    mt = p // (2 * self.groups)
-                    gi = (p // 2) % self.groups
-                    row = m0 + Int32(16 * mt) + g + Int32(8 * (p % 2))
-                    col = n0 + Int64(8 * gi) + Int64(2) * Int64(j)
+                    mt = p // Int32(2 * self.groups)
+                    gi = (p // Int32(2)) % Int32(self.groups)
+                    row = m0 + mt * Int32(16) + g + (p % Int32(2)) * Int32(8)
+                    col = n0 + Int64(gi) * Int64(8) + Int64(2) * Int64(j)
                     if row < rows:
                         if const_expr(self.out_dtype == cutlass.BFloat16):
                             address = Int64(out.toint()) + (Int64(row) * Int64(self.n) + col) * Int64(2)
@@ -506,6 +507,14 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
                             st_global_v2_f32(address, total0, total1)
         else:
             tile_pairs = self.tile_frags // 2
+            addr = Int32(0)
+            base_idx = 0
+            total0 = Float32(0.0)
+            total1 = Float32(0.0)
+            gi = 0
+            row = Int32(0)
+            col = Int64(0)
+            address = Int64(0)
             for mt in cutlass.range_constexpr(self.m_tiles):
                 if Int32(mt) < live_tiles:
                     if const_expr(mt > 0):
