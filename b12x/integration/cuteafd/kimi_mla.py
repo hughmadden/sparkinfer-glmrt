@@ -722,6 +722,23 @@ class _ContextPartial:
 
 
 class _DraftContextPartial(_ContextPartial):
+    def __init__(self, g, max_rows, max_context, begin, heads, splits,
+                 device_splits=False, heads_per_tile=16, explicit_intervals=True):
+        self.g, self.begin, self.heads, self.splits = g, begin, heads, splits
+        self.device_splits = device_splits
+        self.smem = make_smem_layout(
+            query_tile=1, fp8=False, heads_per_tile=heads_per_tile,
+            candidates_per_chunk=32, kv_stages=2, math_warps_per_query=4)
+        chunks = (max_context + self.smem.candidates_per_chunk - 1) // self.smem.candidates_per_chunk
+        self.chunks_per_split = (chunks + splits - 1) // splits
+        self.forward = DenseMlaForwardKernel(
+            layout=self.smem, page_size=g.page_rows, num_heads=heads,
+            num_splits=splits, chunks_per_split=self.chunks_per_split,
+            query_tile=1, fp8=False, qk_dim=576, value_dim=512, window_size=None,
+            ds_mla_record=g.kv_cache == "fp8", dynamic_split_chunks=True, device_splits=device_splits,
+            explicit_intervals=explicit_intervals)
+        self.merge = _ContextPartialMerge(heads, splits, device_splits)
+
     @cute.jit
     def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
                  visible_intervals: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
@@ -849,7 +866,8 @@ def compile_mla_draft_partial_aot(g: MlaDraftGeometry, *, max_rows=64, max_conte
     return compile_program(launch, name="mla_draft_partial", operands=operands,
         scalars=(Scalar("rows"), Scalar("page_table_width", "int64"),
                  Scalar("active_splits"), Scalar("attention_scale", "float32")),
-        key=(g, max_rows, max_context, num_splits, "explicit_intervals", "base2"),
+        key=(g, max_rows, max_context, num_splits, launch.smem.kv_stages,
+             launch.smem.candidates_per_chunk, "explicit_intervals", "base2"),
         scratch={"scratch": launch.scratch_bytes},
         geometry={**vars(g), "max_rows": max_rows, "max_context": max_context,
                   "num_splits": num_splits, "runtime_splits": True,

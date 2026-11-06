@@ -875,14 +875,473 @@ def write_partial_or_final(
                     output_lse[query_row, head] = lse
 
 
+from b12x._lib.intrinsics import ldmatrix_m8n8x4_trans_b16
+
+
+@cute.jit
+def qk_bf16_pipelined(
+    qk,
+    kv_smem_addr: Int32,
+    local_warp: Int32,
+    lane: Int32,
+    q_frag,
+    *,
+    record_stride_bytes: cutlass.Constexpr,
+    qk_dim: cutlass.Constexpr,
+):
+    """Pipelined BF16 K-by-Q MMA for the 32-candidate 16-head draft Context tile."""
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    first_candidate = (local_warp & Int32(1)) * Int32(16)
+    a_lane_base = (
+        kv_smem_addr
+        + (first_candidate + a_row) * Int32(record_stride_bytes)
+        + a_col * Int32(2)
+    )
+    k_quads = qk_dim // 64
+    a0_0, a0_1, a0_2, a0_3 = ldmatrix_m8n8x4_b16(a_lane_base)
+    a1_0, a1_1, a1_2, a1_3 = ldmatrix_m8n8x4_b16(a_lane_base + Int32(32))
+    c1_0 = Float32(0.0)
+    c1_1 = Float32(0.0)
+    c1_2 = Float32(0.0)
+    c1_3 = Float32(0.0)
+    c2_0 = Float32(0.0)
+    c2_1 = Float32(0.0)
+    c2_2 = Float32(0.0)
+    c2_3 = Float32(0.0)
+    c3_0 = Float32(0.0)
+    c3_1 = Float32(0.0)
+    c3_2 = Float32(0.0)
+    c3_3 = Float32(0.0)
+    for kq in cutlass.range_constexpr(k_quads):
+        ko2 = Int32((4 * kq + 2) * 32)
+        ko3 = Int32((4 * kq + 3) * 32)
+        a2_0, a2_1, a2_2, a2_3 = ldmatrix_m8n8x4_b16(a_lane_base + ko2)
+        a3_0, a3_1, a3_2, a3_3 = ldmatrix_m8n8x4_b16(a_lane_base + ko3)
+        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+            qk[0],
+            qk[1],
+            qk[2],
+            qk[3],
+            a0_0,
+            a0_1,
+            a0_2,
+            a0_3,
+            q_frag[(2 * kq) * 4 + 0],
+            q_frag[(2 * kq) * 4 + 1],
+        )
+        c1_0, c1_1, c1_2, c1_3 = mma_m16n8k16_f32_bf16(
+            c1_0,
+            c1_1,
+            c1_2,
+            c1_3,
+            a1_0,
+            a1_1,
+            a1_2,
+            a1_3,
+            q_frag[(2 * kq) * 4 + 2],
+            q_frag[(2 * kq) * 4 + 3],
+        )
+        if cutlass.const_expr(kq + 1 < k_quads):
+            nko0 = Int32((4 * kq + 4) * 32)
+            nko1 = Int32((4 * kq + 5) * 32)
+            a0_0, a0_1, a0_2, a0_3 = ldmatrix_m8n8x4_b16(a_lane_base + nko0)
+            a1_0, a1_1, a1_2, a1_3 = ldmatrix_m8n8x4_b16(a_lane_base + nko1)
+        c2_0, c2_1, c2_2, c2_3 = mma_m16n8k16_f32_bf16(
+            c2_0,
+            c2_1,
+            c2_2,
+            c2_3,
+            a2_0,
+            a2_1,
+            a2_2,
+            a2_3,
+            q_frag[(2 * kq + 1) * 4 + 0],
+            q_frag[(2 * kq + 1) * 4 + 1],
+        )
+        c3_0, c3_1, c3_2, c3_3 = mma_m16n8k16_f32_bf16(
+            c3_0,
+            c3_1,
+            c3_2,
+            c3_3,
+            a3_0,
+            a3_1,
+            a3_2,
+            a3_3,
+            q_frag[(2 * kq + 1) * 4 + 2],
+            q_frag[(2 * kq + 1) * 4 + 3],
+        )
+    qk[0] = (qk[0] + c2_0) + (c1_0 + c3_0)
+    qk[1] = (qk[1] + c2_1) + (c1_1 + c3_1)
+    qk[2] = (qk[2] + c2_2) + (c1_2 + c3_2)
+    qk[3] = (qk[3] + c2_3) + (c1_3 + c3_3)
+    return qk
+
+
+@cute.jit
+def mask_and_scale_pipelined(
+    qk,
+    chunk_begin: Int32,
+    visible_begin: Int32,
+    visible_end: Int32,
+    scale_log2: Float32,
+    local_warp: Int32,
+    lane: Int32,
+):
+    """Apply K3 causal bounds and base-2 scale to one 16x8 score sub-tile."""
+    gid = lane >> Int32(2)
+    candidate0 = chunk_begin + (local_warp & Int32(1)) * Int32(16) + gid
+    candidate1 = candidate0 + Int32(8)
+    if candidate0 < visible_begin or candidate0 >= visible_end:
+        qk[0] = Float32(_MASK)
+        qk[1] = Float32(_MASK)
+    if candidate1 < visible_begin or candidate1 >= visible_end:
+        qk[2] = Float32(_MASK)
+        qk[3] = Float32(_MASK)
+    qk[0] = qk[0] * scale_log2
+    qk[1] = qk[1] * scale_log2
+    qk[2] = qk[2] * scale_log2
+    qk[3] = qk[3] * scale_log2
+    return qk
+
+
+@cute.jit
+def online_softmax_pipelined(
+    qk,
+    p,
+    acc,
+    global_max,
+    global_sum,
+    reduce_max_addr: Int32,
+    reduce_sum_addr: Int32,
+    local_warp: Int32,
+    lane: Int32,
+    local_tid: Int32,
+    *,
+    barrier_id: cutlass.Constexpr,
+    value_dim: cutlass.Constexpr,
+    heads_per_tile: cutlass.Constexpr,
+    math_warps_per_query: cutlass.Constexpr,
+    barrier_threads: cutlass.Constexpr,
+):
+    """Base-2 online softmax for 32-candidate 2x2-warp (cand_tile x head_subtile) tiles."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    pairs = heads_per_tile // 4
+    head_tiles = heads_per_tile // 8
+    value_slots = (value_dim // (16 * math_warps_per_query)) * 2
+    cand_tile = local_warp & Int32(1)
+    head_subtile = local_warp >> Int32(1)
+
+    local_max = []
+    for h_sub in cutlass.range_constexpr(2):
+        value = fmax_f32(qk[h_sub], qk[h_sub + 2])
+        for offset in (4, 8, 16):
+            value = fmax_f32(
+                value,
+                cute.arch.shuffle_sync_bfly(value, offset=offset),
+            )
+        local_max.append(value)
+
+    local_sum = []
+    for h_sub in cutlass.range_constexpr(2):
+        p[h_sub] = exp2_approx(qk[h_sub] - local_max[h_sub])
+        p[h_sub + 2] = exp2_approx(qk[h_sub + 2] - local_max[h_sub])
+        local_sum.append(p[h_sub] + p[h_sub + 2])
+    for offset in (4, 8, 16):
+        for h_sub in cutlass.range_constexpr(2):
+            local_sum[h_sub] = local_sum[h_sub] + cute.arch.shuffle_sync_bfly(
+                local_sum[h_sub], offset=offset
+            )
+
+    if gid == Int32(0):
+        for h_sub in cutlass.range_constexpr(2):
+            head = head_subtile * Int32(8) + tid * Int32(2) + Int32(h_sub)
+            st_shared_f32(
+                reduce_max_addr
+                + (cand_tile * Int32(heads_per_tile) + head) * Int32(4),
+                local_max[h_sub],
+            )
+            st_shared_f32(
+                reduce_sum_addr
+                + (cand_tile * Int32(heads_per_tile) + head) * Int32(4),
+                local_sum[h_sub],
+            )
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
+
+    if local_tid < Int32(heads_per_tile):
+        head = local_tid
+        m0 = ld_shared_f32(reduce_max_addr + head * Int32(4))
+        m1 = ld_shared_f32(
+            reduce_max_addr + (Int32(heads_per_tile) + head) * Int32(4)
+        )
+        block_max_val = fmax_f32(m0, m1)
+        s0 = ld_shared_f32(reduce_sum_addr + head * Int32(4))
+        s1 = ld_shared_f32(
+            reduce_sum_addr + (Int32(heads_per_tile) + head) * Int32(4)
+        )
+        block_sum_val = s0 * exp2_approx(m0 - block_max_val) + s1 * exp2_approx(
+            m1 - block_max_val
+        )
+        st_shared_f32(reduce_max_addr + head * Int32(4), block_max_val)
+        st_shared_f32(reduce_sum_addr + head * Int32(4), block_sum_val)
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
+
+    block_max = []
+    block_sum = []
+    new_max = []
+    alpha = []
+    block_scale = []
+    for pair in cutlass.range_constexpr(pairs):
+        head = Int32((pair // 2) * 8) + tid * Int32(2) + Int32(pair % 2)
+        pair_max = ld_shared_f32(reduce_max_addr + head * Int32(4))
+        pair_sum = ld_shared_f32(reduce_sum_addr + head * Int32(4))
+        updated_max = fmax_f32(global_max[pair], pair_max)
+        rescale = Float32(0.0)
+        if global_sum[pair] > Float32(0.0):
+            rescale = exp2_approx(global_max[pair] - updated_max)
+        block_max.append(pair_max)
+        block_sum.append(pair_sum)
+        new_max.append(updated_max)
+        alpha.append(rescale)
+        block_scale.append(exp2_approx(pair_max - updated_max))
+
+    u_max0 = new_max[0]
+    u_max1 = new_max[1]
+    if head_subtile != Int32(0):
+        u_max0 = new_max[2]
+        u_max1 = new_max[3]
+    warp_scale = [
+        exp2_approx(local_max[0] - u_max0),
+        exp2_approx(local_max[1] - u_max1),
+    ]
+
+    pair_lane = gid >> Int32(1)
+    for tile in cutlass.range_constexpr(head_tiles):
+        alpha0 = cute.arch.shuffle_sync(alpha[tile * 2], pair_lane)
+        alpha1 = cute.arch.shuffle_sync(alpha[tile * 2 + 1], pair_lane)
+        row_alpha = alpha0
+        if (gid & Int32(1)) != Int32(0):
+            row_alpha = alpha1
+        for slot in cutlass.range_constexpr(value_slots):
+            acc[slot * (2 * head_tiles) + 2 * tile] = (
+                acc[slot * (2 * head_tiles) + 2 * tile] * row_alpha
+            )
+            acc[slot * (2 * head_tiles) + 2 * tile + 1] = (
+                acc[slot * (2 * head_tiles) + 2 * tile + 1] * row_alpha
+            )
+
+    for pair in cutlass.range_constexpr(pairs):
+        global_sum[pair] = (
+            global_sum[pair] * alpha[pair] + block_sum[pair] * block_scale[pair]
+        )
+        global_max[pair] = new_max[pair]
+    return p, warp_scale
+
+
+@cute.jit
+def pv_bf16_pipelined(
+    weights,
+    acc,
+    kv_smem_addr: Int32,
+    weight_addr: Int32,
+    local_warp: Int32,
+    lane: Int32,
+    *,
+    record_stride_bytes: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+    value_dim: cutlass.Constexpr,
+    heads_per_tile: cutlass.Constexpr,
+    candidates_per_chunk: cutlass.Constexpr,
+    math_warps_per_query: cutlass.Constexpr,
+    barrier_threads: cutlass.Constexpr,
+):
+    """Pipelined BF16 probability/value MMA for the 32-candidate 16-head draft Context tile."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    cand_tile = local_warp & Int32(1)
+    head_subtile = local_warp >> Int32(1)
+    candidate0 = cand_tile * Int32(16) + gid
+    candidate1 = candidate0 + Int32(8)
+    weight_stride = candidates_per_chunk + 8
+
+    for half in cutlass.range_constexpr(2):
+        head = head_subtile * Int32(8) + tid * Int32(2) + Int32(half)
+        st_shared_bf16_from_f32(
+            weight_addr + (head * Int32(weight_stride) + candidate0) * Int32(2),
+            weights[half],
+        )
+        st_shared_bf16_from_f32(
+            weight_addr + (head * Int32(weight_stride) + candidate1) * Int32(2),
+            weights[half + 2],
+        )
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
+
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    value_tiles = value_dim // (16 * math_warps_per_query)
+    a_lane_base = (
+        weight_addr
+        + (a_row * Int32(weight_stride) + a_col) * Int32(2)
+    )
+    p0_0, p0_1, p0_2, p0_3 = ldmatrix_m8n8x4_b16(a_lane_base)
+    p1_0, p1_1, p1_2, p1_3 = ldmatrix_m8n8x4_b16(a_lane_base + Int32(32))
+
+    v_lane_base = (
+        kv_smem_addr
+        + lane * Int32(record_stride_bytes)
+        + local_warp * Int32(16)
+    )
+    slot_stride = math_warps_per_query * 16
+    groups = (2 * value_tiles) // 4
+    v0_0, v0_1, v0_2, v0_3 = ldmatrix_m8n8x4_trans_b16(v_lane_base)
+    v1_0, v1_1, v1_2, v1_3 = ldmatrix_m8n8x4_trans_b16(
+        v_lane_base + Int32(slot_stride)
+    )
+    v2_0, v2_1, v2_2, v2_3 = ldmatrix_m8n8x4_trans_b16(
+        v_lane_base + Int32(2 * slot_stride)
+    )
+    v3_0, v3_1, v3_2, v3_3 = ldmatrix_m8n8x4_trans_b16(
+        v_lane_base + Int32(3 * slot_stride)
+    )
+    for g_idx in cutlass.range_constexpr(groups):
+        if cutlass.const_expr(g_idx + 1 < groups):
+            ng_off = Int32((g_idx + 1) * 4 * slot_stride)
+            nv0_0, nv0_1, nv0_2, nv0_3 = ldmatrix_m8n8x4_trans_b16(
+                v_lane_base + ng_off
+            )
+            nv1_0, nv1_1, nv1_2, nv1_3 = ldmatrix_m8n8x4_trans_b16(
+                v_lane_base + ng_off + Int32(slot_stride)
+            )
+            nv2_0, nv2_1, nv2_2, nv2_3 = ldmatrix_m8n8x4_trans_b16(
+                v_lane_base + ng_off + Int32(2 * slot_stride)
+            )
+            nv3_0, nv3_1, nv3_2, nv3_3 = ldmatrix_m8n8x4_trans_b16(
+                v_lane_base + ng_off + Int32(3 * slot_stride)
+            )
+        b0 = (g_idx * 4 + 0) * 4
+        b1 = (g_idx * 4 + 1) * 4
+        b2 = (g_idx * 4 + 2) * 4
+        b3 = (g_idx * 4 + 3) * 4
+
+        acc[b0], acc[b0 + 1], acc[b0 + 2], acc[b0 + 3] = mma_m16n8k16_f32_bf16(
+            acc[b0],
+            acc[b0 + 1],
+            acc[b0 + 2],
+            acc[b0 + 3],
+            p0_0,
+            p0_1,
+            p0_2,
+            p0_3,
+            v0_0,
+            v0_1,
+        )
+        acc[b1], acc[b1 + 1], acc[b1 + 2], acc[b1 + 3] = mma_m16n8k16_f32_bf16(
+            acc[b1],
+            acc[b1 + 1],
+            acc[b1 + 2],
+            acc[b1 + 3],
+            p0_0,
+            p0_1,
+            p0_2,
+            p0_3,
+            v1_0,
+            v1_1,
+        )
+        acc[b2], acc[b2 + 1], acc[b2 + 2], acc[b2 + 3] = mma_m16n8k16_f32_bf16(
+            acc[b2],
+            acc[b2 + 1],
+            acc[b2 + 2],
+            acc[b2 + 3],
+            p0_0,
+            p0_1,
+            p0_2,
+            p0_3,
+            v2_0,
+            v2_1,
+        )
+        acc[b3], acc[b3 + 1], acc[b3 + 2], acc[b3 + 3] = mma_m16n8k16_f32_bf16(
+            acc[b3],
+            acc[b3 + 1],
+            acc[b3 + 2],
+            acc[b3 + 3],
+            p0_0,
+            p0_1,
+            p0_2,
+            p0_3,
+            v3_0,
+            v3_1,
+        )
+
+        acc[b0], acc[b0 + 1], acc[b0 + 2], acc[b0 + 3] = mma_m16n8k16_f32_bf16(
+            acc[b0],
+            acc[b0 + 1],
+            acc[b0 + 2],
+            acc[b0 + 3],
+            p1_0,
+            p1_1,
+            p1_2,
+            p1_3,
+            v0_2,
+            v0_3,
+        )
+        acc[b1], acc[b1 + 1], acc[b1 + 2], acc[b1 + 3] = mma_m16n8k16_f32_bf16(
+            acc[b1],
+            acc[b1 + 1],
+            acc[b1 + 2],
+            acc[b1 + 3],
+            p1_0,
+            p1_1,
+            p1_2,
+            p1_3,
+            v1_2,
+            v1_3,
+        )
+        acc[b2], acc[b2 + 1], acc[b2 + 2], acc[b2 + 3] = mma_m16n8k16_f32_bf16(
+            acc[b2],
+            acc[b2 + 1],
+            acc[b2 + 2],
+            acc[b2 + 3],
+            p1_0,
+            p1_1,
+            p1_2,
+            p1_3,
+            v2_2,
+            v2_3,
+        )
+        acc[b3], acc[b3 + 1], acc[b3 + 2], acc[b3 + 3] = mma_m16n8k16_f32_bf16(
+            acc[b3],
+            acc[b3 + 1],
+            acc[b3 + 2],
+            acc[b3 + 3],
+            p1_0,
+            p1_1,
+            p1_2,
+            p1_3,
+            v3_2,
+            v3_3,
+        )
+
+        if cutlass.const_expr(g_idx + 1 < groups):
+            v0_0, v0_1, v0_2, v0_3 = nv0_0, nv0_1, nv0_2, nv0_3
+            v1_0, v1_1, v1_2, v1_3 = nv1_0, nv1_1, nv1_2, nv1_3
+            v2_0, v2_1, v2_2, v2_3 = nv2_0, nv2_1, nv2_2, nv2_3
+            v3_0, v3_1, v3_2, v3_3 = nv3_0, nv3_1, nv3_2, nv3_3
+    return acc
+
+
 __all__ = [
     "exp2_approx",
     "log2_approx",
     "mask_and_scale",
+    "mask_and_scale_pipelined",
     "online_softmax",
+    "online_softmax_pipelined",
     "pv_bf16",
+    "pv_bf16_pipelined",
     "pv_fp8",
     "qk_bf16",
+    "qk_bf16_pipelined",
     "qk_fp8",
     "stage_absorbed_query",
     "write_partial_or_final",

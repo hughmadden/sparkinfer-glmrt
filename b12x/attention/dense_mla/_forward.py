@@ -6,11 +6,15 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
-from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
+from b12x._lib.intrinsics import (
+    get_ptr_as_int64,
+    ldmatrix_m8n8x4_b16,
+    shared_ptr_to_u32,
+)
 
 from ._io import (
     issue_dense_page_gather,
@@ -23,10 +27,14 @@ from ._layout import (
 )
 from ._math import (
     mask_and_scale,
+    mask_and_scale_pipelined,
     online_softmax,
+    online_softmax_pipelined,
     pv_bf16,
+    pv_bf16_pipelined,
     pv_fp8,
     qk_bf16,
+    qk_bf16_pipelined,
     qk_fp8,
     stage_absorbed_query,
     write_partial_or_final,
@@ -229,6 +237,29 @@ class DenseMlaForwardKernel:
             global_max_fragment[idx] = Float32(-1.0e30)
             global_sum_fragment[idx] = Float32(0.0)
 
+        if cutlass.const_expr(
+            self.explicit_intervals
+            and not self.fp8
+            and self.heads_per_tile == 16
+            and self.candidates_per_chunk == 32
+        ):
+            q_frag = cute.make_rmem_tensor(18 * 4, Uint32)
+            b_row = (local_warp >> Int32(1)) * Int32(8) + (lane & Int32(7))
+            b_col = (lane >> Int32(3)) * Int32(8)
+            b_lane_base = (
+                q_smem_addr
+                + b_row * Int32(self.layout.record_stride_bytes)
+                + b_col * Int32(2)
+            )
+            for pair in cutlass.range_constexpr(18):
+                qb0, qb1, qb2, qb3 = ldmatrix_m8n8x4_b16(
+                    b_lane_base + Int32(pair * 64)
+                )
+                q_frag[pair * 4 + 0] = qb0
+                q_frag[pair * 4 + 1] = qb1
+                q_frag[pair * 4 + 2] = qb2
+                q_frag[pair * 4 + 3] = qb3
+
         consumer_phase = Int32(0)
         consumer_index = Int32(0)
         kv_buffer_bytes = Int32(
@@ -246,10 +277,11 @@ class DenseMlaForwardKernel:
                 mbar_base + consumer_index,
                 phase=consumer_phase,
             )
-            cute.arch.barrier(
-                barrier_id=barrier_id,
-                number_of_threads=self.group_threads,
-            )
+            if cutlass.const_expr(not self.explicit_intervals):
+                cute.arch.barrier(
+                    barrier_id=barrier_id,
+                    number_of_threads=self.group_threads,
+                )
 
             if query_valid != Int32(0) and chunk_begin < visible_end:
                 accumulator = [
@@ -262,79 +294,54 @@ class DenseMlaForwardKernel:
                 global_sum = [
                     global_sum_fragment[idx] for idx in range(self.pair_count)
                 ]
-                qk = [Float32(0.0) for _ in range(4 * self.head_tiles_per_row)]
-                if cutlass.const_expr(self.fp8):
-                    qk = qk_fp8(
+                if cutlass.const_expr(
+                    self.explicit_intervals
+                    and not self.fp8
+                    and self.heads_per_tile == 16
+                    and self.candidates_per_chunk == 32
+                ):
+                    qk = [Float32(0.0) for _ in range(4)]
+                    qk = qk_bf16_pipelined(
                         qk,
-                        q_smem_addr,
                         kv_buffer_addr,
                         local_warp,
                         lane,
+                        q_frag,
                         record_stride_bytes=self.layout.record_stride_bytes,
                         qk_dim=self.qk_dim,
                     )
-                else:
-                    qk = qk_bf16(
+                    qk = mask_and_scale_pipelined(
                         qk,
-                        q_smem_addr,
-                        kv_buffer_addr,
+                        chunk_begin,
+                        visible_begin,
+                        visible_end,
+                        score_scale_log2,
                         local_warp,
                         lane,
-                        record_stride_bytes=self.layout.record_stride_bytes,
-                        qk_dim=self.qk_dim,
-                        heads_per_tile=self.heads_per_tile,
                     )
-                qk = mask_and_scale(
-                    qk,
-                    chunk_begin,
-                    visible_begin,
-                    visible_end,
-                    score_scale_log2,
-                    local_warp,
-                    lane,
-                    heads_per_tile=self.heads_per_tile,
-                )
-                probability = [
-                    Float32(0.0) for _ in range(4 * self.head_tiles_per_row)
-                ]
-                probability, warp_scale = online_softmax(
-                    qk,
-                    probability,
-                    accumulator,
-                    global_max,
-                    global_sum,
-                    reduce_max_addr,
-                    reduce_sum_addr,
-                    local_warp,
-                    lane,
-                    local_tid,
-                    barrier_id=barrier_id,
-                    value_dim=self.value_dim,
-                    heads_per_tile=self.heads_per_tile,
-                    math_warps_per_query=self.math_warps_per_query,
-                    barrier_threads=self.group_threads,
-                )
-                weights = [
-                    probability[reg] * warp_scale[(reg // 4) * 2 + reg % 2]
-                    for reg in range(4 * self.head_tiles_per_row)
-                ]
-                if cutlass.const_expr(self.fp8):
-                    accumulator = pv_fp8(
-                        weights,
+                    probability = [Float32(0.0) for _ in range(4)]
+                    probability, warp_scale = online_softmax_pipelined(
+                        qk,
+                        probability,
                         accumulator,
-                        kv_buffer_addr,
-                        weight_scale_addr,
-                        weight_addr,
+                        global_max,
+                        global_sum,
+                        reduce_max_addr,
+                        reduce_sum_addr,
                         local_warp,
                         lane,
                         local_tid,
-                        record_stride_bytes=self.layout.record_stride_bytes,
                         barrier_id=barrier_id,
                         value_dim=self.value_dim,
+                        heads_per_tile=self.heads_per_tile,
+                        math_warps_per_query=self.math_warps_per_query,
                         barrier_threads=self.group_threads,
                     )
-                else:
-                    accumulator = pv_bf16(
+                    weights = [
+                        probability[reg] * warp_scale[reg % 2]
+                        for reg in range(4)
+                    ]
+                    accumulator = pv_bf16_pipelined(
                         weights,
                         accumulator,
                         kv_buffer_addr,
@@ -349,6 +356,94 @@ class DenseMlaForwardKernel:
                         math_warps_per_query=self.math_warps_per_query,
                         barrier_threads=self.group_threads,
                     )
+                else:
+                    qk = [Float32(0.0) for _ in range(4 * self.head_tiles_per_row)]
+                    if cutlass.const_expr(self.fp8):
+                        qk = qk_fp8(
+                            qk,
+                            q_smem_addr,
+                            kv_buffer_addr,
+                            local_warp,
+                            lane,
+                            record_stride_bytes=self.layout.record_stride_bytes,
+                            qk_dim=self.qk_dim,
+                        )
+                    else:
+                        qk = qk_bf16(
+                            qk,
+                            q_smem_addr,
+                            kv_buffer_addr,
+                            local_warp,
+                            lane,
+                            record_stride_bytes=self.layout.record_stride_bytes,
+                            qk_dim=self.qk_dim,
+                            heads_per_tile=self.heads_per_tile,
+                        )
+                    qk = mask_and_scale(
+                        qk,
+                        chunk_begin,
+                        visible_begin,
+                        visible_end,
+                        score_scale_log2,
+                        local_warp,
+                        lane,
+                        heads_per_tile=self.heads_per_tile,
+                    )
+                    probability = [
+                        Float32(0.0) for _ in range(4 * self.head_tiles_per_row)
+                    ]
+                    probability, warp_scale = online_softmax(
+                        qk,
+                        probability,
+                        accumulator,
+                        global_max,
+                        global_sum,
+                        reduce_max_addr,
+                        reduce_sum_addr,
+                        local_warp,
+                        lane,
+                        local_tid,
+                        barrier_id=barrier_id,
+                        value_dim=self.value_dim,
+                        heads_per_tile=self.heads_per_tile,
+                        math_warps_per_query=self.math_warps_per_query,
+                        barrier_threads=self.group_threads,
+                    )
+                    weights = [
+                        probability[reg] * warp_scale[(reg // 4) * 2 + reg % 2]
+                        for reg in range(4 * self.head_tiles_per_row)
+                    ]
+                    if cutlass.const_expr(self.fp8):
+                        accumulator = pv_fp8(
+                            weights,
+                            accumulator,
+                            kv_buffer_addr,
+                            weight_scale_addr,
+                            weight_addr,
+                            local_warp,
+                            lane,
+                            local_tid,
+                            record_stride_bytes=self.layout.record_stride_bytes,
+                            barrier_id=barrier_id,
+                            value_dim=self.value_dim,
+                            barrier_threads=self.group_threads,
+                        )
+                    else:
+                        accumulator = pv_bf16(
+                            weights,
+                            accumulator,
+                            kv_buffer_addr,
+                            weight_addr,
+                            local_warp,
+                            lane,
+                            record_stride_bytes=self.layout.record_stride_bytes,
+                            barrier_id=barrier_id,
+                            value_dim=self.value_dim,
+                            heads_per_tile=self.heads_per_tile,
+                            candidates_per_chunk=self.candidates_per_chunk,
+                            math_warps_per_query=self.math_warps_per_query,
+                            barrier_threads=self.group_threads,
+                        )
                 for idx in cutlass.range_constexpr(self.accumulator_slots):
                     accumulator_fragment[idx] = accumulator[idx]
                 for idx in cutlass.range_constexpr(self.pair_count):
