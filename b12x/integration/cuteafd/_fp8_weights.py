@@ -195,7 +195,7 @@ class Fp8Projection:
         self.kmajor = bool(kmajor) or (self.row_scales and prefill_rows is not None)
         self.prefill_mask = int(prefill_mask)
         self.prefill = prefill_rows is not None
-        self.gemv = self.gemv_wide = self.w8a8 = None
+        self.gemv = self.gemv_wide = self.gemv_m16 = self.w8a8 = None
         if self.prefill:
             from ._glmf_fp8 import BlockFp8Projection
 
@@ -233,6 +233,11 @@ class Fp8Projection:
                                       cta_tiles=wide_t if wide_groups is None else None,
                                       row_scales=self.row_scales, kmajor=self.kmajor,
                                       out_dtype=out_dtype) if cap > int(gemv_rows) else None
+            # HQA block-scale o projections: only M16 won the direct-widen screen.
+            if (self.n, self.k, warps) in ((4096, 16384, 4), (4096, 8192, 8)) \
+                    and not self.row_scales and int(gemv_rows) >= 16 and cap > int(gemv_rows):
+                self.gemv_m16 = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows),
+                    warps=warps, groups=groups, out_dtype=out_dtype, direct_widen=True)
             self.gemv_rows = int(gemv_rows)
             self.max_gemv_rows = cap if self.gemv_wide is not None else int(gemv_rows)
             tile_n = decode_tile_n(self.n)
@@ -244,6 +249,7 @@ class Fp8Projection:
         return (self.n, self.k, self.row_scales, self.kmajor, self.prefill_mask, self.max_gemv_rows,
                 None if self.gemv is None else self.gemv.key(),
                 None if self.gemv_wide is None else self.gemv_wide.key(),
+                None if self.gemv_m16 is None else self.gemv_m16.key(),
                 None if self.w8a8 is None else self.w8a8.key(), self.w8a16.key())
 
     @property
@@ -273,7 +279,14 @@ class Fp8Projection:
             if limit > Int32(self.max_gemv_rows):
                 limit = Int32(self.max_gemv_rows)
             if rows <= limit:
-                if cutlass.const_expr(self.gemv_wide is None):
+                if cutlass.const_expr(self.gemv_m16 is not None):
+                    if rows == Int32(16):
+                        self.gemv_m16(x, w_fp8, scale, out, rows, stream)
+                    elif rows <= Int32(self.gemv_rows):
+                        self.gemv(x, w_fp8, scale, out, rows, stream)
+                    else:
+                        self.gemv_wide(x, w_fp8, scale, out, rows, stream)
+                elif cutlass.const_expr(self.gemv_wide is None):
                     self.gemv(x, w_fp8, scale, out, rows, stream)
                 else:
                     if rows <= Int32(self.gemv_rows):
@@ -597,14 +610,7 @@ class TmaFp8Gemm:
     buffer_align_bytes = 1024
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, compute_warps: int = 4,
-                 num_stages: int = 4, scales: str = "block", tile_n: int = 128,
-                 direct_widen: bool = False):
-        self.direct_widen = bool(direct_widen)
-        self.widen = _e4m3x8_scaled_bf16
-        if self.direct_widen:
-            # Reuse the prior Gemini kernel's exact conversion, not its memory path.
-            from ._fp8_gemv_nc import _e4m3x8_scaled_bf16_fast
-            self.widen = _e4m3x8_scaled_bf16_fast
+                 num_stages: int = 4, scales: str = "block", tile_n: int = 128):
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
         # Narrower N tiles give narrow, long-K projections more CTAs (each widens fewer rows).
@@ -629,7 +635,7 @@ class TmaFp8Gemm:
 
     def key(self) -> tuple:
         return (self.n, self.k, str(self.out_dtype), self.num_compute_warps, self.num_stages, self.scales,
-                self.tile_n, self.direct_widen)
+                self.tile_n)
 
     def _tiled_mma(self):
         return cute.make_tiled_mma(
@@ -759,7 +765,7 @@ class TmaFp8Gemm:
                     if cutlass.const_expr(self.scales != "block"):
                         s = self._scale(scale, n_tile, n, k_tile)
                     lo, hi = ld_shared_v2_u32(stage + n * Int32(self.tile_k) + c * Int32(8))
-                    v0, v1, v2, v3 = self.widen(lo, hi, s)
+                    v0, v1, v2, v3 = _e4m3x8_scaled_bf16(lo, hi, s)
                     # 128-byte swizzle: 16-byte chunk c of row n sits at chunk c ^ (n % 8).
                     st_shared_v4_u32(b_base + n * Int32(128) + ((c ^ (n % Int32(8))) * Int32(16)), v0, v1, v2, v3)
                 cute.arch.barrier(barrier_id=1, number_of_threads=self.compute_threads)

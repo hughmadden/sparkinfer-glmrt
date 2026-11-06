@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired HQA W8A16 direct-widen screen, preserving every production tile."""
+"""Final-round HQA W8A16 tile-residency screen, unchanged conversion and K order."""
 from __future__ import annotations
 import argparse
 import json
@@ -9,20 +9,20 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def direct_program(n, k, decode):
+def tile_program(n, k, decode):
     import torch
     from b12x.integration.cuteafd.glmf_split import _Fp8Linear
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
-    from b12x.integration.cuteafd._fp8_gemv_nc import (
-        _e4m3x4_scaled_bf16x2x2_fast, _e4m3x8_scaled_bf16_fast)
+    from b12x.integration.cuteafd._fp8_weights import MmaFp8Gemv, TmaFp8Gemm
     launch = _Fp8Linear(n, k, 64 if decode else 4096, decode)
-    for op in (launch.projection.gemv, launch.projection.gemv_wide):
-        if op is not None:
-            op.direct_widen = True
-            op.widen = _e4m3x4_scaled_bf16x2x2_fast
-    launch.projection.w8a16.direct_widen = True
-    launch.projection.w8a16.widen = _e4m3x8_scaled_bf16_fast
-    return compile_program(launch, name='hqa_direct_widen', operands=(
+    if decode:
+        old = launch.projection.gemv_wide
+        groups, tiles = (1, 1) if (n,k)==(4096,16384) else (2, 2)
+        launch.projection.gemv_wide = MmaFp8Gemv(n,k,max_rows=64,
+            warps=old.warps,groups=groups,cta_tiles=tiles)
+    else:
+        launch.projection.w8a16 = TmaFp8Gemm(n,k,compute_warps=4,tile_n=64,num_stages=3)
+    return compile_program(launch, name='hqa_tile_residency', operands=(
         Operand('x',torch.bfloat16,f'[rows,{k}]'),
         Operand('weight',torch.uint8,f'[{n},{k}]'),
         Operand('scales',torch.float32,f'[{n//128},{k//128}]'),
@@ -44,7 +44,7 @@ def main():
     if args.preflight:
         import ast
         ast.parse(Path(__file__).read_text())
-        print('HQA direct-widen preflight passed')
+        print('HQA tile-residency preflight passed')
         return
     import torch
     from benchmarks.benchmark_hqa_projection_ceiling import SHAPES,snapshot
@@ -53,7 +53,7 @@ def main():
     torch.manual_seed(836)
     flush=make_l2_flush_fn(True)
     result={'hardware_before':snapshot(),'results':[],
-            'conditions':'Same-process paired alternating L2-cold graphs. Production tiles/memory/MMA/K-fold unchanged; only E4M3->FP32 widening changes from FP16 detour to direct BF16 bits. FP8-A16 only; A8 unchanged.'}
+            'conditions':'Same-process paired alternating L2-cold graphs. Decode groups2/tiles2 (o-full groups1/tiles1); prefill M64/N64/3stages/4warps. Production conversions and K fold unchanged. A8 unchanged.'}
     for shape,(n,k) in SHAPES.items():
         x=(torch.randn(4096,k,device='cuda')*.1).bfloat16()
         w=(torch.randn(n,k,device='cuda')*.1).to(torch.float8_e4m3fn)
@@ -61,10 +61,10 @@ def main():
         out={a:torch.empty(4096,n,device='cuda',dtype=torch.bfloat16) for a in ('base','candidate')}
         programs={decode:{'base':compile_glmf_fp8_linear_aot(input_features=k,output_features=n,
                             max_rows=64 if decode else 4096,decode=decode),
-                          'candidate':direct_program(n,k,decode)} for decode in (True,False)}
+                          'candidate':tile_program(n,k,decode)} for decode in (True,False)}
         scratch=torch.empty(programs[False]['base'].scratch_bytes(4096)['scratch'],device='cuda',dtype=torch.uint8)
         first_row=None
-        for m in (1,4,16,64,2752,4096):
+        for m in (64,2752,4096):
             decode=m<=64
             flag=64 if decode else 0
             graphs={}
@@ -84,10 +84,6 @@ def main():
                 assert torch.isnan(out[arm][m:]).all()
                 graphs[arm]=graph
             assert torch.equal(out['base'][:m].view(torch.uint8),out['candidate'][:m].view(torch.uint8)),(shape,m)
-            if m==1:
-                first_row=out['candidate'][0].clone()
-            if decode:
-                assert torch.equal(first_row.view(torch.uint8),out['candidate'][0].view(torch.uint8))
             samples={a:[] for a in out}
             start,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
             for i in range(args.samples):
@@ -103,10 +99,16 @@ def main():
             args.output.write_text(json.dumps(result,indent=2)+'\n')
         del programs,graphs,x,w,s,out,scratch,expected
         torch.cuda.empty_cache()
+    from tests.integration.test_cuteafd_glmf_native_stages import test_flash_standalone_block_fp8_matches_fused
+    result['fused_oracles']=[]
+    for heads in (32,64):
+        for m in (1,4,16,17,64):
+            test_flash_standalone_block_fp8_matches_fused(heads,'decode',m,64)
+            result['fused_oracles'].append([heads,m])
     result['hardware_after']=snapshot()
     result['complete']=True
     args.output.write_text(json.dumps(result,indent=2)+'\n')
-    print('HQA direct-widen complete: all 24 byte/graph/tail checks passed',flush=True)
+    print('HQA tile-residency complete: all 12 byte/graph/tail checks passed',flush=True)
 
 
 if __name__=='__main__':
