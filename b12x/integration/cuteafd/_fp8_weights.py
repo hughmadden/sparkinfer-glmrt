@@ -597,7 +597,14 @@ class TmaFp8Gemm:
     buffer_align_bytes = 1024
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, compute_warps: int = 4,
-                 num_stages: int = 4, scales: str = "block", tile_n: int = 128):
+                 num_stages: int = 4, scales: str = "block", tile_n: int = 128,
+                 direct_widen: bool = False):
+        self.direct_widen = bool(direct_widen)
+        self.widen = _e4m3x8_scaled_bf16
+        if self.direct_widen:
+            # Reuse the prior Gemini kernel's exact conversion, not its memory path.
+            from ._fp8_gemv_nc import _e4m3x8_scaled_bf16_fast
+            self.widen = _e4m3x8_scaled_bf16_fast
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
         # Narrower N tiles give narrow, long-K projections more CTAs (each widens fewer rows).
@@ -622,7 +629,7 @@ class TmaFp8Gemm:
 
     def key(self) -> tuple:
         return (self.n, self.k, str(self.out_dtype), self.num_compute_warps, self.num_stages, self.scales,
-                self.tile_n)
+                self.tile_n, self.direct_widen)
 
     def _tiled_mma(self):
         return cute.make_tiled_mma(
@@ -752,7 +759,7 @@ class TmaFp8Gemm:
                     if cutlass.const_expr(self.scales != "block"):
                         s = self._scale(scale, n_tile, n, k_tile)
                     lo, hi = ld_shared_v2_u32(stage + n * Int32(self.tile_k) + c * Int32(8))
-                    v0, v1, v2, v3 = _e4m3x8_scaled_bf16(lo, hi, s)
+                    v0, v1, v2, v3 = self.widen(lo, hi, s)
                     # 128-byte swizzle: 16-byte chunk c of row n sits at chunk c ^ (n % 8).
                     st_shared_v4_u32(b_base + n * Int32(128) + ((c ^ (n % Int32(8))) * Int32(16)), v0, v1, v2, v3)
                 cute.arch.barrier(barrier_id=1, number_of_threads=self.compute_threads)
@@ -889,7 +896,12 @@ class MmaFp8Gemv:
     def __init__(self, n: int, k: int, *, max_rows: int = 64, warps: int = 4, groups: int = 4,
                  out_dtype=cutlass.BFloat16, row_scales: bool = False, kmajor: bool = False,
                  load_hint: str = "stream", prefetch_blocks: int = 0, prefetch_bytes: int = 1024,
-                 cta_tiles: int | None = None):
+                 cta_tiles: int | None = None, direct_widen: bool = False):
+        self.direct_widen = bool(direct_widen)
+        self.widen = _e4m3x4_scaled_bf16x2x2
+        if self.direct_widen:
+            from ._fp8_gemv_nc import _e4m3x4_scaled_bf16x2x2_fast
+            self.widen = _e4m3x4_scaled_bf16x2x2_fast
         if load_hint not in ("stream", "l2_128b", "l2_256b"):
             raise ValueError("load_hint is stream, l2_128b or l2_256b")
         if prefetch_blocks and (prefetch_bytes % 128 or prefetch_bytes > 4096):
@@ -930,6 +942,8 @@ class MmaFp8Gemv:
                str(self.out_dtype), self.row_scales, self.kmajor)
         if self.load_hint != "stream" or self.prefetch_blocks:
             key += (self.load_hint, self.prefetch_blocks, self.prefetch_bytes)
+        if self.direct_widen:
+            key += ("direct_widen",)
         return key
 
     def _storage(self):
@@ -1070,8 +1084,8 @@ class MmaFp8Gemv:
                 bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
                 for gi in cutlass.range_constexpr(self.groups):
                     for t in cutlass.range_constexpr(4):
-                        b0, b1 = _e4m3x4_scaled_bf16x2x2(cur[(chunk * self.groups + gi) * 4 + t],
-                                                          s_cur[gi if self.row_scales else 0])
+                        b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t],
+                                           s_cur[gi if self.row_scales else 0])
                         bw[8 * gi + 2 * t] = b0
                         bw[8 * gi + 2 * t + 1] = b1
                 for mt in cutlass.range_constexpr(self.m_tiles):
