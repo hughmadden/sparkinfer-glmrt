@@ -616,7 +616,7 @@ class _ContextPartialMerge:
 
 class _ContextPartial:
     def __init__(self, g, max_rows, max_context, begin, heads, splits,
-                 device_splits=False, heads_per_tile=16):
+                 device_splits=False, heads_per_tile=16, explicit_intervals=False):
         self.g, self.begin, self.heads, self.splits = g, begin, heads, splits
         self.device_splits = device_splits
         self.smem = make_smem_layout(query_tile=1, fp8=False, heads_per_tile=heads_per_tile)
@@ -626,7 +626,8 @@ class _ContextPartial:
             layout=self.smem, page_size=g.page_rows, num_heads=heads,
             num_splits=splits, chunks_per_split=self.chunks_per_split,
             query_tile=1, fp8=False, qk_dim=576, value_dim=512, window_size=None,
-            ds_mla_record=g.kv_cache == "fp8", dynamic_split_chunks=True, device_splits=device_splits)
+            ds_mla_record=g.kv_cache == "fp8", dynamic_split_chunks=True, device_splits=device_splits,
+            explicit_intervals=explicit_intervals)
         self.merge = _ContextPartialMerge(heads, splits, device_splits)
 
     def scratch_bytes(self, rows):
@@ -657,6 +658,34 @@ class _ContextPartial:
         # dense final/merge ABI emits natural logs and cannot go on this wire.
         self.forward(q, kv, table, lengths, cu, out, lo, po, pl, lo, lo,
             Float32(g.softmax_scale * math.log2(math.e)), Int64(g.heads * 576 * 2), Int64(576 * 2),
+            Int64(g.page_rows * g.record_bytes), Int64(g.record_bytes), page_table_width,
+            rows, rows, active_splits, stream)
+        self.merge(po, pl, attn, lse, rows, active_splits, stream)
+
+
+class _DraftContextPartial(_ContextPartial):
+    @cute.jit
+    def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
+                 visible_intervals: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
+                 lse: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 page_table_width: Int64, active_splits: Int32, attention_scale: Float32,
+                 stream: cuda.CUstream):
+        g, h, s = self.g, self.heads, self.splits
+        q = cute.make_tensor(cute.recast_ptr(query, dtype=cutlass.Uint8), cute.make_layout((1,)))
+        kv = cute.make_tensor(cute.recast_ptr(kv_cache, dtype=cutlass.Uint8), cute.make_layout((1,)))
+        table = cute.make_tensor(page_table, cute.make_layout((Int64(rows) * page_table_width,)))
+        intervals = cute.make_tensor(visible_intervals, cute.make_layout((Int64(rows) * Int64(2),)))
+        cu = cute.make_tensor(cu_seqlens_q, cute.make_layout((rows + Int32(1),)))
+        out = cute.make_tensor(attn, cute.make_layout((rows, h, 512), stride=(h * 512, 512, 1)))
+        lo = cute.make_tensor(lse, cute.make_layout((rows, h), stride=(h, 1)))
+        po = cute.make_tensor(cute.recast_ptr(scratch, dtype=BFloat16),
+            cute.make_layout((rows, h, s, 512), stride=(h * s * 512, s * 512, 512, 1)))
+        pl_ptr = cute.make_ptr(Float32,
+            Int64(scratch.toint()) + _offset(Int64(rows) * Int64(h * s * 512 * 2)),
+            cute.AddressSpace.gmem, assumed_align=16)
+        pl = cute.make_tensor(pl_ptr, cute.make_layout((rows, h, s), stride=(h * s, s, 1)))
+        self.forward(q, kv, table, intervals, cu, out, lo, po, pl, lo, lo,
+            attention_scale * Float32(math.log2(math.e)), Int64(g.heads * 576 * 2), Int64(576 * 2),
             Int64(g.page_rows * g.record_bytes), Int64(g.record_bytes), page_table_width,
             rows, rows, active_splits, stream)
         self.merge(po, pl, attn, lse, rows, active_splits, stream)
@@ -727,3 +756,44 @@ def compile_kimi_mla_partial_aot(g=KimiMlaGeometry(), *, max_rows=64, max_contex
                   "num_splits": num_splits, "runtime_splits": True,
                   "device_splits": device_splits, "fixed_split_grid": num_splits if device_splits else 0,
                   "lse_base": 2}, doc=compile_kimi_mla_partial_aot.__doc__)
+
+
+def compile_mla_draft_partial_aot(g: MlaDraftGeometry, *, max_rows=64, max_context=1048576,
+                                  num_splits=16):
+    """Context-owned draft partial with an explicit compact-owner interval per query.
+
+    The caller applies the checkpoint's global full/noncausal/window mask before
+    mapping both endpoints into its owned-page stream. Intervals are I32
+    [rows,2], 0 <= begin <= end <= owned capacity; cu_seqlens_q is [0,1,...].
+    Each row's page table names compact local physical pages. This preserves
+    sub-page window boundaries without pretending local lengths are global
+    positions. All h64 queries produce normalized BF16 partials and base2 LSE.
+    Runtime attention_scale includes the checkpoint's YaRN correction.
+    """
+    if type(g) is not MlaDraftGeometry:
+        raise ValueError("draft Context partial requires h64 MlaDraftGeometry")
+    if not 1 <= max_rows <= 4096 or not 1 <= max_context <= 1048576:
+        raise ValueError("invalid planned row or owned-context capacity")
+    if num_splits != 16:
+        raise ValueError("draft Context partial requires capacity for 16 splits")
+    launch = _DraftContextPartial(g, max_rows, max_context, 0, g.heads, num_splits,
+                                  explicit_intervals=True)
+    operands = (
+        Operand("query", torch.bfloat16, "[rows,64,576]"),
+        Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
+                "[pages,64,656]" if g.kv_cache == "fp8" else "[pages,64,576]"),
+        Operand("page_table", torch.int32, "[rows,page_table_width]", align=4),
+        Operand("visible_intervals", torch.int32, "[rows,2]", align=4),
+        Operand("cu_seqlens_q", torch.int32, "[rows+1]", align=4),
+        Operand("attn", torch.bfloat16, "[rows,64,512]", "out"),
+        Operand("lse", torch.float32, "[rows,64]", "out", align=4),
+        Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"))
+    return compile_program(launch, name="mla_draft_partial", operands=operands,
+        scalars=(Scalar("rows"), Scalar("page_table_width", "int64"),
+                 Scalar("active_splits"), Scalar("attention_scale", "float32")),
+        key=(g, max_rows, max_context, num_splits, "explicit_intervals", "base2"),
+        scratch={"scratch": launch.scratch_bytes},
+        geometry={**vars(g), "max_rows": max_rows, "max_context": max_context,
+                  "num_splits": num_splits, "runtime_splits": True,
+                  "explicit_intervals": True, "runtime_attention_scale": True,
+                  "lse_base": 2}, doc=compile_mla_draft_partial_aot.__doc__)
