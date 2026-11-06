@@ -459,8 +459,10 @@ FP8_GEMV_GROUPS_DEFAULT = 4
 FP8_GEMV_WIDE = {
     # The thin TP2 q_b tile changes column groups; preserve the shipped wide tile.
     (8192, 1536): (4, 4, 4),
+    (16384, 1536): (2, 1, 4),
     (34816, 5120): (4, 2, 4), (5120, 17408): (4, 1, 1),
-    (4096, 16384): (4, 2, 2), (2048, 4096): (8, 1, 1), (4096, 4096): (8, 2, 4),
+    (4096, 16384): (4, 2, 2), (4096, 8192): (8, 1, 4),
+    (2048, 4096): (8, 1, 1), (4096, 4096): (8, 2, 4),
     (4096, 2048): (2, 1, 1),
     (24576, 4096): (8, 2, 4), (154880, 4096): (8, 2, 4),
     (13568, 4096): (2, 2, 2), (14848, 4096): (2, 2, 2), (152576, 4096): (8, 2, 4),
@@ -499,7 +501,12 @@ def fp8_gemv_wide(n: int, k: int, *, warps: int, groups: int) -> tuple[int, int 
 # shipped tile.  The nc path needs few column blocks (n=5120) to pay: on the wide-n shapes
 # it loses badly (34816x5120 0.62/0.51/0.46, 16384x5120 0.59/0.51/0.45), and on every
 # other measured shape the base kernel at least ties it, so everything else stays put.
-FP8_GEMV_WIDE_KERNEL = {(5120, 17408): "nc"}
+FP8_GEMV_WIDE_KERNEL = {
+    (5120, 17408): "nc",
+    (16384, 1536): "nc",
+    (4096, 16384): "nc",
+    (4096, 8192): "nc",
+}
 
 
 def fp8_gemv_wide_kernel(n: int, k: int, *, warps: int, row_scales: bool = False,
