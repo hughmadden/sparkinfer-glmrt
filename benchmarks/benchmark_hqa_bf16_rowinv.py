@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import statistics
+import subprocess
 import sys
 import warnings
 
@@ -25,10 +26,12 @@ def main():
     p.add_argument('--native-lib', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--samples', type=int, default=31)
+    p.add_argument('--warm-launches', type=int, default=200,
+                   help='back-to-back launches per timed warm graph; cold stays one launch')
     p.add_argument('--tiles', type=Path, help='JSON mapping K,N to candidate tiles_by_rows')
     p.add_argument('--preflight', action='store_true')
     args = p.parse_args()
-    if not args.native_lib.is_file() or args.output.exists() or args.samples < 1:
+    if not args.native_lib.is_file() or args.output.exists() or args.samples < 1 or args.warm_launches < 1:
         raise ValueError('existing native library, new output and positive samples required')
     tiles = json.loads(args.tiles.read_text()) if args.tiles else None
     if tiles is not None and set(tiles) != {f'{k},{n}' for k, n in SHAPES}:
@@ -58,7 +61,14 @@ def main():
         torch=torch.__version__, cuda=torch.version.cuda, bandwidth_tb_s=1.8,
         native_lib=str(args.native_lib), native_lib_sha256=hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
         baseline_tiles=BASE_TILES, candidate_tiles=tiles, results=[], gates=[],
-        conditions='Alternating arm order; warm graph replay then timed replay; cold flush then timed replay. 1.8 TB/s theoretical compulsory weight/input/output floor. No TF32 oracle. Nonempty poisoned graphs and 11-offset row invariance.')
+        warm_launches=args.warm_launches,
+        conditions='Alternating arm order; batched warm graph replay then timed batched replay divided by launch count; cold flush then single timed replay. 1.8 TB/s theoretical compulsory weight/input/output floor. No TF32 oracle. Nonempty poisoned graphs and 11-offset row invariance.')
+
+    def arm_snapshot():
+        query = subprocess.run(['nvidia-smi', '-i', 'GPU-' + str(prop.uuid).removeprefix('GPU-'),
+            '--query-gpu=clocks_event_reasons.active,clocks.sm,temperature.gpu,power.draw,power.limit',
+            '--format=csv,noheader'], capture_output=True, text=True, check=True)
+        return query.stdout.strip()
 
     def save():
         args.output.write_text(json.dumps(result, indent=2) + '\n')
@@ -120,30 +130,52 @@ def main():
             result['gates'].append(dict(k=k, n=n, arm=arm, row_invariant=invariance[arm],
                 rows=GATE_ROWS, offsets=OFFSETS, graph_poison=True, fp32_oracle=True, tail_guard=True))
         for m in ROWS:
+            warm_graphs = {}
+            for arm, out in outputs.items():
+                expected = out[:m].clone()
+                graphs[arm, m].replay()
+                torch.cuda.synchronize()
+                expected.copy_(out[:m])
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for _ in range(args.warm_launches):
+                        call(arm, m)
+                out.fill_(float('nan'))
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(out[:m].view(torch.int16), expected.view(torch.int16))
+                assert torch.isnan(out[m:]).all()
+                warm_graphs[arm] = graph
             samples = {mode: {arm: [] for arm in outputs} for mode in ('warm', 'cold')}
+            telemetry = {arm: [] for arm in outputs}
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             order = list(outputs)
             for i in range(args.samples):
                 for arm in order if i % 2 == 0 else order[::-1]:
+                    before = arm_snapshot()
                     for mode in ('warm', 'cold') if i % 2 == 0 else ('cold', 'warm'):
+                        timed_graph = graphs[arm, m] if mode == 'cold' else warm_graphs[arm]
+                        launches = 1 if mode == 'cold' else args.warm_launches
                         if mode == 'cold':
                             flush()
                         else:
-                            graphs[arm, m].replay()
+                            timed_graph.replay()
                         start.record()
-                        graphs[arm, m].replay()
+                        timed_graph.replay()
                         end.record()
                         end.synchronize()
-                        samples[mode][arm].append(start.elapsed_time(end) * 1000)
+                        samples[mode][arm].append(start.elapsed_time(end) * 1000 / launches)
+                    telemetry[arm].append(dict(before=before, after=arm_snapshot()))
             floor = (2*n*k + 2*m*(n+k)) / 1.8e6
             medians = {mode: {arm: statistics.median(values) for arm, values in arms.items()}
                        for mode, arms in samples.items()}
             cell = dict(k=k, n=n, m=m, floor_us=floor, median_us=medians,
                 floor_fraction={mode: {arm: floor/us for arm, us in arms.items()} for mode, arms in medians.items()},
                 tma_gap_us=medians['cold']['tma']-min(floor, medians['cold']['cublas']),
-                skip_duel=medians['cold']['tma'] <= 1.05*medians['cold']['cublas'], samples_us=samples)
+                skip_duel=medians['cold']['tma'] <= 1.05*medians['cold']['cublas'], samples_us=samples,
+                arm_telemetry=telemetry)
             result['results'].append(cell)
-            print(json.dumps({key: value for key, value in cell.items() if key != 'samples_us'}), flush=True)
+            print(json.dumps({key: value for key, value in cell.items() if key not in ('samples_us', 'arm_telemetry')}), flush=True)
             save()
         del graphs, programs, outputs, x, w, reference
         torch.cuda.empty_cache()
