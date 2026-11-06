@@ -61,6 +61,11 @@ def baseline_kwargs(args):
     return {} if args.shapes_explicit else dict(tiles_by_rows=BASE_TILES)
 
 
+def reclaim_snapshot():
+    return {key: int(value) for line in Path('/proc/vmstat').read_text().splitlines()
+            for key, value in (line.split(),) if key.startswith(('pgscan', 'pgsteal'))}
+
+
 def main():
     args = parse_args()
     tiles = args.tiles
@@ -90,6 +95,7 @@ def main():
         native.restype = C.c_int32
     flush = make_l2_flush_fn(True)
     result = dict(device=prop.name, sms=prop.multi_processor_count, hardware_before=snapshot(),
+        host_reclaim_before=reclaim_snapshot(),
         torch=torch.__version__, cuda=torch.version.cuda, bandwidth_tb_s=1.8,
         native_lib=str(args.native_lib), native_lib_sha256=hashlib.sha256(args.native_lib.read_bytes()).hexdigest()
             if args.native_lib else None,
@@ -205,7 +211,7 @@ def main():
                         end.record()
                         end.synchronize()
                         samples[mode][arm].append(start.elapsed_time(end) * 1000 / launches)
-                    telemetry[arm].append(dict(before=before, after=arm_snapshot()))
+                    telemetry[arm].append(dict(before=before, after=arm_snapshot(), host_reclaim=reclaim_snapshot()))
             floor = (2*n*k + m*(2*k + out_dtype.itemsize*n)) / 1.8e6
             medians = {mode: {arm: statistics.median(values) for arm, values in arms.items()}
                        for mode, arms in samples.items()}
@@ -220,6 +226,7 @@ def main():
         del graphs, programs, outputs, x, w, reference
         torch.cuda.empty_cache()
     result['hardware_after'] = snapshot()
+    result['host_reclaim_after'] = reclaim_snapshot()
     result['complete'] = True
     save()
 
