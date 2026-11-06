@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Five-shape BF16 projection screen; run under cuteafd hwlock in its dev image."""
+"""Native attention projection screen; run under cuteafd hwlock in its dev image."""
 from __future__ import annotations
 
 import argparse
@@ -21,21 +21,54 @@ OFFSETS = (0, 1, 17, 63, 64, 65, 127, 139, 511, 1023, 2047)
 BASE_TILES = ((16, 1, 4, 16, 64, 6),)
 
 
-def main():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--native-lib', type=Path, required=True)
+    p.add_argument('--native-lib', type=Path)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--samples', type=int, default=31)
     p.add_argument('--warm-launches', type=int, default=200,
                    help='back-to-back launches per timed warm graph; cold stays one launch')
     p.add_argument('--tiles', type=Path, help='JSON mapping K,N to candidate tiles_by_rows')
+    p.add_argument('--shapes', help='semicolon-separated N,K shapes; baseline is the real default route')
+    p.add_argument('--out-dtype', choices=('bf16', 'f32'), default='bf16')
     p.add_argument('--preflight', action='store_true')
-    args = p.parse_args()
-    if not args.native_lib.is_file() or args.output.exists() or args.samples < 1 or args.warm_launches < 1:
-        raise ValueError('existing native library, new output and positive samples required')
-    tiles = json.loads(args.tiles.read_text()) if args.tiles else None
-    if tiles is not None and set(tiles) != {f'{k},{n}' for k, n in SHAPES}:
-        raise ValueError('candidate must explicitly cover all five shapes')
+    args = p.parse_args(argv)
+    args.shapes_explicit = args.shapes is not None
+    if args.shapes is None:
+        args.shapes = SHAPES
+    else:
+        try:
+            pairs = [tuple(map(int, entry.split(','))) for entry in args.shapes.split(';')]
+            if not pairs or any(len(pair) != 2 or min(pair) <= 0 or any(v % 128 for v in pair)
+                                for pair in pairs) or len(set(pairs)) != len(pairs):
+                raise ValueError
+            args.shapes = tuple((k, n) for n, k in pairs)
+        except ValueError:
+            p.error('--shapes requires unique positive N,K pairs divisible by 128')
+    args.cublas = args.out_dtype == 'bf16'
+    if args.cublas and (args.native_lib is None or not args.native_lib.is_file()):
+        p.error('--native-lib must name an existing library for BF16 timing')
+    if args.output.exists() or args.samples < 1 or args.warm_launches < 1:
+        p.error('new output and positive samples/launches required')
+    args.tiles = json.loads(args.tiles.read_text()) if args.tiles else None
+    if args.tiles is not None and set(args.tiles) != {f'{k},{n}' for k, n in args.shapes}:
+        p.error('candidate must explicitly cover every selected shape')
+    return args
+
+
+def baseline_kwargs(args):
+    # Preserve the original Flash experiment when no new shape list is requested.
+    return {} if args.shapes_explicit else dict(tiles_by_rows=BASE_TILES)
+
+
+def reclaim_snapshot():
+    return {key: int(value) for line in Path('/proc/vmstat').read_text().splitlines()
+            for key, value in (line.split(),) if key.startswith(('pgscan', 'pgsteal'))}
+
+
+def main():
+    args = parse_args()
+    tiles = args.tiles
     if args.preflight:
         import ast
         ast.parse(Path(__file__).read_text())
@@ -43,6 +76,7 @@ def main():
         return
 
     import torch
+    import cutlass
     from benchmarks.common import make_l2_flush_fn
     from benchmarks.benchmark_hqa_projection_ceiling import snapshot
     from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
@@ -52,17 +86,25 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.manual_seed(1045)
     prop = torch.cuda.get_device_properties(0)
-    lib = C.CDLL(str(args.native_lib))
-    native = lib.cuteafd_cuda_linear_bf16_cublas_async
-    native.argtypes = [C.c_void_p] * 4 + [C.c_size_t] * 3 + [C.c_void_p]
-    native.restype = C.c_int32
+    out_dtype = torch.bfloat16 if args.out_dtype == 'bf16' else torch.float32
+    cute_out_dtype = cutlass.BFloat16 if args.out_dtype == 'bf16' else cutlass.Float32
+    if args.cublas:
+        lib = C.CDLL(str(args.native_lib))
+        native = lib.cuteafd_cuda_linear_bf16_cublas_async
+        native.argtypes = [C.c_void_p] * 4 + [C.c_size_t] * 3 + [C.c_void_p]
+        native.restype = C.c_int32
     flush = make_l2_flush_fn(True)
     result = dict(device=prop.name, sms=prop.multi_processor_count, hardware_before=snapshot(),
+        host_reclaim_before=reclaim_snapshot(),
         torch=torch.__version__, cuda=torch.version.cuda, bandwidth_tb_s=1.8,
-        native_lib=str(args.native_lib), native_lib_sha256=hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
-        baseline_tiles=BASE_TILES, candidate_tiles=tiles, results=[], gates=[],
+        native_lib=str(args.native_lib), native_lib_sha256=hashlib.sha256(args.native_lib.read_bytes()).hexdigest()
+            if args.native_lib else None,
+        baseline_tiles='shape_default' if args.shapes_explicit else BASE_TILES,
+        candidate_tiles=tiles, results=[], gates=[],
         warm_launches=args.warm_launches,
         conditions='Alternating arm order; batched warm graph replay then timed batched replay divided by launch count; cold flush then single timed replay. 1.8 TB/s theoretical compulsory weight/input/output floor. No TF32 oracle. Nonempty poisoned graphs and 11-offset row invariance.')
+    if args.shapes_explicit or args.out_dtype != 'bf16':
+        result.update(output_dtype=str(out_dtype))
 
     def arm_snapshot():
         query = subprocess.run(['nvidia-smi', '-i', 'GPU-' + str(prop.uuid).removeprefix('GPU-'),
@@ -73,22 +115,25 @@ def main():
     def save():
         args.output.write_text(json.dumps(result, indent=2) + '\n')
 
-    for k, n in SHAPES:
+    for k, n in args.shapes:
         x = (torch.randn(2048, k, device='cuda') * .1).bfloat16()
         for offset in OFFSETS:
             x[offset].copy_(x[0].clone())
         w = (torch.randn(n, k, device='cuda') * .02).bfloat16()
-        reference = x.float() @ w.float().T
         programs = {}
-        for arm, config in [('tma', BASE_TILES)] + ([('candidate', tiles[f'{k},{n}'])] if tiles else []):
-            kernel = TmaBf16Projection(n, k, tiles_by_rows=config)
+        reference = x.float() @ w.float().T
+        configs = [('tma', baseline_kwargs(args))]
+        if tiles:
+            configs.append(('candidate', dict(tiles_by_rows=tiles[f'{k},{n}'])))
+        for arm, config in configs:
+            kernel = TmaBf16Projection(n, k, out_dtype=cute_out_dtype, **config)
             programs[arm] = compile_program(kernel, name='hqa_bf16_rowinv_' + arm, operands=(
                 Operand('x', torch.bfloat16, f'[rows,{k}]'),
                 Operand('w', torch.bfloat16, f'[{n},{k}]'),
-                Operand('out', torch.bfloat16, f'[rows,{n}]', 'out')),
+                Operand('out', out_dtype, f'[rows,{n}]', 'out')),
                 scalars=(Scalar('rows'),), key=kernel.key())
-        outputs = {arm: torch.empty(2048, n, device='cuda', dtype=torch.bfloat16)
-                   for arm in ('cublas', *programs)}
+        outputs = {arm: torch.empty(2048, n, device='cuda', dtype=out_dtype)
+                   for arm in (('cublas',) if args.cublas else ()) + tuple(programs)}
 
         def call(arm, m):
             if arm == 'cublas':
@@ -102,7 +147,8 @@ def main():
         graphs = {}
         row_zero = {}
         invariance = {arm: True for arm in outputs}
-        for m in sorted(set(ROWS + GATE_ROWS)):
+        gate_rows = GATE_ROWS
+        for m in sorted(set(ROWS + gate_rows)):
             for arm, out in outputs.items():
                 out.fill_(float('nan'))
                 call(arm, m)
@@ -128,7 +174,7 @@ def main():
             if arm != 'cublas':
                 assert invariance[arm], (k, n, arm, 'row invariance')
             result['gates'].append(dict(k=k, n=n, arm=arm, row_invariant=invariance[arm],
-                rows=GATE_ROWS, offsets=OFFSETS, graph_poison=True, fp32_oracle=True, tail_guard=True))
+                rows=gate_rows, offsets=OFFSETS, graph_poison=True, fp32_oracle=True, tail_guard=True))
         for m in ROWS:
             warm_graphs = {}
             for arm, out in outputs.items():
@@ -165,14 +211,14 @@ def main():
                         end.record()
                         end.synchronize()
                         samples[mode][arm].append(start.elapsed_time(end) * 1000 / launches)
-                    telemetry[arm].append(dict(before=before, after=arm_snapshot()))
-            floor = (2*n*k + 2*m*(n+k)) / 1.8e6
+                    telemetry[arm].append(dict(before=before, after=arm_snapshot(), host_reclaim=reclaim_snapshot()))
+            floor = (2*n*k + m*(2*k + out_dtype.itemsize*n)) / 1.8e6
             medians = {mode: {arm: statistics.median(values) for arm, values in arms.items()}
                        for mode, arms in samples.items()}
             cell = dict(k=k, n=n, m=m, floor_us=floor, median_us=medians,
                 floor_fraction={mode: {arm: floor/us for arm, us in arms.items()} for mode, arms in medians.items()},
-                tma_gap_us=medians['cold']['tma']-min(floor, medians['cold']['cublas']),
-                skip_duel=medians['cold']['tma'] <= 1.05*medians['cold']['cublas'], samples_us=samples,
+                tma_gap_us=medians['cold']['tma']-min(floor, medians['cold'].get('cublas', float('inf'))),
+                skip_duel=medians['cold']['tma'] <= 1.05*medians['cold'].get('cublas', float('inf')), samples_us=samples,
                 arm_telemetry=telemetry)
             result['results'].append(cell)
             print(json.dumps({key: value for key, value in cell.items() if key not in ('samples_us', 'arm_telemetry')}), flush=True)
@@ -180,6 +226,7 @@ def main():
         del graphs, programs, outputs, x, w, reference
         torch.cuda.empty_cache()
     result['hardware_after'] = snapshot()
+    result['host_reclaim_after'] = reclaim_snapshot()
     result['complete'] = True
     save()
 

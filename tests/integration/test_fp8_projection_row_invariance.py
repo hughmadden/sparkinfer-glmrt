@@ -1,50 +1,13 @@
-"""Bitwise row invariance of every decode projection that switches GEMV and GEMM.
+"""Production FP8 decode projections keep one canonical reduction through 64 rows.
 
-Drop-in location (this copy is not a host-suite test; ``pytest scripts/tests``
-does not collect ``scripts/qualify``)::
-
-    third_party/sparkinfer/tests/integration/test_fp8_projection_row_invariance.py
-
-Needs an SM120 or SM121 GPU. Not run with the #210 write-up.
-
-Contract, on the pinned fork (``91b104db``) and after the fix: row 0 of a
-one-row launch equals row 0 of the same weights and the same row embedded in
-a launch of M = 16, 17, 32 and 64. Comparison is the BF16 integer bits.
-Other input rows are a finite poison, and the output buffer is filled with
-the ``int16`` sentinel ``0x7FFF`` so an unwritten row cannot pass.
-
-On this pin the contract is expected to fail where the live ``rows`` scalar
-crosses the GEMV cap (do not xfail; a red row is the defect, a green row is
-the fix):
-
-* ``s16`` — GEMV through 16, ``TmaFp8Gemm`` above. M=16 should pass. M=17, 32
-  and 64 should fail. This is the #173 KDA W8/S16 break, shared by every
-  full-head GLM Flash projection, GLM 5.3 W8 decode, and Qwen W8 decode.
-* ``s32`` — narrow GEMV through 16 and a wide GEMV through 32 with the same
-  ``(warps, groups)``, TMA above 32. M=16, 17 and 32 should pass. M=64 should
-  fail. Half-head KDA, the KDA output-row/shard projections, and MiMo W8.
-* ``copy`` — the dual-copy switch (``RoutedFp8Projection`` or ``_Fp8Switch``):
-  GEMV through 16, a BF16 TMA GEMM above. Same expected colours as ``s16``.
-  Production FP8 checkpoints use the ``fp8_only`` path; these two shapes are
-  the unmeasured equivalent, not a second copy of every BF16 projection.
-
-The structural check does not freeze the 16 or 32 cap. A compiled GEMV must
-use more than one warp, and a wide GEMV must keep that tile's
-``(warps, groups)``. A same-order GEMV through 64 and TMA at every width
-both satisfy the bit contract. The colours above are the prediction for
-this pin.
-
-This file passes ``fp8_rows`` from the projection's own cap
-(``max_gemv_rows``, or ``max_fp8_rows`` for the switch). It does not execute
-the Rust scalar, the baked ``Int32(FP8_GEMV_ROWS)``, or the output-row
-wrappers. Those stay on TMA at M=32 until they move with the cap; a
-kernel-only change goes green here while serving still switches.
-
-Serving pads 17 up to a bucket (GLM Flash 32, GLM short-context 20, Qwen
-speculative 24). The kernel still branches on the live ``rows`` scalar, so
-the bucket above 16 is the other kernel. M=17 is the first integer past the
-switch that #173 measured. The file stops at 64. The ``_m128`` program is a
-separate compile and is not launched.
+Requires SM120/SM121. Historical s16/s32 case tags identify the old defect,
+not current routing: constructors now cover canonical decode widths through 64.
+The same row embedded at different offsets must preserve its integer output
+bits. HQA stages additionally gate every width 1..64, BF16/F32 output, poisoned
+CUDA graph replay and tails. At 128/2048 rows TmaFp8Gemm changes reduction;
+those widths are checked against their own dequantized FP32 product oracle,
+not against decode bits. Kernel tests pass fp8_rows from the projection cap;
+the exported/host scalar contract needs its separate admission tests.
 """
 
 from __future__ import annotations
@@ -59,7 +22,7 @@ except ImportError:  # collected from scripts/qualify, not the fork package
 
 
 _PROGRAMS: dict = {}
-_WIDTHS = (16, 17, 32, 64)
+_WIDTHS = (1, 4, 8, 16, 17, 32, 64)
 _SENTINEL = 0x7FFF
 
 
@@ -128,12 +91,26 @@ _CASES = (
 )
 
 
+# Checkpoint-native [N,K] shapes, including contiguous TP2 head slices.
+_NATIVE_SHAPES = (
+    ('ml4_q', 8192, 6144), ('ml4_q_half', 4096, 6144),
+    ('ml4_o', 6144, 8192), ('ml4_o_half', 6144, 4096),
+    ('kimi_q_b', 18432, 1536), ('kimi_q_b_half', 9216, 1536),
+    ('kimi_o', 7168, 12288), ('kimi_o_half', 7168, 6144),
+    ('step_o', 4096, 12288), ('step_o_half', 4096, 6144),
+    ('muse_o', 8192, 8192), ('muse_o_half', 8192, 4096),
+    ('glm_q_b', 16384, 2048), ('glm_q_b_half', 8192, 2048),
+    ('glm_o', 6144, 16384), ('glm_o_half', 6144, 8192),
+)
+_CASES += tuple((f'native_{name}', 'native', 'plain', n, k) for name, n, k in _NATIVE_SHAPES)
+
+
 def _ids():
     seen = set()
     for case_id, tag, kind, n, k in _CASES:
         assert case_id not in seen, case_id
         seen.add(case_id)
-        assert tag in ("s16", "s32", "copy")
+        assert tag in ("s16", "s32", "copy", "native")
         assert n > 0 and k > 0 and k % 128 == 0
         # GEMV legality is checked against the built kernel. Reject shapes that
         # cannot be a 4-warp, 4-group tile either, so a typo fails at import.
@@ -154,7 +131,7 @@ def _program(key, make):
     return _PROGRAMS[key]
 
 
-def _build(kind, n, k):
+def _build(kind, n, k, out_dtype=None):
     """The production decode projection, not a retuned stand-in."""
     if kind == "w8":
         from b12x.integration.cuteafd.glmf import _w8
@@ -179,7 +156,8 @@ def _build(kind, n, k):
         return GlmfOutputShard(n, k, 64, False, False).proj
     if kind == "plain":
         from b12x.integration.cuteafd._fp8_weights import Fp8Projection
-        return Fp8Projection(n, k)
+        import cutlass
+        return Fp8Projection(n, k, out_dtype=cutlass.BFloat16 if out_dtype is None else out_dtype)
     if kind == "mimo":
         from b12x.integration.cuteafd.mimo_attention import mimo_w8
         return mimo_w8(n, k, None)
@@ -232,10 +210,11 @@ def _check_shape(proj, kind):
         assert gemv.warps > 1
     if wide is not None:
         assert gemv is not None
-        assert (wide.warps, wide.groups) == (gemv.warps, gemv.groups)
+        # Groups partition output columns; only warps change the K reduction.
+        assert wide.warps == gemv.warps
 
 
-def _compile(case_id, kind, n, k, proj):
+def _compile(case_id, kind, n, k, proj, out_dtype=None):
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
 
     scale = _scale_kind(proj, kind)
@@ -245,7 +224,7 @@ def _compile(case_id, kind, n, k, proj):
             self.p = proj
 
         def key(self):
-            return (kind, n, k, scale, self.p.key())
+            return (kind, n, k, scale, str(out_dtype), self.p.key())
 
         @__import__("cutlass").cute.jit
         def __call__(self, x, w, s, o, rows, fp8_rows, stream):
@@ -297,7 +276,7 @@ def _compile(case_id, kind, n, k, proj):
             Operand("x", torch.bfloat16, "x"),
             Operand("w", torch.float8_e4m3fn, "w"),
             Operand("s", torch.float32, "s", align=16),
-            Operand("o", torch.bfloat16, "o", "out"),
+            Operand("o", torch.bfloat16 if out_dtype is None else out_dtype, "o", "out"),
         ), (Scalar("rows"), Scalar("fp8_rows"))
     return _program(body.key(), lambda: compile_program(
         body, name=f"inv_{case_id}", operands=ops, scalars=scalars, key=body.key()))
@@ -358,7 +337,8 @@ def _fresh(rows, n):
 
 
 @pytest.mark.parametrize("rows", _WIDTHS)
-@pytest.mark.parametrize("case", _CASES, ids=[c[0] for c in _CASES])
+@pytest.mark.parametrize("case", [c for c in _CASES if c[1] != "native"],
+                         ids=[c[0] for c in _CASES if c[1] != "native"])
 def test_fp8_projection_row_invariance(case, rows):
     """Row 0 at M=1 matches the same row embedded at ``rows``, as integer bits."""
     import torch
@@ -391,3 +371,57 @@ def test_fp8_projection_row_invariance(case, rows):
         f"{case_id} [{tag}] M=1 vs embedded M={rows}: row 0 BF16 bits differ "
         f"({int((bits_one != bits_row0).sum())} of {n} columns)"
     )
+
+
+@pytest.mark.parametrize('output', ('bf16', 'f32'))
+@pytest.mark.parametrize('case', [c for c in _CASES if c[1] == 'native'],
+                         ids=[c[0] for c in _CASES if c[1] == 'native'])
+def test_native_attention_fp8_projection(case, output):
+    import cutlass
+    import torch
+    case_id, _, kind, n, k = case
+    dtype = torch.bfloat16 if output == 'bf16' else torch.float32
+    cute_dtype = cutlass.BFloat16 if output == 'bf16' else cutlass.Float32
+    bits_dtype = torch.int16 if output == 'bf16' else torch.int32
+    sentinel = 0x7FFF if output == 'bf16' else 0x7FFFFFFF
+    proj = _build(kind, n, k, out_dtype=cute_dtype)
+    _check_shape(proj, kind)
+    program = _compile(case_id + '_' + output, kind, n, k, proj, out_dtype=dtype)
+    seed = 31_027 + n + k
+    w8, scale, dequant = _weights(n, k, 'block', seed, dequant=True)
+    x, row0 = _rows(k, 2048, seed + 3)
+    offsets = (0, 1, 17, 63, 64, 65, 127, 139, 511, 1023, 2047)
+    for offset in offsets:
+        x[offset].copy_(row0)
+    # Disable TF32 for the independent FP32 accumulation oracle, restoring it for other tests.
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        reference = x.float() @ dequant.float().T
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    out = torch.empty((2049, n), device='cuda', dtype=dtype)
+    first = None
+    for rows in (*range(1, 65), 128, 2048):
+        out.view(bits_dtype).fill_(sentinel)
+        _launch(program, kind, x, w8, scale, None, out, rows, 64)
+        torch.cuda.synchronize()
+        expected = out[:rows].clone()
+        assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
+        torch.testing.assert_close(expected.float(), reference[:rows], rtol=1e-2, atol=1e-2)
+        if first is None:
+            first = expected[0].clone()
+        if rows <= 64:
+            for offset in offsets:
+                if offset < rows:
+                    assert torch.equal(first.view(bits_dtype), expected[offset].view(bits_dtype)), (
+                        case_id, output, rows, offset, 'decode row invariance')
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _launch(program, kind, x, w8, scale, None, out, rows, 64)
+        out.view(bits_dtype).fill_(sentinel)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out[:rows].view(bits_dtype), expected.view(bits_dtype)), (
+            case_id, output, rows, 'poisoned graph replay')
+        assert (out[rows:].view(bits_dtype) == sentinel).all(), (case_id, output, rows, 'tail')
