@@ -69,6 +69,7 @@ class DenseMlaForwardKernel:
         block_window: bool = False,
         dynamic_split_chunks: bool = False,
         device_splits: bool = False,
+        explicit_intervals: bool = False,
     ):
         self.layout = layout
         self.page_size = int(page_size)
@@ -87,6 +88,9 @@ class DenseMlaForwardKernel:
         if self.device_splits and not self.dynamic_split_chunks:
             raise ValueError("device splits require dynamic split chunks")
         self.query_tile = int(query_tile)
+        self.explicit_intervals = bool(explicit_intervals)
+        if self.explicit_intervals and (self.query_tile != 1 or window_size is not None or noncausal_block):
+            raise ValueError("explicit intervals require one already-masked query per request")
         if self.query_tile != int(layout.query_tile):
             raise ValueError("dense MLA query_tile must match the SMEM layout")
         if self.query_tile not in (1, 2, 3, 4):
@@ -518,7 +522,11 @@ class DenseMlaForwardKernel:
         query_begin = Int32(cu_seqlens_q[request])
         query_end = Int32(cu_seqlens_q[request + Int32(1)])
         query_length = query_end - query_begin
-        cache_length = Int32(cache_seqlens[request])
+        if cutlass.const_expr(self.explicit_intervals):
+            # Draft Context supplies compact-owner bounds after its global mask.
+            cache_length = Int32(cache_seqlens[request * Int32(2) + Int32(1)])
+        else:
+            cache_length = Int32(cache_seqlens[request])
 
         # A tile only ever needs cache records below the causal end of its
         # deepest query row, which removes the redundant tail of early
@@ -549,6 +557,9 @@ class DenseMlaForwardKernel:
                 self.candidates_per_chunk
             )
         if cutlass.const_expr(self.noncausal_block):
+            visible_chunks_end = cache_length
+        if cutlass.const_expr(self.explicit_intervals):
+            first_valid_chunk = Int32(cache_seqlens[request * Int32(2)]) // Int32(self.candidates_per_chunk)
             visible_chunks_end = cache_length
         valid_chunks = (
             visible_chunks_end + Int32(self.candidates_per_chunk - 1)
@@ -740,6 +751,9 @@ class DenseMlaForwardKernel:
                 block_begin = cache_length - query_length
                 if visible_begin > block_begin:
                     visible_begin = block_begin
+                visible_end = cache_length
+            if cutlass.const_expr(self.explicit_intervals):
+                visible_begin = Int32(cache_seqlens[request * Int32(2)])
                 visible_end = cache_length
 
             score_scale = sm_scale_log2

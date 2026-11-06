@@ -69,6 +69,88 @@ def test_partial_compile_contract(monkeypatch):
         k.compile_kimi_mla_partial_aot(k.MlaDraftGeometry())
 
 
+def test_draft_partial_compile_contract(monkeypatch):
+    from b12x.integration.cuteafd import kimi_mla as k
+    calls = []
+    monkeypatch.setattr(k, "compile_program", lambda launch, **kw: calls.append((launch, kw)) or kw)
+    for window in (None, 4096):
+        p = k.compile_mla_draft_partial_aot(k.MlaDraftGeometry(window_size=window))
+        launch = calls[-1][0]
+        assert launch.forward.explicit_intervals
+        assert launch.forward.query_tile == 1 and launch.forward.num_heads == 64
+        assert not launch.forward.noncausal_block and launch.forward.window_size is None
+        assert p["geometry"]["lse_base"] == 2
+        assert p["geometry"]["runtime_attention_scale"]
+        assert [(s.name, s.ctype) for s in p["scalars"]] == [
+            ("rows", "int32"), ("page_table_width", "int64"),
+            ("active_splits", "int32"), ("attention_scale", "float32")]
+    with pytest.raises(ValueError):
+        k.compile_mla_draft_partial_aot(k.KimiMlaGeometry())
+    for args in ({"max_rows": 0}, {"max_context": 1048577}, {"num_splits": 1}):
+        with pytest.raises(ValueError):
+            k.compile_mla_draft_partial_aot(k.MlaDraftGeometry(), **args)
+    target = k.compile_kimi_mla_partial_aot()
+    assert not calls[-1][0].forward.explicit_intervals
+    assert "runtime_attention_scale" not in target["geometry"]
+
+
+@pytest.mark.parametrize("cache", ["bf16", "fp8"])
+@pytest.mark.parametrize("window", [None, 4096])
+@pytest.mark.parametrize("high_ids", [False, True])
+def test_draft_partial_global_window_and_subpage_intervals(cache, window, high_ids):
+    require_b12x()
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd.kimi_mla import MlaDraftGeometry, compile_mla_draft_partial_aot
+    from b12x.integration.cuteafd.context_split import compile_lse_combine2_aot
+    torch.manual_seed(1354)
+    anchors = [0, 1, 63, 64, 4095, 4096, 4097, 4163]
+    block, rows, n = 8, len(anchors) * 8, 4224
+    raw, values = records(cache, n)
+    pool = raw.reshape(-1, 64, raw.shape[-1])
+    q = (torch.randn((rows, 64, 576), device="cuda") * .25).bfloat16()
+    with exportable_compilation():
+        p = compile_mla_draft_partial_aot(MlaDraftGeometry(kv_cache=cache, window_size=window),
+                                          max_rows=rows, max_context=n)
+        combine = compile_lse_combine2_aot(heads=64)
+    cu = torch.arange(rows + 1, device="cuda", dtype=torch.int32)
+    scale = .037  # Deliberately differs from the target scale.
+    outputs, lses = [], []
+    for rank in (0, 1):
+        local = pool[rank::2].contiguous()
+        first = (2**31 // (64 * raw.element_size() * raw.shape[-1]) + 1) if high_ids else 0
+        owned = torch.empty((first + len(local), *local.shape[1:]), dtype=raw.dtype, device="cuda")
+        owned[first:] = local
+        table = torch.arange(first, first + len(local), device="cuda", dtype=torch.int32)[None].repeat(rows, 1)
+        selected = torch.tensor([i for i in range(n) if (i // 64) % 2 == rank])
+        bounds = []
+        for anchor in anchors:
+            for offset in range(block):
+                begin = 0 if window is None else max(0, min(anchor, anchor + offset + 1 - window))
+                end = anchor + block
+                bounds.append((int((selected < begin).sum()), int((selected < end).sum())))
+        intervals = torch.tensor(bounds, device="cuda", dtype=torch.int32)
+        out = torch.full((rows, 64, 512), float("nan"), device="cuda", dtype=torch.bfloat16)
+        lse = torch.full((rows, 64), float("nan"), device="cuda")
+        scratch = torch.full((p.scratch_bytes(rows)["scratch"],), 255, device="cuda", dtype=torch.uint8)
+        p.launch(q, owned, table, intervals, cu, out, lse, scratch,
+                 scalars=(rows, table.shape[1], 8, scale))
+        for row, (begin, end) in enumerate(bounds):
+            if begin == end:
+                assert torch.count_nonzero(out[row]) == 0 and torch.isneginf(lse[row]).all()
+        outputs.append(out)
+        lses.append(lse)
+    merged = torch.empty_like(outputs[0])
+    combine.launch(outputs[0], lses[0], outputs[1], lses[1], lses[0], merged, scalars=(rows,))
+    for row in range(rows):
+        anchor, offset = anchors[row // block], row % block
+        begin = 0 if window is None else max(0, min(anchor, anchor + offset + 1 - window))
+        live = values[begin:anchor + block].double()
+        scores = q[row].double() @ live.T * scale
+        reference = torch.softmax(scores, dim=-1) @ live[:, :512]
+        torch.testing.assert_close(merged[row].float(), reference.float(), atol=.006, rtol=.025)
+    assert torch.isfinite(merged).all()
+
+
 def test_k6_decode_buckets_derive_from_native_dispatch_constants():
     import ast
     source = Path(__file__).resolve().parents[2] / "b12x/gemm/trellis_linear/_native.py"
