@@ -50,6 +50,8 @@ import torch
 import triton
 import triton.language as tl
 from cutlass import Int32, Int64, Uint8, Uint32, Uint64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
@@ -2921,7 +2923,21 @@ class DenseGemmKernel:
                         tiled_copy_C_Atom,
                     )
 
-                    thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+                    if cutlass.const_expr(self.block_fp8):
+                        epi_tidx = Int32(
+                            llvm.inline_asm(
+                                T.i32(),
+                                [Int32(tidx).ir_value()],
+                                "mov.u32 $0, $1;",
+                                "=r,r",
+                                has_side_effects=True,
+                                is_align_stack=False,
+                                asm_dialect=llvm.AsmDialect.AD_ATT,
+                            )
+                        ) & Int32(0x1FF)
+                    else:
+                        epi_tidx = tidx
+                    thr_copy_r2s = tiled_copy_r2s.get_slice(epi_tidx)
                     tRS_sD = thr_copy_r2s.partition_D(sC)
                     tRS_rAcc = tiled_copy_r2s.retile(accumulators)
 
