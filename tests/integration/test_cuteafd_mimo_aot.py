@@ -1,9 +1,11 @@
-"""cuteafd MiMo V2 Flash AOT programs vs transformers ``modeling_mimo_v2_flash``.
+"""cuteafd MiMo V2.6 Flash AOT programs vs transformers ``modeling_mimo_v2_flash``.
 
-Real MiMo-V2-Flash weights (layer 0: dense MLP and full attention; layer 1:
-SWA attention with sinks and the FP32 router), golden activations when
-mounted. Decode programs (m64) at 1/16/64 live rows, prefill programs (m4096)
-up to 4096 rows. Every output is compared with the module it replaces at
+Real MiMo-V2.6-Flash-MOPD weights (layer 0: dense MLP and full attention;
+layer 1: SWA attention with sinks and the BF16 router), golden activations
+when mounted. The checkpoint's fused ``qkv_proj`` is dequantized per TP shard
+and de-interleaved (``_mimo.fused_qkv``) into the programs' joint BF16 rows.
+Decode programs (m64) at 1/16/64 live rows, prefill programs (m4096) up to
+4096 rows. Every output is compared with the module it replaces at
 cosine >= 0.9999; attention runs as the engine chains it (producer ->
 attention -> o_proj) over prefill chunks and decode steps against the
 reference module over the whole sequence. FP8 KV records (``kv="fp8"``): the
@@ -18,7 +20,8 @@ import torch
 
 from ..conftest import require_b12x
 from ._mimo import (
-    config, cos_sin, cosine, golden_rows, layer_kind, masks, reference_module, reference_rope, rms_norm, tensor,
+    checkpoint_config, config, cos_sin, cosine, golden_rows, layer_kind, masks, reference_module, reference_rope,
+    rms_norm, tensor,
 )
 
 DECODE, PREFILL = 64, 4096
@@ -31,13 +34,21 @@ KVS = ["bf16", "fp8", "int8"]
 @pytest.fixture(scope="module")
 def g():
     require_b12x()
-    from b12x.integration.cuteafd import MIMO_V2_FLASH
+    from b12x.integration.cuteafd import MIMO_V26_FLASH
 
     # The NVIDIA PyTorch images default FP32 matmuls to TF32; the router
     # reference must be FP32 like the checkpoint's F.linear.
     torch.backends.cuda.matmul.allow_tf32 = False
 
-    return MIMO_V2_FLASH
+    geometry, cfg, raw = MIMO_V26_FLASH, config(), checkpoint_config()
+    assert geometry.norm_eps == cfg.rms_norm_eps
+    for kind, layer_type in (("full", "full_attention"), ("swa", "sliding_attention")):
+        assert geometry.rope_theta(kind) == cfg.rope_parameters[layer_type]["rope_theta"]
+    assert geometry.kv_heads("swa") == 2 * cfg.num_key_value_heads
+    assert geometry.window == cfg.sliding_window
+    assert geometry.router_fp32 == (raw["moe_router_dtype"] != "bfloat16")
+    assert (raw["add_swa_attention_sink_bias"], raw["add_full_attention_sink_bias"]) == (True, False)
+    return geometry
 
 
 _PROGRAMS: dict = {}
@@ -46,13 +57,13 @@ _PROGRAMS: dict = {}
 def _program(program_kind, **kw):
     key = (program_kind, tuple(sorted(kw.items())))
     if key not in _PROGRAMS:
-        from b12x.integration.cuteafd import MIMO_V2_FLASH, mimo_attention, mimo_ffn
+        from b12x.integration.cuteafd import MIMO_V26_FLASH, mimo_attention, mimo_ffn
 
         fn = {"norm": mimo_ffn.compile_mimo_norm_aot, "ffn": mimo_ffn.compile_mimo_ffn_aot,
               "router": mimo_ffn.compile_mimo_router_scores_aot, "o": mimo_attention.compile_mimo_o_aot,
               "producer": mimo_attention.compile_mimo_producer_aot,
               "attention": mimo_attention.compile_mimo_attention_aot}[program_kind]
-        _PROGRAMS[key] = fn(MIMO_V2_FLASH, **kw)
+        _PROGRAMS[key] = fn(MIMO_V26_FLASH, **kw)
     return _PROGRAMS[key]
 
 
@@ -104,11 +115,15 @@ def test_mimo_router_scores(g, rows):
     from b12x.integration.cuteafd.mimo_ffn import split_router_weight
 
     program = _program("router")
+    # V2.6 stores the router weight BF16 (``moe_router_dtype``) and takes it as
+    # stored; V2 Flash's FP32 weight is split into hi + lo BF16 rows.
     gate = reference_module("MiMoV2FlashTopkRouter", config(), prefix="model.layers.1.mlp.gate.",
-                            fp32=("weight", "e_score_correction_bias"))
+                            fp32=("weight", "e_score_correction_bias") if g.router_fp32
+                            else ("e_score_correction_bias",))
     x = rms_norm(golden_rows(1, rows), tensor("model.layers.1.post_attention_layernorm.weight"))
     logits = torch.empty((rows, 256), dtype=torch.float32, device="cuda")
-    program.launch(x, split_router_weight(gate.weight), logits, _scratch(program, rows), scalars=(rows,))
+    weight = split_router_weight(gate.weight) if g.router_fp32 else gate.weight.contiguous()
+    program.launch(x, weight, logits, _scratch(program, rows), scalars=(rows,))
     with torch.no_grad():
         expected, _, expected_ids = gate(x)
     torch.cuda.synchronize()
@@ -168,7 +183,7 @@ def test_mimo_producer(g, layer, capacity, rows):
     slots = torch.randperm(rows + 8, device="cuda")[:rows]
     cache = torch.zeros((rows + 8, r), dtype=torch.bfloat16, device="cuda")
     query = torch.empty((rows, 64, 192), dtype=torch.bfloat16, device="cuda")
-    table = cos_sin(int(positions.max()) + 1, kind)
+    table = cos_sin(int(positions.max()) + 1, kind, theta=g.rope_theta(kind))
     program.launch(x, positions, slots, table, _qkv(attn), cache, query, _scratch(program, rows), scalars=(rows,))
     with torch.no_grad():
         q = attn.q_proj(x).view(1, rows, 64, 192).transpose(1, 2)
@@ -230,7 +245,7 @@ def test_mimo_producer_kv8_records(g, layer, capacity, rows):
     x = _layer_input(layer, rows)
     positions = torch.arange(rows, device="cuda") + 7
     slots = torch.randperm(rows + 8, device="cuda")[:rows]
-    table = cos_sin(int(positions.max()) + 1, kind)
+    table = cos_sin(int(positions.max()) + 1, kind, theta=g.rope_theta(kind))
     caches = {}
     for kv in KVS:
         program = _program("producer", kind=kind, max_rows=capacity, kv=kv)
@@ -278,7 +293,7 @@ def _step(g, kind, route, sequences, x_rows, attn_weights, splits=8):
     producer = _program("producer", kind=kind, max_rows=capacity, kv=kv)
     attention = _program("attention", kind=kind, route=route, max_rows=capacity, kv=kv)
     o = _program("o", max_rows=capacity)
-    table = cos_sin(int(positions.max()) + 1, kind)
+    table = cos_sin(int(positions.max()) + 1, kind, theta=g.rope_theta(kind))
     query = torch.empty((rows, 64, 192), dtype=torch.bfloat16, device="cuda")
     out = torch.empty((rows, 64, 128), dtype=torch.bfloat16, device="cuda")
     if kind == "full":
