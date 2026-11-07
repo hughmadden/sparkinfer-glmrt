@@ -10,9 +10,10 @@ cosine >= 0.9999; attention runs as the engine chains it (producer ->
 attention -> o_proj) over prefill chunks and decode steps against the
 reference module over the whole sequence. FP8 KV records (``kv="fp8"``): the
 producer's bytes against a torch quantization of the BF16 records, the chain
-at cosine >= 0.9996 -- the E4M3 rounding of keys and values alone measures
-0.99965 against the BF16 reference at 700-4096 rows, so the chain is held
-within 5e-5 of that ceiling; int8 rounds finer and stays at 0.9998.
+at the measured ceiling of the E4M3 rounding itself less 1e-5 (``COS_KV``,
+from ``FP8_KV_CEILING``): keys and values rounded to the producer's E4M3
+records alone measure 0.99965 against the BF16 reference at 700-4096 rows;
+int8 rounds finer and stays at 0.9998.
 """
 
 from __future__ import annotations
@@ -29,7 +30,17 @@ from ._mimo import (
 DECODE, PREFILL = 64, 4096
 ROWS = [(DECODE, 1), (DECODE, 16), (DECODE, 64), (PREFILL, 4096)]
 COS = 0.9999
-COS_KV = {"int8": 0.9998, "fp8": 0.9996}
+# The FP8 chain bound follows the format's own ceiling, not an engine margin:
+# the chain feeds attention E4M3-rounded 64-dim/amax-448 K/V records while
+# the reference attends BF16 records, so no implementation can match the
+# reference better than the record rounding allows. Pure-PyTorch ceiling
+# (the reference module's own K/V through the producer's rule, then eager
+# attention): 0.9996527 at 700 rows, 0.9996647 at 1571, 0.9996682 at 4096.
+# Bound = the shortest-length ceiling less 1e-5; the engine measures
+# 0.9996526 there (1e-7 under the ceiling) and within 4e-7 at every length.
+FP8_KV_CEILING = 0.9996527
+FP8_KV_ALLOWANCE = 1e-5
+COS_KV = {"int8": 0.9998, "fp8": FP8_KV_CEILING - FP8_KV_ALLOWANCE}
 KVS = ["bf16", "fp8", "int8"]
 
 
