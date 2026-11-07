@@ -10,7 +10,9 @@ cosine >= 0.9999; attention runs as the engine chains it (producer ->
 attention -> o_proj) over prefill chunks and decode steps against the
 reference module over the whole sequence. FP8 KV records (``kv="fp8"``): the
 producer's bytes against a torch quantization of the BF16 records, the chain
-at cosine >= 0.998 (the E4M3 rounding of keys and values).
+at cosine >= 0.9996 -- the E4M3 rounding of keys and values alone measures
+0.99965 against the BF16 reference at 700-4096 rows, so the chain is held
+within 5e-5 of that ceiling; int8 rounds finer and stays at 0.9998.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from ._mimo import (
 DECODE, PREFILL = 64, 4096
 ROWS = [(DECODE, 1), (DECODE, 16), (DECODE, 64), (PREFILL, 4096)]
 COS = 0.9999
-COS_FP8 = 0.9998
+COS_KV = {"int8": 0.9998, "fp8": 0.9996}
 KVS = ["bf16", "fp8", "int8"]
 
 
@@ -376,7 +378,7 @@ def test_mimo_attention_chain(g, layer, schedule, kv):
     expected = _reference(layer, x)
     weights = _weights(layer)
     seq = _Sequence(g, kind, total, kv=kv)
-    bound = COS_FP8 if kv != "bf16" else COS
+    bound = COS if kv == "bf16" else COS_KV[kv]
     worst = 1.0
     for route, n in steps:
         while n > 0:
@@ -416,4 +418,4 @@ def test_mimo_attention_two_sequences(g, layer, kv):
     torch.cuda.synchronize()
     ca, cb = cosine(got[:a_new], ea[a_len:]), cosine(got[a_new:], eb[b_len:])
     print(f"mimo_{kind}_attention {kv} two sequences: a {ca:.7f} b {cb:.7f}")
-    assert min(ca, cb) >= (COS_FP8 if kv != "bf16" else COS)
+    assert min(ca, cb) >= (COS if kv == "bf16" else COS_KV[kv])
