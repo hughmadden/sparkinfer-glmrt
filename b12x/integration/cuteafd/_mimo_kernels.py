@@ -416,9 +416,10 @@ class MimoGqaAttention:
         # across the CTA halves during the Q copy, split K and V into separate cp.async commit
         # groups per tile (s_q, K0, V0, K1, V1), drain progressively (wait_group(3->2->1->0)),
         # and fuse sink prefetch + softmax.finalize into the last tile's QK phase before wait_v.
-        self.pipe2 = (self.tokens == 1 and self.window > 0 and not self.kv_fp8
-                      and not self.paged and self.direct and self.window <= 2 * self.tile_n
-                      and self.threads >= 2 * self.tile_n)
+        # Subclasses (e.g. MuseGqaAttention) override _tile and must stay on the _tile path.
+        self.pipe2 = (type(self) is MimoGqaAttention and self.tokens == 1 and self.window > 0
+                      and not self.kv_fp8 and not self.paged and self.direct
+                      and self.window <= 2 * self.tile_n and self.threads >= 2 * self.tile_n)
 
     def key(self) -> tuple:
         return (self.heads, self.kv_heads, self.tokens, self.window, self.paged, self.sink, self.direct,
