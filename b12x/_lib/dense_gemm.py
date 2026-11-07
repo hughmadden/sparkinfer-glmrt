@@ -1001,8 +1001,29 @@ class DenseGemmKernel:
             barrier_id=2,
             num_threads=self.num_mma_warps * self.num_threads_per_warp,
         )
-        self.load_register_requirement = 40
-        self.mma_register_requirement = 232
+        # setmaxnreg budgets: MMA warps increase, the TMA warp decreases, and the
+        # per-CTA pool is rebalanced inside the SM's 64K register file.
+        # Block-FP8 (W8A8) at 8 MMA warps and one CTA per SM uses 240/24: with
+        # CUTLASS DSL 4.8.1 the 232 budget spills (LDL/STL 3/2 -> 37/22 and
+        # 4/2 -> 25/16 per kernel). Measured on RTX PRO 6000 (SM120), MiMo
+        # W8A8 m4096 programs at 2752 rows, 4.6.2 time / 4.8.1 time:
+        # 232 -> 0.72-0.91, 240 -> 0.98-1.00; GLM 5.3 producer and GLM Flash
+        # KDA neutral (0.98-1.00 either way); outputs bitwise identical
+        # (cuteafd #1423, sparkinfer-glmrt PR for this change).
+        if self.block_fp8 and self.num_mma_warps == 8 and self.occupancy == 1:
+            self.load_register_requirement = 24
+            self.mma_register_requirement = 240
+        else:
+            self.load_register_requirement = 40
+            self.mma_register_requirement = 232
+        mma_regs = self.num_mma_warps * self.num_threads_per_warp * self.mma_register_requirement
+        load_regs = self.num_threads_per_warp * self.load_register_requirement
+        if (mma_regs + load_regs) * self.occupancy > 65536:
+            raise ValueError(
+                f"setmaxnreg budgets exceed the SM register file: {self.num_mma_warps} MMA warps x "
+                f"{self.mma_register_requirement} + 1 TMA warp x {self.load_register_requirement} "
+                f"at {self.occupancy} CTA(s)/SM"
+            )
 
     def _setup_attributes(self):
         mma_sf_dtype = cutlass.Float8E8M0FNU if self.block_fp8 else self.sf_dtype
