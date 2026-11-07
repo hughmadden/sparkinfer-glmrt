@@ -227,6 +227,17 @@ def compile_glmf_kda_core_aot(g=GLM53_FLASH, *, max_rows=64, decode=True,
         state_dtype=state_dtype, state_rounding=state_rounding)
 
 
+def compile_glmf_kda_core_projected_aot(g=GLM53_FLASH, *, max_rows=64, decode=True,
+                                        state_dtype="float32", state_rounding="window"):
+    """``compile_glmf_kda_core_aot`` over in-projection rows the caller writes into ``scratch``
+    (``[rows, kda_in_width]`` at its base: q, k, v and the original f_a/g_a/b rows), so an engine
+    whose projections are not BF16 GEMMs (KX7 exact packs) runs only the KDA body."""
+    if not isinstance(g, GLMFGeometry):
+        raise ValueError("GLM Flash KDA requires its low-rank GLMFGeometry")
+    return compile_kda_core_aot(g, max_rows=max_rows, decode=decode,
+        state_dtype=state_dtype, state_rounding=state_rounding, projected=True)
+
+
 def compile_glmf_projected_kda_aot(g=GLM53_FLASH, *, max_rows=64, decode=True,
                                    state_dtype="float32", state_rounding="window"):
     """Native-weight caller supplies q/k/v, f_b, g_b and raw beta BF16 rows."""

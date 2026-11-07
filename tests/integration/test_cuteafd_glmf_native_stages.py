@@ -16,11 +16,15 @@ def _cuda():
 
 @pytest.mark.parametrize("rows,decode", [(1, True), (16, True), (64, True), (129, False)])
 @pytest.mark.parametrize("heads", [32, 64])
-@pytest.mark.parametrize("fully_projected", [False, True])
-def test_flash_kda_core_bitwise(rows, decode, heads, fully_projected):
+@pytest.mark.parametrize("mode", ["core", "fully_projected", "caller_rows"])
+def test_flash_kda_core_bitwise(rows, decode, heads, mode):
+    """``mode``: the staged core (aux projection + pack), the native-weight seam, or the projected
+    core over in-projection rows the caller writes into its scratch (as KX7 engines do)."""
+    fully_projected = mode == "fully_projected"
     from b12x.integration.cuteafd._common import GLM53_FLASH
     from b12x.integration.cuteafd.glmf import compile_glmf_kda_aot, compile_glmf_kda_commit_aot
     from b12x.integration.cuteafd.glmf_split import (compile_glmf_kda_core_aot,
+                                                   compile_glmf_kda_core_projected_aot,
                                                    compile_glmf_projected_kda_aot)
     from b12x.integration.cuteafd._glm_kernels import BatchedBf16Gemm
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
@@ -29,8 +33,8 @@ def test_flash_kda_core_bitwise(rows, decode, heads, fully_projected):
     g = replace(GLM53_FLASH, kda_heads=heads)
     cap, d, h, p = max(64, rows), g.kda_width, g.hidden, g.kda_in_width
     fused = compile_glmf_kda_aot(g, max_rows=cap, decode=decode, output_kind="norm")
-    split = (compile_glmf_projected_kda_aot if fully_projected else
-             compile_glmf_kda_core_aot)(g, max_rows=cap, decode=decode)
+    split = {"core": compile_glmf_kda_core_aot, "fully_projected": compile_glmf_projected_kda_aot,
+             "caller_rows": compile_glmf_kda_core_projected_aot}[mode](g, max_rows=cap, decode=decode)
     x, w = rand(rows, h), rand(p, h)
     wf, cw = rand(2, d, 128), rand(3*d, 4, dtype=torch.float32)
     al, dt, norm = rand(heads, dtype=torch.float32), rand(d, dtype=torch.float32), rand(128, scale=1)
@@ -74,6 +78,11 @@ def test_flash_kda_core_bitwise(rows, decode, heads, fully_projected):
             fused.launch(*args, fs, scalars=(rows,))
         if fully_projected:
             split.launch(q, k, v, decay, gate, beta, cw, al, dt, norm, conv, state,
+                slots, first, out, replay, ss, scalars=(rows, spec))
+        elif mode == "caller_rows":
+            # The whole in-projection rows (q | k | v | f_a, g_a, beta) at the base of scratch.
+            ss[:rows * p * 2].view(torch.bfloat16).copy_(proj.reshape(-1))
+            split.launch(x, q, k, v, q, fab, wf, cw, al, dt, norm, conv, state,
                 slots, first, out, replay, ss, scalars=(rows, spec))
         else:
             split.launch(x, q, k, v, q, fab, wf, cw, al, dt, norm, conv, state,
