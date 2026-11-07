@@ -93,6 +93,7 @@ _GLM_HEAD_DIM = 576
 _GLM_NEXT_HEAD_DIM = 512
 _PREFILL_BLOCK_THREADS = 384
 _PREFILL_IO_THREADS = 128
+_PREFILL_REGISTER_FILE = 65_536
 _IO_REGS = 32
 _MATH_REGS = 232
 _H32_IO_REGS = 24
@@ -2108,6 +2109,30 @@ def s6_xv_nope_mg_dsv4(
     return acc0, acc1
 
 
+def _check_prefill_register_budget(
+    math_regs: int, io_regs: int, math_threads: int
+) -> None:
+    """Reject a setmaxnreg split that fills the SM120 CTA register file exactly.
+
+    The warp-specialized setmaxnreg pair reserves the math warpgroup's increase
+    out of the pool the IO warpgroup releases. When the peak per-thread
+    allocations add up to exactly the CTA register file (65,536), SM120 selects
+    an exact-fill TRY_ALLOC that the retry loop never completes: the kernel
+    hangs on launch (measured with a 240/32 split on the 384-thread prefill
+    CTA; 240/24 runs with 1,024 registers of slack). Keep at least one register
+    of slack for any future split.
+    """
+    assert (
+        math_regs * math_threads + io_regs * _PREFILL_IO_THREADS
+        < _PREFILL_REGISTER_FILE
+    ), (
+        f"setmaxnreg split {math_regs}/{io_regs} fills the "
+        f"{_PREFILL_REGISTER_FILE}-register file exactly for "
+        f"{math_threads}+{_PREFILL_IO_THREADS} threads; an exact-fill "
+        f"TRY_ALLOC hangs on SM120"
+    )
+
+
 class UnifiedPrefillMGKernel:
     def __init__(
         self,
@@ -2221,6 +2246,11 @@ class UnifiedPrefillMGKernel:
             and not self.row_xor
             and self.head_offset == 0
             and not self.pack_hilo_rows
+        )
+        _check_prefill_register_budget(
+            _H32_MATH_REGS if self.use_h32_240_24_reg_budget else _MATH_REGS,
+            _H32_IO_REGS if self.use_h32_240_24_reg_budget else _IO_REGS,
+            self.math_threads,
         )
 
     @cute.jit
