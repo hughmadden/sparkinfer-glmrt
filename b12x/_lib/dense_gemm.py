@@ -984,6 +984,22 @@ class DenseGemmKernel:
         self.threads_per_cta = (
             self.num_mma_warps + 1  # 1 warp for DMA
         ) * self.num_threads_per_warp
+        cta_threads = (self.num_mma_warps + 1) * self.num_threads_per_warp
+        mma_threads = self.num_mma_warps * self.num_threads_per_warp
+        self.epi_tidx_mask = (1 << (self.threads_per_cta - 1).bit_length()) - 1
+        if (
+            self.threads_per_cta != cta_threads
+            or self.threads_per_cta <= 0
+            or mma_threads <= 0
+            or (self.epi_tidx_mask & (self.epi_tidx_mask + 1)) != 0
+            or self.threads_per_cta > self.epi_tidx_mask + 1
+            or mma_threads > self.epi_tidx_mask + 1
+        ):
+            raise ValueError(
+                f"Invalid CTA/MMA thread geometry for epilogue tidx mask: "
+                f"threads_per_cta={self.threads_per_cta}, mma_threads={mma_threads}, "
+                f"epi_tidx_mask=0x{self.epi_tidx_mask:x}"
+            )
 
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
 
@@ -1525,9 +1541,12 @@ class DenseGemmKernel:
         n0 = tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
         for acc_n in cutlass.range_constexpr(cute.size(scale_cols)):
             n_coord = n0 + coord_mn[0, acc_n][1]
-            scale_cols[acc_n] = cutlass.Float32(0.0)
-            if n_coord < Int32(sfb.shape[0]):
+            if cutlass.const_expr(sfb.shape[0] % self.tile_shape_mnk[1] == 0):
                 scale_cols[acc_n] = cutlass.Float32(sfb[(n_coord, k_tile_global, tile_coord_mnl[2])])
+            else:
+                scale_cols[acc_n] = cutlass.Float32(0.0)
+                if n_coord < Int32(sfb.shape[0]):
+                    scale_cols[acc_n] = cutlass.Float32(sfb[(n_coord, k_tile_global, tile_coord_mnl[2])])
 
     @cute.jit
     def _accumulate_block_fp8_stage(
@@ -2924,6 +2943,11 @@ class DenseGemmKernel:
                     )
 
                     if cutlass.const_expr(self.block_fp8):
+                        cta_threads = (self.num_mma_warps + 1) * self.num_threads_per_warp
+                        mma_threads = self.num_mma_warps * self.num_threads_per_warp
+                        assert self.threads_per_cta == cta_threads
+                        assert (self.epi_tidx_mask & (self.epi_tidx_mask + 1)) == 0
+                        assert mma_threads <= self.threads_per_cta <= self.epi_tidx_mask + 1
                         epi_tidx = Int32(
                             llvm.inline_asm(
                                 T.i32(),
@@ -2934,7 +2958,7 @@ class DenseGemmKernel:
                                 is_align_stack=False,
                                 asm_dialect=llvm.AsmDialect.AD_ATT,
                             )
-                        ) & Int32(0x1FF)
+                        ) & Int32(self.epi_tidx_mask)
                     else:
                         epi_tidx = tidx
                     thr_copy_r2s = tiled_copy_r2s.get_slice(epi_tidx)
