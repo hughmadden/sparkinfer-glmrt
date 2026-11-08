@@ -7851,6 +7851,19 @@ def _select_mxfp8_tile_k(
         and _use_low_sm_dense_tactics(sm_count)
     ):
         return 128
+    # V4.1 main-wide (N=5120, K=15360) prefers BK64: the smaller per-stage
+    # scale tile keeps the K loop on the manual_bk64_sf path. Measured on
+    # SM120 at M=2048/2752/4096, interleaved and sustained against BK128 on
+    # the same tiler: 689.7/912.8/1444.0 vs 700.1/920.1/1458.7 us
+    # (-1.5/-0.8/-1.0%), bit-identical output at every row. The neighbouring
+    # (5120, 17408) shape in the high-SM table is unmeasured and keeps BK128.
+    if (
+        expected_m is not None
+        and expected_m >= 2048
+        and not _use_low_sm_dense_tactics(sm_count)
+        and (n, k) == (5120, 15360)
+    ):
+        return 64
     # BK64 is an explicitly hinted production specialization. Choosing it from
     # live M when expected_m is absent would change both tile K and generated
     # code at M=2048, violating the no-hint frozen-resolution reuse contract.
