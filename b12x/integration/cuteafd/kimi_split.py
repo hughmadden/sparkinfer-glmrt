@@ -98,6 +98,27 @@ class _KdaCore:
             out, replay, scratch, rows, Int32(0), spec, stream)
 
 
+class _KdaCoreProjected(_KdaCore):
+    """``_KdaCore`` over in-projection rows the caller already wrote: the KDA body alone.
+
+    The caller writes ``[rows, kda_in_width]`` BF16 (q | k | v | the original f_a, g_a/gate and
+    beta rows, as the fused in-projection lays them out) at the base of ``scratch``; this program
+    skips the aux projection and the q/k/v pack and runs conv, recurrence, gates and norm exactly
+    as ``_KdaCore`` does after its pack. Operands, scalars and scratch are ``_KdaCore``'s."""
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
+                 gate: cute.Pointer, w_fab: cute.Pointer, w_f: cute.Pointer,
+                 conv_w: cute.Pointer, a_log: cute.Pointer, dt_bias: cute.Pointer,
+                 o_norm: cute.Pointer, conv_state: cute.Pointer, state: cute.Pointer,
+                 slots: cute.Pointer, seq_first: cute.Pointer, out: cute.Pointer,
+                 replay: cute.Pointer, scratch: cute.Pointer, rows: Int32, spec: Int32,
+                 stream: cuda.CUstream):
+        self.core.body(x, w_fab, w_fab, w_fab, w_f, conv_w, a_log, dt_bias,
+            o_norm, w_fab, w_fab, w_fab, conv_state, state, slots, seq_first,
+            out, replay, scratch, rows, Int32(0), spec, stream)
+
+
 def compile_kimi_kda_core_aot(g=KDAGeometry(hidden=7168, kda_heads=48), *,
                                max_rows=64, decode=True, state_dtype="float32",
                                state_rounding="window"):
@@ -115,11 +136,14 @@ def compile_kimi_kda_core_aot(g=KDAGeometry(hidden=7168, kda_heads=48), *,
 
 
 def compile_kda_core_aot(g, *, max_rows=64, decode=True, state_dtype="float32",
-                         state_rounding="window"):
-    """Shared projection-free KDA; retain the geometry's original gate/beta arithmetic."""
+                         state_rounding="window", projected=False):
+    """Shared projection-free KDA; retain the geometry's original gate/beta arithmetic.
+
+    ``projected``: the caller writes the in-projection rows into ``scratch`` itself
+    (``_KdaCoreProjected``); the operands, scalars and scratch are unchanged."""
     max_rows = _check_rows(max_rows)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
-    launch = _KdaCore(g, max_rows, decode, state_dtype, state_rounding)
+    launch = (_KdaCoreProjected if projected else _KdaCore)(g, max_rows, decode, state_dtype, state_rounding)
     h, d, heads = g.hidden, g.kda_width, g.kda_heads
     full = kda_layout(g)["full_rank_gate"]
     operands = (
@@ -139,9 +163,9 @@ def compile_kda_core_aot(g, *, max_rows=64, decode=True, state_dtype="float32",
         Operand("replay", torch.float32,
                 f"[{kda_replay_layout(heads, 3 * d, launch.core.replay_rows)[2] // 4}]", "inout"),
         Operand("scratch", torch.uint8, "[split_kda_scratch_bytes]", "scratch"))
-    return compile_program(launch, name="kimi_kda_core", operands=operands,
-        scalars=(Scalar("rows"), Scalar("spec")),
-        key=(g, max_rows, decode, state_dtype, state_rounding, launch.fab.key()),
+    return compile_program(launch, name="kimi_kda_core_projected" if projected else "kimi_kda_core",
+        operands=operands, scalars=(Scalar("rows"), Scalar("spec")),
+        key=(g, max_rows, decode, state_dtype, state_rounding, launch.fab.key()) + (("projected",) if projected else ()),
         scratch={"scratch": lambda rows: launch.fab_offset + _align(rows * launch.aux_width * 2)},
         geometry={**vars(g), "max_rows": max_rows, "decode": decode, "output_kind": "norm",
                   "fab_offset": launch.fab_offset, **_state_geometry(state_dtype, state_rounding),
