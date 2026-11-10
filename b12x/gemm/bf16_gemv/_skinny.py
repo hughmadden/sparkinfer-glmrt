@@ -323,7 +323,7 @@ DECODE_TMA_TILES = {
     (18432, 1536): ((16, 1, 4, 16, 64, 6),),
     (9216, 1536): ((2, 4, 128, 3), (16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
     (7168, 12288): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
-    (7168, 6144): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
+    (7168, 6144): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
     (8192, 8192): ((16, 1, 4, 16, 64, 6),),
     (8192, 4096): ((16, 1, 4, 16, 64, 6),),
     # HQA O: expose N parallelism at verify widths, preserving ordered K16.
@@ -349,6 +349,30 @@ DECODE_TMA_TILES = {
     (4096, 6144): ((64, 1, 4, 32, 12), (256, 1, 4, 64, 9)),
     (384, 4096): ((256, 1, 2, 16, 8),),
     (3072, 4096): ((64, 1, 4, 32, 8), (256, 1, 4, 32, 12)),
+    # Kimi K3's BF16 core (TJ, 2026-11-11): the dense projections this family
+    # lacked entries for, so every decode call ran prefill_config's 64x128x3
+    # tile (17-194 CTAs on 188 SMs, two stages in flight) while a CTA's
+    # in-flight bytes are what set its bandwidth. The 16-row band trades MMA
+    # width for stage depth because rows 2-6 are 99% of decode calls and C16
+    # verify lands past it; 32 rows to 32 and 64 past it hand the wave back to
+    # wider tiles. Raptor SM120, L2-flushed cold medians, 50 interleaved
+    # graph replays per row against the shipped route in one session, rows 1-64
+    # (tests/integration/test_cuteafd_kimi_projection_tiles.py holds the
+    # byte-identity gate at rows 1-65): 2112x7168 51.2 -> 24.6 us (2.08x),
+    # 3584x7168 53.2 -> 36.9 (1.44x), 6144x7168 67.6 -> 57.3 (1.18x),
+    # 24752x7168 260.1 -> 227.3 (1.14x), 7168x6144 59.4 -> 59.4 at <=16,
+    # 61.4 -> 59.4 at 17-32 and 67.6 -> 61.4 past it, 7168x3072 34.8 -> 30.7
+    # (1.13x), 7168x3584 40.8 -> 34.8 (1.17x). 24752x7168's <=16 band re-reads
+    # its 355 MiB once and the 32-wide 16-stage tile pays that better than a
+    # 64-wide one. Each entry reruns the ordered K16 accumulation untouched:
+    # byte-identical to prefill_config at every row, row-invariant, no store
+    # past `rows`.
+    (2112, 7168): ((16, 1, 4, 16, 64, 9), (64, 2, 2, 32, 64, 8)),
+    (3584, 7168): ((16, 1, 4, 16, 64, 9), (64, 2, 2, 32, 64, 8)),
+    (6144, 7168): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
+    (24752, 7168): ((16, 1, 4, 16, 32, 16), (32, 2, 2, 32, 32, 12), (64, 2, 2, 32, 64, 8)),
+    (7168, 3072): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
+    (7168, 3584): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
 }
 
 
