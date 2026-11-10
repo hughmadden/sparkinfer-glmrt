@@ -28,7 +28,7 @@ import sys
 
 import cutlass.cute as cute
 import torch
-from cutlass import Int32
+from cutlass import BFloat16, Int32
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -164,7 +164,7 @@ def main():
         out = torch.empty((max_rows, n), device="cuda", dtype=torch.bfloat16)
         arms, keys = {}, {}
         for spec in specs:
-            launch, key = _build_arm(spec, n, k, torch.bfloat16)
+            launch, key = _build_arm(spec, n, k, BFloat16)
             arms[spec["name"]], keys[spec["name"]] = _program(launch, key), key
         reference = {}
         for rows in sorted(args.rows, reverse=True):
