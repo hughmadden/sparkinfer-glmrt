@@ -487,15 +487,88 @@ def benchmark_prefill_route(args):
         torch.cuda.empty_cache()
 
 
+THRESHOLD_DEFAULTS = dict(narrow=8, decode=16, wide2=32, wide3=48,
+                          folded=16, prefill=130)
+THRESHOLD_CONSTANTS = dict(narrow="_K6_NARROW_ROWS", decode="_K6_DECODE_ROWS",
+                           wide2="_K6_WIDE2_ROWS", wide3="_K6_WIDE3_ROWS",
+                           folded="_FOLDED_DECODE_ROWS", prefill="_PREFILL_MIN_ROWS")
+
+
+def threshold_config(text):
+    """Only lower a tile's coverage boundary; never overrun its row capacity."""
+    values = dict(THRESHOLD_DEFAULTS)
+    if text:
+        for assignment in text.split(","):
+            name, separator, value = assignment.partition("=")
+            if not separator or name not in values:
+                raise ValueError(f"unknown threshold assignment {assignment!r}")
+            values[name] = int(value)
+    for name in ("narrow", "decode", "wide2", "wide3", "folded"):
+        if not 0 <= values[name] <= THRESHOLD_DEFAULTS[name]:
+            raise ValueError(f"{name} must be 0..{THRESHOLD_DEFAULTS[name]}")
+    if not values["narrow"] <= values["decode"] <= values["wide2"] <= values["wide3"]:
+        raise ValueError("decode thresholds must be ordered")
+    if not 1 <= values["prefill"] <= 130:
+        raise ValueError("prefill must be 1..130 (fixed partial capacity)")
+    return values
+
+
+def threshold_variant(source, destination, values):
+    """Materialize a benchmark-only module; production sources stay untouched."""
+    text = source.read_text()
+    for name, constant in THRESHOLD_CONSTANTS.items():
+        text, count = re.subn(rf"^{constant} = [0-9]+$",
+                              f"{constant} = {values[name]}", text, flags=re.MULTILINE)
+        if count != 1:
+            raise ValueError(f"expected one threshold definition for {constant}")
+    # Generic high-rate and grouped decode use the same 16/32/48-row tiles,
+    # but do not currently expose named cutovers. K6 narrow is K6-only.
+    for method in ("_legacy", "_generic_grouped"):
+        start = text.index(f"    def {method}(")
+        end = text.index("\n    @cute.", start)
+        section = text[start:end]
+        for boundary, name in ((16, "decode"), (32, "wide2"), (48, "wide3")):
+            section = section.replace(f"rows <= Int32({boundary})",
+                                      f"rows <= Int32({values[name]})")
+        text = text[:start] + section + text[end:]
+    destination.write_text(text)
+    return destination
+
+
+def thermal_snapshot():
+    """Cumulative driver counters cover short phases that periodic polling misses."""
+    import csv
+    import time
+    fields = ("uuid", "utilization.gpu", "clocks.sm", "power.draw", "power.limit",
+              "temperature.gpu", "temperature.gpu.tlimit",
+              "clocks_event_reasons_counters.sw_power_cap",
+              "clocks_event_reasons_counters.sw_thermal_slowdown",
+              "clocks_event_reasons_counters.hw_thermal_slowdown")
+    output = subprocess.check_output(["nvidia-smi", "--query-gpu=" + ",".join(fields),
+                                      "--format=csv,noheader,nounits"], text=True)
+    return dict(unix_ns=time.time_ns(), gpus=[dict(zip(fields, row, strict=True))
+                for row in csv.reader(output.splitlines(), skipinitialspace=True)])
+
+
 def benchmark_native_comparison(args):
     """Compare a previous native implementation through the same exported ABI."""
     import importlib.util
     from b12x.gemm.trellis_linear import _native
-    candidate = _native.NativeTrellisLinear
-    spec = importlib.util.spec_from_file_location("trellis_native_baseline", args.baseline_native)
-    baseline_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(baseline_module)
+    def native_module(path, name):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    baseline_module = native_module(args.baseline_native, "trellis_native_baseline")
     baseline = baseline_module.NativeTrellisLinear
+    values = threshold_config(args.thresholds)
+    if args.thresholds:
+        path = threshold_variant(Path(_native.__file__), args.output_dir / "threshold_native.py", values)
+        candidate = native_module(path, "trellis_native_threshold").NativeTrellisLinear
+    else:
+        candidate = _native.NativeTrellisLinear
     import hashlib
     import torch
     from cuda.bindings import driver as cuda
@@ -505,21 +578,8 @@ def benchmark_native_comparison(args):
     if args.compile_only:
         import multiprocessing
         from b12x._lib.compile_pool import _initialize_worker
-        # Driver attributes do not create a CUDA context in this compiler process.
-        status, = cuda.cuInit(0)
-        if int(status):
-            raise RuntimeError(status)
-        def attribute(name):
-            status, value = cuda.cuDeviceGetAttribute(getattr(cuda.CUdevice_attribute, name), 0)
-            if int(status):
-                raise RuntimeError(status)
-            return value
-        capability = tuple(attribute("CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_" + part)
-                           for part in ("MAJOR", "MINOR"))
-        _initialize_worker(0, capability, "native-byte-comparison", "native-byte-comparison",
-                           attribute("CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT"),
-                           attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN"),
-                           attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR"),
+        _initialize_worker(0, (12, 0), "native-byte-comparison", "native-byte-comparison",
+                           args.export_sms, 101376, 102400,
                            multiprocessing.Array("i", [0, 0]))
 
     def snapshot():
@@ -551,6 +611,8 @@ def benchmark_native_comparison(args):
     rows_list = list(map(int, args.rows.split(",")))
     if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 1:
         raise ValueError("native comparison requires rows 1..4096 and positive samples")
+    if args.thresholds and not args.check_only and args.samples < 50:
+        raise ValueError("threshold measurements require at least 50 samples")
     max_rows = max(129, max(rows_list))
     arms = (("baseline", baseline), ("candidate", candidate))
     if args.compile_only:
@@ -571,6 +633,8 @@ def benchmark_native_comparison(args):
     report = dict(metadata=dict(device=props.name if props else "CPU-only", sms=props.multi_processor_count if props else None,
         l2_bytes=l2, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=args.bits,
         input_dtype=args.input_dtype, codebook=args.codebook,
+        thresholds=values, source_sha256=hashlib.sha256(Path(_native.__file__).read_bytes()).hexdigest(),
+        baseline_sha256=hashlib.sha256(args.baseline_native.read_bytes()).hexdigest(),
         ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[])
     if family and not args.compile_only:
         report["metadata"]["streaming_read"] = streaming_read_bandwidth(l2, args.samples)
@@ -582,6 +646,15 @@ def benchmark_native_comparison(args):
     for k, n, side in shapes:
         directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
         directory.mkdir(parents=True, exist_ok=True)
+        contract = dict(bits=args.bits, k=k, n=n, side=side, max_rows=max_rows,
+                        input_dtype=args.input_dtype, codebook=args.codebook, thresholds=values,
+                        source_sha256=report["metadata"]["source_sha256"],
+                        baseline_sha256=report["metadata"]["baseline_sha256"])
+        manifest = directory / "benchmark_contract.json"
+        if args.compile_only:
+            manifest.write_text(json.dumps(contract, sort_keys=True) + "\n")
+        elif json.loads(manifest.read_text()) != contract:
+            raise ValueError(f"stale exported benchmark contract: {directory}")
         libs = {}
         for stem, core in arms:
             if args.compile_only:
@@ -621,11 +694,12 @@ def benchmark_native_comparison(args):
         candidate_core = candidate(dict(input_features=k, output_features=n, bits=args.bits,
             codebook=args.codebook, sharded_side=side, rotation_count=1,
             max_rows=max_rows, splits=splits, input_dtype=args.input_dtype))
-        assert candidate_core.exact_row_cap == core.exact_row_cap
         def publishes_partials(rows):
-            if rows > (64 if args.codebook == "e4m3" else 129):
+            if rows >= min(core.exact_row_cap + 1, candidate_core.exact_row_cap + 1):
                 return False
-            # The pre-existing short-K K4 E4M3 folded route writes output directly.
+            # Fused K6 decode and folded K4 write output without publishing partials.
+            if args.bits == 6 and rows <= 16:
+                return False
             return not (args.bits == 4 and args.codebook == "e4m3"
                         and splits <= 2 and rows <= 16)
         x = torch.randn(capacity, k, device="cuda", dtype=getattr(torch, {"bf16":"bfloat16", "f16":"float16"}[args.input_dtype]))
@@ -732,6 +806,7 @@ def benchmark_native_comparison(args):
                 events[name] = pairs
                 timed.replay()
             torch.cuda.synchronize()
+            thermal_before = thermal_snapshot()
             samples = {name: [] for name in libs}
             for repeat in range(args.samples):
                 order = list(libs) if repeat % 2 == 0 else list(reversed(libs))
@@ -746,7 +821,8 @@ def benchmark_native_comparison(args):
                 exact=exact[name], sha256=hashes[name], partials_exact=partials_exact[name],
                 partials_checked=publishes_partials(rows), exact_row_cap=core.exact_row_cap,
                 weight_gbs=(k*n*args.bits/8)/(times[name]*1000),
-                baseline_samples_us=samples["baseline"], samples_us=samples[name], snapshot=snapshot())
+                baseline_samples_us=samples["baseline"], samples_us=samples[name], snapshot=snapshot(),
+                thermal_before=thermal_before, thermal_after=thermal_snapshot())
             if family:
                 record["bandwidth_fraction"] = record["weight_gbs"] / report["metadata"]["streaming_read"]["gbs"]
             report["records"].append(record)
@@ -785,7 +861,10 @@ def main():
     parser.add_argument("--timing-rows", help="time only these rows while checking all requested rows")
     parser.add_argument("--input-dtype", choices=("f16", "bf16"), default="bf16")
     parser.add_argument("--codebook", choices=("mcg", "mul1", "f16", "e4m3"), default="mcg")
-    parser.add_argument("--bits", type=int, choices=range(2, 7), default=6)
+    parser.add_argument("--bits", type=int, choices=range(1, 9), default=6)
+    parser.add_argument("--thresholds", help="benchmark-only narrow/decode/wide2/wide3/folded/prefill overrides")
+    parser.add_argument("--export-sms", type=int, choices=(170, 188), default=188,
+                        help="offline SM120 compiler geometry; runtime CTA budget stays device-derived")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.baseline_native:

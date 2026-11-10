@@ -71,7 +71,8 @@ def test_projection_compensation_is_opt_in_and_default_key_is_unchanged(monkeypa
             return tuple(sorted(self.kwargs.items()))
 
     monkeypatch.setitem(sys.modules, "b12x.gemm.bf16_gemv._skinny", SimpleNamespace(
-        COMPENSATED_TILES_BY_ROWS={}, RoutedBf16Projection=Projection, TmaBf16Projection=Projection))
+        COMPENSATED_TILES_BY_ROWS={}, RoutedBf16Projection=Projection,
+        TmaBf16Projection=Projection, wide_prefill_min_rows=lambda *args: 4097))
     namespace = dict(torch=SimpleNamespace(bfloat16="bf16", float32="f32"),
                      BFloat16="bf16", Float32="f32", Operand=lambda *a: a,
                      Scalar=lambda *a: a, compile_program=lambda op, **kwargs: kwargs)
@@ -81,7 +82,8 @@ def test_projection_compensation_is_opt_in_and_default_key_is_unchanged(monkeypa
     explicit = build(width=6144, outputs=7168, compensated=False)
     compensated = build(width=6144, outputs=7168, compensated=True)
     assert default == explicit
-    assert calls[:2] == [(7168, 6144, {"out_dtype": "bf16", "max_skinny_rows": 0})] * 2
+    assert calls[:2] == [(7168, 6144, {"out_dtype": "bf16", "max_skinny_rows": 0,
+                                     "wide": False, "wide_min_rows": None})] * 2
     assert calls[2] == (7168, 6144, {"out_dtype": "bf16", "tiles_by_rows": (), "compensated": True})
     assert default["geometry"] == dict(width=6144, outputs=7168, output_dtype="bf16", skinny_rows=0,
                                        exact_row_cap=2**31 - 1)
@@ -109,7 +111,8 @@ def _compensated_build(monkeypatch, table):
             return tuple(sorted(self.kwargs.items()))
 
     monkeypatch.setitem(sys.modules, "b12x.gemm.bf16_gemv._skinny", SimpleNamespace(
-        COMPENSATED_TILES_BY_ROWS=table, RoutedBf16Projection=Projection, TmaBf16Projection=Projection))
+        COMPENSATED_TILES_BY_ROWS=table, RoutedBf16Projection=Projection,
+        TmaBf16Projection=Projection, wide_prefill_min_rows=lambda *args: 4097))
     namespace = dict(torch=SimpleNamespace(bfloat16="bf16", float32="f32"),
                      BFloat16="bf16", Float32="f32", Operand=lambda *a: a,
                      Scalar=lambda *a: a, compile_program=lambda op, **kwargs: kwargs)
@@ -175,3 +178,39 @@ def test_invalid_geometry_is_rejected_before_cuda_import(argv):
     with pytest.raises(SystemExit) as error:
         _BENCH.parse_args(argv)
     assert error.value.code == 2
+
+
+def _native_threshold_bench():
+    path = _PATH.with_name("kimi_k6_dense.py")
+    spec = importlib.util.spec_from_file_location("native_threshold_benchmark", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("text", ["narrow=9", "decode=17", "wide2=33", "wide3=49",
+                                  "folded=17", "prefill=131", "prefill=0",
+                                  "narrow=8,decode=4", "splits=4", "stages=3"])
+def test_native_thresholds_refuse_unsafe_knobs(text):
+    with pytest.raises(ValueError):
+        _native_threshold_bench().threshold_config(text)
+
+
+def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
+    bench = _native_threshold_bench()
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    original = source.read_text()
+    unchanged = bench.threshold_variant(source, tmp_path / "defaults.py", bench.threshold_config(None))
+    assert unchanged.read_text() == original
+    values = bench.threshold_config("narrow=4,decode=8,wide2=24,wide3=32,prefill=64")
+    variant = bench.threshold_variant(source, tmp_path / "variant.py", values).read_text()
+    assert "_K6_NARROW_ROWS = 4" in variant
+    assert "_PREFILL_MIN_ROWS = 64" in variant
+    before, after = ast.parse(original), ast.parse(variant)
+    base = next(n for n in before.body if isinstance(n, ast.ClassDef) and n.name == "NativeTrellisLinear")
+    changed = next(n for n in after.body if isinstance(n, ast.ClassDef) and n.name == "NativeTrellisLinear")
+    methods = {n.name: n for n in changed.body if isinstance(n, ast.FunctionDef)}
+    for method in (n for n in base.body if isinstance(n, ast.FunctionDef)):
+        if method.name not in ("_legacy", "_generic_grouped"):
+            assert ast.dump(method) == ast.dump(methods[method.name]), method.name
+    assert source.read_text() == original
