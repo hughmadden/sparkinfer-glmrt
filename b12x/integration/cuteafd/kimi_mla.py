@@ -23,8 +23,17 @@ from b12x.attention.dense_mla._forward import DenseMlaForwardKernel
 from b12x.attention.dense_mla._layout import choose_layout, make_smem_layout
 from b12x.attention.dense_mla._merge import DenseMlaMergeKernel
 from ._common import Operand, Scalar, compile_program
-from ._glm_kernels import BatchedBf16Gemm, _bf16, _block_sum, _fp8_scale, _reduction_storage, _rsqrt, _warp_max, glm_projection
+from ._glm_kernels import (BatchedBf16Gemm, _bf16, _block_sum, _fp8_scale, _reduction_storage,
+                           _rsqrt, _warp_max, glm_projection)
 from ._qwen4_attention_kernels import Qwen4GateMul
+
+
+def _wide(n: int, k: int, capacity: int) -> dict:
+    """``glm_projection`` kwargs for a measured shape whose program reaches its floor."""
+    from b12x.gemm.bf16_gemv._skinny import wide_prefill_min_rows
+
+    floor = wide_prefill_min_rows(n, k, capacity)
+    return {"wide": floor is not None, "wide_min_rows": floor}
 
 
 @dataclass(frozen=True)
@@ -221,11 +230,12 @@ class _QueryTail:
 
 
 class _Producer:
-    def __init__(self, g):
+    def __init__(self, g, wide_capacity: int = 0):
         self.g = g
-        self.qkv = glm_projection(g.qkv_a_width, g.hidden)
+        self.qkv = glm_projection(g.qkv_a_width, g.hidden, **_wide(g.qkv_a_width, g.hidden, wide_capacity))
         self.norm = _RankNormPack(g)
-        self.q_b = glm_projection(g.heads * 192, g.q_lora_rank)
+        self.q_b = glm_projection(g.heads * 192, g.q_lora_rank,
+                                  **_wide(g.heads * 192, g.q_lora_rank, wide_capacity))
         self.uk = BatchedBf16Gemm(n=512, k=128, batch=g.heads, a_row=g.heads * 192,
                                    a_batch=192, o_row=g.heads * 576, o_batch=576)
         self.tail = _QueryTail(g.heads)
@@ -313,13 +323,14 @@ class _DraftOutput:
 
 
 class _Output:
-    def __init__(self, g):
+    def __init__(self, g, wide_capacity: int = 0):
         self.g = g
         self.uv = BatchedBf16Gemm(n=128, k=512, batch=g.heads, a_row=g.heads * 512,
                                    a_batch=512, o_row=g.heads * 128, o_batch=128)
-        self.gate_proj = glm_projection(g.heads * 128, g.hidden)
+        self.gate_proj = glm_projection(g.heads * 128, g.hidden,
+                                        **_wide(g.heads * 128, g.hidden, wide_capacity))
         self.gate_mul = Qwen4GateMul(g.heads * 128)
-        self.o = glm_projection(g.hidden, g.heads * 128)
+        self.o = glm_projection(g.hidden, g.heads * 128, **_wide(g.hidden, g.heads * 128, wide_capacity))
 
     @cute.jit
     def __call__(self, attn: cute.Pointer, x: cute.Pointer, w_uv: cute.Pointer,
@@ -479,7 +490,7 @@ def compile_kimi_mla_producer_aot(g=KimiMlaGeometry(), *, max_rows=64):
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]", "out"),
         Operand("q_resid", torch.bfloat16, "[rows,1536]", "out"),
         Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"))
-    return compile_program(_Producer(g), name="kimi_mla_producer", operands=operands,
+    return compile_program(_Producer(g, wide_capacity=max_rows), name="kimi_mla_producer", operands=operands,
         scalars=(Scalar("rows"),), key=(g, max_rows),
         scratch={"scratch": lambda rows: producer_scratch_bytes(g, rows)},
         geometry=vars(g))
@@ -494,7 +505,7 @@ def compile_kimi_mla_output_aot(g=KimiMlaGeometry(), *, max_rows=64):
         Operand("w_o", torch.bfloat16, f"[{g.hidden},{g.heads * 128}]"),
         Operand("out", torch.bfloat16, f"[rows,{g.hidden}]", "out"),
         Operand("scratch", torch.uint8, "[output_scratch_bytes]", "scratch"))
-    return compile_program(_Output(g), name="kimi_mla_output", operands=operands,
+    return compile_program(_Output(g, wide_capacity=max_rows), name="kimi_mla_output", operands=operands,
         scalars=(Scalar("rows"),), key=(g, max_rows),
         scratch={"scratch": lambda rows: output_scratch_bytes(g, rows)},
         geometry=vars(g))

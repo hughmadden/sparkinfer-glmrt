@@ -170,11 +170,13 @@ class _Fp8Switch:
     the quantized rows (``quant_scratch_bytes``); ``prefill_mask`` selects the
     ``fp8_rows`` bits that turn this projection's FP8 route on.
 
-    ``tiles_by_rows``: the BF16 projection's TMA tiles by live rows (``glm_projection``)."""
+    ``tiles_by_rows``: the BF16 projection's TMA tiles by live rows (``glm_projection``).
+    ``bf16_wide_min_rows``: the measured wide prefill floor for this shape, for BF16-only
+    programs with no FP8 prefill route (the wide tile from that many live rows)."""
 
     def __init__(self, n: int, k: int, *, fp8: bool, row_scales: bool = False, prefill_rows: int | None = None,
                  prefill_mask: int = 0xFF, wide_rows: int = 0, decode_rows: int | None = None,
-                 tiles_by_rows: tuple = ()):
+                 tiles_by_rows: tuple = (), bf16_wide_min_rows: int | None = None):
         from b12x.gemm.bf16_gemv._skinny import skinny_max_rows
         from ._fp8_weights import FP8_DECODE_ROWS, MmaFp8Gemv
         from ._glmf_fp8 import BlockFp8Projection
@@ -182,7 +184,11 @@ class _Fp8Switch:
         self.n, self.k = int(n), int(k)
         # Preserve activation quantization admission independently of BF16 implementation.
         self.activation_quant_row_threshold = 8 if self.n >= 2048 else skinny_max_rows(self.n, self.k)
-        self.bf16 = glm_projection(self.n, self.k, wide=prefill_rows is not None, tiles_by_rows=tiles_by_rows)
+        # ``bf16_wide_min_rows`` adds the measured wide prefill route to a BF16
+        # program that has no FP8 prefill route (Kimi K3), with that shape's floor.
+        wide = prefill_rows is not None or bf16_wide_min_rows is not None
+        self.bf16 = glm_projection(self.n, self.k, wide=wide, wide_min_rows=bf16_wide_min_rows,
+                                   tiles_by_rows=tiles_by_rows)
         self.prefill = None
         self.fp8 = None
         self.fp8_wide = None
@@ -570,7 +576,7 @@ def _tile_geometry(launch) -> dict:
 class _Kda:
     def __init__(self, g: GLMFGeometry, max_rows: int = 64, fp8=False, state_dtype: str = "float32",
                  state_rounding: str = "window", decode: bool | None = None, seq_ctas: int = 1,
-                 decode_tiles: bool = False):
+                 decode_tiles: bool = False, bf16_wide: bool = False):
         self.g = g
         self.output_norm = False
         fp8, prefill = _fp8_mode(fp8)
@@ -602,6 +608,13 @@ class _Kda:
         self.f32_norm = layout["o_norm_dtype"] == "float32"
         prefill_rows = int(max_rows) if prefill else None
         self.chunked_bytes = 0 if self.chunked is None else self.chunked.nbytes
+        # bf16_wide: the measured wide prefill floor per projection shape. Only
+        # the BF16 prefill route (no FP8 operands) takes it; decode programs keep
+        # their own tiles below the floor.
+        from b12x.gemm.bf16_gemv._skinny import wide_prefill_min_rows
+
+        in_wide = wide_prefill_min_rows(p, g.hidden, max_rows) if bf16_wide else None
+        out_wide = wide_prefill_min_rows(g.hidden, d, max_rows) if bf16_wide else None
         # decode_tiles: the BF16 projections whose shape has a table pick their TMA tiles by live
         # rows; a table extends that projection's key, the programs without one keep theirs.
         self.decode_tiles = {name: KDA_DECODE_TILES[shape]
@@ -609,7 +622,7 @@ class _Kda:
                              if decode_tiles and shape in KDA_DECODE_TILES}
         # Prefill: fp8_rows bit 0 turns the in-projection's FP8 GEMM on, bit 1 o_proj's.
         self.in_proj = _Fp8Switch(p, g.hidden, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=1,
-                                  tiles_by_rows=self.decode_tiles.get("in", ()))
+                                  tiles_by_rows=self.decode_tiles.get("in", ()), bf16_wide_min_rows=in_wide)
         # f_b(f_a), and g_b(g_a) only for a low-rank output gate.
         self.fg = BatchedBf16Gemm(n=d, k=g.kda_head_dim, batch=layout["fg_batch"], a_row=p,
                                   a_batch=g.kda_head_dim, o_row=self.fg_stride, o_batch=d,
@@ -623,7 +636,7 @@ class _Kda:
                                           seq_ctas=self.seq_ctas, round_beta=layout["round_recurrent_beta"])
         self.norm = GlmfKdaGatedNorm(heads=g.kda_heads, eps=g.norm_eps, gate_stride=self.gate_stride)
         self.o_proj = _Fp8Switch(g.hidden, d, fp8=fp8, row_scales=True, prefill_rows=prefill_rows, prefill_mask=2,
-                                 tiles_by_rows=self.decode_tiles.get("out", ()))
+                                 tiles_by_rows=self.decode_tiles.get("out", ()), bf16_wide_min_rows=out_wide)
 
     def key(self) -> tuple:
         return (self.in_proj.key(), self.fg.key(), self.o_proj.key(), self.g,
@@ -846,7 +859,8 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
                          fp8_only: str | None = None, output_dtype: str = "bfloat16",
                          prefill_expanded: bool = False, output_kind: str = "projection",
                          state_dtype: str = "float32", state_rounding: str = "window",
-                         seq_ctas: int = 1, decode_tiles: bool = False, decode: bool = False) -> AotProgram:
+                         seq_ctas: int = 1, decode_tiles: bool = False, decode: bool = False,
+                         bf16_wide: bool = False) -> AotProgram:
     """One shared KDA layer for GLMFGeometry or KDAGeometry.
 
     ``decode=True`` exposes BF16-only replay and the ``rows, spec`` scalars.
@@ -892,11 +906,17 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
     live rows from ``KDA_DECODE_TILES`` (per weight shape; a shape without a table keeps
     ``prefill_config``). The operands, scalars and scratch of the default program; the tiles
     keep each output's K order, so the outputs are expected bit-identical to it. With a table it
-    extends the key and geometry."""
+    extends the key and geometry.
+
+    ``bf16_wide`` (default off; BF16 prefill programs, ``fp8=False``, ``decode=False``): the
+    in-projection and o_proj take the measured wide prefill route from their shapes'
+    ``WIDE_PREFILL_MIN_ROWS_BY_SHAPE`` floors (``_Kda``'s ``bf16_wide``)."""
     max_rows = _check_rows(max_rows)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
     if decode and (fp8 is not False or fp8_only is not None):
         raise ValueError("decode=True is for BF16-only KDA; FP8 decode already supplies replay")
+    if bf16_wide and (fp8 is not False or fp8_only is not None or decode):
+        raise ValueError("bf16_wide takes the BF16 KDA prefill route (fp8=False, fp8_only=None, decode=False)")
     if fp8_only is not None:
         if fp8 is not False:
             raise ValueError("fp8_only takes no fp8 copies")
@@ -909,7 +929,7 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
     fp8_on, prefill = _fp8_mode(fp8)
     launch = (_KdaBf16Decode if decode else _KdaFp8Prefill if prefill else _KdaFp8 if fp8_on else _Kda)(
         g, max_rows, fp8, state_dtype, state_rounding, seq_ctas=seq_ctas,
-        decode_tiles=decode_tiles, **({"decode": True} if decode else {}))
+        decode_tiles=decode_tiles, bf16_wide=bf16_wide, **({"decode": True} if decode else {}))
     launch.output_norm = output_kind == "norm"
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, d, p, heads = g.hidden, g.kda_width, g.kda_in_width, g.kda_heads

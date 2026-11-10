@@ -106,7 +106,7 @@ class Bf16PrefillKernel:
     def __init__(self, n: int, k: int, *, compute_warps: int | None = None,
                  tile_n: int | None = None, num_stages: int | None = None,
                  compensated: bool = True, warp_layout: tuple[int, int] | None = None,
-                 tile_m: int | None = None):
+                 tile_m: int | None = None, tile_k: int | None = None):
         """Defaults keep the original 64x64x64, two-stage, compensated kernel.
 
         ``compensated=False`` accumulates directly in the tensor-core FP32
@@ -114,6 +114,9 @@ class Bf16PrefillKernel:
         ``warp_layout`` ``(wm, wn)`` with ``tile_m`` arranges the MMA warps in
         a grid (each owns a ``tile_m / wm`` x ``tile_n / wn`` block): the same
         per-element K order, fewer shared-memory fragment reads per MMA.
+        ``tile_k`` widens the pipelined K step (default 64); the K tiles run in
+        increasing order either way, so the per-element accumulation order and
+        its bits do not depend on it.
         """
         self.warp_layout = None
         if compute_warps is not None:
@@ -131,10 +134,12 @@ class Bf16PrefillKernel:
             self.tile_n = int(tile_n)
         if num_stages is not None:
             self.num_stages = int(num_stages)
+        if tile_k is not None:
+            self.tile_k = int(tile_k)
         self.compensated = bool(compensated)
         self.n, self.k = int(n), int(k)
-        if self.n <= 0 or self.k <= 0 or self.k % self.tile_k:
-            raise ValueError("BF16 prefill needs positive N and K divisible by 64")
+        if self.n <= 0 or self.k <= 0 or self.k % self.tile_k or self.tile_k % 16:
+            raise ValueError("BF16 prefill needs positive N and a K divisible by its K tile")
         self.k_tiles = self.k // self.tile_k
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
 
