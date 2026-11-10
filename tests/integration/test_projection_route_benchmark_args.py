@@ -204,6 +204,44 @@ def test_reference_encoder_build_requires_explicit_official_source(monkeypatch, 
     assert error.value.code == 2
 
 
+@pytest.mark.parametrize("text", ["decode=8", "wide2=24"])
+def test_grouped_threshold_builder_refuses_partial_plane_overlap(text, tmp_path):
+    bench = _native_threshold_bench()
+    with pytest.raises(ValueError, match="next projection's partial plane"):
+        bench.threshold_config(text, groups=4)
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    with pytest.raises(ValueError, match="next projection's partial plane"):
+        bench.threshold_variant(source, tmp_path / "bad.py", bench.threshold_config(text), groups=4)
+
+
+@pytest.mark.parametrize("decode,wide2", [(8, 32), (16, 24)])
+def test_native_grouped_constructor_refuses_partial_plane_overlap(decode, wide2):
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    tree = ast.parse(source.read_text())
+    check = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "validate_grouped_route_thresholds")
+    core = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                and n.name == "NativeTrellisLinear")
+    init = next(n for n in core.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    namespace = {"_GROUPED_DECODE_ROWS": decode, "_GROUPED_WIDE2_ROWS": wide2}
+    exec(compile(ast.Module(body=[check, init], type_ignores=[]), str(source), "exec"), namespace)
+    with pytest.raises(AssertionError, match="next projection's partial plane"):
+        namespace["__init__"](SimpleNamespace(), {"groups": 4})
+
+
+def test_standalone_threshold_variant_keeps_grouped_routes_frozen(tmp_path):
+    bench = _native_threshold_bench()
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    variant = bench.threshold_variant(source, tmp_path / "standalone.py", bench.threshold_config("decode=8"))
+    def grouped(text):
+        core = next(n for n in ast.parse(text).body if isinstance(n, ast.ClassDef)
+                    and n.name == "NativeTrellisLinear")
+        return ast.dump(next(n for n in core.body if isinstance(n, ast.FunctionDef)
+                             and n.name == "_generic_grouped"))
+    assert grouped(variant.read_text()) == grouped(source.read_text())
+    assert "_GROUPED_DECODE_ROWS = 16" in variant.read_text()
+
+
 def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
     bench = _native_threshold_bench()
     source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"

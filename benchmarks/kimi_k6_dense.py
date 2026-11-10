@@ -494,7 +494,7 @@ THRESHOLD_CONSTANTS = dict(narrow="_K6_NARROW_ROWS", decode="_K6_DECODE_ROWS",
                            folded="_FOLDED_DECODE_ROWS", prefill="_PREFILL_MIN_ROWS")
 
 
-def threshold_config(text):
+def threshold_config(text, groups=1):
     """Only lower a tile's coverage boundary; never overrun its row capacity."""
     values = dict(THRESHOLD_DEFAULTS)
     if text:
@@ -510,20 +510,25 @@ def threshold_config(text):
         raise ValueError("decode thresholds must be ordered")
     if not 1 <= values["prefill"] <= 130:
         raise ValueError("prefill must be 1..130 (fixed partial capacity)")
+    if groups == 4 and (values["decode"] < 16 or values["wide2"] < 32):
+        raise ValueError("grouped wide2/wide3 lower cutovers overlap the next projection's partial plane")
     return values
 
 
-def threshold_variant(source, destination, values):
+def threshold_variant(source, destination, values, groups=1):
     """Materialize a benchmark-only module; production sources stay untouched."""
+    threshold_config(",".join(f"{name}={value}" for name, value in values.items()), groups)
     text = source.read_text()
+    if groups == 4:
+        text = text.replace("_GROUPED_DECODE_ROWS = 16", f"_GROUPED_DECODE_ROWS = {values['decode']}")
+        text = text.replace("_GROUPED_WIDE2_ROWS = 32", f"_GROUPED_WIDE2_ROWS = {values['wide2']}")
     for name, constant in THRESHOLD_CONSTANTS.items():
         text, count = re.subn(rf"^{constant} = [0-9]+$",
                               f"{constant} = {values[name]}", text, flags=re.MULTILINE)
         if count != 1:
             raise ValueError(f"expected one threshold definition for {constant}")
-    # Generic high-rate and grouped decode use the same 16/32/48-row tiles,
-    # but do not currently expose named cutovers. K6 narrow is K6-only.
-    for method in ("_legacy", "_generic_grouped"):
+    # Grouped tiles require full earlier row blocks; standalone cutovers do not apply.
+    for method in (("_legacy", "_generic_grouped") if groups == 4 else ("_legacy",)):
         start = text.index(f"    def {method}(")
         end = text.index("\n    @cute.", start)
         section = text[start:end]
@@ -563,9 +568,9 @@ def benchmark_native_comparison(args):
 
     baseline_module = native_module(args.baseline_native, "trellis_native_baseline")
     baseline = baseline_module.NativeTrellisLinear
-    values = threshold_config(args.thresholds)
+    values = threshold_config(args.thresholds, args.groups)
     if args.thresholds:
-        path = threshold_variant(Path(_native.__file__), args.output_dir / "threshold_native.py", values)
+        path = threshold_variant(Path(_native.__file__), args.output_dir / "threshold_native.py", values, args.groups)
         candidate = native_module(path, "trellis_native_threshold").NativeTrellisLinear
     else:
         candidate = _native.NativeTrellisLinear
@@ -700,7 +705,7 @@ def benchmark_native_comparison(args):
             if rows >= min(core.exact_row_cap + 1, candidate_core.exact_row_cap + 1):
                 return False
             # Fused K6 decode and folded K4 write output without publishing partials.
-            if args.bits == 6 and rows <= 16:
+            if args.groups == 1 and args.bits == 6 and rows <= 16:
                 return False
             return not (args.bits == 4 and args.codebook == "e4m3"
                         and splits <= 2 and rows <= 16)

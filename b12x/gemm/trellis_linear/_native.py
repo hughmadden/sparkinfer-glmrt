@@ -53,6 +53,16 @@ _K6_NARROW_ROWS = 8
 _K6_DECODE_ROWS = 16
 _K6_WIDE2_ROWS = 32
 _K6_WIDE3_ROWS = 48
+_GROUPED_DECODE_ROWS = 16
+_GROUPED_WIDE2_ROWS = 32
+
+
+def validate_grouped_route_thresholds(decode_rows, wide2_rows):
+    # Earlier active blocks store whole 16-row tiles at a runtime-rows stride.
+    assert decode_rows >= 16, "grouped wide2 below row 17 overlaps the next projection's partial plane"
+    assert wide2_rows >= 32, "grouped wide3 below row 33 overlaps the next projection's partial plane"
+
+
 K6_DECODE_ROUTE_THRESHOLDS = (_K6_NARROW_ROWS, _K6_DECODE_ROWS, _K6_WIDE2_ROWS, _K6_WIDE3_ROWS)
 _PREFILL_STAGES = 2
 _PREFILL_PRODUCER_REGS = 104
@@ -611,6 +621,8 @@ class NativeTrellisLinear:
         return _E4M3_DECODE_ROWS if self.e4m3 else _PREFILL_MIN_ROWS - 1
 
     def __init__(self, g):
+        if g.get("groups", 1) == 4:
+            validate_grouped_route_thresholds(_GROUPED_DECODE_ROWS, _GROUPED_WIDE2_ROWS)
         self.k, self.n = g["input_features"], g["output_features"]
         self.bits, self.e4m3 = g["bits"], g["codebook"] == "e4m3"
         self.mul1 = g["codebook"] == "mul1"
@@ -2657,11 +2669,11 @@ class NativeTrellisLinear:
                         self.multiply_grouped(inputs, payloads, scales, partial, rows, rotation_id).launch(
                             grid=(min(((rows + Int32(15)) // Int32(16)) * group_tiles, cta_limit), 1, 1),
                             block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                    elif rows <= Int32(16):
+                    elif rows <= Int32(_GROUPED_DECODE_ROWS):
                         self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 1, 8).launch(
                             grid=(min(group_tiles, cta_limit), 1, 1),
                             block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
-                    elif rows <= Int32(32):
+                    elif rows <= Int32(_GROUPED_WIDE2_ROWS):
                         self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 2, 4).launch(
                             grid=(min(group_tiles, cta_limit), 1, 1),
                             block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
@@ -2681,11 +2693,11 @@ class NativeTrellisLinear:
                     self.multiply_grouped(inputs, payloads, scales, partial, rows, rotation_id).launch(
                         grid=(min(((rows + Int32(15)) // Int32(16)) * group_tiles, cta_limit), 1, 1),
                         block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                elif rows <= Int32(16):
+                elif rows <= Int32(_GROUPED_DECODE_ROWS):
                     self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 1, 8).launch(
                         grid=(min(group_tiles, cta_limit), 1, 1),
                         block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
-                elif rows <= Int32(32):
+                elif rows <= Int32(_GROUPED_WIDE2_ROWS):
                     self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 2, 4).launch(
                         grid=(min(group_tiles, cta_limit), 1, 1),
                         block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
