@@ -605,6 +605,8 @@ def benchmark_native_comparison(args):
         lib.load()
         return lib
 
+    if args.groups != 1 and args.transforms:
+        raise ValueError("grouped threshold comparison measures the native multiply/reduce only")
     default_shapes = "4096:4096:1,4096:4096:2,4096:1024:1,1024:4096:2,16384:4096:1,4096:154880:1,4096:6144:1,6144:4096:2"
     family = "glmf" if args.glmf_verify else args.family_verify
     shapes = list(FAMILY_SHAPES[family]) if family else [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
@@ -632,7 +634,7 @@ def benchmark_native_comparison(args):
         torch.cuda.synchronize()
     report = dict(metadata=dict(device=props.name if props else "CPU-only", sms=props.multi_processor_count if props else None,
         l2_bytes=l2, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=args.bits,
-        input_dtype=args.input_dtype, codebook=args.codebook,
+        input_dtype=args.input_dtype, codebook=args.codebook, groups=args.groups,
         thresholds=values, source_sha256=hashlib.sha256(Path(_native.__file__).read_bytes()).hexdigest(),
         baseline_sha256=hashlib.sha256(args.baseline_native.read_bytes()).hexdigest(),
         ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[])
@@ -647,7 +649,7 @@ def benchmark_native_comparison(args):
         directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
         directory.mkdir(parents=True, exist_ok=True)
         contract = dict(bits=args.bits, k=k, n=n, side=side, max_rows=max_rows,
-                        input_dtype=args.input_dtype, codebook=args.codebook, thresholds=values,
+                        input_dtype=args.input_dtype, codebook=args.codebook, thresholds=values, groups=args.groups,
                         source_sha256=report["metadata"]["source_sha256"],
                         baseline_sha256=report["metadata"]["baseline_sha256"])
         manifest = directory / "benchmark_contract.json"
@@ -663,14 +665,14 @@ def benchmark_native_comparison(args):
                 try:
                     with exportable_compilation():
                         program = compile_trellis_linear_aot(input_features=k, output_features=n,
-                            bits=args.bits, codebook=args.codebook, sharded_side=side, rotation_count=1,
-                            max_rows=max_rows, input_dtype=args.input_dtype)
+                            bits=args.bits, codebook=args.codebook, sharded_side=side, rotation_count=args.groups,
+                            max_rows=max_rows, input_dtype=args.input_dtype, groups=args.groups)
                 finally:
                     _native.NativeTrellisLinear = candidate
                 exported(program, directory, stem, load_module=False)
                 (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
             else:
-                libs[stem] = load(directory, stem, 5)
+                libs[stem] = load(directory, stem, 5 if args.groups == 1 else 14)
         ingress = egress = None
         if args.transforms:
             from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
@@ -703,17 +705,20 @@ def benchmark_native_comparison(args):
             return not (args.bits == 4 and args.codebook == "e4m3"
                         and splits <= 2 and rows <= 16)
         x = torch.randn(capacity, k, device="cuda", dtype=getattr(torch, {"bf16":"bfloat16", "f16":"float16"}[args.input_dtype]))
-        inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
-        payload = torch.randint(256, (k*n*args.bits//8,), device="cuda", dtype=torch.uint8)
-        scales = torch.rand(k//128, device="cuda", dtype=torch.float16) + .125
-        partials = {name: torch.empty(decode_cap*splits*n, device="cuda") for name in libs}
-        outputs = {name: torch.empty(capacity*n, device="cuda") for name in libs}
+        inputs = torch.tensor([x.data_ptr()] * args.groups, device="cuda", dtype=torch.int64)
+        payload = torch.randint(256, (args.groups, k*n*args.bits//8), device="cuda", dtype=torch.uint8)
+        scales = torch.rand(args.groups, k//128, device="cuda", dtype=torch.float16) + .125
+        partials = {name: torch.empty(decode_cap*splits*n*args.groups, device="cuda") for name in libs}
+        outputs = {name: torch.empty(capacity*n*args.groups, device="cuda") for name in libs}
         if args.transforms:
             source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
             suh = torch.rand(k, device="cuda", dtype=torch.float16) + .125
             svh = torch.rand(n, device="cuda", dtype=torch.float16) + .125
             final_dtype = torch.float32 if n > 65536 else torch.bfloat16
             finals = {name: torch.empty(capacity*n, device="cuda", dtype=final_dtype) for name in libs}
+        def live_output(name, count):
+            return outputs[name].view(args.groups, capacity, n)[:, :count]
+
         # Untimed boost warm-up before row 1 of each shape
         boost_warmup()
         for rows in rows_list:
@@ -727,8 +732,12 @@ def benchmark_native_comparison(args):
                                          count, (args.cta_limit or props.multi_processor_count*4), stream)
                     if result:
                         raise RuntimeError(f"ingress returned {result}")
-                result = libs[name].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
-                    partials[name].data_ptr(), outputs[name].data_ptr(), count, 0,
+                pointers = ([inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
+                             partials[name].data_ptr(), outputs[name].data_ptr()] if args.groups == 1 else
+                            [inputs.data_ptr(), *(p.data_ptr() for p in payload),
+                             *(s.data_ptr() for s in scales), partials[name].data_ptr(),
+                             *(outputs[name][i*capacity*n:].data_ptr() for i in range(args.groups))])
+                result = libs[name].run(*pointers, count, 0,
                     (args.cta_limit or props.multi_processor_count*4), stream)
                 if result:
                     raise RuntimeError(f"{name} returned {result}")
@@ -747,27 +756,27 @@ def benchmark_native_comparison(args):
                     call(name)
                     end.record()
                 events[name] = (start, end)
-                outputs[name][:rows*n].fill_(float("nan"))
+                live_output(name, rows).fill_(float("nan"))
                 if args.transforms:
                     finals[name][:rows*n].fill_(float("nan"))
                 if publishes_partials(rows):
-                    partials[name][:rows*splits*n].fill_(float("nan"))
+                    partials[name][:rows*splits*n*args.groups].fill_(float("nan"))
                 graph.replay()
                 torch.cuda.synchronize()
-                if not torch.isfinite(outputs[name][:rows*n]).all().item():
+                if not torch.isfinite(live_output(name, rows)).all().item():
                     raise RuntimeError(f"{name}: poisoned output not overwritten")
                 if args.transforms and not torch.isfinite(finals[name][:rows*n]).all().item():
                     raise RuntimeError(f"{name}: poisoned transformed output not overwritten")
-                if publishes_partials(rows) and not torch.isfinite(partials[name][:rows*splits*n]).all().item():
+                if publishes_partials(rows) and not torch.isfinite(partials[name][:rows*splits*n*args.groups]).all().item():
                     raise RuntimeError(f"{name}: poisoned partial not overwritten")
                 graphs[name] = graph
-                hashes[name] = hashlib.sha256(outputs[name][:rows*n].cpu().numpy().tobytes()).hexdigest()
+                hashes[name] = hashlib.sha256(live_output(name, rows).cpu().numpy().tobytes()).hexdigest()
             exact = {}
             partials_exact = {}
             for name in libs:
-                out_eq = torch.equal(outputs[name][:rows*n].view(torch.int32), outputs["baseline"][:rows*n].view(torch.int32))
-                part_eq = (torch.equal(partials[name][:rows*splits*n].view(torch.int32),
-                                       partials["baseline"][:rows*splits*n].view(torch.int32))
+                out_eq = torch.equal(live_output(name, rows).view(torch.int32), live_output("baseline", rows).view(torch.int32))
+                part_eq = (torch.equal(partials[name][:rows*splits*n*args.groups].view(torch.int32),
+                                       partials["baseline"][:rows*splits*n*args.groups].view(torch.int32))
                            if publishes_partials(rows) else None)
                 if args.transforms:
                     out_eq = out_eq and torch.equal(finals[name][:rows*n].view(torch.int32),
@@ -776,10 +785,10 @@ def benchmark_native_comparison(args):
                 partials_exact[name] = part_eq
                 if not exact[name]:
                     raise RuntimeError(f"non-bit-exact {k}:{n}:{side} rows={rows} {name} (out_eq={out_eq}, part_eq={part_eq})")
-                saved = outputs[name][:n].clone()
-                outputs[name][:n].fill_(float("nan"))
+                saved = live_output(name, 1).clone()
+                live_output(name, 1).fill_(float("nan"))
                 call(name, 1)
-                if not torch.equal(saved.view(torch.int32), outputs[name][:n].view(torch.int32)):
+                if not torch.equal(saved.view(torch.int32), live_output(name, 1).view(torch.int32)):
                     raise RuntimeError(f"row invariance failure: {name} rows={rows}")
                 graphs[name].replay()
             if args.check_only or (args.timing_rows and rows not in set(map(int, args.timing_rows.split(",")))):
@@ -820,7 +829,7 @@ def benchmark_native_comparison(args):
                 baseline_us=times["baseline"], candidate_us=times[name], ratio=times["baseline"]/times[name],
                 exact=exact[name], sha256=hashes[name], partials_exact=partials_exact[name],
                 partials_checked=publishes_partials(rows), exact_row_cap=core.exact_row_cap,
-                weight_gbs=(k*n*args.bits/8)/(times[name]*1000),
+                weight_gbs=(args.groups*k*n*args.bits/8)/(times[name]*1000),
                 baseline_samples_us=samples["baseline"], samples_us=samples[name], snapshot=snapshot(),
                 thermal_before=thermal_before, thermal_after=thermal_snapshot())
             if family:
@@ -898,6 +907,8 @@ def main():
     parser.add_argument("--codebook", choices=("mcg", "mul1", "f16", "e4m3"), default="mcg")
     parser.add_argument("--bits", type=int, choices=range(1, 9), default=6)
     parser.add_argument("--thresholds", help="benchmark-only narrow/decode/wide2/wide3/folded/prefill overrides")
+    parser.add_argument("--groups", type=int, choices=(1, 4), default=1,
+                        help="standalone or independent grouped KDA threshold comparison")
     parser.add_argument("--export-sms", type=int, choices=(170, 188), default=188,
                         help="offline SM120 compiler geometry; runtime CTA budget stays device-derived")
     parser.add_argument("--encoder-source", type=Path, help="official GPTQModel gptqmodel_ext/exllamav3 source")
