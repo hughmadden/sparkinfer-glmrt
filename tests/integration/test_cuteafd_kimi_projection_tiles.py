@@ -38,12 +38,12 @@ ROWS = (1, 2, 5, 6, 16, 17, 32, 33, 64, 65)
 #: ``tile_k`` 128 entries (the trailing seventh element): the same K order, a
 #: wider pipelined K step.
 TILE_K_ENTRIES = {
-    # The two shipped entries:
-    "kda_out": ((128, 1, 4, 16, 64, 4, 128),),
+    # The shipped entry:
     "gate_up": ((128, 1, 4, 16, 32, 6, 128),),
-    # And two that do not ship (the band stayed at tile_k 64): the same
-    # seventh element on a narrow and on a wide N tile.
+    # And three that do not ship (those bands stay at tile_k 64): the same
+    # seventh element on narrow, wide and deeper-stage tiles.
     "kda_in": ((128, 1, 4, 16, 32, 6, 128),),
+    "kda_out": ((128, 1, 4, 16, 64, 4, 128),),
     "latent_up": ((128, 1, 4, 16, 128, 2, 128),),
 }
 _PROGRAMS: dict = {}

@@ -310,7 +310,8 @@ WIDE_PREFILL_CONFIG = dict(warp_layout=(2, 2), tile_m=128, tile_n=128, num_stage
 WIDE_PREFILL_MIN_ROWS = 512
 
 # Measured SM120 TMA tensor-core decode tiles by live rows, per weight shape [N, K]:
-# (rows, warp_m, warp_n, tile_n, num_stages) in ascending rows. Each entry retiles
+# (rows, warp_m, warp_n, tile_n, num_stages) in ascending rows, a seventh
+# trailing element widening the K tile (tile_k, default 64). Each entry retiles
 # the same uncompensated m16n8k16 MMA K-reduction as prefill_config and produces
 # bitwise-identical outputs at every decode/verify width.
 DECODE_TMA_TILES = {
@@ -370,19 +371,22 @@ DECODE_TMA_TILES = {
     #
     # A trailing seventh element widens the K tile (tile_k, default 64): the
     # same ordered K16 segments, half the barriers, the same in-flight bytes
-    # per CTA. It pays only where the <=16 band streams weights per call, so
-    # just those two bands moved; 6144x7168 59.4 -> 57.3 us at rows 2-6 (tie
-    # at 1 and 16) and 24752x7168 229.4/227.3 -> 225.3/223.2 (1.01-1.02x at
-    # every row of the band). Every other <=16 band tied or lost, and both
-    # wider bands lost outright: a 128-K tile fits 2-4 stages, so rows 33-64
-    # fall to 0.71-0.90x at rows 48-64. 2112x7168's <=16 band was the only
-    # other >2% candidate and it read bimodally (22.5/24.6 us alternating),
-    # so it stays 64. Dropping a middle band where rows 17-32 tie with the
-    # row-64 tile was tried and rejected: the collapsed table measures
-    # 0.83-1.00x at row 17 on all three shapes that carry the middle entry.
+    # per CTA. Only 24752x7168's <=16 band pays for it, and that reading is
+    # stable: two sessions, the old and the new table each measured as the
+    # shipped route, put the new entry tight at 223.2 us (rows 1-2) and 225.3
+    # (rows 4-16) against the old table's tight 227.3 (1.01-1.02x, disjoint
+    # sample sets). 6144x7168 read the same 2 us at rows 2-6 in the first
+    # session, but identical programs on that shape are bistable between 57.3
+    # and 59.4 us (both tables show both modes at every row) and the second
+    # session tied at every row, so its band stays tile_k 64. Every other
+    # <=16 band tied or lost, and both wider bands lost outright: a 128-K
+    # tile fits 2-4 stages, so rows 48-64 fall to 0.71-0.90x. Dropping a
+    # middle band where rows 17-32 tie with the row-64 tile was tried and
+    # rejected: the collapsed table measures 0.83-1.00x at row 17 on all
+    # three shapes that carry the middle entry.
     (2112, 7168): ((16, 1, 4, 16, 64, 9), (64, 2, 2, 32, 64, 8)),
     (3584, 7168): ((16, 1, 4, 16, 64, 9), (64, 2, 2, 32, 64, 8)),
-    (6144, 7168): ((16, 1, 4, 16, 64, 4, 128), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
+    (6144, 7168): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
     (24752, 7168): ((16, 1, 4, 16, 32, 6, 128), (32, 2, 2, 32, 32, 12), (64, 2, 2, 32, 64, 8)),
     (7168, 3072): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
     (7168, 3584): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
