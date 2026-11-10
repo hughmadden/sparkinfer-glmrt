@@ -154,6 +154,15 @@ def main():
     properties = torch.cuda.get_device_properties(0)
     flush = make_l2_flush_fn(True)
     results = []
+    result = {"kind": "bf16_prefill_routes", "device": torch.cuda.get_device_name(),
+              "device_uuid": str(getattr(properties, "uuid", "unavailable")),
+              "torch_version": torch.__version__, "cuda_version": torch.version.cuda,
+              "argv": sys.argv, "sms": properties.multi_processor_count,
+              "conditions": "interleaved CUDA graph replays in alternating arm order, "
+                            "2x-L2 eviction before every timed replay, bitwise gate against base "
+                            "at every cell, graph-replay and poisoned-tail checks, prefix and "
+                            "offset row invariance",
+              "arms": [spec["name"] for spec in specs], "results": results}
     for n, k in args.shapes:
         generator = torch.Generator(device="cuda").manual_seed(20261111 + n * 1009 + k)
         max_rows = max(args.rows)
@@ -248,17 +257,9 @@ def main():
         results.append({"n": n, "k": k, "weight_bytes": n * k * 2, "cells": cells,
                         "row_invariance": invariance, "telemetry_before": gpu_before,
                         "telemetry_after": nvidia_smi_gpu_mode_snapshot()})
+        args.output.write_text(json.dumps(result, indent=2) + "\n")
         del arms, keys, x, w, out, reference
         torch.cuda.empty_cache()
-    result = {"kind": "bf16_prefill_routes", "device": torch.cuda.get_device_name(),
-              "device_uuid": str(getattr(properties, "uuid", "unavailable")),
-              "torch_version": torch.__version__, "cuda_version": torch.version.cuda,
-              "argv": sys.argv, "sms": properties.multi_processor_count,
-              "conditions": "interleaved CUDA graph replays in alternating arm order, "
-                            "2x-L2 eviction before every timed replay, bitwise gate against base "
-                            "at every cell, graph-replay and poisoned-tail checks, prefix and "
-                            "offset row invariance",
-              "arms": [spec["name"] for spec in specs], "results": results}
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 
