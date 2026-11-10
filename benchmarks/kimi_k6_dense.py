@@ -857,6 +857,64 @@ def benchmark_native_comparison(args):
 
 
 
+def encode_reference_fixtures(args):
+    """Encode each projection independently with unchanged official CUDA operators."""
+    import hashlib
+    import importlib.util
+    import torch
+    import numpy as np
+
+    torch.ops.load_library(str(args.encoder_library.resolve()))
+    spec = importlib.util.spec_from_file_location(
+        "fixture_trellis_oracle", Path(__file__).resolve().parents[1] / "tests/_reference/native_trellis.py")
+    oracle = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oracle)
+    bits = args.bits
+    torch.manual_seed(273)
+    costs = torch.empty((256, 2, 65536 >> bits), device="cuda", dtype=torch.float16)
+    edges = torch.empty((256, 256, 65536 >> bits), device="cuda", dtype=torch.int16)
+    records = []
+    shapes = [(7168, 6144)] * 4 + [(7168, 3072)] * 2
+    for index, (k, n) in enumerate(shapes):
+        # These are full tensor-core-order random tiles, not random packed bytes.
+        tiles = torch.randn((k*n//256, 256), device="cuda", dtype=torch.float32)
+        quantized = torch.empty_like(tiles)
+        indices = torch.empty_like(tiles, dtype=torch.int16)
+        torch.ops.trellis_bench_encoder.quantize_tiles(
+            tiles, quantized, indices, costs, edges, bits,
+            args.codebook == "mcg", args.codebook == "mul1")
+        packed = torch.empty((k//16, n//16, 16*bits), device="cuda", dtype=torch.int16)
+        torch.ops.trellis_bench_encoder.pack_trellis(packed, indices.view(k//16, n//16, 256), bits)
+        torch.cuda.synchronize()
+        sample = packed.view(-1, 16*bits)[:8].cpu().numpy().tobytes()
+        decoded = oracle.Reference(args.codebook).decode_tiles(sample, bits)
+        perm = []
+        for lane in range(32):
+            r, c = 2*(lane % 4), lane//4
+            perm.extend((r*16+c, (r+1)*16+c, (r+8)*16+c, (r+9)*16+c,
+                         r*16+c+8, (r+1)*16+c+8, (r+8)*16+c+8, (r+9)*16+c+8))
+        expected = quantized[:8].cpu().numpy()
+        got = decoded.reshape(8, 256)[:, perm]
+        if not np.array_equal(got.view(np.uint32), expected.view(np.uint32)):
+            raise RuntimeError("official encoder reconstruction differs from independent packed-byte decoder")
+        # Side1 native tiles are [N128,K16,N16-within128], never concatenated calibrations.
+        payload = packed.view(k//16, n//128, 8, 16*bits).permute(1, 0, 2, 3).contiguous().view(torch.uint8).flatten().cpu()
+        inverse = torch.argsort(torch.tensor(perm, device="cuda"))
+        weight = tiles[:, inverse].view(k//16, n//16, 16, 16).permute(0, 2, 1, 3).reshape(k, n).T.to(torch.bfloat16).contiguous().cpu()
+        path = args.output_dir / f"projection{index}_k{bits}.pt"
+        torch.save(dict(payload=payload, weight=weight, k=k, n=n, bits=bits,
+                        codebook=args.codebook, source_seed=273, projection=index), path)
+        record = dict(path=path.name, k=k, n=n, bits=bits, projection=index,
+                      sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                      payload_sha256=hashlib.sha256(payload.numpy().tobytes()).hexdigest(),
+                      oracle_tiles=8, oracle_exact=True)
+        records.append(record)
+        (args.output_dir / f"fixtures_k{bits}.json").write_text(json.dumps(records, indent=2) + "\n")
+        print(json.dumps(record), flush=True)
+        del tiles, quantized, indices, packed, payload, weight
+    torch.cuda.synchronize()
+
+
 def reference_encoder(source, directory):
     """Build only the unchanged GPTQModel quantize/pack operators, not its GEMMs."""
     from torch.utils.cpp_extension import load
@@ -918,6 +976,8 @@ def main():
                         help="offline SM120 compiler geometry; runtime CTA budget stays device-derived")
     parser.add_argument("--encoder-source", type=Path, help="official GPTQModel gptqmodel_ext/exllamav3 source")
     parser.add_argument("--encoder-build-only", action="store_true", help="CPU compile official quantize/pack operators")
+    parser.add_argument("--encoder-library", type=Path, help="prebuilt official quantize/pack operators for fixture generation")
+    parser.add_argument("--encode-fixtures", action="store_true", help="encode independent full Kimi KDA and gate/up fixtures")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.encoder_build_only:
@@ -925,6 +985,11 @@ def main():
             parser.error("--encoder-build-only requires --encoder-source")
         hashes = reference_encoder(args.encoder_source, args.output_dir / "encoder")
         (args.output_dir / "encoder_sources.json").write_text(json.dumps(hashes, indent=2) + "\n")
+        return
+    if args.encode_fixtures:
+        if args.encoder_library is None or args.bits not in (6, 8) or args.codebook not in ("mcg", "mul1"):
+            parser.error("--encode-fixtures requires --encoder-library, K6/K8 and MCG/MUL1")
+        encode_reference_fixtures(args)
         return
     if args.baseline_native:
         benchmark_native_comparison(args)

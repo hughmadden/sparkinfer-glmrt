@@ -242,6 +242,14 @@ def test_standalone_threshold_variant_keeps_grouped_routes_frozen(tmp_path):
     assert "_GROUPED_DECODE_ROWS = 16" in variant.read_text()
 
 
+def test_reference_fixtures_require_prebuilt_official_encoder(monkeypatch, tmp_path):
+    bench = _native_threshold_bench()
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path), "--encode-fixtures"])
+    with pytest.raises(SystemExit) as error:
+        bench.main()
+    assert error.value.code == 2
+
+
 def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
     bench = _native_threshold_bench()
     source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
