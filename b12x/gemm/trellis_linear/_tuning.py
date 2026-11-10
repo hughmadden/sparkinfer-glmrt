@@ -75,12 +75,13 @@ def validate_query(query):
     )
 
     if normalize_codebook(query.codebook) != query.codebook or query.bits not in (
-        2, 3, 4, 5, 6,
+        1, 2, 3, 4, 5, 6, 7, 8,
     ):
         raise ValueError(
             "Trellis queries require a canonical codebook and supported native rate"
         )
-    validate_codebook_bits(query.codebook, query.bits)
+    if query.codebook != "mcg":
+        validate_codebook_bits(query.codebook, query.bits)
     if query.weight_layout == "native":
         if query.pair_kind is not None or query.rate_axis is not None:
             raise ValueError("native Trellis layout cannot carry pair metadata")

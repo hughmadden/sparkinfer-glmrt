@@ -18,7 +18,7 @@ def offline_compiler():
                        101376, 102400, multiprocessing.Array("i", [0, 0]))
 
 
-@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("bits", list(range(1, 9)))
 @pytest.mark.parametrize("codebook", ["e4m3", "f16", "mcg", "mul1"])
 @pytest.mark.parametrize("side", [1, 2])
 def test_native_trellis_export(bits, codebook, side, tmp_path):
