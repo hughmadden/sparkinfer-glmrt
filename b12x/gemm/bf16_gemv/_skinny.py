@@ -363,14 +363,27 @@ DECODE_TMA_TILES = {
     # 24752x7168 260.1 -> 227.3 (1.14x), 7168x6144 59.4 -> 59.4 at <=16,
     # 61.4 -> 59.4 at 17-32 and 67.6 -> 61.4 past it, 7168x3072 34.8 -> 30.7
     # (1.13x), 7168x3584 40.8 -> 34.8 (1.17x). 24752x7168's <=16 band re-reads
-    # its 355 MiB once and the 32-wide 16-stage tile pays that better than a
-    # 64-wide one. Each entry reruns the ordered K16 accumulation untouched:
+    # its 355 MiB once and the 32-wide tile pays that better than a 64-wide
+    # one. Each entry reruns the ordered K16 accumulation untouched:
     # byte-identical to prefill_config at every row, row-invariant, no store
     # past `rows`.
+    #
+    # A trailing seventh element widens the K tile (tile_k, default 64): the
+    # same ordered K16 segments, half the barriers, the same in-flight bytes
+    # per CTA. It pays only where the <=16 band streams weights per call, so
+    # just those two bands moved; 6144x7168 59.4 -> 57.3 us at rows 2-6 (tie
+    # at 1 and 16) and 24752x7168 229.4/227.3 -> 225.3/223.2 (1.01-1.02x at
+    # every row of the band). Every other <=16 band tied or lost, and both
+    # wider bands lost outright: a 128-K tile fits 2-4 stages, so rows 33-64
+    # fall to 0.71-0.90x at rows 48-64. 2112x7168's <=16 band was the only
+    # other >2% candidate and it read bimodally (22.5/24.6 us alternating),
+    # so it stays 64. Dropping a middle band where rows 17-32 tie with the
+    # row-64 tile was tried and rejected: the collapsed table measures
+    # 0.83-1.00x at row 17 on all three shapes that carry the middle entry.
     (2112, 7168): ((16, 1, 4, 16, 64, 9), (64, 2, 2, 32, 64, 8)),
     (3584, 7168): ((16, 1, 4, 16, 64, 9), (64, 2, 2, 32, 64, 8)),
-    (6144, 7168): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
-    (24752, 7168): ((16, 1, 4, 16, 32, 16), (32, 2, 2, 32, 32, 12), (64, 2, 2, 32, 64, 8)),
+    (6144, 7168): ((16, 1, 4, 16, 64, 4, 128), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
+    (24752, 7168): ((16, 1, 4, 16, 32, 6, 128), (32, 2, 2, 32, 32, 12), (64, 2, 2, 32, 64, 8)),
     (7168, 3072): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
     (7168, 3584): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6)),
 }
@@ -546,7 +559,8 @@ class RowTiledBf16Projection:
                 k_step = {} if len(entry) < 7 else dict(tile_k=entry[6])
                 self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(),
                                                     warp_layout=(warp_m, warp_n), tile_m=tile_m,
-                                                    tile_n=tile_n, num_stages=stages, **k_step, **self.base))
+                                                    tile_n=tile_n, num_stages=stages,
+                                                    **dict(self.base) | k_step))
         capacity = cutlass_utils.get_smem_capacity_in_bytes("sm_120")
         for entry, launch in zip(self.tiles_by_rows, self.tiled):
             kernel = launch.kernel
