@@ -4057,9 +4057,7 @@ def _decode_k6_words_shfl(
     e4m3: cutlass.Constexpr, mul1: cutlass.Constexpr, input_bf16: cutlass.Constexpr,
 ):
     wa, wb = _k6_align_shfl_ordered(w0, w1, prev_lane, shift)
-    if cutlass.const_expr(bits >= 7):
-        b0, b1, b2, b3 = packed_dequant_trellis_highrate_to_half2x4(z0, z1, z2, shift, bits, mul1)
-    elif cutlass.const_expr(mul1):
+    if cutlass.const_expr(mul1):
         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, 6)
     else:
         b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, 6)
