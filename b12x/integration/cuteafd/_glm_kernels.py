@@ -50,16 +50,19 @@ FP8_MAX = 448.0
 ROPE_PAIRS = 32
 
 
-def glm_projection(n: int, k: int, wide: bool = False, tiles_by_rows: tuple = ()):
+def glm_projection(n: int, k: int, wide: bool = False, tiles_by_rows: tuple = (),
+                   wide_min_rows: int | None = None):
     """One BF16 MMA accumulation at every live width, including serial decode.
 
     SIMT and MMA sum K differently; crossing their former M8/M9 boundary
     changed a verified row's bits. Row and wide-prefill tiles only retile the
     same MMA fold, so decode, verify and prefill share canonical arithmetic.
+    ``wide_min_rows`` is the wide route's measured floor for this shape.
     """
     from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection
 
-    return RoutedBf16Projection(n, k, max_skinny_rows=0, wide=wide, tiles_by_rows=tiles_by_rows)
+    return RoutedBf16Projection(n, k, max_skinny_rows=0, wide=wide, wide_min_rows=wide_min_rows,
+                                tiles_by_rows=tiles_by_rows)
 
 
 @cute.jit

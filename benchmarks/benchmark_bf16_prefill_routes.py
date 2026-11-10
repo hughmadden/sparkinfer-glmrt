@@ -65,14 +65,19 @@ def _arm_spec(text):
     if text in ("base", "wide"):
         return {"name": text, "kind": text}
     if text.startswith("tiles="):
-        values = [int(value) for value in text.removeprefix("tiles=").split(",")]
+        spec = {"name": text, "kind": "tiles"}
+        values = []
+        for token in text.removeprefix("tiles=").split(","):
+            if token.startswith("k"):
+                spec["tile_k"] = int(token[1:])
+            else:
+                values.append(int(token))
         if len(values) not in (5, 6):
-            raise SystemExit(f"{text}: tiles= takes WM,WN,TM,TN,STAGES[,MIN_ROWS]")
-        spec = {"name": text, "kind": "tiles", "warp_layout": (values[0], values[1]),
-                "tile_m": values[2], "tile_n": values[3], "num_stages": values[4],
-                "min_rows": values[5] if len(values) == 6 else None}
+            raise SystemExit(f"{text}: tiles= takes WM,WN,TM,TN,STAGES[,MIN_ROWS][,kK]")
+        spec.update(warp_layout=(values[0], values[1]), tile_m=values[2], tile_n=values[3],
+                    num_stages=values[4], min_rows=values[5] if len(values) == 6 else None)
         return spec
-    raise SystemExit(f"unknown arm {text!r}: base, wide or tiles=WM,WN,TM,TN,STAGES[,MIN_ROWS]")
+    raise SystemExit(f"unknown arm {text!r}: base, wide or tiles=WM,WN,TM,TN,STAGES[,MIN_ROWS][,kK]")
 
 
 class _Routed:
@@ -105,6 +110,8 @@ def _build_arm(spec, n, k, out_dtype):
                 (n, k, "wide", WIDE_PREFILL_MIN_ROWS))
     config = dict(warp_layout=tuple(spec["warp_layout"]), tile_m=int(spec["tile_m"]),
                   tile_n=int(spec["tile_n"]), num_stages=int(spec["num_stages"]), compensated=False)
+    if spec.get("tile_k") is not None:
+        config["tile_k"] = int(spec["tile_k"])
     if config["tile_m"] % (16 * config["warp_layout"][0]):
         raise SystemExit(f"{spec['name']}: tile_m must be a multiple of 16 * warp_m")
     prefill = TmaBf16Projection(n, k, out_dtype=out_dtype, tiles_by_rows=(), **config)

@@ -309,6 +309,27 @@ class RowTiledSkinnyBf16Gemv:
 WIDE_PREFILL_CONFIG = dict(warp_layout=(2, 2), tile_m=128, tile_n=128, num_stages=2, compensated=False)
 WIDE_PREFILL_MIN_ROWS = 512
 
+# Measured SM120 wide-prefill floor by weight shape [N, K]: from this many live
+# rows the wide tile beats prefill_config (interleaved, L2-cold, bitwise
+# identical). Narrow and small outputs need 1024 rows: four 128-row M tiles by
+# their few N tiles still underfill 188 SMs below it. 24752x7168 and 3584x7168
+# fill the card at 512 rows. A shape without an entry keeps prefill_config.
+WIDE_PREFILL_MIN_ROWS_BY_SHAPE = {
+    (24752, 7168): 512,
+    (3584, 7168): 512,
+    (6144, 7168): 1024,
+    (7168, 6144): 1024,
+    (7168, 3072): 1024,
+    (7168, 3584): 1024,
+    (2112, 7168): 1024,
+}
+
+
+def wide_prefill_min_rows(n: int, k: int, capacity: int) -> int | None:
+    """Wide-route floor for a measured shape whose program capacity reaches it."""
+    floor = WIDE_PREFILL_MIN_ROWS_BY_SHAPE.get((int(n), int(k)))
+    return floor if floor is not None and int(capacity) >= floor else None
+
 # Measured SM120 TMA tensor-core decode tiles by live rows, per weight shape [N, K]:
 # (rows, warp_m, warp_n, tile_n, num_stages) in ascending rows, a seventh
 # trailing element widening the K tile (tile_k, default 64). Each entry retiles
@@ -594,9 +615,12 @@ class RoutedBf16Projection:
     """
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, max_skinny_rows: int | None = None,
-                 wide: bool = False, tiles_by_rows: tuple = (), skinny_tiles_by_rows: tuple = ()):
+                 wide: bool = False, wide_min_rows: int | None = None, tiles_by_rows: tuple = (),
+                 skinny_tiles_by_rows: tuple = ()):
         """``wide`` adds the ``WIDE_PREFILL_CONFIG`` TMA route from
-        ``WIDE_PREFILL_MIN_ROWS`` live rows (prefill capacities).
+        ``WIDE_PREFILL_MIN_ROWS`` live rows (prefill capacities), or from
+        ``wide_min_rows`` when given (``wide_prefill_min_rows``'s measured
+        per-shape floor).
 
         ``tiles_by_rows`` (default none) picks the TMA route's tiles by live rows
         below that (``RowTiledBf16Projection``; its first entry's rows exceed
@@ -621,6 +645,9 @@ class RoutedBf16Projection:
         else:
             self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=())
         self.tiles_by_rows = self.large.tiles_by_rows if tiles_by_rows else ()
+        self.wide_min_rows = int(WIDE_PREFILL_MIN_ROWS if wide_min_rows is None else wide_min_rows)
+        if self.wide_min_rows < 1:
+            raise ValueError("wide_min_rows must be positive")
         self.wide = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(), **WIDE_PREFILL_CONFIG) \
             if wide and self.n % 2 == 0 else None
 
@@ -635,6 +662,8 @@ class RoutedBf16Projection:
         # tiles_by_rows extends the key; projections without it keep theirs.
         return (self.n, self.k, str(self.out_dtype), self.max_skinny_rows, s.cols, s.rows_per_tile,
                 s.threads, tuple(sorted(self.large.config.items())), self.wide is not None) \
+            + ((("wide_min_rows", self.wide_min_rows),
+                ) if self.wide is not None and self.wide_min_rows != WIDE_PREFILL_MIN_ROWS else ()) \
             + ((("tiles_by_rows", self.tiles_by_rows),) if self.tiles_by_rows else ()) \
             + ((("skinny_tiles_by_rows", self.skinny_tiles_by_rows),) if self.skinny_tiles_by_rows else ())
 
@@ -645,7 +674,7 @@ class RoutedBf16Projection:
             self.skinny(x, w, out, rows, stream)
         else:
             if cutlass.const_expr(self.wide is not None):
-                if rows >= Int32(WIDE_PREFILL_MIN_ROWS):
+                if rows >= Int32(self.wide_min_rows):
                     self.wide(x, w, out, rows, stream)
                 else:
                     self.large(x, w, out, rows, stream)

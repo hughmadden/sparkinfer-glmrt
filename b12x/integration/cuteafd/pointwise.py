@@ -534,7 +534,8 @@ def compile_post_silu_split_aot(*, width, limit):
         scalars=(Scalar("rows"),), key=(width, limit), geometry=dict(width=width, limit=limit))
 
 
-def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16, compensated=False):
+def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16, compensated=False,
+                                wide=False):
     """Canonical BF16 MMA projection, with one explicit output boundary.
 
     FP32 output preserves the accumulator (router/partial sums); BF16 output
@@ -544,29 +545,42 @@ def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16, 
     shape has them (the entries retile the same canonical accumulation, so
     they emit the canonical kernel's bits) and fixed prefill tiles otherwise;
     the default route and its compile identity stay unchanged.
+    ``wide`` adds the measured wide prefill route from the shape's floor
+    (``WIDE_PREFILL_MIN_ROWS_BY_SHAPE``), still the same ordered-K16
+    uncompensated fold.
     """
     from b12x.gemm.bf16_gemv._skinny import (
         COMPENSATED_TILES_BY_ROWS,
         RoutedBf16Projection,
         TmaBf16Projection,
+        wide_prefill_min_rows,
     )
 
     if width <= 0 or outputs <= 0 or width % 8 or outputs % 8:
         raise ValueError("projection dimensions must be positive multiples of eight")
     if output_dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("projection output is BF16 or FP32")
-    if not isinstance(compensated, bool):
-        raise ValueError("projection compensated must be boolean")
+    if not isinstance(compensated, bool) or not isinstance(wide, bool):
+        raise ValueError("projection compensated and wide must be boolean")
+    if compensated and wide:
+        raise ValueError("the wide prefill route is uncompensated")
     dtype = BFloat16 if output_dtype == torch.bfloat16 else Float32
     tiles_by_rows = COMPENSATED_TILES_BY_ROWS.get((int(outputs), int(width)), ()) if compensated else ()
+    wide_min_rows = wide_prefill_min_rows(outputs, width, 2**31 - 1) if wide else None
+    if wide and wide_min_rows is None:
+        raise ValueError(f"no measured wide prefill floor for {outputs}x{width}")
     launch = TmaBf16Projection(outputs, width, out_dtype=dtype, tiles_by_rows=tiles_by_rows,
                                compensated=True) \
-        if compensated else RoutedBf16Projection(outputs, width, out_dtype=dtype, max_skinny_rows=0)
+        if compensated else RoutedBf16Projection(outputs, width, out_dtype=dtype, max_skinny_rows=0,
+                                                 wide=wide, wide_min_rows=wide_min_rows)
     geometry = dict(width=width, outputs=outputs, output_dtype=str(output_dtype), skinny_rows=0)
     if compensated:
         geometry["compensated"] = True
         if tiles_by_rows:
             geometry["tiles_by_rows"] = tiles_by_rows
+    if wide:
+        geometry["wide"] = True
+        geometry["wide_min_rows"] = wide_min_rows
     return compile_program(launch, name="bf16_projection", operands=(
         Operand("x", torch.bfloat16, f"[rows,{width}]"),
         Operand("w", torch.bfloat16, f"[{outputs},{width}]"),
