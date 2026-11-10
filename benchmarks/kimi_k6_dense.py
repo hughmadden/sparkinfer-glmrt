@@ -852,9 +852,18 @@ def reference_encoder(source, directory):
     binding.write_text('''#include <torch/library.h>
 #include "quant/quantize.cuh"
 void pack_trellis(at::Tensor packed, at::Tensor unpacked, int K);
+void quantize(at::Tensor input, at::Tensor output, at::Tensor indices,
+              at::Tensor costs, at::Tensor edges, int64_t K, bool mcg, bool mul1) {
+  TORCH_CHECK(K >= 1 && K <= 8, "K must be 1..8");
+  quantize_tiles(input, output, indices, costs, edges, static_cast<int>(K), mcg, mul1);
+}
+void pack(at::Tensor packed, at::Tensor unpacked, int64_t K) {
+  TORCH_CHECK(K >= 1 && K <= 8, "K must be 1..8");
+  pack_trellis(packed, unpacked, static_cast<int>(K));
+}
 TORCH_LIBRARY(trellis_bench_encoder, m) {
-  m.def("quantize_tiles(Tensor input, Tensor(a!) output, Tensor(b!) indices, Tensor(c!) costs, Tensor(d!) edges, int K, bool mcg, bool mul1) -> ()", &quantize_tiles);
-  m.def("pack_trellis(Tensor(a!) packed, Tensor unpacked, int K) -> ()", &pack_trellis);
+  m.def("quantize_tiles(Tensor input, Tensor(a!) output, Tensor(b!) indices, Tensor(c!) costs, Tensor(d!) edges, int K, bool mcg, bool mul1) -> ()", &quantize);
+  m.def("pack_trellis(Tensor(a!) packed, Tensor unpacked, int K) -> ()", &pack);
 }
 ''')
     sources = [binding, *(source / name for name in (
