@@ -196,6 +196,14 @@ def test_native_thresholds_refuse_unsafe_knobs(text):
         _native_threshold_bench().threshold_config(text)
 
 
+def test_reference_encoder_build_requires_explicit_official_source(monkeypatch, tmp_path):
+    bench = _native_threshold_bench()
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path), "--encoder-build-only"])
+    with pytest.raises(SystemExit) as error:
+        bench.main()
+    assert error.value.code == 2
+
+
 def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
     bench = _native_threshold_bench()
     source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"

@@ -843,6 +843,32 @@ def benchmark_native_comparison(args):
 
 
 
+def reference_encoder(source, directory):
+    """Build only the unchanged GPTQModel quantize/pack operators, not its GEMMs."""
+    from torch.utils.cpp_extension import load
+    source = source.resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    binding = directory / "encoder_bindings.cpp"
+    binding.write_text('''#include <torch/library.h>
+#include "quant/quantize.cuh"
+void pack_trellis(at::Tensor packed, at::Tensor unpacked, int K);
+TORCH_LIBRARY(trellis_bench_encoder, m) {
+  m.def("quantize_tiles(Tensor input, Tensor(a!) output, Tensor(b!) indices, Tensor(c!) costs, Tensor(d!) edges, int K, bool mcg, bool mul1) -> ()", &quantize_tiles);
+  m.def("pack_trellis(Tensor(a!) packed, Tensor unpacked, int K) -> ()", &pack_trellis);
+}
+''')
+    sources = [binding, *(source / name for name in (
+        "quant/quantize.cu", "quant/pack.cu", "quant/exl3_devctx.cu"))]
+    load(name="trellis_bench_encoder", sources=[str(path) for path in sources],
+         extra_include_paths=[str(source)], extra_cflags=["-O3"],
+         extra_cuda_cflags=["-O3", "-lineinfo", "-gencode=arch=compute_120,code=sm_120"],
+         build_directory=str(directory), is_python_module=False, verbose=True)
+    import hashlib
+    return {str(path.relative_to(source)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(source.rglob("*")) if path.is_file()
+            and path.suffix in (".cu", ".cuh", ".h", ".cpp")}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -865,8 +891,16 @@ def main():
     parser.add_argument("--thresholds", help="benchmark-only narrow/decode/wide2/wide3/folded/prefill overrides")
     parser.add_argument("--export-sms", type=int, choices=(170, 188), default=188,
                         help="offline SM120 compiler geometry; runtime CTA budget stays device-derived")
+    parser.add_argument("--encoder-source", type=Path, help="official GPTQModel gptqmodel_ext/exllamav3 source")
+    parser.add_argument("--encoder-build-only", action="store_true", help="CPU compile official quantize/pack operators")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.encoder_build_only:
+        if args.encoder_source is None:
+            parser.error("--encoder-build-only requires --encoder-source")
+        hashes = reference_encoder(args.encoder_source, args.output_dir / "encoder")
+        (args.output_dir / "encoder_sources.json").write_text(json.dumps(hashes, indent=2) + "\n")
+        return
     if args.baseline_native:
         benchmark_native_comparison(args)
         return
