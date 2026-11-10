@@ -489,8 +489,9 @@ class RowTiledBf16Projection:
     """``TmaBf16Projection`` with its tiles picked by the live rows of a launch.
 
     ``tiles_by_rows`` entries are ``(rows, compute_warps, tile_n, num_stages)``,
-    ``(rows, warp_m, warp_n, tile_n, num_stages)`` or
-    ``(rows, warp_m, warp_n, tile_m, tile_n, num_stages)`` in
+    ``(rows, warp_m, warp_n, tile_n, num_stages)``,
+    ``(rows, warp_m, warp_n, tile_m, tile_n, num_stages)`` or the previous
+    form with a trailing ``tile_k`` (default 64) in
     ascending ``rows``: a launch runs the first entry whose ``rows`` it does
     not exceed (``16 * compute_warps`` x ``tile_n`` tiles, or ``warp_m`` x
     ``warp_n`` warps over a ``16 * warp_m`` or the explicit ``tile_m`` row
@@ -513,11 +514,12 @@ class RowTiledBf16Projection:
     def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16, **base):
         self.n, self.k = int(n), int(k)
         self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
-        if not self.tiles_by_rows or any(len(entry) not in (4, 5, 6) for entry in self.tiles_by_rows):
+        if not self.tiles_by_rows or any(len(entry) not in (4, 5, 6, 7) for entry in self.tiles_by_rows):
             raise ValueError(
                 "tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages), "
-                "(rows, warp_m, warp_n, tile_n, num_stages) or "
-                "(rows, warp_m, warp_n, tile_m, tile_n, num_stages)")
+                "(rows, warp_m, warp_n, tile_n, num_stages), "
+                "(rows, warp_m, warp_n, tile_m, tile_n, num_stages) or "
+                "(rows, warp_m, warp_n, tile_m, tile_n, num_stages, tile_k)")
         self.limits = tuple(entry[0] for entry in self.tiles_by_rows)
         # Entry i serves floors[i] < rows <= limits[i].
         self.floors = (0,) + self.limits[:-1]
@@ -538,12 +540,13 @@ class RowTiledBf16Projection:
                     _, warp_m, warp_n, tile_n, stages = entry
                     tile_m = 16 * warp_m
                 else:
-                    _, warp_m, warp_n, tile_m, tile_n, stages = entry
+                    _, warp_m, warp_n, tile_m, tile_n, stages = entry[:6]
                 if tile_m % (16 * warp_m):
                     raise ValueError(f"tiles_by_rows entry {entry}: tile_m must be a multiple of 16 * warp_m")
+                k_step = {} if len(entry) < 7 else dict(tile_k=entry[6])
                 self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(),
                                                     warp_layout=(warp_m, warp_n), tile_m=tile_m,
-                                                    tile_n=tile_n, num_stages=stages, **self.base))
+                                                    tile_n=tile_n, num_stages=stages, **k_step, **self.base))
         capacity = cutlass_utils.get_smem_capacity_in_bytes("sm_120")
         for entry, launch in zip(self.tiles_by_rows, self.tiled):
             kernel = launch.kernel

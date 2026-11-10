@@ -35,6 +35,13 @@ SHAPES = {
     "latent_up": (3584, 7168, torch.bfloat16),
 }
 ROWS = (1, 2, 5, 6, 16, 17, 32, 33, 64, 65)
+#: ``tile_k`` 128 entries (the trailing seventh element): the same K order, a
+#: wider pipelined K step.
+TILE_K_ENTRIES = {
+    "kda_in": ((128, 1, 4, 16, 64, 4, 128),),
+    "kda_out": ((128, 2, 2, 64, 64, 2, 128),),
+    "output": ((128, 1, 4, 16, 128, 2, 128),),
+}
 _PROGRAMS: dict = {}
 _TENSORS: dict = {}
 
@@ -106,6 +113,44 @@ def _bits(x: torch.Tensor) -> torch.Tensor:
 def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
     """Byte-identical: the bit patterns, so signed zeros and NaN payloads count."""
     return a.dtype == b.dtype and a.shape == b.shape and bool(torch.equal(_bits(a), _bits(b)))
+
+
+def _tile_k(name: str):
+    """A table with a wider ``tile_k``: one more MMA K step per pipeline stage."""
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+
+    if ("tile_k", name) not in _PROGRAMS:
+        width, outputs, dtype = SHAPES[name]
+        table = TILE_K_ENTRIES[name]
+        launch = TmaBf16Projection(outputs, width, out_dtype=_cute_dtype(dtype), tiles_by_rows=table)
+        _PROGRAMS[("tile_k", name)] = compile_program(
+            launch, name="test_kimi_projection_tile_k",
+            operands=(Operand("x", torch.bfloat16, f"[rows,{width}]"),
+                      Operand("w", torch.bfloat16, f"[{outputs},{width}]"),
+                      Operand("out", dtype, f"[rows,{outputs}]", "out")),
+            scalars=(Scalar("rows"),), key=launch.key())
+    return _PROGRAMS[("tile_k", name)]
+
+
+@pytest.mark.parametrize("rows", [1, 6, 32, 64])
+@pytest.mark.parametrize("name", sorted(TILE_K_ENTRIES))
+def test_a_wide_k_step_keeps_the_default_route_bits(name, rows):
+    """``tile_k`` 128 runs the K tiles in the same increasing order: the outputs
+    must keep the ``prefill_config`` kernel's bytes."""
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+
+    width, outputs, dtype = SHAPES[name]
+    launch = TmaBf16Projection(outputs, width, out_dtype=_cute_dtype(dtype),
+                               tiles_by_rows=TILE_K_ENTRIES[name])
+    kernels = [program.kernel for program in launch.row_tiled.tiled]
+    assert kernels and all(kernel.tile_k == 128 for kernel in kernels), \
+        f"{name}: the entry's tile_k did not reach the kernel"
+    w = _weight(name)
+    x = _activations(name, rows, seed=3000 + rows)
+    want = _project(_default(name), x, w, dtype)
+    got = _project(_tile_k(name), x, w, dtype)
+    assert _same(got, want), f"{name} at {rows} rows: tile_k 128 against prefill_config"
 
 
 def test_every_kimi_shape_selects_its_table():
