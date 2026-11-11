@@ -337,9 +337,9 @@ def msa_select_blocks_reference(
     scores.scatter_(2, scatter_idx, force_values)
 
     gather_k = min(topk, num_blocks)
-    top_values, top_indices = torch.topk(
-        scores, k=gather_k, dim=2, largest=True, sorted=False
-    )
+    top_values, top_indices = torch.sort(scores, dim=2, descending=True, stable=True)
+    top_values = top_values[:, :, :gather_k]
+    top_indices = top_indices[:, :, :gather_k]
     base = torch.zeros_like(query_positions) if block_base is None else block_base
     local_indices = top_indices.to(torch.int32) - base.view(1, q_rows, 1)
     valid = top_values > float("-inf")

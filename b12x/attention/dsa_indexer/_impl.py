@@ -49,6 +49,7 @@ from .tiled_topk import (
     run_tiled_topk,
 )
 from .persistent_topk import clear_persistent_topk2048_kernel_cache
+from .msa_topk import stable_msa_topk
 
 
 _INDEX_HEAD_DIM = 128
@@ -439,14 +440,7 @@ def msa_topk_blocks(
             top_values[:num_heads, :q_rows, :gather_k],
             top_indices[:num_heads, :q_rows, :gather_k],
         )
-    top_values, top_indices = torch.topk(
-        scores,
-        k=gather_k,
-        dim=2,
-        largest=True,
-        sorted=False,
-        out=topk_out,
-    )
+    top_values, top_indices = stable_msa_topk(scores, topk=gather_k, out=topk_out)
     if out_indices is not None:
         local_indices = result[:, :, :gather_k]
         local_indices.copy_(top_indices)
