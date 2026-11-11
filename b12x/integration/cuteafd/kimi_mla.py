@@ -56,9 +56,11 @@ class KimiMlaGeometry:
         if self.heads not in (48, 96):
             raise ValueError("Kimi MLA requires 48 or 96 heads")
         if (self.hidden, self.q_lora_rank, self.kv_lora_rank, self.qk_nope_dim,
-            self.qk_rope_dim, self.v_head_dim, self.page_rows, self.norm_eps) != (
-                7168, 1536, 512, 128, 64, 128, 64, 1e-6):
-            raise ValueError("unsupported Kimi K3 MLA geometry or rank-norm epsilon")
+            self.qk_rope_dim, self.v_head_dim, self.page_rows) != (
+                7168, 1536, 512, 128, 64, 128, 64):
+            raise ValueError("unsupported Kimi MLA geometry")
+        if not math.isfinite(self.norm_eps) or self.norm_eps <= 0:
+            raise ValueError("Kimi rank-norm epsilon must be finite and positive")
 
     @property
     def qkv_a_width(self):

@@ -37,6 +37,7 @@ from b12x._lib.intrinsics import (
     ld_global_v4_u32,
     ld_shared_v2_u32,
     pack_f32x2_to_bfloat2,
+    pow2_ceil_ue8m0,
     shared_ptr_to_u32,
     st_global_u32,
     st_global_v4_u32,
@@ -404,18 +405,36 @@ class GlmIndexPost:
     128^-0.5 * q_scale`` (the query scale folds out of ``relu``). Key:
     ``LayerNorm(wk(x))`` (weight, bias, eps), RoPE, BF16 round, E4M3 with a
     per-token FP32 scale into the index cache page (64 x 128 E4M3 rows then
-    64 FP32 scales) at ``slots[row]``.
+    64 FP32 scales) at ``slots[row]``. ``scale_format="ue8m0"`` rounds
+    ``max(amax, floor)/448`` up to a power of two while retaining FP32 scale
+    slots. K3.1 uses query/key floors 1e-10/1e-4; the default FP32 route
+    preserves GLM's original zero-block and unrounded-scale arithmetic.
 
     One warp per (row, head) plus one warp for the key; lane ``l`` owns the
     four outputs ``4l..4l+3``.
     """
 
-    def __init__(self, *, heads: int, eps: float, weight_scale: float, page_rows: int = 64, rope: bool = True):
+    def __init__(self, *, heads: int, eps: float, weight_scale: float, page_rows: int = 64,
+                 rope: bool = True, scale_format: str = "fp32", query_amax_floor: float = 0.0,
+                 key_amax_floor: float = 0.0):
+        if scale_format not in ("fp32", "ue8m0"):
+            raise ValueError("index scale format must be fp32 or ue8m0")
+        import math
+        if any(not math.isfinite(v) or v < 0 for v in (query_amax_floor, key_amax_floor)):
+            raise ValueError("index amax floors must be finite and nonnegative")
+        if scale_format == "ue8m0" and min(query_amax_floor, key_amax_floor) <= 0:
+            raise ValueError("UE8M0 index scales require positive amax floors")
+        if scale_format == "fp32" and (query_amax_floor != 0 or key_amax_floor != 0):
+            raise ValueError("unrounded FP32 index scales use the original zero-block convention")
         self.heads = int(heads)
         self.eps = float(eps)
         self.weight_scale = float(weight_scale)
         self.page_rows = int(page_rows)
         self.page_bytes = self.page_rows * (128 + 4)
+        # Both formats store FP32 slots; UE8M0 changes rounding, not the page ABI.
+        self.scale_format = scale_format
+        self.query_amax_floor = float(query_amax_floor)
+        self.key_amax_floor = float(key_amax_floor)
         # NoPE layers (Mistral Large 4 every fourth layer) skip the query/key RoPE.
         self.rope = bool(rope)
 
@@ -476,7 +495,11 @@ class GlmIndexPost:
             self._rotate(lane, src, cs, out)
             local = fmax_f32(fmax_f32(fabs_f32(out[0]), fabs_f32(out[1])),
                              fmax_f32(fabs_f32(out[2]), fabs_f32(out[3])))
-            scale = _fp8_scale(_warp_max(local))
+            if cutlass.const_expr(self.scale_format == "ue8m0"):
+                amax = fmax_f32(_warp_max(local), Float32(self.query_amax_floor))
+                scale, _ = pow2_ceil_ue8m0(div_rn_f32(amax, Float32(FP8_MAX)))
+            else:
+                scale = _fp8_scale(_warp_max(local))
             packed = cvt_f32x4_to_e4m3x4(div_rn_f32(out[0], scale), div_rn_f32(out[1], scale),
                                          div_rn_f32(out[2], scale), div_rn_f32(out[3], scale))
             words = cute.make_ptr(
@@ -508,7 +531,11 @@ class GlmIndexPost:
             self._rotate(lane, src, cs, out)
             local = fmax_f32(fmax_f32(fabs_f32(out[0]), fabs_f32(out[1])),
                              fmax_f32(fabs_f32(out[2]), fabs_f32(out[3])))
-            scale = _fp8_scale(_warp_max(local))
+            if cutlass.const_expr(self.scale_format == "ue8m0"):
+                amax = fmax_f32(_warp_max(local), Float32(self.key_amax_floor))
+                scale, _ = pow2_ceil_ue8m0(div_rn_f32(amax, Float32(FP8_MAX)))
+            else:
+                scale = _fp8_scale(_warp_max(local))
             slot = Int64(slots[token])
             if slot >= Int64(0):
                 page = slot // Int64(self.page_rows)
