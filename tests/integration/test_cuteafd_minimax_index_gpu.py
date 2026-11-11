@@ -122,3 +122,62 @@ def test_signed_heads_and_low_id_ties_match_independent_oracle(programs, tied):
             expected = sorted(picked + [blocks - 1])
             assert actual[head] == expected
         assert (output[:, 1:] == -7).all(), "inactive capacity rows were overwritten"
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_contiguous_prefill_matches_independent_signed_block_oracle(tied):
+    require_b12x()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.minimax_indexer import compile_minimax_index_aot
+
+    capacity, max_pages = 16, 96
+    program = compile_minimax_index_aot(max_rows=capacity, max_pages=max_pages, mode="prefill")
+    extent = max_pages * 64
+    generator = torch.Generator(device="cuda").manual_seed(20261112)
+    keys = torch.randn((extent, 128), generator=generator, device="cuda").to(torch.float8_e4m3fn)
+    if tied:
+        keys.fill_(1)
+    key_scales = torch.rand(extent, generator=generator, device="cuda") + .5
+    if tied:
+        key_scales.fill_(1)
+    query = torch.empty((capacity, 4, 128), dtype=torch.float8_e4m3fn, device="cuda")
+    query_scales = torch.rand((capacity, 4), generator=generator, device="cuda") + .5
+    starts = torch.empty(capacity, dtype=torch.int32, device="cuda")
+    ends = torch.empty_like(starts)
+    output = torch.full((4, capacity, 16), -7, dtype=torch.int32, device="cuda")
+    scratch = torch.empty(program.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda")
+    cases = [([0], [65]), ([0, 2816, 2816, 0], [2700, 2817, 2816 + 129, 257])]
+    signs = torch.tensor([1., -1., 1., -1.], device="cuda")
+    for first, last in cases:
+        rows, k_rows = len(first), max(last)
+        query.copy_(signs[None, :, None].expand(capacity, 4, 128).to(torch.float8_e4m3fn))
+        starts[:rows] = torch.tensor(first, dtype=torch.int32, device="cuda")
+        ends[:rows] = torch.tensor(last, dtype=torch.int32, device="cuda")
+        output.fill_(-7)
+
+        def launch():
+            program.launch(query, query_scales, keys, key_scales, starts, ends, output, scratch,
+                           scalars=(rows, k_rows))
+
+        with kernel_resolution_guard("MiniMax prefill index live rows and graph replay"):
+            launch()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch()
+            for _ in range(2):
+                query.copy_((-query.float()).to(torch.float8_e4m3fn))
+                graph.replay()
+                torch.cuda.synchronize()
+                actual = output[:, :rows].cpu().tolist()
+                for row, (begin, end) in enumerate(zip(first, last)):
+                    k = keys[begin:end].float() * key_scales[begin:end, None]
+                    scores = (query[row].float() @ k.T) * query_scales[row, :, None] * 128 ** -.5
+                    block_scores = torch.stack([scores[:, p:p + 128].amax(-1)
+                                                for p in range(0, end - begin, 128)], dim=-1).cpu().tolist()
+                    for head in range(4):
+                        own = len(block_scores[head]) - 1
+                        history = sorted(range(own), key=lambda b: (-block_scores[head][b], b))[:15]
+                        picked = sorted(history + [own])
+                        expected = picked + [-1] * (16 - len(picked))
+                        assert actual[head][row] == expected, (row, head, actual[head][row], expected)
+                assert (output[:, rows:] == -7).all(), "inactive index rows were overwritten"
