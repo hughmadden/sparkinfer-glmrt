@@ -1310,11 +1310,12 @@ def test_paged_forward_matches_reference_extend_with_relative_bias() -> None:
 
 @torch.inference_mode()
 @pytest.mark.parametrize("length", [65, 72, 80, 96, 129, 204, 257])
-def test_fp8_dense_extend_preserves_full_pages_before_partial_tail(length) -> None:
-    """Qwen GQA geometry through the generic, non-MSA paged forward API."""
+@pytest.mark.parametrize("q_heads,kv_heads", [(32, 4), (24, 2)])
+def test_fp8_dense_extend_preserves_full_pages_before_partial_tail(length, q_heads, kv_heads) -> None:
+    """Generic GQA and exact Qwen4 geometry; not the engine's selected-position route."""
     require_b12x()
     q, k, v, table, lengths, cu = _make_inputs(
-        q_seqlens=[1], cache_seqlens=[length], q_heads=32, kv_heads=4,
+        q_seqlens=[1], cache_seqlens=[length], q_heads=q_heads, kv_heads=kv_heads,
         head_dim_qk=256, head_dim_vo=256, dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16)
     k, v, ks, vs = quantize_paged_kv_cache_e4m3(k, v, table, lengths)
