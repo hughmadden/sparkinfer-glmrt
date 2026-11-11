@@ -282,12 +282,23 @@ class Fp8MoeGeometry:
     activations: str = "a16"
     activation: str = "silu_bf16_product"
     projection: str = "bf16"
+    swiglu_alpha: float | None = None
+    swiglu_beta: float | None = None
 
     def __post_init__(self) -> None:
         import math
 
-        if self.activation not in ("silu_bf16_product", "silu_post_clamp_fp32_product"):
+        if self.activation not in ("silu_bf16_product", "silu_post_clamp_fp32_product", "swigluoai"):
             raise ValueError("unknown expert activation contract")
+        if self.activation == "swigluoai":
+            if self.weights != "nvfp4" or self.swiglu_limit <= 0:
+                raise ValueError("SwiGLU-OAI requires native NVFP4 and a positive limit")
+            if (self.swiglu_alpha is None or not math.isfinite(self.swiglu_alpha)
+                    or self.swiglu_alpha <= 0 or self.swiglu_beta is None
+                    or not math.isfinite(self.swiglu_beta)):
+                raise ValueError("SwiGLU-OAI requires a positive finite alpha and finite beta")
+        elif self.swiglu_alpha is not None or self.swiglu_beta is not None:
+            raise ValueError("alpha/beta are only part of the SwiGLU-OAI contract")
         if self.projection != "bf16":
             raise ValueError("expert projections must round to BF16 before activation/route sum")
         if not math.isfinite(self.swiglu_limit) or self.swiglu_limit < 0:
@@ -335,7 +346,8 @@ class Fp8MoeGeometry:
 
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
         return Fp8MoeGeometry(self.name, self.hidden, self.experts, self.top_k, self.intermediate, int(tp),
-                              self.swiglu_limit, self.weights, self.activations, self.activation, self.projection)
+                              self.swiglu_limit, self.weights, self.activations, self.activation, self.projection,
+                              self.swiglu_alpha, self.swiglu_beta)
 
 
 # MiMo V2 Flash (no SwiGLU clamp in its config) and the GLM 5.3 MTP layer.
@@ -685,11 +697,13 @@ class _StreamNvfp4A4Route:
         self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i)
         self.fused = nvfp4_a4_fused()
         if self.fused:
-            self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation)
+            self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
+                                               alpha=g.swiglu_alpha, beta=g.swiglu_beta)
             self.swiglu = None
         else:
             self.gate_up = StreamNvfp4LinearA4(n=i, k=h, experts=e)
-            self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation)
+            self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
+                                               alpha=g.swiglu_alpha, beta=g.swiglu_beta)
         self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e)
         self.small_gate = ()
         self.small_down = ()
@@ -697,10 +711,10 @@ class _StreamNvfp4A4Route:
             # Separate kernels keep the wide tile's SMEM reservation out of the
             # sparse-expert launch. Every specialization is planned before capture.
             self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
-                                               live_min=17)
+                                               alpha=g.swiglu_alpha, beta=g.swiglu_beta, live_min=17)
             self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e, live_min=17)
             self.small_gate = tuple(StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
-                                                        tile_m=16, tile_n=n, live_max=16, stages=SMALL_GATE_STAGES)
+                                                        alpha=g.swiglu_alpha, beta=g.swiglu_beta, tile_m=16, tile_n=n, live_max=16, stages=SMALL_GATE_STAGES)
                                     for n in (32, 64, 128))
             self.small_down = tuple(StreamNvfp4LinearA4(n=h, k=i, experts=e, tile_m=16, tile_n=n,
                                                         live_max=16) for n in (32, 64, 128))
@@ -962,6 +976,8 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
                   "wire": bool(wire), "weights": g.weights, "activations": g.activations,
                   "activation": g.activation, "projection": g.projection,
+                  **({"swiglu_alpha": g.swiglu_alpha, "swiglu_beta": g.swiglu_beta}
+                     if g.activation == "swigluoai" else {}),
                   "prefill": prefill, "mxfp4_down_a8": bool(mxfp4_down_a8),
                   "weight_read_grouping": ({"contract": "exact_grouping", "segments": [{"end_rows": int(max_rows), "group_rows": STREAM_TILE_M}]}
                                            if row_addresses else launch.weight_read_grouping(g.weights, max_rows)),

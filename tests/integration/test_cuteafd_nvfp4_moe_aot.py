@@ -144,7 +144,14 @@ def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
             (alpha * inscale if a4 else alpha)).bfloat16().to(dtype)
         gate = project(xr, operand(w1, q1), a1[expert], in1[expert])
         up = project(xr, operand(w3, q3), a3[expert], in1[expert])
-        if g.activation == "silu_post_clamp_fp32_product":
+        if g.activation == "swigluoai":
+            from b12x.moe._shared.kernels.reference import _apply_gated_activation
+
+            act = _apply_gated_activation(
+                gate.float(), up.float(), activation="swigluoai_uninterleave",
+                swiglu_limit=limit, swiglu_alpha=g.swiglu_alpha,
+                swiglu_beta=g.swiglu_beta).bfloat16().to(dtype)
+        elif g.activation == "silu_post_clamp_fp32_product":
             silu = torch.nn.functional.silu(gate.float())
             up32 = up.float()
             if limit > 0:
@@ -321,14 +328,21 @@ def test_nvfp4_moe_a4_fused_exact(name, tp, real, capacity, rows, wire, hot, sca
     assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
 
 
-def test_nvfp4_sparse_tiles_reuse_and_graph(monkeypatch):
+@pytest.mark.parametrize("activation", ["silu_bf16_product", "swigluoai"])
+def test_nvfp4_sparse_tiles_reuse_and_graph(monkeypatch, activation):
     """One capacity program covers sparse/dense chunks under frozen resolution."""
     from b12x.integration.cuteafd import fp8_moe
 
-    g = fp8_moe.Fp8MoeGeometry("nvfp4_sparse_test", hidden=256, experts=32, top_k=2,
-                              intermediate=256, weights="nvfp4", activations="a4")
+    g = fp8_moe.Fp8MoeGeometry("nvfp4_sparse_test_" + activation, hidden=256, experts=32, top_k=2,
+                              intermediate=256, weights="nvfp4", activations="a4", activation=activation,
+                              **(dict(swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0)
+                                 if activation == "swigluoai" else {}))
     capacity = 256
     w = _weights(g, g.slice)
+    if activation == "swigluoai":
+        # Exercise the trained clamp, not only the unsaturated alpha/beta arms.
+        for scales in (w[1], w[3]):
+            split_scales(scales, g.experts, g.slice, g.hidden)[1].mul_(16.0)
     monkeypatch.setenv("B12X_NVFP4_A4_FUSED", "1")
     program = fp8_moe.compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False)
     monkeypatch.setenv("B12X_NVFP4_A4_FUSED", "0")
