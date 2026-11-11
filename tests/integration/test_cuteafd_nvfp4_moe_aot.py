@@ -283,6 +283,40 @@ A4_CASES = [
 ]
 
 
+@pytest.mark.parametrize("tp,real,capacity,rows", [(6, 512, 16, 1), (5, 624, 80, 17)])
+def test_minimax_vendor_nvfp4_a4(tp, real, capacity, rows):
+    g = _geometry("minimax_nvfp4a4", tp)
+    c, worst = _run(g, real, capacity, rows, hot=4, scale=40.0)
+    print(f"MiniMax W4A4 tp{tp} real={real} stored={g.slice} rows={rows}: cosine={c:.7f} worst={worst:.7f}")
+    assert c >= 0.9999 and worst >= 0.999
+    from b12x.integration.cuteafd.fp8_moe import fp8_moe_scratch_bytes
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    w = _weights(g, real)
+    program = _PROGRAMS[(g, capacity, False, "auto")]
+    x = torch.zeros(rows, g.hidden, device="cuda", dtype=torch.bfloat16)
+    ids = torch.arange(g.top_k, device="cuda", dtype=torch.int32).expand(rows, -1).contiguous()
+    weights = torch.full((rows, g.top_k), 1.0 / g.top_k, device="cuda")
+    out = torch.empty_like(x)
+    scratch = torch.empty(fp8_moe_scratch_bytes(g, "auto", capacity, False), device="cuda", dtype=torch.uint8)
+    tensors = (x, ids, weights, *w, out, scratch)
+    pointers = [t.data_ptr() for t in tensors]
+    program.launch(*tensors, scalars=(rows,))
+    with kernel_resolution_guard("MiniMax native worker graph replay"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            program.launch(*tensors, scalars=(rows,))
+        x.fill_(0.25)
+        program.launch(*tensors, scalars=(rows,))
+        eager = out.clone()
+        graph.replay()
+        assert torch.equal(out, eager)
+        assert torch.isfinite(out).all() and torch.count_nonzero(out) > 0
+        program.launch(*tensors, scalars=(1,))
+        assert torch.equal(out[:1], eager[:1])
+    assert pointers == [t.data_ptr() for t in tensors]
+
+
 @pytest.mark.parametrize("name,tp,real,capacity,rows,wire,hot,scale,route", A4_CASES)
 def test_nvfp4_moe_a4(name, tp, real, capacity, rows, wire, hot, scale, route):
     g = _geometry(name, tp)
