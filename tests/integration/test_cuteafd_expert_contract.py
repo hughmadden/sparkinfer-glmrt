@@ -64,6 +64,21 @@ def test_cpu_geometry_contract(tp, width):
         Fp8MoeGeometry("bad", 4096, 352, 8, 1536, activation="unknown")
 
 
+@pytest.mark.parametrize("tp,width", [(1, 3072), (2, 1536), (3, 1024), (4, 768), (5, 640), (6, 512), (7, 512), (8, 384)])
+def test_cpu_minimax_vendor_expert_geometry(tp, width):
+    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, _resolve, fp8_moe_scratch_bytes
+
+    g = GEOMETRIES["minimax_nvfp4a4"].with_tp(tp)
+    assert (g.hidden, g.experts, g.top_k, g.intermediate, g.slice) == (6144, 128, 4, 3072, width)
+    assert (g.weights, g.activations, g.activation, g.projection) == ("nvfp4", "a4", "swigluoai", "bf16")
+    assert (g.swiglu_alpha, g.swiglu_beta, g.swiglu_limit) == (1.702, 1.0, 7.0)
+    for capacity in (1, 16, 80, 1024, 4096):
+        assert _resolve("auto", capacity, False, g.kind) == "stream"
+        assert fp8_moe_scratch_bytes(g, "auto", capacity, False) > 0
+        with pytest.raises(ValueError, match="original BF16"):
+            fp8_moe_scratch_bytes(g, "auto", capacity, True)
+
+
 def bf16_reference(x, ids, route_weights, w1, w3, w2, limit, contract):
     # Sum in slot order, as MoeCombine does (including duplicate expert ids).
     result = torch.zeros_like(x, dtype=torch.float32)

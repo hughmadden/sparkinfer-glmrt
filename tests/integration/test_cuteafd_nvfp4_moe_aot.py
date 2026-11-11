@@ -421,20 +421,6 @@ def test_nvfp4_geometry():
     assert [_geometry("qwen4_nvfp4", tp).slice for tp in (1, 2, 3, 4, 6)] == [640, 384, 256, 256, 128]
 
 
-@pytest.mark.parametrize("tp,width", [(1, 3072), (2, 1536), (3, 1024), (4, 768), (5, 640), (6, 512), (7, 512), (8, 384)])
-def test_minimax_vendor_expert_geometry(tp, width):
-    from b12x.integration.cuteafd.fp8_moe import fp8_moe_scratch_bytes
-
-    g = _geometry("minimax_nvfp4a4", tp)
-    assert (g.hidden, g.experts, g.top_k, g.intermediate, g.slice) == (6144, 128, 4, 3072, width)
-    assert (g.weights, g.activations, g.activation, g.projection) == ("nvfp4", "a4", "swigluoai", "bf16")
-    assert (g.swiglu_alpha, g.swiglu_beta, g.swiglu_limit) == (1.702, 1.0, 7.0)
-    for capacity in (1, 16, 80, 1024, 4096):
-        assert fp8_moe_scratch_bytes(g, "auto", capacity, False) > 0
-        with pytest.raises(ValueError, match="original BF16"):
-            fp8_moe_scratch_bytes(g, "auto", capacity, True)
-
-
 def test_e4m3_scale_is_exact():
     """Every E2M1 x E4M3 product is a BF16 number: the widening is exact."""
     table = torch.tensor(E2M1 + tuple(-v for v in E2M1))
