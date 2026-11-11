@@ -155,8 +155,8 @@ def test_sparse_selections_reuse_program_and_graph_with_live_shapes(mode):
                 for head in range(4):
                     # Different sparse histories per row/head exercise union masks,
                     # not merely the all-blocks/dense special case.
-                    history = [b for b in range(current) if (b + head + row) % 3 != 0][:15]
-                    blocks = history + [current]
+                    history = sorted(range(current), key=lambda b: ((b + head + row) % 3, b))[:15]
+                    blocks = sorted(history + [current])
                     selected[head, row, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device="cuda")
 
         def launch():
