@@ -46,6 +46,25 @@ def test_tie_heavy_selection_matches_scalar_oracle(device, blocks, topk):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_topk_accepts_strided_caller_scratch_and_preserves_source():
+    device = "cuda"
+    # Three-way ties straddle scan-tile boundaries and the top-k cutoff.
+    scores = -(torch.arange(4 * 2 * 513, device=device).reshape(4, 2, 513) % 3).float()
+    positions = torch.tensor([512 * 128, 511 * 128], device=device, dtype=torch.int32)
+    values = torch.empty((4, 2, 32), device=device)[:, :, ::2]
+    indices = torch.empty((4, 2, 32), device=device, dtype=torch.int64)[:, :, ::2]
+    output = torch.empty((4, 2, 16), device=device, dtype=torch.int32)
+    scratch = torch.empty((4, 2, 1026), device=device)[:, :, ::2]
+    original = scores.clone()
+    actual = msa_topk_blocks(block_scores=scores, query_positions=positions,
+        out_indices=output, score_scratch=scratch, top_values=values, top_indices=indices)
+    expected = scalar_oracle(scores.cpu(), positions.cpu(), torch.zeros(2, dtype=torch.int32), 16)
+    assert torch.equal(actual.cpu(), expected)
+    assert torch.equal(scores, original)
+    assert actual.data_ptr() == output.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_topk_buffers_replay_live_counts_and_score_mutation():
     device = "cuda"
     capacity = (4, 3, 1025)

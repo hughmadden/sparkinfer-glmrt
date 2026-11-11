@@ -9,12 +9,14 @@ import triton.language as tl
 @triton.jit(do_not_specialize=[
     "rows", "blocks", "topk", "score_head_stride", "score_row_stride",
     "value_head_stride", "value_row_stride", "index_head_stride", "index_row_stride",
+    "score_block_stride", "value_slot_stride", "index_slot_stride",
 ])
 def _stable_msa_topk(
     scores, values, indices, rows, blocks, topk,
     score_head_stride, score_row_stride,
     value_head_stride, value_row_stride,
     index_head_stride, index_row_stride,
+    score_block_stride, value_slot_stride, index_slot_stride,
     BLOCK: tl.constexpr,
 ):
     head = tl.program_id(0).to(tl.int64)
@@ -28,16 +30,18 @@ def _stable_msa_topk(
         best_id = 2147483647
         for start in range(tl.cdiv(blocks, BLOCK)):
             ids = start * BLOCK + offsets
-            tile = tl.load(score_row + ids.to(tl.int64), ids < blocks, other=float("-inf"))
+            tile = tl.load(score_row + ids.to(tl.int64) * score_block_stride,
+                           ids < blocks, other=float("-inf"))
             tile_value = tl.max(tile, axis=0)
             tile_id = tl.min(tl.where((ids < blocks) & (tile == tile_value), ids, 2147483647), axis=0)
             better = (tile_value > best_value) | ((tile_value == best_value) & (tile_id < best_id))
             best_id = tl.where(better, tile_id, best_id)
             best_value = tl.maximum(best_value, tile_value)
-        tl.store(value_row + slot, best_value)
-        tl.store(index_row + slot, best_id.to(tl.int64))
+        tl.store(value_row + slot.to(tl.int64) * value_slot_stride, best_value)
+        tl.store(index_row + slot.to(tl.int64) * index_slot_stride, best_id.to(tl.int64))
         # One CTA owns a score row. Retire its winner before the next scan.
-        tl.store(score_row + best_id.to(tl.int64), float("-inf"), best_id < blocks)
+        tl.store(score_row + best_id.to(tl.int64) * score_block_stride,
+                 float("-inf"), best_id < blocks)
         tl.debug_barrier()
 
 
@@ -69,6 +73,7 @@ def stable_msa_topk(
         scores.stride(0), scores.stride(1),
         out[0].stride(0), out[0].stride(1),
         out[1].stride(0), out[1].stride(1),
+        scores.stride(2), out[0].stride(2), out[1].stride(2),
         BLOCK=256, num_warps=4,
     )
     return out
