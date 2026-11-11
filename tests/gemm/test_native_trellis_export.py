@@ -34,9 +34,8 @@ def test_native_trellis_export(bits, codebook, side, tmp_path):
     program.export_to_c(str(destination), stem, "cuteafd_" + stem)
     checked = validate_exported_header(program, destination / f"{stem}.h", "cuteafd_" + stem)
     assert checked["argument_count"] == 9
-    if bits == 6 and codebook in ("mcg", "mul1"):
-        from b12x.gemm.trellis_linear._native import K6_DECODE_ROUTE_THRESHOLDS
-        assert program.geometry["decode_route_thresholds"] == list(K6_DECODE_ROUTE_THRESHOLDS)
+    from b12x.gemm.trellis_linear._native import decode_route_thresholds
+    assert program.geometry["decode_route_thresholds"] == list(decode_route_thresholds(program.geometry))
     assert not torch.cuda.is_initialized()
 
 

@@ -519,6 +519,8 @@ def threshold_variant(source, destination, values, groups=1):
     """Materialize a benchmark-only module; production sources stay untouched."""
     threshold_config(",".join(f"{name}={value}" for name, value in values.items()), groups)
     text = source.read_text()
+    if values != threshold_config(None) and groups == 1:
+        text = text.replace("self.decode_rows = decode_rows(g)", f"self.decode_rows = {values['decode']}")
     if groups == 4:
         text = text.replace("_GROUPED_DECODE_ROWS = 16", f"_GROUPED_DECODE_ROWS = {values['decode']}")
         text = text.replace("_GROUPED_WIDE2_ROWS = 32", f"_GROUPED_WIDE2_ROWS = {values['wide2']}")

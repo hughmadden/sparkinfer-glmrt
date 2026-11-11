@@ -319,6 +319,55 @@ def test_kimi_decision_requires_symbol_inventory_before_cuda(monkeypatch, tmp_pa
     assert error.value.code == 2
 
 
+def _native_route_policy():
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    nodes = []
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and
+                (t.id.startswith("_K6_") or t.id.startswith("_GROUPED_") or
+                 t.id in ("DECODE_ROWS_BY_SHAPE", "_FOLDED_DECODE_ROWS", "_GEMINI_NARROW_ROWS"))
+                for t in node.targets):
+            nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in ("decode_rows", "decode_route_thresholds"):
+            nodes.append(node)
+    namespace = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace
+
+
+def test_measured_decode_rows_are_scoped_to_qualified_format_and_storage_sides():
+    policy = _native_route_policy()
+    build = policy["decode_rows"]
+    for (bits, n, k), (edge, sides) in policy["DECODE_ROWS_BY_SHAPE"].items():
+        for side in (1, 2):
+            g = dict(bits=bits, output_features=n, input_features=k, sharded_side=side,
+                     codebook="mcg", input_dtype="bf16", groups=1)
+            assert build(g) == (edge if side in sides else 16)
+            for key, value in (("codebook", "mul1"), ("input_dtype", "f16"), ("groups", 4)):
+                assert build(dict(g, **{key: value})) == 16
+    assert build(dict(bits=6, output_features=3072, input_features=7168,
+                      sharded_side=1, codebook="mcg", input_dtype="bf16")) == 16
+
+
+@pytest.mark.parametrize("bits,n,k,groups,expected", [
+    (6, 6144, 7168, 1, (8, 32, 48)),
+    (6, 6144, 7168, 4, (16, 32, 48)),
+    (6, 3072, 7168, 1, (16, 32, 48)),
+    (6, 163840, 7168, 1, (16, 32, 48)),
+    (8, 6144, 7168, 1, (8, 32, 48)),
+    (8, 6144, 7168, 4, (16, 32, 48)),
+    (8, 7168, 3072, 1, (16, 32, 48)),
+    (4, 6144, 7168, 1, ()),
+])
+def test_native_route_metadata_describes_each_actual_program(bits, n, k, groups, expected):
+    policy = _native_route_policy()
+    g = dict(bits=bits, output_features=n, input_features=k, splits=(k + 1023)//1024,
+             sharded_side=1, codebook="mcg", input_dtype="bf16", groups=groups, max_rows=4096)
+    assert policy["decode_route_thresholds"](g) == expected
+    g["max_rows"] = 8
+    assert policy["decode_route_thresholds"](g) == ()
+
+
 def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
     bench = _native_threshold_bench()
     source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
@@ -334,6 +383,6 @@ def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
     changed = next(n for n in after.body if isinstance(n, ast.ClassDef) and n.name == "NativeTrellisLinear")
     methods = {n.name: n for n in changed.body if isinstance(n, ast.FunctionDef)}
     for method in (n for n in base.body if isinstance(n, ast.FunctionDef)):
-        if method.name not in ("_legacy", "_generic_grouped"):
+        if method.name not in ("__init__", "_legacy", "_generic_grouped"):
             assert ast.dump(method) == ast.dump(methods[method.name]), method.name
     assert source.read_text() == original

@@ -123,8 +123,8 @@ def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
             *(Operand(f"{p}_output", torch.float32, f"[rows,{n}]", "out") for p in GROUP_NAMES),
         )
         pointers = _GroupedPointers(g)
-    from b12x.gemm.trellis_linear._native import K6_DECODE_ROUTE_THRESHOLDS
-    routes = list(K6_DECODE_ROUTE_THRESHOLDS) if codebook in ("mcg", "mul1") and bits == 6 else []
+    from b12x.gemm.trellis_linear._native import decode_route_thresholds
+    routes = list(decode_route_thresholds(g))
     return compile_program(pointers, name="trellis_linear", operands=operands,
                            scalars=tuple(Scalar(name) for name in SCALARS),
                            key=tuple(g.values()), version=4,

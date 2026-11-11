@@ -63,7 +63,99 @@ def validate_grouped_route_thresholds(decode_rows, wide2_rows):
     assert wide2_rows >= 32, "grouped wide3 below row 33 overlaps the next projection's partial plane"
 
 
-K6_DECODE_ROUTE_THRESHOLDS = (_K6_NARROW_ROWS, _K6_DECODE_ROWS, _K6_WIDE2_ROWS, _K6_WIDE3_ROWS)
+# Cold-L2, 50 alternating samples at rows 12/16 on SM170 and SM188 exports.
+# Only standalone MCG with BF16 inputs and the listed storage sides qualified.
+DECODE_ROWS_BY_SHAPE = {
+    (6, 6144, 7168): (8, (1,)),
+    (6, 7168, 6144): (8, (1, 2)),
+    (6, 3584, 7168): (8, (1,)),
+    (6, 640, 7168): (8, (1,)),
+    (6, 18432, 1536): (8, (1,)),
+    (6, 9216, 1536): (8, (1,)),
+    (6, 12288, 7168): (8, (1,)),
+    (6, 7168, 12288): (8, (1,)),
+    (6, 6144, 8192): (8, (1, 2)),
+    (6, 6144, 6144): (8, (1, 2)),
+    (6, 16384, 1536): (8, (1,)),
+    (6, 4096, 16384): (8, (1,)),
+    (6, 12288, 4096): (8, (1,)),
+    (6, 4096, 12288): (8, (1,)),
+    (6, 8192, 8192): (8, (1,)),
+    (6, 8192, 6144): (8, (1,)),
+    (6, 13824, 4096): (8, (1,)),
+    (6, 4096, 13824): (8, (1,)),
+    (8, 6144, 7168): (8, (1,)),
+    (8, 7168, 6144): (8, (1, 2)),
+    (8, 3072, 7168): (8, (1,)),
+    (8, 3584, 7168): (8, (1,)),
+    (8, 9216, 1536): (8, (1,)),
+    (8, 12288, 7168): (8, (1,)),
+    (8, 7168, 12288): (8, (1,)),
+    (8, 16384, 2048): (8, (1,)),
+    (8, 6144, 8192): (8, (1, 2)),
+    (8, 12288, 6144): (8, (1,)),
+    (8, 6144, 6144): (8, (1, 2)),
+    (8, 6144, 12288): (8, (1, 2)),
+    (8, 6144, 2048): (8, (1,)),
+    (8, 6144, 1024): (8, (2,)),
+    (8, 8192, 4096): (8, (1, 2)),
+    (8, 4096, 4096): (8, (1, 2)),
+    (8, 4096, 8192): (8, (1, 2)),
+    (8, 16384, 1536): (8, (1,)),
+    (8, 8192, 1536): (8, (1,)),
+    (8, 4096, 16384): (8, (1,)),
+    (8, 12288, 4096): (8, (1,)),
+    (8, 6144, 4096): (8, (1, 2)),
+    (8, 4096, 6144): (8, (1, 2)),
+    (8, 4096, 2048): (8, (1,)),
+    (8, 4096, 1024): (8, (2,)),
+    (8, 8192, 8192): (8, (1,)),
+    (8, 2048, 8192): (8, (1,)),
+    (8, 8192, 6144): (8, (1,)),
+    (8, 3072, 6144): (8, (1,)),
+    (8, 13824, 4096): (8, (1,)),
+    (8, 4096, 13824): (8, (1,)),
+}
+
+
+def decode_rows(g):
+    measured = DECODE_ROWS_BY_SHAPE.get((g["bits"], g["output_features"], g["input_features"]))
+    if (measured is not None and g.get("groups", 1) == 1 and g["codebook"] == "mcg"
+            and g.get("input_dtype", "f16") == "bf16" and g["sharded_side"] in measured[1]):
+        return measured[0]
+    return _K6_DECODE_ROWS
+
+
+def decode_route_thresholds(g):
+    """Actual arithmetic edges below row 64, not a cross-program superset."""
+    bits, k, n, splits = (g[key] for key in ("bits", "input_features", "output_features", "splits"))
+    if g.get("groups", 1) == 4:
+        edges = [] if bits < 5 else [_GROUPED_DECODE_ROWS, _GROUPED_WIDE2_ROWS, 48]
+    elif bits == 6:
+        folded = k & (k - 1) != 0 and ((2 < splits <= 6 and n <= 4096) or (2 < splits <= 8 and n <= 1536))
+        narrow = False
+        if not folded and n <= 65536:
+            if splits == 1 or n <= 1536:
+                narrow = True
+            elif k & (k - 1):
+                if splits == 2 and n <= 9216:
+                    narrow = not (k == 1536 and n == 8192)
+                else:
+                    narrow = (splits == 4 and n <= 8192) or (8 < splits <= 12 and n <= 4096)
+            else:
+                narrow = splits in (2, 4, 8)
+        edge = decode_rows(g)
+        edges = [edge, _K6_WIDE2_ROWS, _K6_WIDE3_ROWS]
+        if narrow and _K6_NARROW_ROWS < edge:
+            edges.append(_K6_NARROW_ROWS)
+    elif bits == 4 and g["codebook"] == "e4m3":
+        if g.get("input_dtype", "f16") == "f16":
+            edges = [16, 32, 48] if splits <= 2 else [_GEMINI_NARROW_ROWS, 16, 32, 48]
+        else:
+            edges = [_FOLDED_DECODE_ROWS, 48] if splits <= 2 else ([48] if splits <= 16 else [])
+    else:
+        edges = [] if bits < 5 else [decode_rows(g), 32, 48]
+    return tuple(sorted({edge for edge in edges if 0 < edge < min(64, g["max_rows"])}))
 _PREFILL_STAGES = 2
 _PREFILL_PRODUCER_REGS = 104
 _PREFILL_CONSUMER_REGS = 192
@@ -627,6 +719,7 @@ class NativeTrellisLinear:
         self.bits, self.e4m3 = g["bits"], g["codebook"] == "e4m3"
         self.mul1 = g["codebook"] == "mul1"
         self.input_bf16 = g.get("input_dtype", "f16") == "bf16"
+        self.decode_rows = decode_rows(g)
         # High-rate windows need more live registers than the frozen K2--K4 path.
         self.min_blocks_per_mp = 2 if self.bits >= 5 else self.CTAS_PER_SM
         self.input_units = g["sharded_side"] == 2
@@ -850,7 +943,7 @@ class NativeTrellisLinear:
             self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
                 grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-        elif rows <= Int32(16):
+        elif rows <= Int32(self.decode_rows):
             self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
                 grid=(min(tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
@@ -3861,7 +3954,7 @@ class NativeTrellisLinear:
     def _decode_k6(self, inputs: cute.Tensor, payload: cute.Tensor,
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
-        if rows <= Int32(_K6_DECODE_ROWS):
+        if rows <= Int32(self.decode_rows):
             if cutlass.const_expr((self.k & (self.k - 1)) != 0 and
                                   ((2 < self.splits <= 6 and self.n <= 4096) or
                                    (2 < self.splits <= 8 and self.n <= 1536))):

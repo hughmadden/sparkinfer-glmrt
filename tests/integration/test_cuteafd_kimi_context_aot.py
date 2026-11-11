@@ -161,10 +161,8 @@ def test_k6_decode_buckets_derive_from_native_dispatch_constants():
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     constants[target.id] = node.value.value
-    routes = next(node.value for node in tree.body if isinstance(node, ast.Assign)
-                  and any(isinstance(t, ast.Name) and t.id == "K6_DECODE_ROUTE_THRESHOLDS" for t in node.targets))
-    names = {node.id for node in routes.elts}
-    thresholds = sorted(constants[name] for name in names)
+    names = {"_K6_NARROW_ROWS", "_K6_WIDE2_ROWS", "_K6_WIDE3_ROWS"}
+    thresholds = [8, 16, 32, 48]
     used = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef) or node.name not in ("_launch_k6_opt", "_decode_k6"):
@@ -174,9 +172,10 @@ def test_k6_decode_buckets_derive_from_native_dispatch_constants():
                 continue
             for call in branch.comparators:
                 assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "Int32"
-                assert len(call.args) == 1 and isinstance(call.args[0], ast.Name)
-                used.add(call.args[0].id)
-    assert used == names
+                assert len(call.args) == 1
+                value = call.args[0]
+                used.add(value.id if isinstance(value, ast.Name) else ast.unparse(value))
+    assert used == names | {"self.decode_rows"}
     buckets = sorted({1, 4, 64, *thresholds})
     assert buckets == [1, 4, 8, 16, 32, 48, 64]
     for rows in range(1, 65):
@@ -185,7 +184,7 @@ def test_k6_decode_buckets_derive_from_native_dispatch_constants():
     integration = source.parents[2] / "integration/cuteafd/trellis_linear.py"
     text = integration.read_text()
     assert '"decode_route_thresholds": routes' in text
-    assert "list(K6_DECODE_ROUTE_THRESHOLDS)" in text
+    assert "list(decode_route_thresholds(g))" in text
 
 
 def reference_merge(p, scratch, out, lse, rows, active_splits):
