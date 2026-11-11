@@ -112,10 +112,21 @@ def test_index_producer_plain_scales_zero_rows_negative_slots_and_replay(big_pag
                 assert torch.equal(page_scales[row], ks[row])
         assert (cache[page, 3 * 128:4 * 128] == 173).all()
         assert (cache[page, 8192 + 3 * 4:8192 + 4 * 4] == 173).all()
+        # Check the quantizer's exact bits against its actual BF16 input,
+        # separately from the independent norm/RoPE reduction comparison.
+        q_at, k_at = rows * 4 * 128, rows * 8 * 128
+        actual_q = scratch[q_at:k_at].reshape(rows, 4, 128)
+        actual_k = scratch[k_at:k_at + rows * 128].reshape(rows, 128)
+        exact_q, exact_qs = _quantize(actual_q)
+        exact_k, exact_ks = _quantize(actual_k)
+        assert torch.equal(qout[:rows].view(torch.uint8), exact_q.view(torch.uint8))
+        assert torch.equal(kout[:rows].view(torch.uint8), exact_k.view(torch.uint8))
+        assert torch.equal(qs[:rows], exact_qs) and torch.equal(ks[:rows], exact_ks)
         assert (qs[0] == 1).all() and ks[0] == 1
-        assert torch.count_nonzero(qout[0].view(torch.uint8)) == 0
-        assert torch.count_nonzero(kout[0].view(torch.uint8)) == 0
-        assert torch.count_nonzero(qout[1:rows].view(torch.uint8)) > 0
+        # Negating zero inputs on replay legitimately produces signed FP8 zero.
+        assert torch.count_nonzero(qout[0].float()) == 0
+        assert torch.count_nonzero(kout[0].float()) == 0
+        assert torch.count_nonzero(qout[1:rows].float()) > 0
 
     program.launch(*tensors, scalars=(7,))
     check(7)
