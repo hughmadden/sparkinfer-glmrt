@@ -59,7 +59,8 @@ def test_scale_load_widens_before_packed_page_stride(boundary, scorer):
             addresses.append(int(element) * 4)
             return 1.0
 
-    page = np.int32(boundary // (2112 * 4) + 13)
+    # CuTe strides are in elements: exercise overflow before the F32 byte conversion.
+    page = np.int32(boundary // 2112 + 13)
     for row in range(64):
         eval(load, dict(Int64=np.int64, k_scales=Scales(), page_id=page, scale_idx=np.int32(row)))
     expected = int(page) * 2112 * 4
