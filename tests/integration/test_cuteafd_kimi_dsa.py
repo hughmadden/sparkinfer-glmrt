@@ -136,7 +136,8 @@ def test_kimi_index_topk_matches_qdq_selection(mode, ties):
         scores = (torch.einsum("hd,jd->hj", queries[row].float(), key).relu()
                   * weights[row, :, None]).sum(0) * scale
         selected = torch.argsort(scores, descending=True, stable=True)[:2048]
-        expected = torch.sort(physical[selected].int()).values
+        # Canonical order is ascending logical token, mapped to physical slots.
+        expected = physical[torch.sort(selected).values].int()
         valid = output[row, :len(expected)]
         assert torch.equal(valid, expected), (mode, ties, length, program.geometry)
         assert torch.all(output[row, len(expected):] == -1)
