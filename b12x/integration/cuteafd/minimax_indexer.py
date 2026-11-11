@@ -202,9 +202,11 @@ class _Decode(_Index):
                                            block=(128, 1, 1), stream=stream)
         cache_bytes = cute.recast_ptr(index_k_cache, dtype=cutlass.Uint8)
         self.scorer(
-            self._tensor(cute.recast_ptr(q_fp8, dtype=cutlass.Uint8), (rows, 4, 128), (512, 128, 1)),
+            cute.recast_tensor(self._tensor(cute.recast_ptr(q_fp8, dtype=cutlass.Uint8),
+                (rows, 4, 128), (512, 128, 1)), cutlass.Uint8),
             self._tensor(weights, (rows, 4), (4, 1)),
-            self._tensor(cache_bytes, (Int32(pool_pages), 64, 128), (8448, 128, 1)),
+            cute.recast_tensor(self._tensor(cache_bytes,
+                (Int32(pool_pages), 64, 128), (8448, 128, 1)), cutlass.Uint8),
             self._tensor(cute.recast_ptr(controls + 2, dtype=Int64), (1,), (1,)),
             self._tensor(controls + 1, (1,), (1,)),
             self._tensor(cute.recast_ptr(cache_bytes + 8192, dtype=Float32),
@@ -245,7 +247,8 @@ class _Prefill(_Index):
         self.scorer(
             self._tensor(cute.recast_ptr(q_fp8, dtype=cutlass.Uint32), (rows, 4, 32), (128, 32, 1)),
             self._tensor(weights, (rows, 4), (4, 1)),
-            self._tensor(cute.recast_ptr(k_fp8, dtype=cutlass.Uint8), (padded_k_rows, 128), (128, 1)),
+            cute.recast_tensor(self._tensor(cute.recast_ptr(k_fp8, dtype=cutlass.Uint8),
+                (padded_k_rows, 128), (128, 1)), cutlass.Uint8),
             self._tensor(cute.recast_ptr(controls + 2, dtype=Int64), (1,), (1,)),
             self._tensor(k_scale, (padded_k_rows,), (1,)),
             self._tensor(k_start, (rows,), (1,)), self._tensor(k_end, (rows,), (1,)),

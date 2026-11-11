@@ -94,8 +94,9 @@ class _Attention:
             union_masks = self._tensor(masks, (work, 4, 128), (512, 128, 1))
             union_counts = self._tensor(counts, (work, 4), (4, 1))
         cache_layout = cute.make_layout((Int32(pool_pages), 64, 4, 128), stride=(32768, 512, 128, 1))
-        k = cute.make_tensor(cute.recast_ptr(key_cache, dtype=cutlass.Uint8), cache_layout)
-        v = cute.make_tensor(cute.recast_ptr(value_cache, dtype=cutlass.Uint8), cache_layout)
+        # Raw-pointer lowering erases byte signedness; restore it at the adapter boundary.
+        k = cute.recast_tensor(cute.make_tensor(key_cache, cache_layout), cutlass.Uint8)
+        v = cute.recast_tensor(cute.make_tensor(value_cache, cache_layout), cutlass.Uint8)
         dummy_float = self._tensor(cute.recast_ptr(zeros, dtype=cutlass.Float32), (1,), (1,))
         dummy_desc = self._tensor(cute.recast_ptr(zeros, dtype=Int64), (1,), (1,))
         self.forward(
