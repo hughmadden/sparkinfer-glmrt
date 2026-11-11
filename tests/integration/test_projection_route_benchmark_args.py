@@ -263,12 +263,60 @@ def test_kimi_decision_keeps_independent_projection_and_native_remainder_shapes(
     tree = ast.parse(source)
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                 and n.name == "benchmark_kimi_decision")
-    tuples = {ast.literal_eval(n) for n in ast.walk(node)
-              if isinstance(n, ast.Tuple) and all(isinstance(v, ast.Constant) for v in n.elts)}
-    assert ("kda", 24752) in tuples
-    assert ("gate_up", 6144) in tuples
+    assert '("kda", 6144, 4, range(4), 24752)' in ast.get_source_segment(source, node)
+    assert '("gate_up", 3072, 1, range(4, 6), 6144)' in ast.get_source_segment(source, node)
     assert 'outputs=176' in ast.get_source_segment(source, node)
     assert '"KDA and shared gate/up only, not a full-core speed estimate"' in source
+
+
+def _kimi_profile_fixture():
+    def entry(n, k, count, symbols):
+        return dict(device=0, lane="target", geometry=dict(n=n, k=k), phases=dict(decode=dict(
+            count=count, unit_count=255, unknown_rows=0, rows={"5": count}, symbols=symbols)))
+    catalog = [entry(24752, 7168, 5037, ["kda"]),
+               entry(6144, 7168, 8468, ["shared", "mla"]),
+               entry(7168, 3072, 6716, ["down"]), entry(9216, 1536, 1752, ["qb"])]
+    inventory = dict(phase="decode", unit="emitted-token", unit_count=255, kernels=[
+        dict(device=0, name="shared", count=3000, rows={"5": 3000}),
+        dict(device=0, name="shared", count=3716, rows={"5": 3716}),
+        dict(device=0, name="mla", count=1752, rows={"5": 1752}),
+        dict(device=1, name="shared", count=999, rows={"5": 999})])
+    return catalog, inventory
+
+
+def test_kimi_profile_accounting_separates_shared_gate_up_from_single_mla_gate():
+    catalog, inventory = _kimi_profile_fixture()
+    accounting = _native_threshold_bench().kimi_profile_accounting(catalog, inventory)
+    assert accounting["calls_per_emitted_token"] == dict(kda=5037 / 255, gate_up=6716 / 255)
+    assert accounting["symbols"] == {"packed shared gate/up": "shared", "single MLA h48 gate": "mla"}
+    assert accounting["shared_gate_up_count"] + accounting["mla_gate_count"] == accounting["mixed_count"]
+
+
+@pytest.mark.parametrize("bad", ["units", "missing_symbol", "count", "histogram", "unknown", "duplicate"])
+def test_kimi_profile_accounting_refuses_ambiguous_or_incomplete_data(bad):
+    catalog, inventory = _kimi_profile_fixture()
+    if bad == "units":
+        inventory["unit_count"] = 256
+    elif bad == "missing_symbol":
+        inventory["kernels"] = inventory["kernels"][:2]
+    elif bad == "count":
+        inventory["kernels"][0]["count"] -= 1
+    elif bad == "histogram":
+        inventory["kernels"][0]["rows"] = {"4": 3000}
+    elif bad == "unknown":
+        inventory["kernels"][0]["row_unknown"] = 1
+    elif bad == "duplicate":
+        catalog.append(catalog[0])
+    with pytest.raises(ValueError):
+        _native_threshold_bench().kimi_profile_accounting(catalog, inventory)
+
+
+def test_kimi_decision_requires_symbol_inventory_before_cuda(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path), "--kimi-decision",
+                                     "--fixture-dir", str(tmp_path), "--profile-catalog", "catalog.json"])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
 
 
 def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):

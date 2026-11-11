@@ -915,6 +915,58 @@ def encode_reference_fixtures(args):
     torch.cuda.synchronize()
 
 
+def kimi_profile_accounting(catalog, inventory):
+    """Disambiguate packed shared gate/up from the same-shaped single MLA gate."""
+    units = inventory.get("unit_count")
+    if inventory.get("phase") != "decode" or inventory.get("unit") != "emitted-token" or type(units) is not int or units <= 0:
+        raise ValueError("decode inventory must count emitted tokens")
+
+    def entry(n, k):
+        matches = [e for e in catalog if e.get("device") == 0 and e.get("lane") == "target"
+                   and (e.get("geometry") or {}).get("n") == n
+                   and e["geometry"].get("k") == k]
+        if len(matches) != 1:
+            raise ValueError(f"expected one GPU0 target profile entry for N{n}/K{k}")
+        phase = matches[0]["phases"]["decode"]
+        if phase["unit_count"] != units or phase.get("unknown_rows", 0):
+            raise ValueError("profile token counts or known-row coverage disagree")
+        count = phase["count"]
+        if type(count) is not int or count <= 0 or sum(phase["rows"].values()) != count:
+            raise ValueError("profile counts must equal the complete row histogram")
+        return phase
+
+    kda, mixed, down, qb = (entry(n, k) for n, k in
+                           ((24752, 7168), (6144, 7168), (7168, 3072), (9216, 1536)))
+    symbols = {}
+    for kernel in inventory["kernels"]:
+        if kernel.get("device") != 0 or kernel["name"] not in mixed["symbols"]:
+            continue
+        symbol = symbols.setdefault(kernel["name"], dict(count=0, rows={}))
+        if kernel.get("row_unknown", 0):
+            raise ValueError("mixed projection symbol has unknown rows")
+        symbol["count"] += kernel["count"]
+        for row, count in kernel["rows"].items():
+            symbol["rows"][row] = symbol["rows"].get(row, 0) + count
+    if len(symbols) != 2:
+        raise ValueError("mixed projection requires two independently identified symbols")
+    roles = {}
+    for role, reference in (("packed shared gate/up", down), ("single MLA h48 gate", qb)):
+        matches = [name for name, value in symbols.items()
+                   if value["count"] == reference["count"] and value["rows"] == reference["rows"]]
+        if len(matches) != 1:
+            raise ValueError(f"cannot disambiguate {role} from corroborating projection counts")
+        roles[role] = matches[0]
+    combined = {row: down["rows"].get(row, 0) + qb["rows"].get(row, 0)
+                for row in down["rows"].keys() | qb["rows"].keys()}
+    if (len(set(roles.values())) != 2 or mixed["count"] != down["count"] + qb["count"]
+            or mixed["rows"] != combined):
+        raise ValueError("mixed profile does not decompose into shared gate/up plus MLA gate")
+    return dict(calls_per_emitted_token=dict(kda=kda["count"] / units, gate_up=down["count"] / units),
+                emitted_tokens=units, mixed_count=mixed["count"],
+                shared_gate_up_count=down["count"], mla_gate_count=qb["count"], symbols=roles,
+                corroboration="shared down N7168/K3072; MLA q_b N9216/K1536; not names of the mixed weights")
+
+
 def benchmark_kimi_decision(args):
     """Full independent-projection launch sums, not concatenated trellis tensors."""
     import hashlib
@@ -978,15 +1030,9 @@ def benchmark_kimi_decision(args):
                 raise ValueError("six independent oracle-qualified fixtures required")
         report["metadata"]["fixture_manifests"] = fixture_records
         catalog = json.loads(args.profile_catalog.read_text())
-        calls_per_token = {}
-        for role, outputs in (("kda", 24752), ("gate_up", 6144)):
-            matches = [entry for entry in catalog if entry.get("device") == 0
-                       and entry.get("lane") == "target" and entry.get("geometry")
-                       and entry["geometry"].get("n") == outputs
-                       and entry["geometry"].get("k") == 7168]
-            if len(matches) != 1:
-                raise ValueError(f"expected one GPU0 target profile entry for {role}")
-            calls_per_token[role] = matches[0]["phases"]["decode"]["launches_per_unit"]
+        accounting = kimi_profile_accounting(catalog, json.loads(args.profile_inventory.read_text()))
+        calls_per_token = accounting["calls_per_emitted_token"]
+        report["metadata"]["profile_accounting"] = accounting
         report["metadata"]["profile_calls_per_emitted_token"] = calls_per_token
         report["metadata"]["projection_scope"] = "KDA and shared gate/up only, not a full-core speed estimate"
         torch.manual_seed(811)
@@ -1195,6 +1241,7 @@ def main():
     parser.add_argument("--kimi-decision", action="store_true", help="full K6/K8/BF16 KDA and gate/up launch sums")
     parser.add_argument("--fixture-dir", type=Path, help="independently reference-encoded K6/K8 fixture directory")
     parser.add_argument("--profile-catalog", type=Path, help="baseline kernel-catalog.json for per-emitted-token call counts")
+    parser.add_argument("--profile-inventory", type=Path, help="decode kernel-inventory.json disambiguating shared gate/up and MLA gate symbols")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.encoder_build_only:
@@ -1209,8 +1256,9 @@ def main():
         encode_reference_fixtures(args)
         return
     if args.kimi_decision:
-        if not args.compile_only and (args.fixture_dir is None or args.profile_catalog is None):
-            parser.error("--kimi-decision requires --fixture-dir and --profile-catalog")
+        if not args.compile_only and (args.fixture_dir is None or args.profile_catalog is None
+                                      or args.profile_inventory is None):
+            parser.error("--kimi-decision requires --fixture-dir, --profile-catalog and --profile-inventory")
         benchmark_kimi_decision(args)
         return
     if args.baseline_native:
