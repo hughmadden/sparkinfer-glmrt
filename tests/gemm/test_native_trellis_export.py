@@ -18,7 +18,7 @@ def offline_compiler():
                        101376, 102400, multiprocessing.Array("i", [0, 0]))
 
 
-@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("bits", list(range(1, 9)))
 @pytest.mark.parametrize("codebook", ["e4m3", "f16", "mcg", "mul1"])
 @pytest.mark.parametrize("side", [1, 2])
 def test_native_trellis_export(bits, codebook, side, tmp_path):
@@ -34,9 +34,8 @@ def test_native_trellis_export(bits, codebook, side, tmp_path):
     program.export_to_c(str(destination), stem, "cuteafd_" + stem)
     checked = validate_exported_header(program, destination / f"{stem}.h", "cuteafd_" + stem)
     assert checked["argument_count"] == 9
-    if bits == 6 and codebook in ("mcg", "mul1"):
-        from b12x.gemm.trellis_linear._native import K6_DECODE_ROUTE_THRESHOLDS
-        assert program.geometry["decode_route_thresholds"] == list(K6_DECODE_ROUTE_THRESHOLDS)
+    from b12x.gemm.trellis_linear._native import decode_route_thresholds
+    assert program.geometry["decode_route_thresholds"] == list(decode_route_thresholds(program.geometry))
     assert not torch.cuda.is_initialized()
 
 
@@ -79,18 +78,19 @@ def test_trellis_transform_export(kind, features, tmp_path):
     assert not torch.cuda.is_initialized()
 
 
+@pytest.mark.parametrize("bits", [6, 8])
 @pytest.mark.parametrize("codebook", ["mcg", "mul1"])
 @pytest.mark.parametrize("side", [1, 2])
-def test_grouped_native_trellis_export(codebook, side, tmp_path):
+def test_grouped_native_trellis_export(bits, codebook, side, tmp_path):
     import torch
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
     destination = Path(os.environ.get("TRELLIS_EXPORT_DIR", str(tmp_path)))
     destination.mkdir(parents=True, exist_ok=True)
-    stem = f"trellis_k6_{codebook}_s{side}_g4"
+    stem = f"trellis_k{bits}_{codebook}_s{side}_g4"
     with exportable_compilation():
         program = compile_trellis_linear_aot(input_features=7168, output_features=6144,
-            bits=6, codebook=codebook, sharded_side=side, rotation_count=4, max_rows=4096, groups=4)
+            bits=bits, codebook=codebook, sharded_side=side, rotation_count=4, max_rows=4096, groups=4)
     program.export_to_c(str(destination), stem, "cuteafd_" + stem)
     checked = validate_exported_header(program, destination / f"{stem}.h", "cuteafd_" + stem)
     assert checked["argument_count"] == 18

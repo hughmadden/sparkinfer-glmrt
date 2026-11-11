@@ -6644,6 +6644,63 @@ def trellis_align_stream_u32x2(z0, z1, z2, shift, word_delta, *, loc=None, ip=No
 
 
 @dsl_user_op
+def packed_dequant_trellis_highrate_to_half2x4(
+    first, middle, last, shift, bits: int, mul1: bool = False, *, loc=None, ip=None
+):
+    """Decode K7/K8's 65/72-bit span without truncating the oldest state.
+
+    Ring words are MSB-first: ``last`` contains the newest bits. ``shift``
+    aligns its last state; the complete span always occupies three words.
+    """
+    bits = int(bits)
+    if bits not in (7, 8):
+        raise ValueError("high-rate trellis requires K7 or K8")
+    lines = []
+    for index in range(8):
+        offset = (7 - index) * bits
+        # The runtime alignment is 0..31; extract from a 96-bit ring span.
+        lines.extend((f"add.u32 amount, $7, {offset};",
+                      "setp.ge.u32 upper, amount, 32;",
+                      "selp.b32 low, $5, $6, upper;",
+                      "selp.b32 high, $4, $5, upper;",
+                      "setp.ge.u32 upper, amount, 64;",
+                      "selp.b32 low, $4, low, upper;",
+                      "selp.b32 high, 0, high, upper;",
+                      "and.b32 amount, amount, 31;",
+                      f"shf.r.wrap.b32 w{index}, low, high, amount;",
+                      f"and.b32 w{index}, w{index}, 0xffff;"))
+        if mul1:
+            lines.extend((f"mul.lo.u32 w{index}, w{index}, {_TRELLIS_MUL1:#x};",
+                          f"dp4a.u32.u32 w{index}, w{index}, ones, acc;"))
+        else:
+            lines.extend((f"mul.lo.u32 w{index}, w{index}, {_TRELLIS_MCG:#x};",
+                          f"lop3.b32 w{index}, w{index}, {_TRELLIS_MASK:#x}, {_TRELLIS_OR:#x}, 0x6a;"))
+    for pair in range(4):
+        lines.append(f"prmt.b32 low, w{2*pair}, w{2*pair+1}, 0x5410;")
+        if mul1:
+            lines.append(f"fma.rn.f16x2 ${pair}, low, kinv, kbias;")
+        else:
+            lines.extend((f"prmt.b32 high, w{2*pair}, w{2*pair+1}, 0x7632;",
+                          f"add.rn.f16x2 ${pair}, low, high;"))
+    asm = """{
+        .reg .pred upper;
+        .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7,low,high,amount,ones,acc,kinv,kbias;
+        mov.b32 ones, 0x01010101;
+        mov.b32 acc, 0x00006400;
+        mov.b32 kinv, 0x1eee1eee;
+        mov.b32 kbias, 0xc931c931;
+    """ + "\n".join(lines) + "\n}"
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Uint32(value).ir_value(loc=loc, ip=ip) for value in (first, middle, last, shift)],
+        asm, "=r,=r,=r,=r,r,r,r,r", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+                 for i in range(4))
+
+
+@dsl_user_op
 def packed_dequant_trellis_mul1_to_half2x4(
     win_a, win_b, bits: int, *, loc=None, ip=None
 ):
@@ -6653,8 +6710,8 @@ def packed_dequant_trellis_mul1_to_half2x4(
     K2--K5 take two four-weight windows; K6 takes aligned low/high words.
     """
     bits = int(bits)
-    if bits not in (2, 3, 4, 5, 6):
-        raise ValueError("MUL1 supports only K2--K6")
+    if bits not in (1, 2, 3, 4, 5, 6):
+        raise ValueError("MUL1 supports only K1--K6")
     lines = []
     for index in range(8):
         if bits == 6:
@@ -7742,9 +7799,9 @@ def packed_dequant_trellis_to_half2x4(
     whose full eight-weight span can cross three ring words.
     """
     bits = int(bits)
-    if bits not in (2, 3, 4, 5, 6):
+    if bits not in (1, 2, 3, 4, 5, 6):
         raise ValueError(
-            f"unsupported trellis bitrate {bits}; expected 2, 3, 4, 5, or 6"
+            f"unsupported trellis bitrate {bits}; expected 1, 2, 3, 4, 5, or 6"
         )
     asm = """
         {
@@ -7809,9 +7866,9 @@ def packed_dequant_trellis_stream_to_half2x4(
     34 bits and cannot be represented by one 32-bit base window.
     """
     bits = int(bits)
-    if bits not in (2, 3, 4, 5, 6):
+    if bits not in (1, 2, 3, 4, 5, 6):
         raise ValueError(
-            f"unsupported trellis bitrate {bits}; expected 2, 3, 4, 5, or 6"
+            f"unsupported trellis bitrate {bits}; expected 1, 2, 3, 4, 5, or 6"
         )
     asm = """
         {

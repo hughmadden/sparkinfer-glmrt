@@ -39,9 +39,10 @@ class Case:
                             scalars=(rows, rotation, limit))
 
 
-@pytest.mark.parametrize("side,bits,codebook", [(1, 4, "e4m3"), (2, 4, "e4m3"), (1, 2, "e4m3"), (2, 3, "e4m3"), (1, 4, "f16"), (2, 3, "f16"), *[(side, bits, cb) for side in (1, 2) for bits in (2, 3, 4, 5, 6) for cb in ("mcg", "mul1")]])
-def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
-    c = Case(side=side, bits=bits, codebook=codebook)
+@pytest.mark.parametrize("side,bits,codebook", [(1, 4, "e4m3"), (2, 4, "e4m3"), (1, 2, "e4m3"), (2, 3, "e4m3"), (1, 4, "f16"), (2, 3, "f16"), *[(side, bits, cb) for side in (1, 2) for bits in range(1, 9) for cb in ("mcg", "mul1")]])
+@pytest.mark.parametrize("input_dtype", ["f16", "bf16"])
+def test_accuracy_rows_and_cta_invariance(side, bits, codebook, input_dtype):
+    c = Case(side=side, bits=bits, codebook=codebook, input_dtype=input_dtype)
     c.launch(64, rotation=0)
     other_expected = c.output[:64].clone()
     other_ref = c.other_x[:64].double() @ c.weight.double()
@@ -105,7 +106,7 @@ def test_graph_replay_and_invalid_launch():
         assert torch.isnan(c.output).all()
 
 
-@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("bits", list(range(1, 9)))
 @pytest.mark.parametrize("codebook", ["e4m3", "f16", "mcg", "mul1"])
 def test_bit_exact_decode(bits, codebook):
     import cutlass
@@ -302,7 +303,7 @@ def test_kimi_shapes(k, n, side, bits, codebook):
                                    x[chosen].double() @ weight.double(), rtol=2e-4, atol=2e-5)
 
 
-@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("bits", list(range(1, 9)))
 @pytest.mark.parametrize("codebook", ["e4m3", "f16", "mcg", "mul1"])
 def test_geometry_codebooks(bits, codebook):
     from b12x.integration.cuteafd.trellis_linear import geometry
@@ -449,7 +450,7 @@ def test_grouped_geometry_fails_closed(groups, rotation_count):
 
 
 @pytest.mark.parametrize("side", [1, 2])
-@pytest.mark.parametrize("bits", [5, 6])
+@pytest.mark.parametrize("bits", [5, 6, 8])
 @pytest.mark.parametrize("codebook", ["mcg", "mul1"])
 @pytest.mark.parametrize("input_dtype", ["f16", "bf16"])
 @pytest.mark.parametrize("k,n", [(1152, 256), pytest.param(7168, 6144,
