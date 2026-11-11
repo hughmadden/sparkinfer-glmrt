@@ -677,3 +677,41 @@ def test_msa_contiguous_block_scores_graph_replay_tracks_live_weights() -> None:
     )
     torch.testing.assert_close(block_scores, expected1, atol=1e-4, rtol=1e-4)
     assert compile_cache_info()["compile_misses"] == warm_compile_misses
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for physical-page addressing")
+@pytest.mark.parametrize("boundary", [2**31, 2**32])
+@pytest.mark.parametrize("rows,width,route", [(1, 2, "persistent"),
+                                             (1, 1024, "single"), (4, 1024, "multi")])
+def test_scalar_paged_scorers_read_high_recycled_pages(monkeypatch, boundary, rows, width, route):
+    from b12x.attention.dsa_indexer import kernel
+    from b12x.attention.dsa_indexer._impl import build_paged_mqa_schedule_metadata
+
+    clear_indexer_caches()
+    device = torch.device("cuda")
+    first = boundary // 8448 + 3
+    cache = torch.empty((first + 2, 8448), dtype=torch.uint8, device=device)
+    # Initialize only the two live pages; the large untouched prefix models a recycled pool.
+    cache[first:, :8192].copy_(torch.ones((2, 8192), dtype=torch.float32, device=device)
+                              .to(torch.float8_e4m3fn).view(torch.uint8))
+    scales = torch.tensor([0.25, 0.5], dtype=torch.float32, device=device)
+    cache[first:, 8192:].copy_(scales[:, None].expand(2, 64).contiguous().view(torch.uint8))
+    table = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    table[:, :2] = torch.tensor([first, first + 1], dtype=torch.int32, device=device)
+    lengths = torch.full((rows,), 65, dtype=torch.int32, device=device)
+    schedule = build_paged_mqa_schedule_metadata(lengths, 64)
+    q = torch.ones((rows, 4, 128), dtype=torch.float32, device=device).to(torch.float8_e4m3fn)
+    weights = torch.ones((rows, 4), dtype=torch.float32, device=device)
+    # Large caches normally choose TMA; explicitly qualify the shared scalar fallback.
+    monkeypatch.setattr(kernel, "_needs_paged_index_k_scalar_load", lambda *args: True)
+    assert ("single" if kernel._should_use_schedule_single_row_kernel(q_rows=rows, max_pages=width)
+            else "multi" if kernel._should_use_schedule_multi_row_kernel(q_rows=rows, max_pages=width)
+            else "persistent") == route
+    actual = kernel.run_paged_logits_kernel(
+        q_fp8=q, weights=weights, index_k_cache=cache, real_page_table=table,
+        seqlens_per_query=lengths, schedule_metadata=schedule)
+    torch.cuda.synchronize()
+    expected = torch.full((rows, 65), 128.0, dtype=torch.float32, device=device)
+    expected[:, 64] = 256.0
+    torch.testing.assert_close(actual[:, :65], expected, atol=0, rtol=0)
+    assert torch.isneginf(actual[:, 65:]).all()

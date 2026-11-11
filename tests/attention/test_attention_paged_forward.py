@@ -1309,6 +1309,31 @@ def test_paged_forward_matches_reference_extend_with_relative_bias() -> None:
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("length", [65, 72, 80, 96, 129, 204, 257])
+@pytest.mark.parametrize("q_heads,kv_heads", [(32, 4), (24, 2)])
+def test_fp8_dense_extend_preserves_full_pages_before_partial_tail(length, q_heads, kv_heads) -> None:
+    """Generic GQA and exact Qwen4 geometry; not the engine's selected-position route."""
+    require_b12x()
+    q, k, v, table, lengths, cu = _make_inputs(
+        q_seqlens=[1], cache_seqlens=[length], q_heads=q_heads, kv_heads=kv_heads,
+        head_dim_qk=256, head_dim_vo=256, dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16)
+    k, v, ks, vs = quantize_paged_kv_cache_e4m3(k, v, table, lengths)
+    workspace = _make_workspace(q, k, v, mode="extend")
+    workspace.prepare(table, lengths, cu)
+    traits = select_paged_forward_traits_from_plan(workspace.plan)
+    assert traits.num_warps_kv > 1
+    assert not workspace.plan.msa_block_sparse
+    output, lse = workspace.run(q, k, v, output=torch.empty_like(q), k_descale=ks, v_descale=vs)
+    expected, expected_lse = paged_attention_reference(
+        q, k, v, table, lengths, cu, k_descale=ks, v_descale=vs, causal=True)
+    torch.cuda.synchronize()
+    assert (output - expected).abs().max().item() <= .05
+    assert (lse * math.log(2.) - expected_lse).abs().max().item() <= .08
+    assert _cosine_similarity(output, expected) >= .999
+
+
+@torch.inference_mode()
 def test_paged_forward_matches_reference_with_fp8_kv_extend() -> None:
     require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(

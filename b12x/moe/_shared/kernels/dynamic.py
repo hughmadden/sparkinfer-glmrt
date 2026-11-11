@@ -113,6 +113,7 @@ from b12x._lib.intrinsics import (
     scatter_add_bf16x2,
     scatter_add_v4_bf16x2,
 )
+from b12x._lib.activation import gated_activation_value
 from b12x.moe._shared.kernels.activations import (
     SITU,
     SITU_DEFAULT_BETA,
@@ -1806,38 +1807,13 @@ class MoEDynamicKernelBackend:
 
     @cute.jit
     def _gated_activation_value(self, gate: cutlass.Float32, up: cutlass.Float32):
-        if cutlass.const_expr(self.is_v41):
-            gate = gate.to(cutlass.BFloat16).to(cutlass.Float32)
-            up = up.to(cutlass.BFloat16).to(cutlass.Float32)
-        if cutlass.const_expr(self.has_swiglu_limit):
-            limit = cutlass.Float32(self.swiglu_limit)
-            neg_limit = cutlass.Float32(-self.swiglu_limit)
-            if gate > limit:
-                gate = limit
-            if up > limit:
-                up = limit
-            if up < neg_limit:
-                up = neg_limit
-        sigmoid_arg = gate
-        up_term = up
-        if cutlass.const_expr(self.is_swigluoai):
-            sigmoid_arg = cutlass.Float32(self.swiglu_alpha) * gate
-            up_term = up + cutlass.Float32(self.swiglu_beta)
-        sigmoid = cute.arch.rcp_approx(
-            cutlass.Float32(1.0) + cute.math.exp(-sigmoid_arg, fastmath=self.fast_math)
+        return gated_activation_value(
+            gate, up, is_v41=self.is_v41, has_limit=self.has_swiglu_limit,
+            limit_value=self.swiglu_limit, is_swigluoai=self.is_swigluoai,
+            alpha=self.swiglu_alpha, offset=self.swiglu_beta, is_situ=self.is_situ,
+            situ_beta=SITU_DEFAULT_BETA, situ_linear_beta=SITU_DEFAULT_LINEAR_BETA,
+            fast_math=self.fast_math,
         )
-        if cutlass.const_expr(self.is_situ):
-            beta = cutlass.Float32(SITU_DEFAULT_BETA)
-            linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
-            situ_gate = (
-                beta * cute.math.tanh(gate / beta, fastmath=self.fast_math) * sigmoid
-            )
-            situ_up = linear_beta * cute.math.tanh(
-                up / linear_beta,
-                fastmath=self.fast_math,
-            )
-            return situ_gate * situ_up
-        return gate * sigmoid * up_term
 
     @cute.jit
     def _resident_grid_barrier(
