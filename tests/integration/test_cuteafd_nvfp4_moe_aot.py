@@ -382,6 +382,9 @@ def test_nvfp4_sparse_tiles_reuse_and_graph(monkeypatch, activation):
         with torch.cuda.graph(graph):
             run()
         graph.replay()
+        if activation == "swigluoai":
+            x.neg_()
+            graph.replay()
         torch.cuda.synchronize()
         assert pointers == tuple(t.data_ptr() for t in (x, ids, weights, *w, out, scratch))
         separate_out.fill_(float("nan"))
