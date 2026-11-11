@@ -44,7 +44,7 @@ def test_invalid_scale_policy(kwargs):
 def test_kimi_index_post_explicit_qdq_abi():
     tree = ast.parse((ROOT / "kimi_dsa.py").read_text())
     nodes = [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))]
-    ns = dict(dataclass=dataclass, math=math, GlmIndexPost=constructor(),
+    ns = dict(dataclass=dataclass, math=math, GlmIndexPost=constructor(), _IndexProducer=object,
         torch=SimpleNamespace(bfloat16="bf16", int64="i64", float32="f32", uint8="u8", float8_e4m3fn="e4m3"),
         Operand=lambda *args, **kwargs: (args, kwargs), Scalar=lambda name: name,
         compile_program=lambda launch, **kwargs: dict(launch=launch, **kwargs))

@@ -16,6 +16,7 @@ import torch
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import GlmIndexPost
 from .glm_indexer import compile_glm_index_topk_aot
+from .glm_attention import _IndexProducer, index_producer_scratch_bytes
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,13 @@ class KimiDsaGeometry:
         return self.page_rows * (self.index_head_dim + 4)
 
 
+def _post(g):
+    return GlmIndexPost(heads=g.index_heads, eps=g.index_norm_eps,
+        weight_scale=g.index_heads ** -0.5 * g.index_head_dim ** -0.5,
+        page_rows=g.page_rows, rope=False, scale_format="ue8m0",
+        query_amax_floor=1e-10, key_amax_floor=1e-4)
+
+
 def compile_kimi_index_post_aot(g=KimiDsaGeometry(), *, max_rows=64):
     """Projected BF16 iq/kw -> E4M3 queries, folded weights, paged keys/scales.
 
@@ -48,10 +56,7 @@ def compile_kimi_index_post_aot(g=KimiDsaGeometry(), *, max_rows=64):
     """
     if not 1 <= int(max_rows) <= 4096:
         raise ValueError("indexer row capacity must be in 1..4096")
-    launch = GlmIndexPost(heads=g.index_heads, eps=g.index_norm_eps,
-        weight_scale=g.index_heads ** -0.5 * g.index_head_dim ** -0.5,
-        page_rows=g.page_rows, rope=False, scale_format="ue8m0",
-        query_amax_floor=1e-10, key_amax_floor=1e-4)
+    launch = _post(g)
     operands = (
         Operand("iq", torch.bfloat16, "[rows,32,128]"),
         Operand("kw", torch.bfloat16, "[rows,160]"),
@@ -70,6 +75,45 @@ def compile_kimi_index_post_aot(g=KimiDsaGeometry(), *, max_rows=64):
                   "scale_format": "ue8m0", "scale_storage": "float32",
                   "query_amax_floor": 1e-10, "key_amax_floor": 1e-4},
         doc=compile_kimi_index_post_aot.__doc__)
+
+
+class _KimiIndexProducer(_IndexProducer):
+    def __init__(self, g):
+        super().__init__(g)
+        self.post = _post(g)
+
+
+def compile_kimi_index_producer_aot(g=KimiDsaGeometry(), *, max_rows=64):
+    """Native BF16 projections and NoPE QDQ over the shared index producer.
+
+    w_ik concatenates native wk and weights_proj rows. q_resid is the MLA
+    producer's normalized q-LoRA output; no extra query normalization occurs.
+    """
+    if not 1 <= int(max_rows) <= 4096:
+        raise ValueError("indexer row capacity must be in 1..4096")
+    launch = _KimiIndexProducer(g)
+    operands = (
+        Operand("x", torch.bfloat16, "[rows,7168]"),
+        Operand("q_resid", torch.bfloat16, "[rows,1536]"),
+        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("index_slots", torch.int64, "[rows]", align=8),
+        Operand("cos_sin", torch.float32, "[P,64]", align=4),
+        Operand("w_iq", torch.bfloat16, "[4096,1536]"),
+        Operand("w_ik", torch.bfloat16, "[160,7168]"),
+        Operand("k_norm_w", torch.bfloat16, "[128]"),
+        Operand("k_norm_b", torch.bfloat16, "[128]"),
+        Operand("index_cache", torch.uint8, "[pages,8448]", "inout"),
+        Operand("q_fp8", torch.float8_e4m3fn, "[rows,32,128]", "out"),
+        Operand("head_weights", torch.float32, "[rows,32]", "out"),
+        Operand("scratch", torch.uint8, "[index_producer_scratch_bytes]", "scratch"),
+    )
+    return compile_program(launch, name="kimi_index_producer", operands=operands,
+        scalars=(Scalar("rows"),), key=(g, int(max_rows), launch.key(), "ue8m0"),
+        geometry={**vars(g), "max_rows": int(max_rows), "rope": False,
+                  "scale_format": "ue8m0", "scale_storage": "float32",
+                  "query_amax_floor": 1e-10, "key_amax_floor": 1e-4},
+        scratch={"scratch": lambda rows: index_producer_scratch_bytes(g, rows)},
+        doc=compile_kimi_index_producer_aot.__doc__)
 
 
 def compile_kimi_index_topk_aot(g=KimiDsaGeometry(), *, max_rows, max_pages, mode="decode"):
@@ -105,6 +149,6 @@ def compile_kimi_sparse_mla_aot(g=None, *, max_rows=64):
         scalars=(Scalar("rows"), Scalar("requests"), Scalar("table_stride", "int64"), Scalar("active_splits")),
         key=(g, int(max_rows), "selected-token-gather"),
         geometry={**vars(g), **launch.layout, "max_rows": int(max_rows), "topk": 2048,
-                  "page_size": 1, "lse_base": 2},
+                  "page_size": 1, "lse_base": "e"},
         scratch={"scratch": lambda rows: launch.layout["scratch_bytes"]},
         doc=compile_kimi_sparse_mla_aot.__doc__)

@@ -1,6 +1,4 @@
 """K3.1 index post against the pinned non-MX vLLM QDQ arithmetic."""
-import math
-
 import pytest
 import torch
 
@@ -145,16 +143,68 @@ def test_kimi_index_topk_matches_qdq_selection(mode, ties):
         assert torch.all(output[row, len(expected):] == -1)
 
 
+@pytest.mark.parametrize("rows", [1, 17, 64])
+def test_kimi_native_index_projections_and_post(rows):
+    require_b12x()
+    from b12x.integration.cuteafd.kimi_dsa import compile_kimi_index_producer_aot, compile_kimi_index_post_aot
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    torch.manual_seed(7331)
+    p = compile_kimi_index_producer_aot(max_rows=64)
+    x = torch.randn(rows, 7168, device="cuda").bfloat16()
+    q_resid = (torch.randn(rows, 1536, device="cuda") * 0.25).bfloat16()
+    wq = (torch.randn(4096, 1536, device="cuda") / 40).bfloat16()
+    wk = (torch.randn(160, 7168, device="cuda") / 85).bfloat16()
+    norm = torch.randn(128, device="cuda").bfloat16()
+    bias = torch.randn(128, device="cuda").bfloat16()
+    positions = torch.zeros(rows, device="cuda", dtype=torch.int64)
+    slots = torch.arange(rows, device="cuda", dtype=torch.int64)
+    cs = torch.zeros(64, device="cuda")
+    cache = torch.full((1, 8448), 123, device="cuda", dtype=torch.uint8)
+    query = torch.empty(rows, 32, 128, device="cuda", dtype=torch.float8_e4m3fn)
+    weights = torch.empty(rows, 32, device="cuda")
+    scratch = torch.empty(p.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
+    args = (x, q_resid, positions, slots, cs, wq, wk, norm, bias, cache, query, weights, scratch)
+    p.launch(*args, scalars=(rows,))
+    torch.cuda.synchronize()
+    # Read the shared producer's native projected rows, before exact QDQ.
+    iq_bytes = rows * 4096 * 2
+    kw_start = (iq_bytes + 1023) // 1024 * 1024
+    iq = scratch[:iq_bytes].view(torch.bfloat16).reshape(rows, 32, 128)
+    kw = scratch[kw_start:kw_start + rows * 160 * 2].view(torch.bfloat16).reshape(rows, 160)
+    torch.testing.assert_close(iq.float().flatten(1), q_resid.float() @ wq.float().T, rtol=0.01, atol=0.004)
+    torch.testing.assert_close(kw.float(), x.float() @ wk.float().T, rtol=0.01, atol=0.016)
+    expected_cache = torch.full_like(cache, 123)
+    expected_query = torch.empty_like(query)
+    expected_weights = torch.empty_like(weights)
+    post = compile_kimi_index_post_aot(max_rows=64)
+    post.launch(iq, kw, positions, slots, cs, norm, bias, expected_query, expected_weights,
+                expected_cache, scalars=(rows,))
+    torch.cuda.synchronize()
+    assert torch.equal(cache, expected_cache)
+    assert torch.equal(query.view(torch.uint8), expected_query.view(torch.uint8))
+    assert torch.equal(weights, expected_weights)
+    graph = torch.cuda.CUDAGraph()
+    with kernel_resolution_guard("native Kimi indexer precompiled"), torch.cuda.graph(graph):
+        p.launch(*args, scalars=(rows,))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(cache, expected_cache)
+    assert torch.equal(query.view(torch.uint8), expected_query.view(torch.uint8))
+    assert torch.equal(weights, expected_weights)
+
+
 @pytest.mark.parametrize("cache_format", ["bf16", "fp8"])
 @pytest.mark.parametrize("rows", [1, 5])
-def test_kimi_sparse_mla_selected_tokens(cache_format, rows):
+@pytest.mark.parametrize("heads", [48, 96])
+def test_kimi_sparse_mla_selected_tokens(cache_format, rows, heads):
     require_b12x()
     from b12x.integration.cuteafd.kimi_dsa import compile_kimi_sparse_mla_aot
     from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry
     from b12x._lib.runtime_control import kernel_resolution_guard
 
     torch.manual_seed(7321)
-    g = KimiMlaGeometry(name="kimi_k31_mla", heads=48, norm_eps=1e-5, kv_cache=cache_format)
+    g = KimiMlaGeometry(name="kimi_k31_mla", heads=heads, norm_eps=1e-5, kv_cache=cache_format)
     p = compile_kimi_sparse_mla_aot(g, max_rows=64)
     tokens = 4096
     records = torch.randn(tokens, 576, device="cuda").bfloat16()
@@ -174,10 +224,10 @@ def test_kimi_sparse_mla_selected_tokens(cache_format, rows):
     indices = torch.full((rows, 2048), -1, device="cuda", dtype=torch.int32)
     for row, length in enumerate(lengths.tolist()):
         indices[row, :length] = torch.sort(torch.randperm(tokens - 1, device="cuda")[:length] + 1).values.int()
-    query = torch.randn(rows, 48, 576, device="cuda").bfloat16()
+    query = torch.randn(rows, heads, 576, device="cuda").bfloat16()
     offsets = torch.arange(rows + 1, device="cuda", dtype=torch.int32)
-    output = torch.empty(rows, 48, 512, device="cuda", dtype=torch.bfloat16)
-    lse = torch.empty(rows, 48, device="cuda")
+    output = torch.empty(rows, heads, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(rows, heads, device="cuda")
     scratch = torch.empty(p.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
     args = (query, cache, indices, lengths, offsets, output, lse, scratch)
     scalars = (rows, rows, 2048, p.geometry["num_splits"])
@@ -188,7 +238,7 @@ def test_kimi_sparse_mla_selected_tokens(cache_format, rows):
         scores = query[row].float() @ kv.T * (192 ** -0.5)
         expected = scores.softmax(-1) @ kv[:, :512]
         torch.testing.assert_close(output[row].float(), expected, rtol=0.035, atol=0.012)
-        torch.testing.assert_close(lse[row], scores.logsumexp(-1) / math.log(2), rtol=3e-4, atol=3e-4)
+        torch.testing.assert_close(lse[row], scores.logsumexp(-1), rtol=3e-4, atol=3e-4)
     before = output.clone()
     graph = torch.cuda.CUDAGraph()
     with kernel_resolution_guard("selected Kimi MLA precompiled"), torch.cuda.graph(graph):
