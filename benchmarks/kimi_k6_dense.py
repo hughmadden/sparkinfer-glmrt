@@ -1394,6 +1394,9 @@ def benchmark_kimi_full_core(args):
             graphs, events = {}, {}
             for arm in arms:
                 targets = [baseline_final] if arm in ("native","bf16") else finals[arm]+([remainder_out] if remainder else [])
+                if role == "mla_uk":
+                    # UK writes the 512 latent columns, not each head's 64-column key tail.
+                    targets = [baseline_final.view(capacity,48,576)[:,:,:512]]
                 run(arm,rows)
                 expected = [t[:rows].clone() for t in targets]
                 graph = torch.cuda.CUDAGraph()
