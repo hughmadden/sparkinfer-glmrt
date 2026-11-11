@@ -1,0 +1,75 @@
+"""CPU export contracts; GPU QDQ and binary identity are separate gates."""
+import ast
+from dataclasses import dataclass
+import math
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1] / "b12x/integration/cuteafd"
+
+
+def constructor():
+    tree = ast.parse((ROOT / "_glm_kernels.py").read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "GlmIndexPost")
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    wrapper = ast.ClassDef(name="Core", bases=[], keywords=[], body=[init], decorator_list=[])
+    ns = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), "index", "exec"), ns)
+    return ns["Core"]
+
+
+def test_index_scale_policy_defaults_preserve_glm():
+    core = constructor()(heads=32, eps=1e-5, weight_scale=1.0)
+    assert (core.scale_format, core.query_amax_floor, core.key_amax_floor) == ("fp32", 0.0, 0.0)
+    assert core.page_bytes == 8448 and core.rope
+    tree = ast.parse((ROOT / "_glm_kernels.py").read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "GlmIndexPost")
+    gates = [n for n in ast.walk(cls) if isinstance(n, ast.If)
+             and ast.unparse(n.test) == "cutlass.const_expr(self.scale_format == 'ue8m0')"]
+    assert len(gates) == 2
+    for gate in gates:
+        assert len(gate.orelse) == 1
+        assert ast.unparse(gate.orelse[0]) == "scale = _fp8_scale(_warp_max(local))"
+
+
+@pytest.mark.parametrize("kwargs", [dict(scale_format="other"), dict(scale_format="ue8m0"),
+    dict(query_amax_floor=1e-10), dict(key_amax_floor=-1), dict(key_amax_floor=float("nan"))])
+def test_invalid_scale_policy(kwargs):
+    with pytest.raises(ValueError):
+        constructor()(heads=32, eps=1e-5, weight_scale=1.0, **kwargs)
+
+
+def test_kimi_index_post_explicit_qdq_abi():
+    tree = ast.parse((ROOT / "kimi_dsa.py").read_text())
+    nodes = [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))]
+    ns = dict(dataclass=dataclass, math=math, GlmIndexPost=constructor(),
+        torch=SimpleNamespace(bfloat16="bf16", int64="i64", float32="f32", uint8="u8", float8_e4m3fn="e4m3"),
+        Operand=lambda *args, **kwargs: (args, kwargs), Scalar=lambda name: name,
+        compile_program=lambda launch, **kwargs: dict(launch=launch, **kwargs))
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "kimi", "exec"), ns)
+    result = ns["compile_kimi_index_post_aot"](max_rows=4096)
+    core = result["launch"]
+    assert (core.scale_format, core.query_amax_floor, core.key_amax_floor) == ("ue8m0", 1e-10, 1e-4)
+    assert core.page_bytes == 8448 and not core.rope
+    assert result["scalars"] == ("rows",)
+    assert result["geometry"]["scale_storage"] == "float32"
+    assert [op[0][0] for op in result["operands"]] == ["iq", "kw", "positions", "slots", "cos_sin",
+        "k_weight", "k_bias", "q_fp8", "head_weights", "cache"]
+    for eps in (0, -1, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            ns["KimiDsaGeometry"](index_norm_eps=eps)
+
+
+def test_kimi_rank_norm_accepts_checkpoint_epsilon_without_changing_k3_default():
+    tree = ast.parse((ROOT / "kimi_mla.py").read_text())
+    geometry = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "KimiMlaGeometry")
+    ns = dict(dataclass=dataclass, math=math)
+    exec(compile(ast.Module(body=[geometry], type_ignores=[]), "mla", "exec"), ns)
+    cls = ns["KimiMlaGeometry"]
+    assert cls().norm_eps == 1e-6
+    assert cls(norm_eps=1e-5).norm_eps == 1e-5
+    for eps in (0, -1, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            cls(norm_eps=eps)
