@@ -1,6 +1,7 @@
 """MiniMax producer block oracles; native helpers, live-size reuse and replay."""
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,11 +24,21 @@ def _reference(x, weight, positions, cs):
 
 
 def _quantize(value):
-    value = value.float()
-    maximum = value.abs().amax(-1, keepdim=True)
-    scale = torch.where(maximum > 0, maximum / 448.0, 1.0)
-    inverse = 1.0 / scale
-    return (value * inverse).clamp(-448, 448).to(torch.float8_e4m3fn), scale.squeeze(-1)
+    # CPU FP32 division is RN, unlike Torch CUDA's approximate reciprocal.
+    values = value.float().cpu().numpy()
+    maximum = np.abs(values).max(-1, keepdims=True)
+    scale = np.where(maximum > 0, maximum / np.float32(448), np.float32(1))
+    inverse = np.float32(1) / scale
+    packed = torch.from_numpy(values * inverse).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return packed.to(value.device), torch.from_numpy(scale.squeeze(-1)).to(value.device)
+
+
+def _equal_except_signed_zero(actual, expected):
+    a, b = actual.view(torch.uint8), expected.view(torch.uint8)
+    different = a != b
+    zero = ((a & 127) == 0) & ((b & 127) == 0)
+    assert not (different & ~zero).any()
+    return int((different & zero).sum().item())
 
 
 @pytest.mark.parametrize("heads", [1, 4, 64])
@@ -119,8 +130,8 @@ def test_index_producer_plain_scales_zero_rows_negative_slots_and_replay(big_pag
         actual_k = scratch[k_at:k_at + rows * 128].reshape(rows, 128)
         exact_q, exact_qs = _quantize(actual_q)
         exact_k, exact_ks = _quantize(actual_k)
-        assert torch.equal(qout[:rows].view(torch.uint8), exact_q.view(torch.uint8))
-        assert torch.equal(kout[:rows].view(torch.uint8), exact_k.view(torch.uint8))
+        _equal_except_signed_zero(qout[:rows], exact_q)
+        _equal_except_signed_zero(kout[:rows], exact_k)
         assert torch.equal(qs[:rows], exact_qs) and torch.equal(ks[:rows], exact_ks)
         assert (qs[0] == 1).all() and ks[0] == 1
         # Negating zero inputs on replay legitimately produces signed FP8 zero.
@@ -137,9 +148,20 @@ def test_index_producer_plain_scales_zero_rows_negative_slots_and_replay(big_pag
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             program.launch(*tensors, scalars=(7,))
+        eager_q, eager_k, eager_qs, eager_ks = [t.clone() for t in (qout, kout, qs, ks)]
+        graph.replay()
+        assert torch.equal(qs, eager_qs) and torch.equal(ks, eager_ks)
+        signs = _equal_except_signed_zero(qout, eager_q) + _equal_except_signed_zero(kout, eager_k)
+        print(f"big_page={big_page} eager/replay signed-zero differences={signs}")
+        check(7)
         iq.neg_()
         ik.neg_()
+        program.launch(*tensors, scalars=(7,))
+        eager_q, eager_k, eager_qs, eager_ks = [t.clone() for t in (qout, kout, qs, ks)]
         graph.replay()
+        assert torch.equal(qs, eager_qs) and torch.equal(ks, eager_ks)
+        signs = _equal_except_signed_zero(qout, eager_q) + _equal_except_signed_zero(kout, eager_k)
+        print(f"big_page={big_page} mutated eager/replay signed-zero differences={signs}")
         check(7)
     assert pointers == [t.data_ptr() for t in tensors]
 
