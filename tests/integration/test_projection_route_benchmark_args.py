@@ -250,6 +250,27 @@ def test_reference_fixtures_require_prebuilt_official_encoder(monkeypatch, tmp_p
     assert error.value.code == 2
 
 
+def test_kimi_decision_requires_encoded_fixtures_and_profile_before_cuda(monkeypatch, tmp_path):
+    bench = _native_threshold_bench()
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path), "--kimi-decision"])
+    with pytest.raises(SystemExit) as error:
+        bench.main()
+    assert error.value.code == 2
+
+
+def test_kimi_decision_keeps_independent_projection_and_native_remainder_shapes():
+    source = _PATH.with_name("kimi_k6_dense.py").read_text()
+    tree = ast.parse(source)
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == "benchmark_kimi_decision")
+    tuples = {ast.literal_eval(n) for n in ast.walk(node)
+              if isinstance(n, ast.Tuple) and all(isinstance(v, ast.Constant) for v in n.elts)}
+    assert ("kda", 24752) in tuples
+    assert ("gate_up", 6144) in tuples
+    assert 'outputs=176' in ast.get_source_segment(source, node)
+    assert '"KDA and shared gate/up only, not a full-core speed estimate"' in source
+
+
 def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
     bench = _native_threshold_bench()
     source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"

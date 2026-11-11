@@ -915,6 +915,220 @@ def encode_reference_fixtures(args):
     torch.cuda.synchronize()
 
 
+def benchmark_kimi_decision(args):
+    """Full independent-projection launch sums, not concatenated trellis tensors."""
+    import hashlib
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import (
+        compile_trellis_input_aot, compile_trellis_output_aot,
+    )
+
+    rows_list = list(map(int, args.rows.split(",")))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 50:
+        raise ValueError("Kimi decision requires rows 1..4096 and at least 50 samples")
+    if args.compile_only:
+        import multiprocessing
+        from b12x._lib.compile_pool import _initialize_worker
+        _initialize_worker(0, (12, 0), "kimi-decision", "kimi-decision",
+                           args.export_sms, 101376, 102400, multiprocessing.Array("i", [0, 0]))
+    source = Path(__file__).resolve().parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    contract = dict(native_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                    capacity=4096, input_dtype="bf16", export_sms=args.export_sms)
+
+    def program(directory, name, builder):
+        if args.compile_only:
+            print("compile", directory.name, name, flush=True)
+            with exportable_compilation():
+                result = builder()
+            exported(result, directory, name, load_module=False)
+            (directory / f"{name}.json").write_text(json.dumps(dict(
+                pointers=len(result.operands), scalars=len(result.scalars))))
+            return None
+        abi = json.loads((directory / f"{name}.json").read_text())
+        lib = C.CDLL(str((directory / f"{name}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        lib.run.argtypes = [C.c_void_p]*abi["pointers"] + [C.c_int32]*abi["scalars"] + [C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
+
+    report = dict(metadata=dict(contract=contract, samples=args.samples,
+        cache="2x runtime L2 eviction outside each timed full-operation interval",
+        scope="grouped KDA + BF16 N176 remainder; two independent gate/up projections; H128 included",
+        equality="replay versus eager within each format; formats deliberately have different numerics",
+        weights="official reference-encoded random tiles, no checkpoint calibration or quality claim",
+        reference_bf16="ordered K16 DECODE_TMA_TILES plus measured wide-prefill route"), records=[])
+    if not args.compile_only:
+        props = torch.cuda.get_device_properties(0)
+        status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+        if int(status):
+            raise RuntimeError(status)
+        limit = props.multi_processor_count * 4
+        flush = torch.empty(2*l2, device="cuda", dtype=torch.uint8)
+        report["metadata"].update(device=props.name, sms=props.multi_processor_count,
+                                  l2_bytes=l2, thermal_initial=thermal_snapshot())
+        fixture_records = {bits: json.loads((args.fixture_dir / f"fixtures_k{bits}.json").read_text())
+                           for bits in (6, 8)}
+        for records in fixture_records.values():
+            if len(records) != 6 or not all(record["oracle_exact"] for record in records):
+                raise ValueError("six independent oracle-qualified fixtures required")
+        report["metadata"]["fixture_manifests"] = fixture_records
+        catalog = json.loads(args.profile_catalog.read_text())
+        calls_per_token = {}
+        for role, outputs in (("kda", 24752), ("gate_up", 6144)):
+            matches = [entry for entry in catalog if entry.get("device") == 0
+                       and entry.get("lane") == "target" and entry.get("geometry")
+                       and entry["geometry"].get("n") == outputs
+                       and entry["geometry"].get("k") == 7168]
+            if len(matches) != 1:
+                raise ValueError(f"expected one GPU0 target profile entry for {role}")
+            calls_per_token[role] = matches[0]["phases"]["decode"]["launches_per_unit"]
+        report["metadata"]["profile_calls_per_emitted_token"] = calls_per_token
+        report["metadata"]["projection_scope"] = "KDA and shared gate/up only, not a full-core speed estimate"
+        torch.manual_seed(811)
+        warm = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        for _ in range(128):
+            torch.mm(warm, warm)
+        torch.cuda.synchronize()
+        del warm
+    for role, n, groups, indices, packed_n in (
+        ("kda", 6144, 4, range(4), 24752),
+        ("gate_up", 3072, 1, range(4, 6), 6144),
+    ):
+        directory = args.output_dir / role
+        directory.mkdir(parents=True, exist_ok=True)
+        if args.compile_only:
+            (directory / "contract.json").write_text(json.dumps(contract, sort_keys=True))
+        elif json.loads((directory / "contract.json").read_text()) != contract:
+            raise ValueError("stale Kimi decision exports")
+        bf16 = program(directory, "bf16", lambda: compile_bf16_projection_aot(
+            width=7168, outputs=packed_n, wide=True))
+        remainder = (program(directory, "remainder", lambda: compile_bf16_projection_aot(
+            width=7168, outputs=176)) if role == "kda" else None)
+        ingress = program(directory, "ingress", lambda: compile_trellis_input_aot(
+            features=7168, max_rows=4096, output_dtype="bf16", groups=groups))
+        egress = program(directory, "egress", lambda: compile_trellis_output_aot(
+            features=n, max_rows=4096, groups=groups))
+        cores = {bits: program(directory, f"core_k{bits}", lambda bits=bits: compile_trellis_linear_aot(
+            input_features=7168, output_features=n, bits=bits, codebook="mcg",
+            sharded_side=1, rotation_count=groups, max_rows=4096, groups=groups,
+            input_dtype="bf16")) for bits in (6, 8)}
+        if args.compile_only:
+            continue
+        fixtures = {}
+        for bits in (6, 8):
+            fixtures[bits] = []
+            for index in indices:
+                record = fixture_records[bits][index]
+                path = args.fixture_dir / record["path"]
+                if hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
+                    raise ValueError(f"fixture checksum mismatch: {path}")
+                fixtures[bits].append(torch.load(path, map_location="cpu", weights_only=True))
+        if not all(torch.equal(a["weight"], b["weight"]) for a, b in zip(fixtures[6], fixtures[8])):
+            raise ValueError("K6 and K8 must encode the same random source weights")
+        weights = [f["weight"].cuda() for f in fixtures[6]]
+        remainder_weight = torch.randn(176, 7168, device="cuda", dtype=torch.bfloat16) if remainder else None
+        packed_weight = torch.cat(weights + ([remainder_weight] if remainder else []))
+        x = torch.randn(4096, 7168, device="cuda", dtype=torch.bfloat16)
+        rotated = [torch.empty_like(x) for _ in indices]
+        suhs = [torch.ones(7168, device="cuda", dtype=torch.float16) for _ in indices]
+        svhs = [torch.ones(n, device="cuda", dtype=torch.float16) for _ in indices]
+        scales = [torch.ones(7168//128, device="cuda", dtype=torch.float16) for _ in indices]
+        tables = [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in rotated]
+        grouped_table = torch.tensor([t.data_ptr() for t in rotated], device="cuda", dtype=torch.int64)
+        payloads = {bits: [f["payload"].cuda() for f in fixtures[bits]] for bits in (6, 8)}
+        partial = torch.empty(129*7*n*len(weights), device="cuda", dtype=torch.float32)
+        raw = [torch.empty(4096, n, device="cuda", dtype=torch.float32) for _ in indices]
+        finals = {f"k{bits}": [torch.empty(4096, n, device="cuda", dtype=torch.bfloat16) for _ in indices]
+                  for bits in (6, 8)}
+        packed_out = torch.empty(4096, packed_n, device="cuda", dtype=torch.bfloat16)
+        remainder_out = torch.empty(4096, 176, device="cuda", dtype=torch.bfloat16) if remainder else None
+
+        def call(lib, *values):
+            result = lib.run(*values, torch.cuda.current_stream().cuda_stream)
+            if result:
+                raise RuntimeError(f"Kimi decision wrapper returned {result}")
+
+        def run(arm, rows):
+            if arm == "bf16":
+                call(bf16, x.data_ptr(), packed_weight.data_ptr(), packed_out.data_ptr(), rows)
+                return
+            bits = int(arm[1:])
+            if groups == 4:
+                call(ingress, x.data_ptr(), *(s.data_ptr() for s in suhs),
+                     *(t.data_ptr() for t in rotated), *(s.data_ptr() for s in scales), rows, limit)
+                call(cores[bits], grouped_table.data_ptr(), *(p.data_ptr() for p in payloads[bits]),
+                     *(s.data_ptr() for s in scales), partial.data_ptr(), *(o.data_ptr() for o in raw), rows, 0, limit)
+                call(egress, *(o.data_ptr() for o in raw), *(s.data_ptr() for s in svhs),
+                     *(o.data_ptr() for o in finals[arm]), rows, limit)
+            else:
+                for i in range(2):
+                    call(ingress, x.data_ptr(), suhs[i].data_ptr(), rotated[i].data_ptr(), scales[i].data_ptr(), rows, limit)
+                    call(cores[bits], tables[i].data_ptr(), payloads[bits][i].data_ptr(), scales[i].data_ptr(),
+                         partial.data_ptr(), raw[i].data_ptr(), rows, 0, limit)
+                    call(egress, raw[i].data_ptr(), svhs[i].data_ptr(), finals[arm][i].data_ptr(), rows, limit)
+            if remainder:
+                call(remainder, x.data_ptr(), remainder_weight.data_ptr(), remainder_out.data_ptr(), rows)
+
+        arms = ("k6", "k8", "bf16")
+        for rows in rows_list:
+            graphs, events = {}, {}
+            for arm in arms:
+                targets = [packed_out] if arm == "bf16" else finals[arm] + ([remainder_out] if remainder else [])
+                run(arm, rows)
+                expected = [t[:rows].clone() for t in targets]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run(arm, rows)
+                for t in targets:
+                    t[:rows].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                if not all(torch.equal(t[:rows].view(torch.int16), ref.view(torch.int16))
+                           and torch.isfinite(t[:rows]).all().item() for t, ref in zip(targets, expected)):
+                    raise RuntimeError(f"{role}/{arm}/{rows}: poisoned replay differs from eager")
+                intervals = 16 if rows <= 64 else 4
+                pairs = [(torch.cuda.Event(enable_timing=True, external=True),
+                          torch.cuda.Event(enable_timing=True, external=True)) for _ in range(intervals)]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for start, end in pairs:
+                        flush.zero_()
+                        start.record()
+                        run(arm, rows)
+                        end.record()
+                graphs[arm], events[arm] = graph, pairs
+                graph.replay()
+            torch.cuda.synchronize()
+            before = thermal_snapshot()
+            samples = {arm: [] for arm in arms}
+            for repeat in range(args.samples):
+                order = arms if repeat % 2 == 0 else tuple(reversed(arms))
+                for arm in order:
+                    graphs[arm].replay()
+                    events[arm][-1][1].synchronize()
+                    samples[arm].append(statistics.mean(a.elapsed_time(b)*1000 for a, b in events[arm]))
+            times = {arm: statistics.median(values) for arm, values in samples.items()}
+            logical = {f"k{bits}": len(weights)*(7168*n*bits//8 + 2*(7168+n)) + (176*7168*2 if remainder else 0)
+                       for bits in (6, 8)}
+            logical["bf16"] = packed_n*7168*2
+            record = dict(role=role, rows=rows, total_call_us=times, samples_us=samples,
+                profile_calls_per_emitted_token=calls_per_token[role],
+                projected_us_per_emitted_token={a: times[a]*calls_per_token[role] for a in arms},
+                logical_weight_bytes=logical, logical_weight_gbs={a: logical[a]/(times[a]*1000) for a in arms},
+                replay_exact=True, poisoned_outputs_overwritten=True,
+                thermal_before=before, thermal_after=thermal_snapshot())
+            report["records"].append(record)
+            print(json.dumps({k: v for k, v in record.items() if k != "samples_us"}), flush=True)
+            (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
+        del graphs, events, expected, targets, fixtures, payloads, weights, packed_weight, x, rotated
+        del suhs, svhs, scales, tables, grouped_table, partial, raw, finals, packed_out, remainder_out, remainder_weight
+
+
 def reference_encoder(source, directory):
     """Build only the unchanged GPTQModel quantize/pack operators, not its GEMMs."""
     from torch.utils.cpp_extension import load
@@ -978,6 +1192,9 @@ def main():
     parser.add_argument("--encoder-build-only", action="store_true", help="CPU compile official quantize/pack operators")
     parser.add_argument("--encoder-library", type=Path, help="prebuilt official quantize/pack operators for fixture generation")
     parser.add_argument("--encode-fixtures", action="store_true", help="encode independent full Kimi KDA and gate/up fixtures")
+    parser.add_argument("--kimi-decision", action="store_true", help="full K6/K8/BF16 KDA and gate/up launch sums")
+    parser.add_argument("--fixture-dir", type=Path, help="independently reference-encoded K6/K8 fixture directory")
+    parser.add_argument("--profile-catalog", type=Path, help="baseline kernel-catalog.json for per-emitted-token call counts")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.encoder_build_only:
@@ -990,6 +1207,11 @@ def main():
         if args.encoder_library is None or args.bits not in (6, 8) or args.codebook not in ("mcg", "mul1"):
             parser.error("--encode-fixtures requires --encoder-library, K6/K8 and MCG/MUL1")
         encode_reference_fixtures(args)
+        return
+    if args.kimi_decision:
+        if not args.compile_only and (args.fixture_dir is None or args.profile_catalog is None):
+            parser.error("--kimi-decision requires --fixture-dir and --profile-catalog")
+        benchmark_kimi_decision(args)
         return
     if args.baseline_native:
         benchmark_native_comparison(args)
