@@ -2,6 +2,7 @@
 import ast
 from dataclasses import dataclass
 import math
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -77,6 +78,60 @@ def test_kimi_sparse_context_reuses_partial_and_global_selection():
     cls = next(n for n in mla.body if isinstance(n, ast.ClassDef) and n.name == "_ContextPartial")
     assert "page_size=64" in ast.unparse(cls)
     assert "Int64(self.page_size * g.record_bytes)" in ast.unparse(cls)
+
+
+@pytest.mark.parametrize("partial", [False, True], ids=["ordinary", "context-partial"])
+def test_kimi_sparse_mla_descriptor_matches_generated_header(partial):
+    tree = ast.parse((ROOT / "kimi_dsa.py").read_text())
+    name = "compile_kimi_sparse_mla" + ("_partial" if partial else "") + "_aot"
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    function.body = [n for n in function.body if not isinstance(n, ast.ImportFrom)]
+
+    @dataclass
+    class Geometry:
+        name: str = "kimi_k31_mla"
+        norm_eps: float = 1e-5
+        heads: int = 96
+        record_bytes: int = 1152
+
+    launch = SimpleNamespace(scratch_bytes=lambda rows: 0, layout={"scratch_bytes": 0})
+    ns = dict(KimiMlaGeometry=Geometry, _Attention=lambda *a, **k: launch,
+        _ContextPartial=lambda *a, **k: launch,
+        torch=SimpleNamespace(bfloat16="bf16", uint8="u8", int32="i32", float32="f32"),
+        Operand=lambda name, *a, **k: SimpleNamespace(name=name),
+        Scalar=lambda name, ctype="int32": SimpleNamespace(name=name, ctype=ctype),
+        compile_program=lambda launch, **kwargs: SimpleNamespace(**kwargs))
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "kimi", "exec"), ns)
+    program = ns[name]()
+
+    # Derive the simulated generated header from the reused launcher's signature,
+    # independently of the descriptor names the exporter passes to its validator.
+    mla = ast.parse((ROOT / "kimi_mla.py").read_text())
+    cls = next(n for n in mla.body if isinstance(n, ast.ClassDef)
+               and n.name == ("_ContextPartial" if partial else "_Attention"))
+    call = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__call__")
+    types = {"cute.Pointer": "void *", "Int32": "int32_t ", "Int64": "int64_t ",
+             "cuda.CUstream": "cudaStream_t "}
+    arguments = call.args.args[1:]
+    params = [types[ast.unparse(a.annotation) if a.annotation else "Int32"] + a.arg
+              for a in arguments]
+    symbol = "cuteafd_" + program.name
+    header = (f"static inline int32_t cute_dsl_{symbol}_wrapper("
+              f"{symbol}_Kernel_Module_t *module, " + ", ".join(params) + ") {\n"
+              f"void *args[{len(arguments) + 1}] = {{"
+              + ",".join("&" + a.arg for a in arguments) + ",&ret};\n}\n"
+              "void _mlir_test(void **args, int32_t num_args);\n")
+    common = ast.parse((ROOT / "_common.py").read_text())
+    validator = next(n for n in common.body if isinstance(n, ast.FunctionDef)
+                     and n.name == "validate_exported_header")
+    scope = dict(AotProgram=object, Path=Path, re=re,
+                 _C_TYPES={"int32": "int32_t", "int64": "int64_t", "float32": "float"})
+    exec(compile(ast.Module(body=[validator], type_ignores=[]), "header", "exec"), scope)
+    checked = scope["validate_exported_header"](program, header, symbol)
+    assert checked == {"symbol": "_mlir_test", "argument_count": len(arguments)}
+    program.operands[2].name = "indices"
+    with pytest.raises(ValueError, match="unexpected wrapper signature"):
+        scope["validate_exported_header"](program, header, symbol)
 
 
 def test_kimi_rank_norm_accepts_checkpoint_epsilon_without_changing_k3_default():
