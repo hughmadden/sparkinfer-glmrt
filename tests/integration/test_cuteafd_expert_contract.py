@@ -79,6 +79,38 @@ def test_cpu_minimax_vendor_expert_geometry(tp, width):
             fp8_moe_scratch_bytes(g, "auto", capacity, True)
 
 
+def test_cpu_minimax_producer_abis_use_existing_arithmetic(monkeypatch):
+    from b12x.integration.cuteafd import minimax_producer as producer
+    from b12x.integration.cuteafd._mimo_kernels import MimoQkvRope
+    from b12x.integration.cuteafd._qwen4_attention_kernels import Qwen4AttnPost
+
+    def capture(launch, **contract):
+        return launch, contract
+
+    monkeypatch.setattr(producer, "compile_program", capture)
+    norm, contract = producer.compile_minimax_norm_rope_aot(heads=64)
+    assert isinstance(norm.norm, Qwen4AttnPost)
+    assert isinstance(norm.rope, MimoQkvRope)
+    assert norm.norm.eps == 1e-6
+    assert contract["scratch"]["scratch"](7) == 7 * 64 * 128 * 2
+    assert contract["operands"][3].dtype is torch.float32
+    assert [s.name for s in contract["scalars"]] == ["rows"]
+    index, contract = producer.compile_minimax_index_producer_aot()
+    assert (index.query.heads, index.key.heads) == (4, 1)
+    assert contract["scratch"]["scratch"](7) == 7 * 9 * 128 * 2
+    assert contract["operands"][6].dtype is torch.float32
+    assert [o.name for o in contract["operands"]][7:11] == ["q_fp8", "q_scale", "k_fp8", "k_scale"]
+    assert contract["geometry"]["page_rows"] == 64
+    oai, contract = producer.compile_minimax_oai_split_aot(width=3072)
+    assert oai.width == 3072
+    assert contract["geometry"] == dict(width=3072, alpha=1.702, beta=1.0, limit=7.0)
+    for value in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            producer.compile_minimax_norm_rope_aot(heads=value)
+        with pytest.raises(ValueError, match="positive integer"):
+            producer.compile_minimax_oai_split_aot(width=value)
+
+
 def bf16_reference(x, ids, route_weights, w1, w3, w2, limit, contract):
     # Sum in slot order, as MoeCombine does (including duplicate expert ids).
     result = torch.zeros_like(x, dtype=torch.float32)
