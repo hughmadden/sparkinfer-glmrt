@@ -319,6 +319,54 @@ def test_kimi_decision_requires_symbol_inventory_before_cuda(monkeypatch, tmp_pa
     assert error.value.code == 2
 
 
+def _full_core_config():
+    return dict(hidden_size=7168,num_hidden_layers=93,num_attention_heads=96,
+        linear_attn_config=dict(kda_layers=list(range(69)),full_attn_layers=list(range(24)),
+                                num_heads=96,head_dim=128),
+        num_shared_experts=2,moe_intermediate_size=3072,routed_expert_hidden_size=3584,
+        q_lora_rank=1536,kv_lora_rank=512,qk_rope_head_dim=64,qk_nope_head_dim=128,
+        num_experts=896,intermediate_size=33792,vocab_size=163840)
+
+
+def test_full_core_config_keeps_physical_counts_and_independent_padded_rank_shapes():
+    bench = _native_threshold_bench()
+    operations = bench.kimi_full_core_operations(_full_core_config())
+    roles = {o["role"]:o for o in operations}
+    assert roles["kda"]["count"] == [69,69]
+    assert roles["attn_out"]["count"] == [93,93]
+    assert roles["latent_down"]["count"] == [46,46]
+    assert roles["mla_gate"]["count"] == [24,24]
+    assert roles["head"]["count"] == [0,1]
+    assert roles["layer0_down"]["native"] and roles["layer0_down"]["output"] == "bf16"
+    shapes = bench.full_core_fixture_shapes(operations)
+    rank = [s for s in shapes if s["role"] == "mla_rank"]
+    assert [s["n"] for s in rank] == [1536,640]
+    assert len([s for s in shapes if s["role"] == "kda"]) == 4
+    assert next(s for s in shapes if s["role"] == "shared_down")["side"] == 2
+
+
+def test_full_core_aggregation_never_sums_concurrent_gpus_and_uses_actual_head_rows():
+    bench = _native_threshold_bench()
+    operations = bench.kimi_full_core_operations(_full_core_config())
+    records = [dict(role=o["role"],rows=r,total_call_us={"native":1} if o["native"] else
+                    dict(k6=1,k8=2,bf16=3)) for o in operations
+               for r in ([1,5] if o["head"] else [5,2752,2688,2240])]
+    result = bench.aggregate_kimi_full_core(operations,records,
+                dict(verify_steps_per_emitted_token=73/255),[5,2752,2688,2240])
+    decode = result["decode"][0]["local_dense_us_per_verify_step"]["k6"]
+    assert decode[1]-decode[0] == 1
+    assert [p["head_calls"] for p in result["prefill"]] == [1,8]
+    assert [p["local_dense_us"]["k6"][1]-p["local_dense_us"]["k6"][0]
+            for p in result["prefill"]] == [1,8]
+
+
+def test_full_core_requires_config_before_cuda(monkeypatch,tmp_path):
+    monkeypatch.setattr(sys,"argv",["benchmark","--output-dir",str(tmp_path),"--full-core","--kimi-decision"])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
+
+
 def _native_route_policy():
     source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
     nodes = []
