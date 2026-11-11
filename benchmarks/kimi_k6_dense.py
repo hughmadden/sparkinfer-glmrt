@@ -1257,8 +1257,8 @@ def benchmark_kimi_full_core(args):
             a_row=a_row, a_batch=a_batch, o_row=o_row, o_batch=o_batch,
             compute_warps=op.get("compute_warps", 4))
         return compile_program(launch, name="dense_kept_batched", operands=(
-            Operand("x", torch.bfloat16, f"[rows,{a_row}]"),
-            Operand("weight", torch.bfloat16, f"[{batch},{op['n']},{op['k']}]"),
+            Operand("a", torch.bfloat16, f"[rows,{a_row}]"),
+            Operand("w", torch.bfloat16, f"[{batch},{op['n']},{op['k']}]"),
             Operand("out", torch.bfloat16, f"[rows,{o_row}]", "out")),
             scalars=(Scalar("rows"),), key=launch.key(), geometry=op)
 
