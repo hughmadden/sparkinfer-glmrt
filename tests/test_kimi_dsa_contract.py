@@ -113,8 +113,8 @@ def test_kimi_sparse_mla_descriptor_matches_generated_header(partial):
     types = {"cute.Pointer": "void *", "Int32": "int32_t ", "Int64": "int64_t ",
              "cuda.CUstream": "cudaStream_t "}
     arguments = call.args.args[1:]
-    params = [types[ast.unparse(a.annotation) if a.annotation else "Int32"] + a.arg
-              for a in arguments]
+    assert all(a.annotation is not None for a in arguments), "exported launcher requires explicit ABI types"
+    params = [types[ast.unparse(a.annotation)] + a.arg for a in arguments]
     symbol = "cuteafd_" + program.name
     header = (f"static inline int32_t cute_dsl_{symbol}_wrapper("
               f"{symbol}_Kernel_Module_t *module, " + ", ".join(params) + ") {\n"

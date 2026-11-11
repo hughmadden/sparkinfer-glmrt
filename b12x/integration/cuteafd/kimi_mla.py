@@ -711,7 +711,7 @@ class _ContextPartial:
     def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
                  cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
                  lse: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-                 page_table_width: Int64, active_splits, stream: cuda.CUstream):
+                 page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
         g, h, s = self.g, self.heads, self.splits
         q = cute.make_tensor(cute.recast_ptr(query + Int64(self.begin * 576), dtype=cutlass.Uint8),
                              cute.make_layout((1,)))
