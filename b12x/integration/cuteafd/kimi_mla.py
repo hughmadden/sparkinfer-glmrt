@@ -348,15 +348,16 @@ class _Output:
 
 
 class _Attention:
-    def __init__(self, g, rows, max_context, mode):
+    def __init__(self, g, rows, max_context, mode, *, page_size=64):
         self.g = g
+        self.page_size = int(page_size)
         self.layout = attention_layout(g, rows, max_context=max_context, mode=mode)
         self.splits = self.layout["num_splits"]
         # Decode and verify keep one query row per tile; a prefill tile shares
         # one gathered KV window across all of its query rows.
         self.smem = dense_mla_layout(g, rows, mode=mode)
         self.forward = DenseMlaForwardKernel(layout=self.smem,
-            page_size=64, num_heads=g.heads, num_splits=self.splits,
+            page_size=self.page_size, num_heads=g.heads, num_splits=self.splits,
             chunks_per_split=self.layout["chunks_per_split"],
             query_tile=self.smem.query_tile, fp8=False,
             qk_dim=576, value_dim=512,
@@ -398,7 +399,7 @@ class _Attention:
             po, pl = out, lse_out
         self.forward(q, kv, table, lengths, cu, out, lse_out, po, pl, lse_out, lse_out,
             score_scale_log2, Int64(g.heads * 576 * 2), Int64(576 * 2),
-            Int64(64 * g.record_bytes), Int64(g.record_bytes), page_table_width, rows, batch, active_splits, stream)
+            Int64(self.page_size * g.record_bytes), Int64(g.record_bytes), page_table_width, rows, batch, active_splits, stream)
         if cutlass.const_expr(self.splits > 1):
             if active_splits > Int32(1):
                 self.merge(po, pl, out, lse_out, active_splits, stream)

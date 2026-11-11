@@ -73,5 +73,38 @@ def compile_kimi_index_post_aot(g=KimiDsaGeometry(), *, max_rows=64):
 
 
 def compile_kimi_index_topk_aot(g=KimiDsaGeometry(), *, max_rows, max_pages, mode="decode"):
-    """Shared 32-head weighted-ReLU selector; physical slots, ascending, -1 padded."""
+    """Shared selector; logical ascending order mapped to physical slots, -1 padded."""
     return compile_glm_index_topk_aot(g, max_rows=max_rows, max_pages=max_pages, mode=mode)
+
+
+def compile_kimi_sparse_mla_aot(g=None, *, max_rows=64):
+    """Selected-token MLA using the existing Kimi BF16 attention pipeline.
+
+    Each query is one request. Its table contains physical token slots, so
+    page_size=1 changes only gather addressing; no global gather/repack occurs.
+    lengths count the valid leading indices (1..2048). They are already causal.
+    The ordinary Kimi UV/sigmoid gate/output stage consumes out unchanged.
+    """
+    from .kimi_mla import KimiMlaGeometry, _Attention
+
+    g = g or KimiMlaGeometry(name="kimi_k31_mla", norm_eps=1e-5)
+    if not 1 <= int(max_rows) <= 4096:
+        raise ValueError("sparse MLA row capacity must be in 1..4096")
+    launch = _Attention(g, int(max_rows), 2048, "decode", page_size=1)
+    operands = (
+        Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
+        Operand("kv_cache", torch.uint8, f"[pool_tokens,{g.record_bytes}]"),
+        Operand("indices", torch.int32, "[rows,2048]", align=4),
+        Operand("lengths", torch.int32, "[rows]", align=4),
+        Operand("query_offsets", torch.int32, "[rows+1]", align=4),
+        Operand("out", torch.bfloat16, f"[rows,{g.heads},512]", "out"),
+        Operand("lse", torch.float32, f"[rows,{g.heads}]", "out", align=4),
+        Operand("scratch", torch.uint8, "[sparse_mla_scratch_bytes]", "scratch"),
+    )
+    return compile_program(launch, name="kimi_sparse_mla", operands=operands,
+        scalars=(Scalar("rows"), Scalar("requests"), Scalar("table_stride", "int64"), Scalar("active_splits")),
+        key=(g, int(max_rows), "selected-token-gather"),
+        geometry={**vars(g), **launch.layout, "max_rows": int(max_rows), "topk": 2048,
+                  "page_size": 1, "lse_base": 2},
+        scratch={"scratch": lambda rows: launch.layout["scratch_bytes"]},
+        doc=compile_kimi_sparse_mla_aot.__doc__)
