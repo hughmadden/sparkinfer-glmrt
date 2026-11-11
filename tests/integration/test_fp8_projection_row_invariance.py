@@ -95,6 +95,12 @@ _CASES = (
 _NATIVE_SHAPES = (
     ('ml4_q', 8192, 6144), ('ml4_q_half', 4096, 6144),
     ('ml4_o', 6144, 8192), ('ml4_o_half', 6144, 4096),
+    ('ml4_dense_gate', 24576, 6144), ('ml4_dense_gate_half', 12288, 6144),
+    ('ml4_dense_up', 24576, 6144), ('ml4_dense_up_half', 12288, 6144),
+    ('ml4_dense_down', 6144, 24576), ('ml4_dense_down_half', 6144, 12288),
+    ('ml4_shared_gate', 6144, 6144), ('ml4_shared_gate_half', 3072, 6144),
+    ('ml4_shared_up', 6144, 6144), ('ml4_shared_up_half', 3072, 6144),
+    ('ml4_shared_down', 6144, 6144), ('ml4_shared_down_half', 6144, 3072),
     ('kimi_q_b', 18432, 1536), ('kimi_q_b_half', 9216, 1536),
     ('kimi_o', 7168, 12288), ('kimi_o_half', 7168, 6144),
     ('step_o', 4096, 12288), ('step_o_half', 4096, 6144),
