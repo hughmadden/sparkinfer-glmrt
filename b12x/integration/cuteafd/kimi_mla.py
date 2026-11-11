@@ -56,9 +56,11 @@ class KimiMlaGeometry:
         if self.heads not in (48, 96):
             raise ValueError("Kimi MLA requires 48 or 96 heads")
         if (self.hidden, self.q_lora_rank, self.kv_lora_rank, self.qk_nope_dim,
-            self.qk_rope_dim, self.v_head_dim, self.page_rows, self.norm_eps) != (
-                7168, 1536, 512, 128, 64, 128, 64, 1e-6):
-            raise ValueError("unsupported Kimi K3 MLA geometry or rank-norm epsilon")
+            self.qk_rope_dim, self.v_head_dim, self.page_rows) != (
+                7168, 1536, 512, 128, 64, 128, 64):
+            raise ValueError("unsupported Kimi MLA geometry")
+        if not math.isfinite(self.norm_eps) or self.norm_eps <= 0:
+            raise ValueError("Kimi rank-norm epsilon must be finite and positive")
 
     @property
     def qkv_a_width(self):
@@ -346,15 +348,16 @@ class _Output:
 
 
 class _Attention:
-    def __init__(self, g, rows, max_context, mode):
+    def __init__(self, g, rows, max_context, mode, *, page_size=64):
         self.g = g
+        self.page_size = int(page_size)
         self.layout = attention_layout(g, rows, max_context=max_context, mode=mode)
         self.splits = self.layout["num_splits"]
         # Decode and verify keep one query row per tile; a prefill tile shares
         # one gathered KV window across all of its query rows.
         self.smem = dense_mla_layout(g, rows, mode=mode)
         self.forward = DenseMlaForwardKernel(layout=self.smem,
-            page_size=64, num_heads=g.heads, num_splits=self.splits,
+            page_size=self.page_size, num_heads=g.heads, num_splits=self.splits,
             chunks_per_split=self.layout["chunks_per_split"],
             query_tile=self.smem.query_tile, fp8=False,
             qk_dim=576, value_dim=512,
@@ -396,7 +399,7 @@ class _Attention:
             po, pl = out, lse_out
         self.forward(q, kv, table, lengths, cu, out, lse_out, po, pl, lse_out, lse_out,
             score_scale_log2, Int64(g.heads * 576 * 2), Int64(576 * 2),
-            Int64(64 * g.record_bytes), Int64(g.record_bytes), page_table_width, rows, batch, active_splits, stream)
+            Int64(self.page_size * g.record_bytes), Int64(g.record_bytes), page_table_width, rows, batch, active_splits, stream)
         if cutlass.const_expr(self.splits > 1):
             if active_splits > Int32(1):
                 self.merge(po, pl, out, lse_out, active_splits, stream)
@@ -685,14 +688,15 @@ class _ContextPartialMerge:
 
 class _ContextPartial:
     def __init__(self, g, max_rows, max_context, begin, heads, splits,
-                 device_splits=False, heads_per_tile=16, explicit_intervals=False):
+                 device_splits=False, heads_per_tile=16, explicit_intervals=False, page_size=64):
         self.g, self.begin, self.heads, self.splits = g, begin, heads, splits
+        self.page_size = int(page_size)
         self.device_splits = device_splits
         self.smem = make_smem_layout(query_tile=1, fp8=False, heads_per_tile=heads_per_tile)
         chunks = (max_context + self.smem.candidates_per_chunk - 1) // self.smem.candidates_per_chunk
         self.chunks_per_split = (chunks + splits - 1) // splits
         self.forward = DenseMlaForwardKernel(
-            layout=self.smem, page_size=g.page_rows, num_heads=heads,
+            layout=self.smem, page_size=self.page_size, num_heads=heads,
             num_splits=splits, chunks_per_split=self.chunks_per_split,
             query_tile=1, fp8=False, qk_dim=576, value_dim=512, window_size=None,
             ds_mla_record=g.kv_cache == "fp8", dynamic_split_chunks=True, device_splits=device_splits,
@@ -707,7 +711,7 @@ class _ContextPartial:
     def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
                  cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
                  lse: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-                 page_table_width: Int64, active_splits, stream: cuda.CUstream):
+                 page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
         g, h, s = self.g, self.heads, self.splits
         q = cute.make_tensor(cute.recast_ptr(query + Int64(self.begin * 576), dtype=cutlass.Uint8),
                              cute.make_layout((1,)))
@@ -727,7 +731,7 @@ class _ContextPartial:
         # dense final/merge ABI emits natural logs and cannot go on this wire.
         self.forward(q, kv, table, lengths, cu, out, lo, po, pl, lo, lo,
             Float32(g.softmax_scale * math.log2(math.e)), Int64(g.heads * 576 * 2), Int64(576 * 2),
-            Int64(g.page_rows * g.record_bytes), Int64(g.record_bytes), page_table_width,
+            Int64(self.page_size * g.record_bytes), Int64(g.record_bytes), page_table_width,
             rows, rows, active_splits, stream)
         self.merge(po, pl, attn, lse, rows, active_splits, stream)
 
