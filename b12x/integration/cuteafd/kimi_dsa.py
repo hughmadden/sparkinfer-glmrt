@@ -121,6 +121,53 @@ def compile_kimi_index_topk_aot(g=KimiDsaGeometry(), *, max_rows, max_pages, mod
     return compile_glm_index_topk_aot(g, max_rows=max_rows, max_pages=max_pages, mode=mode)
 
 
+def compile_kimi_context_index_topk_aot(g=KimiDsaGeometry(), *, max_rows, max_pages, mode="decode"):
+    """Score the full replicated index, returning global logical candidates.
+
+    Use page_stride=1 and page_offset=0, never rank-local top-k. Pass these
+    candidates as the first run and an empty (-inf,-1) second run to the
+    shared dsa_candidate_merge. Its parity filter maps the globally selected
+    logical IDs through each rank's independent compact MLA page table.
+    """
+    from .context_split import compile_scored_index_topk_aot
+
+    return compile_scored_index_topk_aot(g, max_rows=max_rows, max_pages=max_pages, mode=mode)
+
+
+def compile_kimi_sparse_mla_partial_aot(g=None, *, max_rows=64, head_begin=0):
+    """Parity-local selected-token MLA partial with base2 LSE for peer combine.
+
+    Global index selection and shared candidate parity compaction precede this
+    stage. Indices are local physical token slots; lengths may be zero. Query
+    rows retain the h96 stride, while each output contains one h48 range.
+    """
+    from .kimi_mla import KimiMlaGeometry, _ContextPartial
+
+    g = g or KimiMlaGeometry(name="kimi_k31_mla", norm_eps=1e-5)
+    if type(g) is not KimiMlaGeometry or g.heads != 96 or head_begin not in (0, 48):
+        raise ValueError("Kimi sparse Context partial requires an aligned h48 range of h96")
+    if not 1 <= int(max_rows) <= 4096:
+        raise ValueError("sparse MLA row capacity must be in 1..4096")
+    launch = _ContextPartial(g, int(max_rows), 2048, head_begin, 48, 16, page_size=1)
+    operands = (
+        Operand("query", torch.bfloat16, "[rows,96,576]"),
+        Operand("kv_cache", torch.uint8, f"[pool_tokens,{g.record_bytes}]"),
+        Operand("indices", torch.int32, "[rows,2048]", align=4),
+        Operand("lengths", torch.int32, "[rows]", align=4),
+        Operand("query_offsets", torch.int32, "[rows+1]", align=4),
+        Operand("out", torch.bfloat16, "[rows,48,512]", "out"),
+        Operand("lse", torch.float32, "[rows,48]", "out", align=4),
+        Operand("scratch", torch.uint8, "[sparse_mla_scratch_bytes]", "scratch"),
+    )
+    return compile_program(launch, name="kimi_sparse_mla_partial", operands=operands,
+        scalars=(Scalar("rows"), Scalar("table_stride", "int64"), Scalar("active_splits")),
+        key=(g, int(max_rows), head_begin, "selected-token-gather", "base2"),
+        geometry={**vars(g), "max_rows": int(max_rows), "topk": 2048,
+                  "head_begin": head_begin, "head_count": 48, "num_splits": 16,
+                  "page_size": 1, "lse_base": 2},
+        scratch={"scratch": launch.scratch_bytes}, doc=compile_kimi_sparse_mla_partial_aot.__doc__)
+
+
 def compile_kimi_sparse_mla_aot(g=None, *, max_rows=64):
     """Selected-token MLA using the existing Kimi BF16 attention pipeline.
 

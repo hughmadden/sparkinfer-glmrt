@@ -688,14 +688,15 @@ class _ContextPartialMerge:
 
 class _ContextPartial:
     def __init__(self, g, max_rows, max_context, begin, heads, splits,
-                 device_splits=False, heads_per_tile=16, explicit_intervals=False):
+                 device_splits=False, heads_per_tile=16, explicit_intervals=False, page_size=64):
         self.g, self.begin, self.heads, self.splits = g, begin, heads, splits
+        self.page_size = int(page_size)
         self.device_splits = device_splits
         self.smem = make_smem_layout(query_tile=1, fp8=False, heads_per_tile=heads_per_tile)
         chunks = (max_context + self.smem.candidates_per_chunk - 1) // self.smem.candidates_per_chunk
         self.chunks_per_split = (chunks + splits - 1) // splits
         self.forward = DenseMlaForwardKernel(
-            layout=self.smem, page_size=g.page_rows, num_heads=heads,
+            layout=self.smem, page_size=self.page_size, num_heads=heads,
             num_splits=splits, chunks_per_split=self.chunks_per_split,
             query_tile=1, fp8=False, qk_dim=576, value_dim=512, window_size=None,
             ds_mla_record=g.kv_cache == "fp8", dynamic_split_chunks=True, device_splits=device_splits,
@@ -730,7 +731,7 @@ class _ContextPartial:
         # dense final/merge ABI emits natural logs and cannot go on this wire.
         self.forward(q, kv, table, lengths, cu, out, lo, po, pl, lo, lo,
             Float32(g.softmax_scale * math.log2(math.e)), Int64(g.heads * 576 * 2), Int64(576 * 2),
-            Int64(g.page_rows * g.record_bytes), Int64(g.record_bytes), page_table_width,
+            Int64(self.page_size * g.record_bytes), Int64(g.record_bytes), page_table_width,
             rows, rows, active_splits, stream)
         self.merge(po, pl, attn, lse, rows, active_splits, stream)
 

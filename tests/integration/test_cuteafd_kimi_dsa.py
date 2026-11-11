@@ -142,6 +142,27 @@ def test_kimi_index_topk_matches_qdq_selection(mode, ties):
         assert torch.equal(valid, expected), (mode, ties, length, program.geometry)
         assert torch.all(output[row, len(expected):] == -1)
 
+    # Context selection must score the same full history, not each parity's top-k.
+    from b12x.integration.cuteafd.kimi_dsa import compile_kimi_context_index_topk_aot
+    scored = compile_kimi_context_index_topk_aot(max_rows=64, max_pages=width, mode=mode)
+    logical_out = torch.empty_like(output)
+    score_out = torch.empty(rows, 2048, device="cuda")
+    work = torch.zeros(scored.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
+    scored.launch(queries, weights, cache, page_table, lengths, logical_out, score_out, work,
+                  scalars=(rows, width, stride, 1, 0))
+    torch.cuda.synchronize()
+    for row, length in enumerate(lengths.tolist()):
+        logical = torch.arange(length, device="cuda")
+        physical = table[logical // 64].long() * 64 + logical % 64
+        key = keys.reshape(-1, 128)[physical].float()
+        scale = scales.reshape(-1)[physical]
+        scores = (torch.einsum("hd,jd->hj", queries[row].float(), key).relu()
+                  * weights[row, :, None]).sum(0) * scale
+        expected = torch.argsort(scores, descending=True, stable=True)[:2048]
+        assert torch.equal(logical_out[row, :len(expected)], expected.int())
+        assert torch.all(logical_out[row, len(expected):] == -1)
+        torch.testing.assert_close(score_out[row, :len(expected)], scores[expected], rtol=2e-5, atol=2e-5)
+
 
 @pytest.mark.parametrize("rows", [1, 17, 64])
 def test_kimi_native_index_projections_and_post(rows):
@@ -243,6 +264,107 @@ def test_kimi_sparse_mla_selected_tokens(cache_format, rows, heads):
     graph = torch.cuda.CUDAGraph()
     with kernel_resolution_guard("selected Kimi MLA precompiled"), torch.cuda.graph(graph):
         p.launch(*args, scalars=scalars)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(output, before)
+
+
+@pytest.mark.parametrize("cache_format", ["bf16", "fp8"])
+@pytest.mark.parametrize("head_begin", [0, 48])
+def test_kimi_sparse_context_global_selection_parity_and_combine(cache_format, head_begin):
+    require_b12x()
+    from b12x.integration.cuteafd.kimi_dsa import compile_kimi_sparse_mla_partial_aot
+    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry
+    from b12x.integration.cuteafd.context_split import compile_dsa_candidate_merge_aot, compile_lse_combine2_aot
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    torch.manual_seed(7351)
+    rows, pages, pool = 5, 64, 37
+    lengths = [1, 63, 777, 2048, 2047]
+    records = torch.randn(pages * 64, 576, device="cuda").bfloat16()
+    query = torch.randn(rows, 96, 576, device="cuda").bfloat16()
+    # Global selected logical IDs in score order; the second candidate run is empty.
+    selected = []
+    candidates = torch.full((rows, 4096), -1, device="cuda", dtype=torch.int32)
+    scores = torch.full((rows, 4096), -float("inf"), device="cuda")
+    for row, length in enumerate(lengths):
+        ids = torch.randperm(pages * 64, device="cuda")[:length]
+        if row < 2:
+            ids = torch.arange(length, device="cuda")  # empty rank1 partition
+        selected.append(ids)
+        candidates[row, :length] = ids.int()
+        scores[row, :length] = torch.arange(length, 0, -1, device="cuda").float()
+    merge = compile_dsa_candidate_merge_aot(topk=2048)
+    g = KimiMlaGeometry(name="kimi_k31_mla", norm_eps=1e-5, kv_cache=cache_format)
+    partial = compile_kimi_sparse_mla_partial_aot(g, max_rows=64, head_begin=head_begin)
+    combine = compile_lse_combine2_aot(heads=48)
+    offsets = torch.arange(rows + 1, device="cuda", dtype=torch.int32)
+    rank_args, outputs, lses = [], [], []
+    for rank in (0, 1):
+        physical_pages = torch.randperm(pool, device="cuda")[:pages // 2].int()
+        table = physical_pages.repeat(rows, 1).contiguous()
+        packed = torch.zeros(pool * 64, 576, device="cuda", dtype=torch.bfloat16)
+        for logical_page in range(rank, pages, 2):
+            physical = int(physical_pages[logical_page // 2])
+            packed[physical * 64:(physical + 1) * 64] = records[logical_page * 64:(logical_page + 1) * 64]
+        if cache_format == "bf16":
+            cache = packed.view(torch.uint8)
+        else:
+            group = packed[:, :512].float().reshape(pool * 64, 4, 128)
+            scale = group.abs().amax(-1).clamp_min(1e-6) / 448
+            quant = (group / scale[..., None]).to(torch.float8_e4m3fn)
+            cache = torch.zeros(pool * 64, 656, device="cuda", dtype=torch.uint8)
+            cache[:, :512] = quant.view(torch.uint8).reshape(pool * 64, 512)
+            cache[:, 512:528] = scale.view(torch.uint8)
+            cache[:, 528:] = packed[:, 512:].contiguous().view(torch.uint8)
+            restored = (quant.float() * scale[..., None]).reshape(pool * 64, 512).bfloat16()
+            for logical_page in range(rank, pages, 2):
+                physical = int(physical_pages[logical_page // 2])
+                records[logical_page * 64:(logical_page + 1) * 64, :512] = restored[physical * 64:(physical + 1) * 64]
+        out_indices, out_scores = torch.empty(rows, 2048, device="cuda", dtype=torch.int32), torch.empty(rows, 2048, device="cuda")
+        slots = torch.full_like(out_indices, -7)
+        local_lengths = torch.full((rows,), -7, device="cuda", dtype=torch.int32)
+        out = torch.full((rows, 48, 512), float("nan"), device="cuda", dtype=torch.bfloat16)
+        lse = torch.full((rows, 48), float("nan"), device="cuda")
+        work = torch.full((partial.scratch_bytes(rows)["scratch"],), 255, device="cuda", dtype=torch.uint8)
+        ma = (scores, candidates, out_scores, out_indices, table, slots, local_lengths)
+        pa = (query, cache, slots, local_lengths, offsets, out, lse, work)
+        merge.launch(*ma, scalars=(rows, pages // 2, rank))
+        partial.launch(*pa, scalars=(rows, 2048, 16))
+        torch.cuda.synchronize()
+        for row, ids in enumerate(selected):
+            owned = ids[(ids // 64) % 2 == rank].sort().values
+            assert int(local_lengths[row]) == len(owned)
+            expected_slots = physical_pages[owned // 128].long() * 64 + owned % 64
+            assert torch.equal(slots[row, :len(owned)], expected_slots.int())
+            assert torch.all(slots[row, len(owned):] == -1)
+            if len(owned):
+                kv = records[owned].float()
+                logits = query[row, head_begin:head_begin + 48].float() @ kv.T * (192 ** -0.5)
+                torch.testing.assert_close(out[row].float(), logits.softmax(-1) @ kv[:, :512], rtol=0.035, atol=0.012)
+                torch.testing.assert_close(lse[row], logits.logsumexp(-1) / torch.log(torch.tensor(2.0)), rtol=3e-4, atol=3e-4)
+            else:
+                assert torch.count_nonzero(out[row]) == 0
+                assert torch.isneginf(lse[row]).all()
+        rank_args.append((ma, pa))
+        outputs.append(out)
+        lses.append(lse)
+    sink = torch.zeros(48, device="cuda")
+    output = torch.empty_like(outputs[0])
+    ca = (outputs[0], lses[0], outputs[1], lses[1], sink, output)
+    combine.launch(*ca, scalars=(rows,))
+    torch.cuda.synchronize()
+    for row, ids in enumerate(selected):
+        kv = records[ids].float()
+        logits = query[row, head_begin:head_begin + 48].float() @ kv.T * (192 ** -0.5)
+        torch.testing.assert_close(output[row].float(), logits.softmax(-1) @ kv[:, :512], rtol=0.04, atol=0.014)
+    before = output.clone()
+    graph = torch.cuda.CUDAGraph()
+    with kernel_resolution_guard("sparse Context pipeline precompiled"), torch.cuda.graph(graph):
+        for rank, (ma, pa) in enumerate(rank_args):
+            merge.launch(*ma, scalars=(rows, pages // 2, rank))
+            partial.launch(*pa, scalars=(rows, 2048, 16))
+        combine.launch(*ca, scalars=(rows,))
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(output, before)

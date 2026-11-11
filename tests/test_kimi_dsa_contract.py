@@ -62,6 +62,23 @@ def test_kimi_index_post_explicit_qdq_abi():
             ns["KimiDsaGeometry"](index_norm_eps=eps)
 
 
+def test_kimi_sparse_context_reuses_partial_and_global_selection():
+    tree = ast.parse((ROOT / "kimi_dsa.py").read_text())
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    partial = ast.unparse(functions["compile_kimi_sparse_mla_partial_aot"])
+    assert "_ContextPartial(g, int(max_rows), 2048, head_begin, 48, 16, page_size=1)" in partial
+    assert "'lse_base': 2" in partial
+    assert "head_begin not in (0, 48)" in partial
+    ordinary = ast.unparse(functions["compile_kimi_sparse_mla_aot"])
+    assert "'lse_base': 'e'" in ordinary
+    context = ast.unparse(functions["compile_kimi_context_index_topk_aot"])
+    assert "compile_scored_index_topk_aot(g," in context
+    mla = ast.parse((ROOT / "kimi_mla.py").read_text())
+    cls = next(n for n in mla.body if isinstance(n, ast.ClassDef) and n.name == "_ContextPartial")
+    assert "page_size=64" in ast.unparse(cls)
+    assert "Int64(self.page_size * g.record_bytes)" in ast.unparse(cls)
+
+
 def test_kimi_rank_norm_accepts_checkpoint_epsilon_without_changing_k3_default():
     tree = ast.parse((ROOT / "kimi_mla.py").read_text())
     geometry = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "KimiMlaGeometry")
