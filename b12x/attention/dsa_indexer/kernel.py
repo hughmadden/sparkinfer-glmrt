@@ -532,7 +532,7 @@ def _load_index_k_page_scalar(
     while linear < total:
         row = linear // Int32(_INDEX_HEAD_DIM)
         col = linear - row * Int32(_INDEX_HEAD_DIM)
-        s_k_page_stage[row, col, Int32(0)] = k_quant_bytes[page_id, row, col]
+        s_k_page_stage[row, col, Int32(0)] = k_quant_bytes[Int64(page_id), row, col]
         linear += Int32(_PAGED_THREADS_PER_CTA)
 
 
@@ -1024,7 +1024,7 @@ class DSAPagedLogitsKernel:
                                 )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
-                            s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
+                            s_scale[scale_idx] = Float32(k_scales[Int64(page_id), scale_idx])
                             scale_idx += Int32(_PAGED_THREADS_PER_CTA)
                         if use_scalar_k_load_flag == Int32(0):
                             cute.arch.mbarrier_wait(
@@ -1461,7 +1461,7 @@ class DSAScheduledSingleRowLogitsKernel:
                                 )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
-                            s_scale[scale_idx] = Float32(k_scales[page_id, scale_idx])
+                            s_scale[scale_idx] = Float32(k_scales[Int64(page_id), scale_idx])
                             scale_idx += Int32(_PAGED_THREADS_PER_CTA)
                         if use_scalar_k_load_flag == Int32(0):
                             cute.arch.mbarrier_wait(
@@ -1850,7 +1850,7 @@ class DSAScheduledMultiRowLogitsKernel:
                                 scale_idx = tx
                                 while scale_idx < Int32(_PAGE_SIZE):
                                     s_scale[scale_idx] = Float32(
-                                        k_scales[page_id, scale_idx]
+                                        k_scales[Int64(page_id), scale_idx]
                                     )
                                     scale_idx += Int32(_PAGED_THREADS_PER_CTA)
                                 if use_scalar_k_load_flag == Int32(0):
