@@ -368,6 +368,10 @@ GEOMETRIES = {
     # MiMo V2.6 Pro: MXFP4 experts, 384 of them, top-8, unclamped SiLU.
     "mimop": Fp8MoeGeometry("mimop", hidden=6144, experts=384, top_k=8, intermediate=2048, weights="mxfp4"),
     "mimof": Fp8MoeGeometry("mimof", hidden=4096, experts=256, top_k=8, intermediate=2048, weights="mxfp4"),
+    # MiniMax M3 vendor experts: calibrated W4A4 with the shared OAI epilogue.
+    "minimax_nvfp4a4": Fp8MoeGeometry("minimax_nvfp4a4", hidden=6144, experts=128, top_k=4, intermediate=3072,
+                                     swiglu_limit=7.0, weights="nvfp4", activations="a4",
+                                     activation="swigluoai", swiglu_alpha=1.702, swiglu_beta=1.0),
     # NVIDIA ModelOpt NVFP4 releases: native W4A4 at every row count.
     "glm_nvfp4": Fp8MoeGeometry("glm_nvfp4", hidden=6144, experts=256, top_k=8, intermediate=2048, weights="nvfp4", activations="a4"),
     "glmf_nvfp4": Fp8MoeGeometry("glmf_nvfp4", hidden=4096, experts=288, top_k=8, intermediate=2048,
