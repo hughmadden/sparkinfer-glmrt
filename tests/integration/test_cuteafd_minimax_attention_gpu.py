@@ -112,6 +112,39 @@ def _assert_selected_attention(query, key, value, kd, vd, table, lengths, cu,
             assert (lse[row] - expected_lse).abs().max().item() <= .02, (request, row)
 
 
+@pytest.mark.parametrize("boundary", [2**31, 2**32])
+def test_recycled_physical_pages_cross_byte_offset_boundary(boundary):
+    require_b12x()
+    from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
+
+    page_bytes = PAGE * 4 * 128
+    high = boundary // page_bytes + 13
+    pool = high + 2
+    program = compile_minimax_attention_aot(max_rows=1, max_batch=1, mode="decode")
+    generator = torch.Generator(device="cuda").manual_seed(650 + high)
+    # Only initialize live tail pages; the untouched prefix models recycled IDs.
+    key = torch.empty((pool, PAGE, 4, 128), dtype=torch.float8_e4m3fn, device="cuda")
+    value = torch.empty_like(key)
+    key[high:].copy_(_cache(generator, 2))
+    value[high:].copy_(_cache(generator, 2))
+    query = (torch.randn((1, 64, 128), generator=generator, device="cuda") * .5).bfloat16()
+    descale = torch.ones((1, 4), device="cuda")
+    table = torch.tensor([[high, high + 1]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([65], dtype=torch.int32, device="cuda")
+    cu = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    selected = torch.full((4, 1, 16), -1, dtype=torch.int32, device="cuda")
+    selected[:, :, 0] = 0
+    output = torch.empty_like(query)
+    lse = torch.empty((1, 64), device="cuda")
+    scratch = torch.empty(program.scratch_bytes(1)["scratch"], dtype=torch.uint8, device="cuda")
+    program.launch(query, key.view(torch.uint8), value.view(torch.uint8), descale, descale,
+                   table, lengths, cu, selected, output, lse, scratch,
+                   scalars=(1, 1, 2, pool))
+    torch.cuda.synchronize()
+    _assert_selected_attention(query, key, value, descale, descale, table, [65], [0, 1],
+                               selected, output, lse)
+
+
 @pytest.mark.parametrize("mode", ["decode", "extend"])
 def test_sparse_selections_reuse_program_and_graph_with_live_shapes(mode):
     require_b12x()
