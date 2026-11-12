@@ -1,32 +1,138 @@
 """MiniMax residual norm, FP32 router and paged attention KV producers.
 
 Arithmetic/layout reference: Hugh Madden, hughmadden/cuteafd@2cbf6873e,
-with hughmadden/sparkinfer-glmrt@4390f106. Reuse the shared norm and GEMV;
-KV packing preserves request/head descales and skips negative token slots.
+with hughmadden/sparkinfer-glmrt@4390f106. The residual norm and FP32-weight
+router use MiniMax-specific kernels; KV packing preserves request/head
+descales and skips negative token slots.
 All live counts are launch scalars; callers own buffers and graph lifetimes.
 """
 from __future__ import annotations
 
 import cuda.bindings.driver as cuda
+import cutlass
 import cutlass.cute as cute
+import cutlass.utils as cutlass_utils
 import torch
 from cutlass import Float32, Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import cvt_f32x4_to_e4m3x4, div_rn_f32
-from b12x.gemm.bf16_gemv._kernel import SmallNGemvKernel
+from b12x._lib.intrinsics import (
+    cvt_f32x4_to_e4m3x4, div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, st_global_v4_u32,
+)
+from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo, _ld_cached
 from ._common import Operand, Scalar, compile_program
-from .pointwise import _view, compile_affine_norm_aot
+from .minimax_router import minimax_router_scores
+from ._glm_kernels import _block_sum, _reduction_storage, _rsqrt
+from .pointwise import _add, _fma, _mul, _view
+
+
+class _ResidualNorm:
+    """FP32 residual -> BF16 ``(1 + w) * RMSNorm`` in one pass over the row.
+
+    One CTA per row: thread ``t`` owns the eight-element groups ``j * threads
+    + t``, so every warp access is a contiguous 1 KiB (FP32 residual) or
+    512 B (BF16 weight) segment instead of a strided scalar. The residual
+    stays in registers across the block reduction -- the row is read once,
+    which is what the wide rows are limited by -- and the product is rounded
+    to BF16 once, at the packed 16-byte store. The BF16 weight is a
+    read-only broadcast load shared by every row; ``1 + w`` is the
+    checkpoint's zero-centered gamma and there is no mean or bias term.
+    """
+
+    threads = 256
+
+    def __init__(self, width: int, eps: float):
+        self.width = int(width)
+        if self.width <= 0 or self.width % (8 * self.threads):
+            raise ValueError("RMSNorm width must be a positive multiple of 8 * CTA width")
+        if eps <= 0:
+            raise ValueError("epsilon must be positive")
+        self.vectors = self.width // (8 * self.threads)
+        self.eps = float(eps)
+        self.warps = self.threads // 32
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, bias: cute.Pointer,
+                 cos: cute.Pointer, sin: cute.Pointer, positions: cute.Pointer,
+                 out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        # bias/cos/sin/positions are ABI placeholders: this norm has no bias,
+        # no rotary and no subtract-mean term.
+        self.kernel(x, weight, out).launch(
+            grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.jit
+    def _load(self, x_row: Int64, weight_base: Int64, values: cute.Tensor, weights: cute.Tensor):
+        tidx = Int64(cute.arch.thread_idx()[0])
+        for j in cutlass.range_constexpr(self.vectors):
+            at = Int64(j * self.threads) + tidx
+            v0, v1, v2, v3 = ld_global_v4_f32(x_row + at * Int64(32))
+            v4, v5, v6, v7 = ld_global_v4_f32(x_row + at * Int64(32) + Int64(16))
+            values[8 * j + 0] = v0
+            values[8 * j + 1] = v1
+            values[8 * j + 2] = v2
+            values[8 * j + 3] = v3
+            values[8 * j + 4] = v4
+            values[8 * j + 5] = v5
+            values[8 * j + 6] = v6
+            values[8 * j + 7] = v7
+            w0, w1, w2, w3 = _ld_cached(weight_base + at * Int64(16))
+            weights[8 * j + 0] = _bf16_lo(w0)
+            weights[8 * j + 1] = _bf16_hi(w0)
+            weights[8 * j + 2] = _bf16_lo(w1)
+            weights[8 * j + 3] = _bf16_hi(w1)
+            weights[8 * j + 4] = _bf16_lo(w2)
+            weights[8 * j + 5] = _bf16_hi(w2)
+            weights[8 * j + 6] = _bf16_lo(w3)
+            weights[8 * j + 7] = _bf16_hi(w3)
+
+    @cute.jit
+    def _scaled(self, value: Float32, weight: Float32, inv: Float32) -> Float32:
+        return _mul(_mul(value, inv), _add(weight, Float32(1.0)))
+
+    @cute.jit
+    def _store(self, out_row: Int64, values: cute.Tensor, weights: cute.Tensor, inv: Float32):
+        tidx = Int64(cute.arch.thread_idx()[0])
+        for j in cutlass.range_constexpr(self.vectors):
+            at = Int64(j * self.threads) + tidx
+            first = 8 * j
+            st_global_v4_u32(
+                out_row + at * Int64(16),
+                pack_f32x2_to_bfloat2(self._scaled(values[first], weights[first], inv),
+                                      self._scaled(values[first + 1], weights[first + 1], inv)),
+                pack_f32x2_to_bfloat2(self._scaled(values[first + 2], weights[first + 2], inv),
+                                      self._scaled(values[first + 3], weights[first + 3], inv)),
+                pack_f32x2_to_bfloat2(self._scaled(values[first + 4], weights[first + 4], inv),
+                                      self._scaled(values[first + 5], weights[first + 5], inv)),
+                pack_f32x2_to_bfloat2(self._scaled(values[first + 6], weights[first + 6], inv),
+                                      self._scaled(values[first + 7], weights[first + 7], inv)))
+
+    @cute.kernel
+    def kernel(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer):
+        row = Int64(cute.arch.block_idx()[0])
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(_reduction_storage(1, self.warps))
+        sums = storage.sums.get_tensor(cute.make_layout((1, self.warps), stride=(self.warps, 1)))
+        count = 8 * self.vectors
+        values = cute.make_rmem_tensor(cute.make_layout((count,), stride=(1,)), Float32)
+        weights = cute.make_rmem_tensor(cute.make_layout((count,), stride=(1,)), Float32)
+        x_row = Int64(x.toint()) + row * Int64(self.width * 4)
+        out_row = Int64(out.toint()) + row * Int64(self.width * 2)
+        self._load(x_row, Int64(weight.toint()), values, weights)
+        square = Float32(0.0)
+        for k in cutlass.range_constexpr(count):
+            square = _fma(values[k], values[k], square)
+        total = _block_sum(square, sums, Int32(0), self.warps)
+        inv = _rsqrt(_add(div_rn_f32(total, Float32(self.width)), Float32(self.eps)))
+        self._store(out_row, values, weights, inv)
 
 
 class _RouterScores:
     def __init__(self):
-        self.project = SmallNGemvKernel(128, 6144, False, False)
+        self.project = minimax_router_scores(128, 6144)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, logits: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.project(x, weight, weight, logits, rows, Int64(6144), Int64(6144), Int64(128),
-                     Int64(1), Int64(1), Int32(0), stream)
+        self.project(x, weight, logits, rows, stream)
 
 
 class _KvPack:
@@ -65,8 +171,25 @@ class _KvPack:
 
 def compile_minimax_norm_aot():
     """FP32 residual to BF16 Gemma norm, with the shared seven-pointer ABI."""
-    return compile_affine_norm_aot(width=6144, eps=1e-6, zero_centered=True,
-                                  input_dtype=torch.float32, parameter_dtype=torch.bfloat16)
+    # Same program name, operand records and geometry dict the shared AffineNorm
+    # exported: the engine validates the manifest's pointers and reads heads,
+    # bias and rotary alongside width, epsilon, zero_centered and subtract_mean.
+    # Version 2 keeps this block-per-row kernel off the old scalar kernel's
+    # compile identity, which pairs the identical key tuple with version 1.
+    return compile_program(_ResidualNorm(width=6144, eps=1e-6), name="affine_norm",
+        operands=(
+            Operand("x", torch.float32, "[rows,1,6144]"),
+            Operand("weight", torch.bfloat16, "[6144]"),
+            Operand("bias", torch.bfloat16, "[6144] (ignored unless bias)"),
+            Operand("cos", torch.bfloat16, "[positions,0] (ignored unless rotary)"),
+            Operand("sin", torch.bfloat16, "[positions,0] (ignored unless rotary)"),
+            Operand("positions", torch.int64, "[rows] (ignored unless rotary)"),
+            Operand("out", torch.bfloat16, "[rows,1,6144]", "out")),
+        scalars=(Scalar("rows"),),
+        key=(6144, 1, 1e-6, True, False, False, 0, torch.float32, torch.bfloat16),
+        version=2,
+        geometry=dict(width=6144, heads=1, eps=1e-6, zero_centered=True,
+                      subtract_mean=False, bias=False, rotary=0))
 
 
 def compile_minimax_router_scores_aot():
