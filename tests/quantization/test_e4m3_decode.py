@@ -85,6 +85,10 @@ def _decode_all_codes() -> tuple[torch.Tensor, torch.Tensor]:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_fp8_e4m3_to_f32_is_exact_for_all_256_codes() -> None:
+    # Runs on both SM120 (RTX) and SM121 (GB10); cvt.rn.f16x2.e4m3x2 needs
+    # sm_89+, so a target outside SM12x must not silently reach this path.
+    major, minor = torch.cuda.get_device_capability()
+    assert (major, minor) in ((12, 0), (12, 1)), (major, minor)
     codes, out = _decode_all_codes()
     reference = _reference_e4m3(codes)
     decoded = out[:, 0]
