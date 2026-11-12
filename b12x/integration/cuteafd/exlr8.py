@@ -132,7 +132,7 @@ class _Exlr8GroupedServingPointers:
                                        activations=g.get("activations", "a16"),
                                        quantize_pass=g.get("quantize_pass", True),
                                        fc2_f32=g.get("fc2_partials", "f16") == "f32",
-                                       swiglu_limit=g.get("swiglu_limit", 0))
+                                       swiglu_limit=g.get("swiglu_limit", 0), reply_format=g.get("reply_format", 0))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -231,7 +231,11 @@ DEFAULT_SERVING_VARIANT = "k1_k23_coalesced"
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                          device_count=False, shared_expert=False, grouped=False, group_rows=64,
                          grouped_rows=4096, fc2_partials="f16", compact_units=False,
-                         activations="a16", quantize_pass=True, serving_variant=None, swiglu_limit=0):
+                         activations="a16", quantize_pass=True, serving_variant=None, swiglu_limit=0, reply_format=0, core_only=False):
+    if core_only and (grouped or not device_count):
+        raise ValueError("core-only EXLR8 requires unsliced device-count decode")
+    if reply_format not in (0, 1, 2) or (reply_format and not grouped):
+        raise ValueError("compressed inline EXLR8 replies require grouped execution")
     if not 0 <= swiglu_limit < float("inf"):
         raise ValueError("EXLR8 swiglu_limit must be finite and nonnegative")
     if activations not in ("a16", "a8") or (activations == "a8" and not grouped):
@@ -261,6 +265,10 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     if fc2_partials not in ("f16", "f32"):
         raise ValueError("EXLR8 FC2 partials must be f16 or f32")
     g = geometry(hidden, units, top_k, max_groups)
+    if core_only:
+        g["core_only"] = True
+    if reply_format:
+        g["reply_format"] = reply_format
     if swiglu_limit:
         g["swiglu_limit"] = float(swiglu_limit)
     if routed_serving:
@@ -301,7 +309,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
         Operand("intermediate", torch.float16, f"[{m},{u},{r},128]", "scratch"),
         Operand("fc2", torch.float32, f"[{m},{r},{h}]", "scratch"),
         Operand("signs_out", torch.int8, f"[{h}]", align=4),
-        Operand("output", torch.bfloat16, f"[rows,{h}]", "out"),
+        Operand("output", torch.uint8 if reply_format else torch.bfloat16,
+                f"[rows,{h + h // 32 if reply_format == 1 else h // 2 + h // 16}]" if reply_format else f"[rows,{h}]", "out"),
     )
     sizes = scratch_bytes(g)
     if device_count:
@@ -310,14 +319,17 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
         # Compact owned-unit tables appended after the existing prefix.
         operands += (Operand("unit_count", torch.int32, "[E]"),
                      Operand("unit_map", torch.int32, f"[E,{u}]"))
-    return compile_program(_Exlr8GroupedServingPointers(g) if grouped else
-                           _Exlr8CompactServingPointers(g) if compact_units else
-                           _Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
+    launch = (_Exlr8GroupedServingPointers(g) if grouped else
+              _Exlr8CompactServingPointers(g) if compact_units else
+              _Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g))
+    if core_only:
+        launch.core.core_only = True
+    return compile_program(launch,
                            name=(f"exlr8_{activations}_grouped64" if grouped and g["max_rows"] == 64 else
                                  f"exlr8_{activations}_grouped" if grouped else
                                  "exlr8_a16_serving_compact" if compact_units else
                                  "exlr8_shared_a16_serving" if shared_expert else
-                                 "exlr8_a16_serving" if device_count else "exlr8_a16_decode"), operands=operands,
+                                 "exlr8_a16_serving" if device_count else "exlr8_a16_decode") + (f"_reply{reply_format}" if reply_format else "") + ("_core" if core_only else ""), operands=operands,
                            scalars=tuple(Scalar(n) for n in (("rows", "cta_limit", "unit_limit", "l2_bytes") if grouped else
                                                             ("rows", "cta_limit", "unit_limit") if compact_units else
                                                             ("rows", "cta_limit") if device_count
@@ -335,6 +347,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                 + ((grouped_rows,) if grouped and grouped_rows != 4096 else ())
                                 + ((fc2_partials,) if grouped and fc2_partials != "f16" else ())
                                 + ((variant,) if routed_serving else ())
-                                + (("swiglu_limit", float(swiglu_limit)) if swiglu_limit else ())), geometry=g,
+                                + (("swiglu_limit", float(swiglu_limit)) if swiglu_limit else ())
+                                + (("reply_format", reply_format) if reply_format else ())
+                                + (("core_only",) if core_only else ())), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)

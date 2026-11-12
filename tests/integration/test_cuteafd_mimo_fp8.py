@@ -1,5 +1,9 @@
 """cuteafd MiMo V2 Flash FP8 decode programs vs their BF16 programs.
 
+Needs the retired MiMo-V2-Flash checkpoint (split ``q_proj``/``k_proj``/
+``v_proj``; ``CUTEAFD_MIMO_SNAPSHOT``); MiMo-V2.6 Flash stores one fused
+``qkv_proj`` instead, and skips here (``test_cuteafd_mimo_aot.py`` covers it).
+
 ``fp8=True`` producer / o / ffn programs and the FP8 LM head read E4M3 copies
 with per-row x 128-K FP32 scales for steps of ``rows <= fp8_rows`` (<= 32; head <= 16):
 the checkpoint's own E4M3 bytes with its block grids expanded per row
@@ -16,7 +20,7 @@ import pytest
 import torch
 
 from ..conftest import require_b12x
-from ._mimo import cos_sin, golden_rows, raw_tensor, scale_row_of, tensor
+from ._mimo import checkpoint_has, cos_sin, golden_rows, raw_tensor, scale_row_of, tensor
 
 COS = 0.99999
 
@@ -26,6 +30,8 @@ def g():
     require_b12x()
     from b12x.integration.cuteafd import MIMO_V2_FLASH
 
+    if not checkpoint_has("model.layers.0.self_attn.q_proj.weight"):
+        pytest.skip("MiMo-V2-Flash checkpoint (split q/k/v) not mounted")
     return MIMO_V2_FLASH
 
 

@@ -29,8 +29,8 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
         raise ValueError("trellis geometry must contain positive int32 dimensions")
     if input_features % 128 or output_features % 128:
         raise ValueError("trellis input/output dimensions must be multiples of 128")
-    if type(bits) is not int or bits not in (2, 3, 4, 5, 6) or codebook not in ("e4m3", "f16", "mcg", "mul1") or sharded_side not in (1, 2) or type(groups) is not int or groups not in (1, 4) or rotation_count < groups:
-        raise ValueError("trellis requires K2--K6, mcg/mul1/e4m3/f16, side 1/2 and groups 1/4")
+    if type(bits) is not int or bits not in range(1, 9) or codebook not in ("e4m3", "f16", "mcg", "mul1") or sharded_side not in (1, 2) or type(groups) is not int or groups not in (1, 4) or rotation_count < groups:
+        raise ValueError("trellis requires K1--K8, mcg/mul1/e4m3/f16, side 1/2 and groups 1/4")
     if input_dtype not in ("f16", "bf16"):
         raise ValueError("trellis input dtype must be f16 or bf16")
     splits = (input_features + 1023) // 1024
@@ -123,8 +123,11 @@ def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
             *(Operand(f"{p}_output", torch.float32, f"[rows,{n}]", "out") for p in GROUP_NAMES),
         )
         pointers = _GroupedPointers(g)
+    from b12x.gemm.trellis_linear._native import decode_route_thresholds
+    routes = list(decode_route_thresholds(g))
     return compile_program(pointers, name="trellis_linear", operands=operands,
                            scalars=tuple(Scalar(name) for name in SCALARS),
                            key=tuple(g.values()), version=4,
-                           geometry={**g, "exact_row_cap": pointers.core.exact_row_cap},
+                           geometry={**g, "exact_row_cap": pointers.core.exact_row_cap,
+                                     "decode_route_thresholds": routes},
                            scratch={"partial": lambda rows: groups*rows*s*n*4}, doc=__doc__)

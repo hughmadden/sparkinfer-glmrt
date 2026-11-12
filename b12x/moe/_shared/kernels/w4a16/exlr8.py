@@ -152,6 +152,8 @@ class Exlr8A16Kernel:
             raise ValueError("EXLR8 hidden_size must be a positive multiple of 128")
         if min(units_per_expert, top_k, max_groups) < 1:
             raise ValueError("EXLR8 units, top_k and group capacity must be positive")
+        self.core_only = False
+        self.reply_format = 0
         self.hidden_size = int(hidden_size)
         self.units = int(units_per_expert)
         self.top_k = int(top_k)
@@ -169,7 +171,9 @@ class Exlr8A16Kernel:
     def __cache_key__(self):
         return ("exlr8_a16", self.ABI_VERSION, self.CODE_VERSION, self.hidden_size, self.units,
                 self.top_k, self.max_groups, self.fast_math, self.device_count) + (
-                    ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
+                    ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ()) + (
+                    ("core_only",) if self.core_only else ()) + (
+                    ("reply_format", self.reply_format) if self.reply_format else ())
 
     @cute.jit
     def __call__(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -192,10 +196,11 @@ class Exlr8A16Kernel:
                                 fc2, rows, groups).launch(
                     grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
                     block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
-            self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
-                               rows, groups).launch(
-                grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
-                block=(128, 1, 1), stream=stream)
+            if cutlass.const_expr(not self.core_only):
+                self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
+                                   rows, groups).launch(
+                    grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
 
     @cute.jit
     def serving(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -219,10 +224,11 @@ class Exlr8A16Kernel:
                             fc2, rows, group_count).launch(
                 grid=(min(Int32(self.max_groups * self.blocks), cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
-            self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
-                               rows, group_count).launch(
-                grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
-                block=(128, 1, 1), stream=stream)
+            if cutlass.const_expr(not self.core_only):
+                self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
+                                   rows, group_count).launch(
+                    grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
 
     @cute.jit
     def _mma_block(self, payload: Int64, a_address: Int64,
@@ -582,9 +588,14 @@ class Exlr8A16Kernel:
                     values[3] = values[3] + weight * u32_as_f32(w3)
             h0, h1, h2, h3 = _w4a8_had128_quad(values[0], values[1], values[2], values[3], lane)
             signs = ld_global_nc_u32(signs_out.iterator.toint() + col.to(Int64))
-            store_bf16x4(output.iterator.toint() + (row.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(2),
-                         h0 * signed_byte(signs, 0), h1 * signed_byte(signs, 1),
-                         h2 * signed_byte(signs, 2), h3 * signed_byte(signs, 3))
+            if cutlass.const_expr(self.reply_format):
+                self.reply_store.store(output, row, block, lane,
+                    h0 * signed_byte(signs, 0), h1 * signed_byte(signs, 1),
+                    h2 * signed_byte(signs, 2), h3 * signed_byte(signs, 3))
+            else:
+                store_bf16x4(output.iterator.toint() + (row.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(2),
+                             h0 * signed_byte(signs, 0), h1 * signed_byte(signs, 1),
+                             h2 * signed_byte(signs, 2), h3 * signed_byte(signs, 3))
             task += step
 
 
@@ -609,7 +620,9 @@ class Exlr8A16CompactKernel(Exlr8A16Kernel):
     def __cache_key__(self):
         return ("exlr8_a16_compact", self.ABI_VERSION, self.CODE_VERSION, self.hidden_size,
                 self.units, self.top_k, self.max_groups, self.fast_math, self.device_count) + (
-                    ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
+                    ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ()) + (
+                    ("core_only",) if self.core_only else ()) + (
+                    ("reply_format", self.reply_format) if self.reply_format else ())
 
     @cute.jit
     def serving_compact(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -639,10 +652,11 @@ class Exlr8A16CompactKernel(Exlr8A16Kernel):
                                 intermediate, fc2, rows, group_count, unit_limit).launch(
                     grid=(min(Int32(self.max_groups * self.blocks), cta_limit), 1, 1),
                     block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
-            self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
-                               rows, group_count).launch(
-                grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
-                block=(128, 1, 1), stream=stream)
+            if cutlass.const_expr(not self.core_only):
+                self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
+                                   rows, group_count).launch(
+                    grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
 
     @cute.kernel
     def fc1_kernel(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -921,6 +935,8 @@ class Exlr8RoutedServingKernel:
             raise ValueError("EXLR8 units (1..16), top_k and group capacity must be positive")
         if variant not in SERVING_VARIANTS:
             raise ValueError(f"Unknown EXLR8 serving variant: {variant!r}")
+        self.core_only = False
+        self.reply_format = 0
         self.hidden_size = int(hidden_size)
         self.units = int(units_per_expert)
         self.top_k = int(top_k)
@@ -948,7 +964,9 @@ class Exlr8RoutedServingKernel:
             self.max_groups,
             self.fast_math,
             self.variant,
-        ) + (("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
+        ) + (("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ()) + (
+            ("core_only",) if self.core_only else ()) + (
+            ("reply_format", self.reply_format) if self.reply_format else ())
 
     @cute.jit
     def serving(
@@ -995,13 +1013,14 @@ class Exlr8RoutedServingKernel:
                 min_blocks_per_mp=self.CTAS_PER_SM,
                 stream=stream,
             )
-            self.reduce_kernel(
-                route_group_lane, route_weights, fc2, signs_out, output, rows, group_count
-            ).launch(
-                grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
-                block=(128, 1, 1),
-                stream=stream,
-            )
+            if cutlass.const_expr(not self.core_only):
+                self.reduce_kernel(
+                    route_group_lane, route_weights, fc2, signs_out, output, rows, group_count
+                ).launch(
+                    grid=(min((rows * Int32(self.blocks) + Int32(3)) // Int32(4), cta_limit), 1, 1),
+                    block=(128, 1, 1),
+                    stream=stream,
+                )
 
     @cute.jit
     def _build_live_units(
@@ -1681,12 +1700,17 @@ class Exlr8RoutedServingKernel:
                         values[3] = values[3] + weight * u32_as_f32(w3)
             h0, h1, h2, h3 = _w4a8_had128_quad(values[0], values[1], values[2], values[3], lane)
             signs = ld_global_nc_u32(signs_out.iterator.toint() + col.to(Int64))
-            store_bf16x4(
-                output.iterator.toint() + (row.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(2),
-                h0 * signed_byte(signs, 0),
-                h1 * signed_byte(signs, 1),
-                h2 * signed_byte(signs, 2),
-                h3 * signed_byte(signs, 3),
-            )
+            if cutlass.const_expr(self.reply_format):
+                self.reply_store.store(output, row, block, lane,
+                    h0 * signed_byte(signs, 0), h1 * signed_byte(signs, 1),
+                    h2 * signed_byte(signs, 2), h3 * signed_byte(signs, 3))
+            else:
+                store_bf16x4(
+                    output.iterator.toint() + (row.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(2),
+                    h0 * signed_byte(signs, 0),
+                    h1 * signed_byte(signs, 1),
+                    h2 * signed_byte(signs, 2),
+                    h3 * signed_byte(signs, 3),
+                )
             task += step
 

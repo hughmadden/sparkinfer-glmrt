@@ -17,6 +17,31 @@ bench = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(bench)
 
 
+def test_native_oai_geometry_and_cache_keys():
+    from dataclasses import replace
+    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, GEOMETRIES, _StreamNvfp4A4Route
+
+    base = Fp8MoeGeometry("oai_contract", hidden=256, experts=128, top_k=4,
+                          intermediate=256, weights="nvfp4", activations="a4")
+    oai = replace(base, activation="swigluoai", swiglu_limit=7.0,
+                  swiglu_alpha=1.702, swiglu_beta=1.0)
+    assert (oai.with_tp(2).swiglu_alpha, oai.with_tp(2).swiglu_beta) == (1.702, 1.0)
+    key = _StreamNvfp4A4Route(oai, 129, False).key()
+    assert key != _StreamNvfp4A4Route(base, 129, False).key()
+    for field, value in [("swiglu_alpha", 1.5), ("swiglu_beta", 0.5), ("swiglu_limit", 6.0)]:
+        assert key != _StreamNvfp4A4Route(replace(oai, **{field: value}), 129, False).key()
+    for changes in [dict(swiglu_alpha=None), dict(swiglu_alpha=float("nan")),
+                    dict(swiglu_alpha=0.0), dict(swiglu_beta=None),
+                    dict(swiglu_beta=float("inf")), dict(swiglu_limit=0.0),
+                    dict(weights="fp8", activations="a16")]:
+        with pytest.raises(ValueError):
+            replace(oai, **changes)
+    with pytest.raises(ValueError, match="alpha/beta"):
+        replace(base, swiglu_alpha=1.702)
+    assert all(g.activation != "swigluoai" and g.swiglu_alpha is None
+               and g.swiglu_beta is None for g in GEOMETRIES.values())
+
+
 def test_v41_fc1_split_is_explicit_and_defaults_to_one():
     path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v41_slice_pipeline.py"
     tree = ast.parse(path.read_text())

@@ -923,11 +923,17 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64,
-                 activations: str = "a16", quantize_pass: bool = True, fc2_f32: bool | None = None, swiglu_limit: float = 0):
+                 activations: str = "a16", quantize_pass: bool = True, fc2_f32: bool | None = None, swiglu_limit: float = 0, reply_format: int = 0):
         super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True,
                          swiglu_limit=swiglu_limit)
         if activations not in ("a16", "a8"):
             raise ValueError("EXLR8 grouped activations must be 'a16' or 'a8'")
+        if reply_format not in (0, 1, 2):
+            raise ValueError("EXLR8 reply format must be 0/1/2")
+        self.reply_format = int(reply_format)
+        if reply_format:
+            from .reply_store import ReplyStore
+            self.reply_store = ReplyStore(hidden_size, reply_format)
         self.activations = activations
         self.a8 = activations == "a8"
         self.quantize_pass = bool(quantize_pass) and self.a8
@@ -1033,12 +1039,14 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     self.top_k, self.max_groups, self.group_rows, self.CTAS_PER_SM,
                     self.FC2_WS, self.REDUCE_MLP, self.FC2_HALF, self.FC2_STAGES,
                     self.fc1_ws, self.FC1_STAGES, self.quantize_pass) + (
-                        ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
+                        ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ()) + (
+                    ("reply_format", self.reply_format) if self.reply_format else ())
         return ("exlr8_a16_grouped", self.CODE_VERSION, self.hidden_size, self.units,
                 self.top_k, self.max_groups, self.group_rows, self.CTAS_PER_SM,
                 self.FC2_WS, self.REDUCE_MLP, self.FC2_HALF, self.FC2_STAGES,
                 self.fc1_ws, self.FC1_STAGES) + (
-                    ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ())
+                    ("swiglu_limit", self.swiglu_limit) if self.swiglu_limit else ()) + (
+                    ("reply_format", self.reply_format) if self.reply_format else ())
 
     @cute.jit
     def quantize_a_k128_row(self, c: Int32, src_addr: Int64, valid: Int32):
@@ -3708,8 +3716,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             o1 = h1 * signed_byte(signs, 1)
             o2 = h2 * signed_byte(signs, 2)
             o3 = h3 * signed_byte(signs, 3)
-            if sliced:
-                _store_bf16x4_cs(out_ptr, o0, o1, o2, o3)
+            if cutlass.const_expr(self.reply_format):
+                self.reply_store.store(output, row, block, lane, o0, o1, o2, o3)
             else:
-                store_bf16x4(out_ptr, o0, o1, o2, o3)
+                if sliced:
+                    _store_bf16x4_cs(out_ptr, o0, o1, o2, o3)
+                else:
+                    store_bf16x4(out_ptr, o0, o1, o2, o3)
             task += step

@@ -4652,46 +4652,50 @@ def nvfp4_scale_from_amax(
 
 @dsl_user_op
 def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32."""
+    """Decode the low E4M3 (``float8_e4m3fn``) byte of ``fp8_val`` to float32.
+
+    Exact for every code, including the subnormals (exponent field 0:
+    ``mant/8 * 2^-6``): the hardware ``cvt.rn.f16x2.e4m3x2`` widens to f16,
+    which represents all E4M3 values exactly, and ``cvt.f32.f16`` is exact.
+    ``0x00`` decodes to +0 and ``0x80`` to -0. The NaN codes ``0x7F`` and
+    ``0xFF`` decode to NaN (E4M3FN has no infinities). Bits above the low
+    byte are ignored.
+    """
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero, p_neg;
-                .reg .u32 sign_u, exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, fp8_neg;
-
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 sign_u, $1, 0x80;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
-                neg.f32 fp8_neg, fp8_float;
-                setp.ne.u32 p_neg, sign_u, 0;
-                selp.f32 fp8_float, fp8_neg, fp8_float, p_neg;
-                selp.f32 $0, 0f00000000, fp8_float, p_zero;
+                .reg .b32 byte_u;
+                .reg .b16 fp8_pair, lo, hi;
+                .reg .b32 h2;
+                and.b32 byte_u, $1, 0xFF;
+                cvt.u16.u32 fp8_pair, byte_u;
+                cvt.rn.f16x2.e4m3x2 h2, fp8_pair;
+                mov.b32 {lo, hi}, h2;
+                cvt.f32.f16 $0, lo;
             }
             """,
             "=f,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
 
 @dsl_user_op
 def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32 AND compute reciprocal."""
+    """Reciprocal of the exactly decoded low E4M3 byte (see ``fp8_e4m3_to_f32``).
+
+    Every nonzero finite E4M3 value, subnormals included, is a normal float32,
+    so ``rcp.approx.ftz`` never sees a denormal. Zero (``0x00`` or ``0x80``)
+    returns 0, the device quantizers' "unrepresentable scale" convention;
+    the NaN codes return NaN. The sign is kept.
+    """
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -4699,20 +4703,17 @@ def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             """
             {
                 .reg .pred p_zero;
-                .reg .u32 exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, result;
-
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
+                .reg .b32 byte_u, mag_u;
+                .reg .b16 fp8_pair, lo, hi;
+                .reg .b32 h2;
+                .reg .f32 fp8_float, result;
+                and.b32 byte_u, $1, 0xFF;
+                and.b32 mag_u, byte_u, 0x7F;
+                setp.eq.u32 p_zero, mag_u, 0;
+                cvt.u16.u32 fp8_pair, byte_u;
+                cvt.rn.f16x2.e4m3x2 h2, fp8_pair;
+                mov.b32 {lo, hi}, h2;
+                cvt.f32.f16 fp8_float, lo;
                 rcp.approx.ftz.f32 result, fp8_float;
                 selp.f32 $0, 0f00000000, result, p_zero;
             }
@@ -4721,6 +4722,8 @@ def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -6712,6 +6715,63 @@ def trellis_align_stream_u32x2(z0, z1, z2, shift, word_delta, *, loc=None, ip=No
 
 
 @dsl_user_op
+def packed_dequant_trellis_highrate_to_half2x4(
+    first, middle, last, shift, bits: int, mul1: bool = False, *, loc=None, ip=None
+):
+    """Decode K7/K8's 65/72-bit span without truncating the oldest state.
+
+    Ring words are MSB-first: ``last`` contains the newest bits. ``shift``
+    aligns its last state; the complete span always occupies three words.
+    """
+    bits = int(bits)
+    if bits not in (7, 8):
+        raise ValueError("high-rate trellis requires K7 or K8")
+    lines = []
+    for index in range(8):
+        offset = (7 - index) * bits
+        # The runtime alignment is 0..31; extract from a 96-bit ring span.
+        lines.extend((f"add.u32 amount, $7, {offset};",
+                      "setp.ge.u32 upper, amount, 32;",
+                      "selp.b32 low, $5, $6, upper;",
+                      "selp.b32 high, $4, $5, upper;",
+                      "setp.ge.u32 upper, amount, 64;",
+                      "selp.b32 low, $4, low, upper;",
+                      "selp.b32 high, 0, high, upper;",
+                      "and.b32 amount, amount, 31;",
+                      f"shf.r.wrap.b32 w{index}, low, high, amount;",
+                      f"and.b32 w{index}, w{index}, 0xffff;"))
+        if mul1:
+            lines.extend((f"mul.lo.u32 w{index}, w{index}, {_TRELLIS_MUL1:#x};",
+                          f"dp4a.u32.u32 w{index}, w{index}, ones, acc;"))
+        else:
+            lines.extend((f"mul.lo.u32 w{index}, w{index}, {_TRELLIS_MCG:#x};",
+                          f"lop3.b32 w{index}, w{index}, {_TRELLIS_MASK:#x}, {_TRELLIS_OR:#x}, 0x6a;"))
+    for pair in range(4):
+        lines.append(f"prmt.b32 low, w{2*pair}, w{2*pair+1}, 0x5410;")
+        if mul1:
+            lines.append(f"fma.rn.f16x2 ${pair}, low, kinv, kbias;")
+        else:
+            lines.extend((f"prmt.b32 high, w{2*pair}, w{2*pair+1}, 0x7632;",
+                          f"add.rn.f16x2 ${pair}, low, high;"))
+    asm = """{
+        .reg .pred upper;
+        .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7,low,high,amount,ones,acc,kinv,kbias;
+        mov.b32 ones, 0x01010101;
+        mov.b32 acc, 0x00006400;
+        mov.b32 kinv, 0x1eee1eee;
+        mov.b32 kbias, 0xc931c931;
+    """ + "\n".join(lines) + "\n}"
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Uint32(value).ir_value(loc=loc, ip=ip) for value in (first, middle, last, shift)],
+        asm, "=r,=r,=r,=r,r,r,r,r", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+                 for i in range(4))
+
+
+@dsl_user_op
 def packed_dequant_trellis_mul1_to_half2x4(
     win_a, win_b, bits: int, *, loc=None, ip=None
 ):
@@ -6721,8 +6781,8 @@ def packed_dequant_trellis_mul1_to_half2x4(
     K2--K5 take two four-weight windows; K6 takes aligned low/high words.
     """
     bits = int(bits)
-    if bits not in (2, 3, 4, 5, 6):
-        raise ValueError("MUL1 supports only K2--K6")
+    if bits not in (1, 2, 3, 4, 5, 6):
+        raise ValueError("MUL1 supports only K1--K6")
     lines = []
     for index in range(8):
         if bits == 6:
@@ -7810,9 +7870,9 @@ def packed_dequant_trellis_to_half2x4(
     whose full eight-weight span can cross three ring words.
     """
     bits = int(bits)
-    if bits not in (2, 3, 4, 5, 6):
+    if bits not in (1, 2, 3, 4, 5, 6):
         raise ValueError(
-            f"unsupported trellis bitrate {bits}; expected 2, 3, 4, 5, or 6"
+            f"unsupported trellis bitrate {bits}; expected 1, 2, 3, 4, 5, or 6"
         )
     asm = """
         {
@@ -7877,9 +7937,9 @@ def packed_dequant_trellis_stream_to_half2x4(
     34 bits and cannot be represented by one 32-bit base window.
     """
     bits = int(bits)
-    if bits not in (2, 3, 4, 5, 6):
+    if bits not in (1, 2, 3, 4, 5, 6):
         raise ValueError(
-            f"unsupported trellis bitrate {bits}; expected 2, 3, 4, 5, or 6"
+            f"unsupported trellis bitrate {bits}; expected 1, 2, 3, 4, 5, or 6"
         )
     asm = """
         {

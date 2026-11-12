@@ -14,6 +14,20 @@ def test_quant_records_abi(monkeypatch):
     assert dense.record_bytes(17, 6144) == 2*192*528
 
 
+def test_native_mxfp8_bf16_one_entry_table_contract(monkeypatch):
+    monkeypatch.setattr(dense, "compile_program", lambda launch, **kw: (launch, kw))
+    for k, n, side in [(6144, 512, 1), (3072, 6144, 2)]:
+        quant, qinfo = dense.compile_dense_mxfp8_quant_aot(
+            input_features=k, input_dtype="bf16", rotation_count=1)
+        gemm, info = dense.compile_dense_mxfp8_aot(input_features=k, output_features=n,
+            encoding="mxfp8", input_dtype="bf16", rotation_count=1, sharded_side=side)
+        assert quant.bf16
+        assert qinfo["operands"][0].shape == info["operands"][0].shape == "[1]"
+        assert qinfo["geometry"]["rotation_count"] == info["geometry"]["rotation_count"] == 1
+        assert info["operands"][2].dtype == torch.uint8
+        assert gemm.scratch_bytes == dense.record_bytes(4096, k)
+
+
 @pytest.mark.parametrize("encoding,n", [("trellis",8192),("mxfp8",288),("mxfp8",64)])
 @pytest.mark.parametrize("side", [1,2])
 def test_gemm_abi(monkeypatch, encoding, n, side):

@@ -20,8 +20,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shapes", default="4096x4096", help="comma-separated output N x input K")
     parser.add_argument("--rows", default="1,8,9,10,16,32,64")
-    parser.add_argument("--recipes", choices=("routes", "compensation", "trellis"), default="routes",
-                        help="BF16 route comparisons, or the unchanged native K6 prefill baseline")
+    parser.add_argument("--recipes", choices=("routes", "compensation", "decode", "trellis"), default="routes",
+                        help="BF16 route comparisons, the decode/verify tile sweep, "
+                             "or the unchanged native K6 prefill baseline")
+    parser.add_argument("--tiles-file", type=Path,
+                        help="decode recipe only: JSON {NxK: [{name, tiles: [[rows, ...], ...]}]} "
+                             "candidates raced against the shipped route")
     parser.add_argument("--trellis-config", type=Path,
                         help="JSON list of {n,k,side,groups} K6 geometries; trellis recipe only")
     parser.add_argument("--trellis-paired", action="store_true",
@@ -41,9 +45,124 @@ def parse_args(argv=None):
     row_limit = 4096 if args.recipes in ("compensation", "trellis") else 128
     if args.samples < 1 or any(v < 1 or v > row_limit for v in args.rows):
         parser.error(f"positive samples and live rows in 1..{row_limit} required")
+    if args.recipes == "decode" and args.tiles_file is None:
+        parser.error("--recipes decode requires --tiles-file")
     if args.trellis_steady_ms and (not math.isfinite(args.trellis_steady_ms) or args.trellis_steady_ms < 200):
         parser.error("steady sessions must be finite and at least 200 ms")
     return args
+
+
+def _decode_program(n, k, tiles):
+    """One BF16 projection program; ``tiles`` None is the shipped route."""
+    import torch
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+
+    op = TmaBf16Projection(n, k) if tiles is None else TmaBf16Projection(n, k, tiles_by_rows=tiles)
+    operands = (Operand("x", torch.bfloat16, "x"), Operand("w", torch.bfloat16, "w"),
+                Operand("out", torch.bfloat16, "out", "out"))
+    return compile_program(op, name="projection_decode_bench", operands=operands,
+                           scalars=(Scalar("rows"),), key=(n, k, "decode", tiles))
+
+
+def _spread(samples):
+    median = statistics.median(samples)
+    mad = statistics.median(abs(value - median) for value in samples)
+    return dict(median_us=median, mad_us=mad, min_us=min(samples), max_us=max(samples))
+
+
+def _decode_bench(args):
+    """Race the shipped decode route against named tile tables, bitwise per row."""
+    import torch
+    from benchmarks.common import make_l2_flush_fn
+
+    tables = json.loads(args.tiles_file.read_text())
+    torch.manual_seed(174)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    flush = make_l2_flush_fn(True)
+    results = []
+    for n, k in args.shapes:
+        key = f"{n}x{k}"
+        candidates = tables.get(key, [])
+        arms = [("base", None)] + [(str(entry["name"]), tuple(tuple(int(v) for v in t)
+                                                            for t in entry["tiles"]))
+                                   for entry in candidates]
+        programs = {name: _decode_program(n, k, tiles) for name, tiles in arms}
+        capacity = max(args.rows) + 8
+        x = torch.randn(capacity, k, device="cuda").bfloat16()
+        x[max(args.rows):] = float("nan")  # poisoned tail: no live row may read or store it
+        w = (torch.randn(n, k, device="cuda") * 0.03).bfloat16()
+        out = torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16)
+        widest = max(args.rows)
+        # One eager launch at the widest row count fixes every arm's reference bits.
+        reference = {}
+        for name, program in programs.items():
+            out.fill_(float("nan"))
+            program.launch(x, w, out, scalars=(widest,))
+            torch.cuda.synchronize()
+            if not bool(torch.isfinite(out[:widest]).all()):
+                raise RuntimeError(f"{key} {name}: nonfinite live output at rows={widest}")
+            if not bool(torch.isnan(out[widest:]).all()):
+                raise RuntimeError(f"{key} {name}: wrote past rows={widest}")
+            reference[name] = out[:widest].clone()
+        for rows in args.rows:
+            graphs, stable, exact, unbounded = {}, {}, {}, {}
+            for name, program in programs.items():
+                out.fill_(float("nan"))
+                program.launch(x, w, out, scalars=(rows,))
+                torch.cuda.synchronize()
+                stable[name] = bool(torch.equal(out[:rows], reference[name][:rows]))
+                exact[name] = bool(torch.equal(out[:rows], reference["base"][:rows]))
+                unbounded[name] = bool(torch.isnan(out[rows:]).all())
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    program.launch(x, w, out, scalars=(rows,))
+                graphs[name] = graph
+                flush()
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                if not torch.equal(out[:rows], reference[name][:rows]):
+                    raise RuntimeError(f"{key} rows={rows} {name}: graph replay differs")
+            samples = {name: [] for name, _ in arms}
+            for sample in range(args.samples):
+                for name, _ in arms if sample % 2 == 0 else arms[::-1]:
+                    flush()
+                    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+                    start.record()
+                    graphs[name].replay()
+                    end.record()
+                    end.synchronize()
+                    samples[name].append(start.elapsed_time(end) * 1000)
+            spread = {name: _spread(values) for name, values in samples.items()}
+            base = spread["base"]["median_us"]
+            entry = {"n": n, "k": k, "rows": rows, "arms": [a for a, _ in arms],
+                     "spread": spread,
+                     "ratio": {name: value["median_us"] / base for name, value in spread.items()},
+                     "row_invariant_vs_widest": stable,
+                     "bitwise_vs_base": exact,
+                     "no_store_past_rows": unbounded,
+                     "samples_us": samples}
+            if not all(stable.values()) or not all(exact.values()) or not all(unbounded.values()):
+                entry["numerics"] = "FAILED"
+            results.append(entry)
+            print(json.dumps({name: value for name, value in entry.items() if name != "samples_us"}),
+                  flush=True)
+        del programs, graphs, reference, x, w, out
+        torch.cuda.empty_cache()
+    properties = torch.cuda.get_device_properties(0)
+    result = {"kind": "decode", "device": torch.cuda.get_device_name(),
+              "device_uuid": str(getattr(properties, "uuid", "unavailable")),
+              "torch_version": torch.__version__, "cuda_version": torch.version.cuda,
+              "argv": sys.argv, "sms": properties.multi_processor_count,
+              "tiles_file": str(args.tiles_file),
+              "conditions": "shipped TmaBf16Projection route versus named tiles_by_rows tables; "
+                            "CUDA graph replays interleaved per sample, L2 evicted before each "
+                            "replay; poisoned tail rows; every arm checked against one widest-row "
+                            "reference with torch.equal (bitwise) and every row against base",
+              "results": results}
+    if args.output:
+        args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 
 def _program(n, k, recipe):
@@ -335,6 +454,8 @@ def main():
     args = parse_args()
     if args.recipes == "trellis":
         return _trellis_baseline(args)
+    if args.recipes == "decode":
+        return _decode_bench(args)
     import torch
     from benchmarks.common import make_l2_flush_fn
 

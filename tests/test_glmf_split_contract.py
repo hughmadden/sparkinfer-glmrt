@@ -241,3 +241,104 @@ def test_fully_projected_kda_abi(heads, decode):
     assert p["scratch"]["scratch"](17) == 17*g.kda_in_width*2+1024
     with pytest.raises(ValueError, match="requires"):
         ns["compile_projected_kda_core_aot"](object())
+
+
+@pytest.mark.parametrize("decode,capacity", [(True, 64), (True, 128), (False, 4096)])
+def test_block_fp8_projection_abi(decode, capacity):
+    class Projection:
+        def key(self):
+            return ("original-fp8-projection",)
+
+        def prefill_scratch_bytes(self, rows):
+            return rows * 256 if not decode else 0
+
+    ns = extracted(ROOT / "b12x/integration/cuteafd/glmf_split.py",
+        {"compile_glmf_fp8_linear_aot"}, dict(
+            _Fp8Linear=lambda n, k, cap, dec: SimpleNamespace(projection=Projection()),
+            _check_rows=int, Operand=Operand, Scalar=lambda name: name,
+            torch=SimpleNamespace(bfloat16="bf16", uint8="u8", float32="f32"),
+            compile_program=lambda launch, **kw: dict(launch=launch, **kw)))
+    compile_projection = ns["compile_glmf_fp8_linear_aot"]
+    p = compile_projection(input_features=1536, output_features=8192,
+                           max_rows=capacity, decode=decode)
+    assert [(o.name, o.dtype, o.shape) for o in p["operands"][:4]] == [
+        ("x", "bf16", "[rows,1536]"), ("weight", "u8", "[8192,1536]"),
+        ("scales", "f32", "[64,12]"), ("out", "bf16", "[rows,8192]")]
+    assert p["scalars"] == ("rows", "fp8_rows")
+    assert p["scratch"]["scratch"](17) == (256 if decode else 17*256)
+    assert p["geometry"]["storage"] == "row_major_e4m3"
+    assert p["geometry"]["scale_block"] == 128
+    for bad in (0, -128, 129, True):
+        with pytest.raises(ValueError, match="H128"):
+            compile_projection(input_features=bad, output_features=8192)
+
+
+@pytest.mark.parametrize("n,k,warps,groups,rows,cap,row_scales,dtype,selected", [
+    (4096, 16384, 4, 1, 16, 64, False, "bf16", True),
+    (4096, 8192, 8, 1, 16, 64, False, "bf16", True),
+    (8192, 1536, 4, 1, 16, 64, False, "bf16", False),
+    (4096, 16384, 8, 1, 16, 64, False, "bf16", False),
+    (4096, 16384, 4, 2, 16, 64, False, "bf16", False),
+    (4096, 16384, 4, 1, 32, 64, False, "bf16", False),
+    (4096, 16384, 4, 1, 16, 16, False, "bf16", False),
+    (4096, 16384, 4, 1, 16, 64, True, "bf16", False),
+    (4096, 16384, 4, 1, 16, 64, False, "fp32", False),
+])
+def test_hqa_direct_widen_only_measured_recipes(n, k, warps, groups, rows, cap,
+                                               row_scales, dtype, selected):
+    path = ROOT / "b12x/integration/cuteafd/_fp8_weights.py"
+    tree = ast.parse(path.read_text())
+    projection = next(node for node in tree.body
+                      if isinstance(node, ast.ClassDef) and node.name == "Fp8Projection")
+    init = next(node for node in projection.body
+                if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    condition = next(node.test for node in ast.walk(init)
+                     if isinstance(node, ast.If) and any(
+                         isinstance(child, ast.Attribute) and child.attr == "gemv_m16"
+                         for statement in node.body for child in ast.walk(statement))
+                     and "self.n" in ast.unparse(node.test))
+    actual = eval(compile(ast.Expression(condition), str(path), "eval"), dict(
+        self=SimpleNamespace(n=n, k=k, row_scales=row_scales), warps=warps,
+        groups=groups, gemv_rows=rows, cap=cap, out_dtype=dtype,
+        cutlass=SimpleNamespace(BFloat16="bf16")))
+    assert bool(actual) == selected
+    call = next(node for node in projection.body
+                if isinstance(node, ast.FunctionDef) and node.name == "__call__")
+    assert any(isinstance(node, ast.If) and ast.unparse(node.test) == "rows == Int32(16)"
+               for node in ast.walk(call))
+
+
+@pytest.mark.parametrize("n,k,warps,groups,rows,cap,row_scales,dtype,wide_groups,selected", [
+    (8192, 1536, 4, 1, 16, 64, False, "bf16", None, True),
+    (8192, 1536, 4, 1, 16, 128, False, "bf16", None, True),
+    (16384, 1536, 4, 1, 16, 64, False, "bf16", None, False),
+    (8192, 1536, 8, 1, 16, 64, False, "bf16", None, False),
+    (8192, 1536, 4, 4, 16, 64, False, "bf16", None, False),
+    (8192, 1536, 4, 1, 32, 64, False, "bf16", None, False),
+    (8192, 1536, 4, 1, 16, 63, False, "bf16", None, False),
+    (8192, 1536, 4, 1, 16, 64, True, "bf16", None, False),
+    (8192, 1536, 4, 1, 16, 64, False, "fp32", None, False),
+    (8192, 1536, 4, 1, 16, 64, False, "bf16", 4, False),
+])
+def test_hqa_m64_only_measured_recipe(n, k, warps, groups, rows, cap,
+                                    row_scales, dtype, wide_groups, selected):
+    path = ROOT / "b12x/integration/cuteafd/_fp8_weights.py"
+    tree = ast.parse(path.read_text())
+    projection = next(node for node in tree.body
+                      if isinstance(node, ast.ClassDef) and node.name == "Fp8Projection")
+    init = next(node for node in projection.body
+                if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    condition = next(node.test for node in ast.walk(init)
+                     if isinstance(node, ast.If) and any(
+                         isinstance(child, ast.Attribute) and child.attr == "gemv_m64"
+                         for statement in node.body for child in ast.walk(statement))
+                     and "self.n" in ast.unparse(node.test))
+    actual = eval(compile(ast.Expression(condition), str(path), "eval"), dict(
+        self=SimpleNamespace(n=n, k=k, row_scales=row_scales), warps=warps,
+        groups=groups, gemv_rows=rows, cap=cap, out_dtype=dtype,
+        wide_groups=wide_groups, cutlass=SimpleNamespace(BFloat16="bf16")))
+    assert bool(actual) == selected
+    call = next(node for node in projection.body
+                if isinstance(node, ast.FunctionDef) and node.name == "__call__")
+    assert any(isinstance(node, ast.If) and ast.unparse(node.test) == "rows == Int32(64)"
+               for node in ast.walk(call))

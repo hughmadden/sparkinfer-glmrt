@@ -21,6 +21,7 @@ from b12x._lib.intrinsics import (
     weight_stream_policy,
     ld_shared_u32, ld_shared_f32, st_shared_f32, packed_dequant_trellis_to_half2x4,
     packed_dequant_trellis_stream_to_half2x4,
+    packed_dequant_trellis_highrate_to_half2x4,
     packed_dequant_trellis_mul1_to_half2x4,
     shared_ptr_to_u32, st_global_v2_f32, st_global_v4_f32, st_shared_v4_u32,
     trellis_align_stream_u32x2, u32_as_f32,
@@ -48,6 +49,113 @@ _PREFILL_MIN_ROWS = 130
 _E4M3_DECODE_ROWS = 64
 _FOLDED_DECODE_ROWS = 16
 _GEMINI_NARROW_ROWS = 8
+_K6_NARROW_ROWS = 8
+_K6_DECODE_ROWS = 16
+_K6_WIDE2_ROWS = 32
+_K6_WIDE3_ROWS = 48
+_GROUPED_DECODE_ROWS = 16
+_GROUPED_WIDE2_ROWS = 32
+
+
+def validate_grouped_route_thresholds(decode_rows, wide2_rows):
+    # Earlier active blocks store whole 16-row tiles at a runtime-rows stride.
+    assert decode_rows >= 16, "grouped wide2 below row 17 overlaps the next projection's partial plane"
+    assert wide2_rows >= 32, "grouped wide3 below row 33 overlaps the next projection's partial plane"
+
+
+# Cold-L2, 50 alternating samples at rows 12/16 on SM170 and SM188 exports.
+# Only standalone MCG with BF16 inputs and the listed storage sides qualified.
+DECODE_ROWS_BY_SHAPE = {
+    (6, 6144, 7168): (8, (1,)),
+    (6, 7168, 6144): (8, (1, 2)),
+    (6, 3584, 7168): (8, (1,)),
+    (6, 640, 7168): (8, (1,)),
+    (6, 18432, 1536): (8, (1,)),
+    (6, 9216, 1536): (8, (1,)),
+    (6, 12288, 7168): (8, (1,)),
+    (6, 7168, 12288): (8, (1,)),
+    (6, 6144, 8192): (8, (1, 2)),
+    (6, 6144, 6144): (8, (1, 2)),
+    (6, 16384, 1536): (8, (1,)),
+    (6, 4096, 16384): (8, (1,)),
+    (6, 12288, 4096): (8, (1,)),
+    (6, 4096, 12288): (8, (1,)),
+    (6, 8192, 8192): (8, (1,)),
+    (6, 8192, 6144): (8, (1,)),
+    (6, 13824, 4096): (8, (1,)),
+    (6, 4096, 13824): (8, (1,)),
+    (8, 6144, 7168): (8, (1,)),
+    (8, 7168, 6144): (8, (1, 2)),
+    (8, 3072, 7168): (8, (1,)),
+    (8, 3584, 7168): (8, (1,)),
+    (8, 9216, 1536): (8, (1,)),
+    (8, 12288, 7168): (8, (1,)),
+    (8, 7168, 12288): (8, (1,)),
+    (8, 16384, 2048): (8, (1,)),
+    (8, 6144, 8192): (8, (1, 2)),
+    (8, 12288, 6144): (8, (1,)),
+    (8, 6144, 6144): (8, (1, 2)),
+    (8, 6144, 12288): (8, (1, 2)),
+    (8, 6144, 2048): (8, (1,)),
+    (8, 6144, 1024): (8, (2,)),
+    (8, 8192, 4096): (8, (1, 2)),
+    (8, 4096, 4096): (8, (1, 2)),
+    (8, 4096, 8192): (8, (1, 2)),
+    (8, 16384, 1536): (8, (1,)),
+    (8, 8192, 1536): (8, (1,)),
+    (8, 4096, 16384): (8, (1,)),
+    (8, 12288, 4096): (8, (1,)),
+    (8, 6144, 4096): (8, (1, 2)),
+    (8, 4096, 6144): (8, (1, 2)),
+    (8, 4096, 2048): (8, (1,)),
+    (8, 4096, 1024): (8, (2,)),
+    (8, 8192, 8192): (8, (1,)),
+    (8, 2048, 8192): (8, (1,)),
+    (8, 8192, 6144): (8, (1,)),
+    (8, 3072, 6144): (8, (1,)),
+    (8, 13824, 4096): (8, (1,)),
+    (8, 4096, 13824): (8, (1,)),
+}
+
+
+def decode_rows(g):
+    measured = DECODE_ROWS_BY_SHAPE.get((g["bits"], g["output_features"], g["input_features"]))
+    if (measured is not None and g.get("groups", 1) == 1 and g["codebook"] == "mcg"
+            and g.get("input_dtype", "f16") == "bf16" and g["sharded_side"] in measured[1]):
+        return measured[0]
+    return _K6_DECODE_ROWS
+
+
+def decode_route_thresholds(g):
+    """Actual arithmetic edges below row 64, not a cross-program superset."""
+    bits, k, n, splits = (g[key] for key in ("bits", "input_features", "output_features", "splits"))
+    if g.get("groups", 1) == 4:
+        edges = [] if bits < 5 else [_GROUPED_DECODE_ROWS, _GROUPED_WIDE2_ROWS, 48]
+    elif bits == 6:
+        folded = k & (k - 1) != 0 and ((2 < splits <= 6 and n <= 4096) or (2 < splits <= 8 and n <= 1536))
+        narrow = False
+        if not folded and n <= 65536:
+            if splits == 1 or n <= 1536:
+                narrow = True
+            elif k & (k - 1):
+                if splits == 2 and n <= 9216:
+                    narrow = not (k == 1536 and n == 8192)
+                else:
+                    narrow = (splits == 4 and n <= 8192) or (8 < splits <= 12 and n <= 4096)
+            else:
+                narrow = splits in (2, 4, 8)
+        edge = decode_rows(g)
+        edges = [edge, _K6_WIDE2_ROWS, _K6_WIDE3_ROWS]
+        if narrow and _K6_NARROW_ROWS < edge:
+            edges.append(_K6_NARROW_ROWS)
+    elif bits == 4 and g["codebook"] == "e4m3":
+        if g.get("input_dtype", "f16") == "f16":
+            edges = [16, 32, 48] if splits <= 2 else [_GEMINI_NARROW_ROWS, 16, 32, 48]
+        else:
+            edges = [_FOLDED_DECODE_ROWS, 48] if splits <= 2 else ([48] if splits <= 16 else [])
+    else:
+        edges = [] if bits < 5 else [decode_rows(g), 32, 48]
+    return tuple(sorted({edge for edge in edges if 0 < edge < min(64, g["max_rows"])}))
 _PREFILL_STAGES = 2
 _PREFILL_PRODUCER_REGS = 104
 _PREFILL_CONSUMER_REGS = 192
@@ -517,7 +625,9 @@ def decode_tile_raw(address: Int64, tile: Int32, lane: Int32,
         z1 = _load_word(base + i1.to(Int64) * Int64(4), policy)
         z2 = _load_word(base + i2.to(Int64) * Int64(4), policy)
         wa, wb = trellis_align_stream_u32x2(z0, z1, z2, shift, delta)
-    if cutlass.const_expr(mul1):
+    if cutlass.const_expr(bits >= 7):
+        b0, b1, b2, b3 = packed_dequant_trellis_highrate_to_half2x4(z0, z1, z2, shift, bits, mul1)
+    elif cutlass.const_expr(mul1):
         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, bits)
     elif cutlass.const_expr(bits == 6):
         b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, bits)
@@ -574,7 +684,9 @@ def decode_tile_from_base(base: Int64, lane: Int32,
         z1 = _load_word(base + i1.to(Int64) * Int64(4), policy)
         z2 = _load_word(base + i2.to(Int64) * Int64(4), policy)
         wa, wb = trellis_align_stream_u32x2(z0, z1, z2, shift, delta)
-    if cutlass.const_expr(mul1):
+    if cutlass.const_expr(bits >= 7):
+        b0, b1, b2, b3 = packed_dequant_trellis_highrate_to_half2x4(z0, z1, z2, shift, bits, mul1)
+    elif cutlass.const_expr(mul1):
         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, bits)
     elif cutlass.const_expr(bits == 6):
         b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, bits)
@@ -601,10 +713,13 @@ class NativeTrellisLinear:
         return _E4M3_DECODE_ROWS if self.e4m3 else _PREFILL_MIN_ROWS - 1
 
     def __init__(self, g):
+        if g.get("groups", 1) == 4:
+            validate_grouped_route_thresholds(_GROUPED_DECODE_ROWS, _GROUPED_WIDE2_ROWS)
         self.k, self.n = g["input_features"], g["output_features"]
         self.bits, self.e4m3 = g["bits"], g["codebook"] == "e4m3"
         self.mul1 = g["codebook"] == "mul1"
         self.input_bf16 = g.get("input_dtype", "f16") == "bf16"
+        self.decode_rows = decode_rows(g)
         # High-rate windows need more live registers than the frozen K2--K4 path.
         self.min_blocks_per_mp = 2 if self.bits >= 5 else self.CTAS_PER_SM
         self.input_units = g["sharded_side"] == 2
@@ -828,7 +943,7 @@ class NativeTrellisLinear:
             self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
                 grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-        elif rows <= Int32(16):
+        elif rows <= Int32(self.decode_rows):
             self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
                 grid=(min(tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
@@ -1572,6 +1687,9 @@ class NativeTrellisLinear:
                         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, 4)
                     else:
                         b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
+                elif cutlass.const_expr(self.bits >= 7):
+                    b0, b1, b2, b3 = packed_dequant_trellis_highrate_to_half2x4(
+                        w_s0[k16_in_64, 0], w_s0[k16_in_64, 1], w_s0[k16_in_64, 2], shift, self.bits, self.mul1)
                 else:
                     wa, wb = trellis_align_stream_u32x2(
                         w_s0[k16_in_64, 0], w_s0[k16_in_64, 1], w_s0[k16_in_64, 2], shift, delta)
@@ -1617,6 +1735,9 @@ class NativeTrellisLinear:
                         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, 4)
                     else:
                         b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
+                elif cutlass.const_expr(self.bits >= 7):
+                    b0, b1, b2, b3 = packed_dequant_trellis_highrate_to_half2x4(
+                        w_s1[k16_in_64, 0], w_s1[k16_in_64, 1], w_s1[k16_in_64, 2], shift, self.bits, self.mul1)
                 else:
                     wa, wb = trellis_align_stream_u32x2(
                         w_s1[k16_in_64, 0], w_s1[k16_in_64, 1], w_s1[k16_in_64, 2], shift, delta)
@@ -2006,7 +2127,9 @@ class NativeTrellisLinear:
                         wb = (((cur2[t].to(Int64) << Int64(32)) | cur3[t].to(Int64)) >> shift1.to(Int64)).to(Uint32)
                     else:
                         wa, wb = trellis_align_stream_u32x2(cur0[t], cur1[t], cur2[t], shift0, shift1)
-                    if cutlass.const_expr(self.mul1):
+                    if cutlass.const_expr(self.bits >= 7):
+                        b0, b1, b2, b3 = packed_dequant_trellis_highrate_to_half2x4(cur0[t], cur1[t], cur2[t], shift0, self.bits, self.mul1)
+                    elif cutlass.const_expr(self.mul1):
                         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, self.bits)
                     elif cutlass.const_expr(self.bits == 6):
                         b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, self.bits)
@@ -2639,11 +2762,11 @@ class NativeTrellisLinear:
                         self.multiply_grouped(inputs, payloads, scales, partial, rows, rotation_id).launch(
                             grid=(min(((rows + Int32(15)) // Int32(16)) * group_tiles, cta_limit), 1, 1),
                             block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                    elif rows <= Int32(16):
+                    elif rows <= Int32(_GROUPED_DECODE_ROWS):
                         self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 1, 8).launch(
                             grid=(min(group_tiles, cta_limit), 1, 1),
                             block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
-                    elif rows <= Int32(32):
+                    elif rows <= Int32(_GROUPED_WIDE2_ROWS):
                         self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 2, 4).launch(
                             grid=(min(group_tiles, cta_limit), 1, 1),
                             block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
@@ -2663,11 +2786,11 @@ class NativeTrellisLinear:
                     self.multiply_grouped(inputs, payloads, scales, partial, rows, rotation_id).launch(
                         grid=(min(((rows + Int32(15)) // Int32(16)) * group_tiles, cta_limit), 1, 1),
                         block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                elif rows <= Int32(16):
+                elif rows <= Int32(_GROUPED_DECODE_ROWS):
                     self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 1, 8).launch(
                         grid=(min(group_tiles, cta_limit), 1, 1),
                         block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
-                elif rows <= Int32(32):
+                elif rows <= Int32(_GROUPED_WIDE2_ROWS):
                     self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 2, 4).launch(
                         grid=(min(group_tiles, cta_limit), 1, 1),
                         block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
@@ -3779,7 +3902,7 @@ class NativeTrellisLinear:
                        n16_narrow: cutlass.Constexpr, fuse_narrow: cutlass.Constexpr, b_sub_narrow: cutlass.Constexpr,
                        n16_16: cutlass.Constexpr, fuse_16: cutlass.Constexpr, b_sub_16: cutlass.Constexpr,
                        ):
-        if rows <= Int32(8):
+        if rows <= Int32(_K6_NARROW_ROWS):
             n_tiles = self.n // (16 * n16_narrow)
             tiles = Int32(n_tiles) if cutlass.const_expr(fuse_narrow) else Int32(n_tiles * self.splits)
             warps = n16_narrow * (self.splits if fuse_narrow else 1) * b_sub_narrow
@@ -3831,7 +3954,7 @@ class NativeTrellisLinear:
     def _decode_k6(self, inputs: cute.Tensor, payload: cute.Tensor,
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
-        if rows <= Int32(16):
+        if rows <= Int32(self.decode_rows):
             if cutlass.const_expr((self.k & (self.k - 1)) != 0 and
                                   ((2 < self.splits <= 6 and self.n <= 4096) or
                                    (2 < self.splits <= 8 and self.n <= 1536))):
@@ -3858,7 +3981,7 @@ class NativeTrellisLinear:
                     else:
                         self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
                 elif cutlass.const_expr((self.splits == 4 and self.n <= 8192) or (8 < self.splits <= 12 and self.n <= 4096)):
-                    if rows <= Int32(8):
+                    if rows <= Int32(_K6_NARROW_ROWS):
                         self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2 if self.splits == 4 else 1, 1, True, 1)
                     else:
                         self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
@@ -3866,27 +3989,27 @@ class NativeTrellisLinear:
                     self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             elif cutlass.const_expr(self.splits == 2):
                 if cutlass.const_expr(self.n > 8192):
-                    if rows <= Int32(8):
+                    if rows <= Int32(_K6_NARROW_ROWS):
                         self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
                     else:
                         self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
                 else:
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
             elif cutlass.const_expr(self.splits == 4 and self.n > 1536):
-                if rows <= Int32(8):
+                if rows <= Int32(_K6_NARROW_ROWS):
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1)
                 else:
                     self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             elif cutlass.const_expr(self.splits == 4):
                 self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1)
             elif cutlass.const_expr(self.splits == 8):
-                if rows <= Int32(8):
+                if rows <= Int32(_K6_NARROW_ROWS):
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 1, 1, True, 1)
                 else:
                     self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             else:
                 self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
-        elif rows <= Int32(32):
+        elif rows <= Int32(_K6_WIDE2_ROWS):
             if cutlass.const_expr(self.n > 65536 or self.splits == 1):
                 self._decode_existing(inputs, payload, scales, partial, output,
                                       rows, rotation_id, cta_limit, stream)
@@ -3898,7 +4021,7 @@ class NativeTrellisLinear:
                 self.reduce(partial, output, rows).launch(
                     grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
                     block=(128, 1, 1), stream=stream)
-        elif rows <= Int32(48):
+        elif rows <= Int32(_K6_WIDE3_ROWS):
             tiles = Int32(self.n // 128 * self.splits)
             self.multiply_k6_wide(inputs, payload, scales, partial, output, rows, rotation_id, 3, 8).launch(
                 grid=(min(tiles, cta_limit), 1, 1),

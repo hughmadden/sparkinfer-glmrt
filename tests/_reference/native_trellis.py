@@ -15,8 +15,8 @@ class Reference:
 
     @staticmethod
     def codewords(data, bits):
-        if bits not in (2, 3, 4, 5, 6) or len(data) % (32 * bits):
-            raise ValueError("expected complete K2--K6 tiles")
+        if bits not in range(1, 9) or len(data) % (32 * bits):
+            raise ValueError("expected complete K1--K8 tiles")
         # Each little-endian uint32 is an MSB-first segment of the circular code.
         words = np.frombuffer(data, dtype="<u4").reshape(-1, 8 * bits)
         stream = ((words[:, :, None] >> np.arange(31, -1, -1)) & 1).reshape(-1, 256 * bits)

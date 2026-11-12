@@ -16,6 +16,34 @@ _BENCH = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_BENCH)
 
 
+@pytest.mark.parametrize("shape,wide,extended", [
+    ((6144, 7168), True, True),
+    ((6144, 7168), False, False),
+    ((3584, 7168), True, False),
+    ((7168, 6144), True, False),
+])
+def test_wide_override_extends_only_selected_shape_keys(shape, wide, extended):
+    source = _PATH.parents[1] / "b12x/gemm/bf16_gemv/_skinny.py"
+    tree = ast.parse(source.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == "RoutedBf16Projection")
+    key = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "key")
+    namespace = dict(WIDE_PREFILL_MIN_ROWS=512,
+                     WIDE_PREFILL_CONFIG_BY_SHAPE={(6144, 7168): {}})
+    exec(compile(ast.Module(body=[key], type_ignores=[]), str(source), "exec"), namespace)
+    projection = SimpleNamespace(
+        n=shape[0], k=shape[1], out_dtype="bf16", max_skinny_rows=0,
+        skinny=SimpleNamespace(cols=1, rows_per_tile=8, threads=128),
+        large=SimpleNamespace(config={"compensated": False}),
+        wide=SimpleNamespace(key=lambda: ("selected-config",)) if wide else None,
+        wide_min_rows=1024, tiles_by_rows=(), skinny_tiles_by_rows=())
+    original = (*shape, "bf16", 0, 1, 8, 128, (("compensated", False),), wide)
+    if wide:
+        original += (("wide_min_rows", 1024),)
+    expected = original + ((("wide", ("selected-config",)),) if extended else ())
+    assert namespace["key"](projection) == expected
+
+
 def test_compensation_pair_accepts_production_shapes_and_wide_rows():
     args = _BENCH.parse_args(["--recipes", "compensation", "--shapes", "7168x6144,6144x6144",
                               "--rows", "1,16,4096"])
@@ -71,7 +99,8 @@ def test_projection_compensation_is_opt_in_and_default_key_is_unchanged(monkeypa
             return tuple(sorted(self.kwargs.items()))
 
     monkeypatch.setitem(sys.modules, "b12x.gemm.bf16_gemv._skinny", SimpleNamespace(
-        COMPENSATED_TILES_BY_ROWS={}, RoutedBf16Projection=Projection, TmaBf16Projection=Projection))
+        COMPENSATED_TILES_BY_ROWS={}, RoutedBf16Projection=Projection,
+        TmaBf16Projection=Projection, wide_prefill_min_rows=lambda *args: 4097))
     namespace = dict(torch=SimpleNamespace(bfloat16="bf16", float32="f32"),
                      BFloat16="bf16", Float32="f32", Operand=lambda *a: a,
                      Scalar=lambda *a: a, compile_program=lambda op, **kwargs: kwargs)
@@ -81,7 +110,8 @@ def test_projection_compensation_is_opt_in_and_default_key_is_unchanged(monkeypa
     explicit = build(width=6144, outputs=7168, compensated=False)
     compensated = build(width=6144, outputs=7168, compensated=True)
     assert default == explicit
-    assert calls[:2] == [(7168, 6144, {"out_dtype": "bf16", "max_skinny_rows": 0})] * 2
+    assert calls[:2] == [(7168, 6144, {"out_dtype": "bf16", "max_skinny_rows": 0,
+                                     "wide": False, "wide_min_rows": None})] * 2
     assert calls[2] == (7168, 6144, {"out_dtype": "bf16", "tiles_by_rows": (), "compensated": True})
     assert default["geometry"] == dict(width=6144, outputs=7168, output_dtype="bf16", skinny_rows=0,
                                        exact_row_cap=2**31 - 1)
@@ -109,7 +139,8 @@ def _compensated_build(monkeypatch, table):
             return tuple(sorted(self.kwargs.items()))
 
     monkeypatch.setitem(sys.modules, "b12x.gemm.bf16_gemv._skinny", SimpleNamespace(
-        COMPENSATED_TILES_BY_ROWS=table, RoutedBf16Projection=Projection, TmaBf16Projection=Projection))
+        COMPENSATED_TILES_BY_ROWS=table, RoutedBf16Projection=Projection,
+        TmaBf16Projection=Projection, wide_prefill_min_rows=lambda *args: 4097))
     namespace = dict(torch=SimpleNamespace(bfloat16="bf16", float32="f32"),
                      BFloat16="bf16", Float32="f32", Operand=lambda *a: a,
                      Scalar=lambda *a: a, compile_program=lambda op, **kwargs: kwargs)
@@ -175,3 +206,259 @@ def test_invalid_geometry_is_rejected_before_cuda_import(argv):
     with pytest.raises(SystemExit) as error:
         _BENCH.parse_args(argv)
     assert error.value.code == 2
+
+
+def _native_threshold_bench():
+    path = _PATH.with_name("kimi_k6_dense.py")
+    spec = importlib.util.spec_from_file_location("native_threshold_benchmark", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("text", ["narrow=9", "decode=17", "wide2=33", "wide3=49",
+                                  "folded=17", "prefill=131", "prefill=0",
+                                  "narrow=8,decode=4", "splits=4", "stages=3"])
+def test_native_thresholds_refuse_unsafe_knobs(text):
+    with pytest.raises(ValueError):
+        _native_threshold_bench().threshold_config(text)
+
+
+def test_reference_encoder_build_requires_explicit_official_source(monkeypatch, tmp_path):
+    bench = _native_threshold_bench()
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path), "--encoder-build-only"])
+    with pytest.raises(SystemExit) as error:
+        bench.main()
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("text", ["decode=8", "wide2=24"])
+def test_grouped_threshold_builder_refuses_partial_plane_overlap(text, tmp_path):
+    bench = _native_threshold_bench()
+    with pytest.raises(ValueError, match="next projection's partial plane"):
+        bench.threshold_config(text, groups=4)
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    with pytest.raises(ValueError, match="next projection's partial plane"):
+        bench.threshold_variant(source, tmp_path / "bad.py", bench.threshold_config(text), groups=4)
+
+
+@pytest.mark.parametrize("decode,wide2", [(8, 32), (16, 24)])
+def test_native_grouped_constructor_refuses_partial_plane_overlap(decode, wide2):
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    tree = ast.parse(source.read_text())
+    check = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "validate_grouped_route_thresholds")
+    core = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                and n.name == "NativeTrellisLinear")
+    init = next(n for n in core.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    namespace = {"_GROUPED_DECODE_ROWS": decode, "_GROUPED_WIDE2_ROWS": wide2}
+    exec(compile(ast.Module(body=[check, init], type_ignores=[]), str(source), "exec"), namespace)
+    with pytest.raises(AssertionError, match="next projection's partial plane"):
+        namespace["__init__"](SimpleNamespace(), {"groups": 4})
+
+
+def test_standalone_threshold_variant_keeps_grouped_routes_frozen(tmp_path):
+    bench = _native_threshold_bench()
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    variant = bench.threshold_variant(source, tmp_path / "standalone.py", bench.threshold_config("decode=8"))
+    def grouped(text):
+        core = next(n for n in ast.parse(text).body if isinstance(n, ast.ClassDef)
+                    and n.name == "NativeTrellisLinear")
+        return ast.dump(next(n for n in core.body if isinstance(n, ast.FunctionDef)
+                             and n.name == "_generic_grouped"))
+    assert grouped(variant.read_text()) == grouped(source.read_text())
+    assert "_GROUPED_DECODE_ROWS = 16" in variant.read_text()
+
+
+def test_reference_fixtures_require_prebuilt_official_encoder(monkeypatch, tmp_path):
+    bench = _native_threshold_bench()
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path), "--encode-fixtures"])
+    with pytest.raises(SystemExit) as error:
+        bench.main()
+    assert error.value.code == 2
+
+
+def test_kimi_decision_requires_encoded_fixtures_and_profile_before_cuda(monkeypatch, tmp_path):
+    bench = _native_threshold_bench()
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path), "--kimi-decision"])
+    with pytest.raises(SystemExit) as error:
+        bench.main()
+    assert error.value.code == 2
+
+
+def test_kimi_decision_keeps_independent_projection_and_native_remainder_shapes():
+    source = _PATH.with_name("kimi_k6_dense.py").read_text()
+    tree = ast.parse(source)
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == "benchmark_kimi_decision")
+    assert '("kda", 6144, 4, range(4), 24752)' in ast.get_source_segment(source, node)
+    assert '("gate_up", 3072, 1, range(4, 6), 6144)' in ast.get_source_segment(source, node)
+    assert 'outputs=176' in ast.get_source_segment(source, node)
+    assert '"KDA and shared gate/up only, not a full-core speed estimate"' in source
+
+
+def _kimi_profile_fixture():
+    def entry(n, k, count, symbols):
+        return dict(device=0, lane="target", geometry=dict(n=n, k=k), phases=dict(decode=dict(
+            count=count, unit_count=255, unknown_rows=0, rows={"5": count}, symbols=symbols)))
+    catalog = [entry(24752, 7168, 5037, ["kda"]),
+               entry(6144, 7168, 8468, ["shared", "mla"]),
+               entry(7168, 3072, 6716, ["down"]), entry(9216, 1536, 1752, ["qb"])]
+    inventory = dict(phase="decode", unit="emitted-token", unit_count=255, kernels=[
+        dict(device=0, name="shared", count=3000, rows={"5": 3000}),
+        dict(device=0, name="shared", count=3716, rows={"5": 3716}),
+        dict(device=0, name="mla", count=1752, rows={"5": 1752}),
+        dict(device=1, name="shared", count=999, rows={"5": 999})])
+    return catalog, inventory
+
+
+def test_kimi_profile_accounting_separates_shared_gate_up_from_single_mla_gate():
+    catalog, inventory = _kimi_profile_fixture()
+    accounting = _native_threshold_bench().kimi_profile_accounting(catalog, inventory)
+    assert accounting["calls_per_emitted_token"] == dict(kda=5037 / 255, gate_up=6716 / 255)
+    assert accounting["symbols"] == {"packed shared gate/up": "shared", "single MLA h48 gate": "mla"}
+    assert accounting["shared_gate_up_count"] + accounting["mla_gate_count"] == accounting["mixed_count"]
+
+
+@pytest.mark.parametrize("bad", ["units", "missing_symbol", "count", "histogram", "unknown", "duplicate"])
+def test_kimi_profile_accounting_refuses_ambiguous_or_incomplete_data(bad):
+    catalog, inventory = _kimi_profile_fixture()
+    if bad == "units":
+        inventory["unit_count"] = 256
+    elif bad == "missing_symbol":
+        inventory["kernels"] = inventory["kernels"][:2]
+    elif bad == "count":
+        inventory["kernels"][0]["count"] -= 1
+    elif bad == "histogram":
+        inventory["kernels"][0]["rows"] = {"4": 3000}
+    elif bad == "unknown":
+        inventory["kernels"][0]["row_unknown"] = 1
+    elif bad == "duplicate":
+        catalog.append(catalog[0])
+    with pytest.raises(ValueError):
+        _native_threshold_bench().kimi_profile_accounting(catalog, inventory)
+
+
+def test_kimi_decision_requires_symbol_inventory_before_cuda(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path), "--kimi-decision",
+                                     "--fixture-dir", str(tmp_path), "--profile-catalog", "catalog.json"])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
+
+
+def _full_core_config():
+    return dict(hidden_size=7168,num_hidden_layers=93,num_attention_heads=96,
+        linear_attn_config=dict(kda_layers=list(range(69)),full_attn_layers=list(range(24)),
+                                num_heads=96,head_dim=128),
+        num_shared_experts=2,moe_intermediate_size=3072,routed_expert_hidden_size=3584,
+        q_lora_rank=1536,kv_lora_rank=512,qk_rope_head_dim=64,qk_nope_head_dim=128,
+        num_experts=896,intermediate_size=33792,vocab_size=163840)
+
+
+def test_full_core_config_keeps_physical_counts_and_independent_padded_rank_shapes():
+    bench = _native_threshold_bench()
+    operations = bench.kimi_full_core_operations(_full_core_config())
+    roles = {o["role"]:o for o in operations}
+    assert roles["kda"]["count"] == [69,69]
+    assert roles["attn_out"]["count"] == [93,93]
+    assert roles["latent_down"]["count"] == [46,46]
+    assert roles["mla_gate"]["count"] == [24,24]
+    assert roles["head"]["count"] == [0,1]
+    assert roles["layer0_down"]["native"] and roles["layer0_down"]["output"] == "bf16"
+    shapes = bench.full_core_fixture_shapes(operations)
+    rank = [s for s in shapes if s["role"] == "mla_rank"]
+    assert [s["n"] for s in rank] == [1536,640]
+    assert len([s for s in shapes if s["role"] == "kda"]) == 4
+    assert next(s for s in shapes if s["role"] == "shared_down")["side"] == 2
+
+
+def test_full_core_aggregation_never_sums_concurrent_gpus_and_uses_actual_head_rows():
+    bench = _native_threshold_bench()
+    operations = bench.kimi_full_core_operations(_full_core_config())
+    records = [dict(role=o["role"],rows=r,total_call_us={"native":1} if o["native"] else
+                    dict(k6=1,k8=2,bf16=3)) for o in operations
+               for r in ([1,5] if o["head"] else [5,2752,2688,2240])]
+    result = bench.aggregate_kimi_full_core(operations,records,
+                dict(verify_steps_per_emitted_token=73/255),[5,2752,2688,2240])
+    decode = result["decode"][0]["local_dense_us_per_verify_step"]["k6"]
+    assert decode[1]-decode[0] == 1
+    assert [p["head_calls"] for p in result["prefill"]] == [1,8]
+    assert [p["local_dense_us"]["k6"][1]-p["local_dense_us"]["k6"][0]
+            for p in result["prefill"]] == [1,8]
+
+
+def test_full_core_requires_config_before_cuda(monkeypatch,tmp_path):
+    monkeypatch.setattr(sys,"argv",["benchmark","--output-dir",str(tmp_path),"--full-core","--kimi-decision"])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
+
+
+def _native_route_policy():
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    nodes = []
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and
+                (t.id.startswith("_K6_") or t.id.startswith("_GROUPED_") or
+                 t.id in ("DECODE_ROWS_BY_SHAPE", "_FOLDED_DECODE_ROWS", "_GEMINI_NARROW_ROWS"))
+                for t in node.targets):
+            nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in ("decode_rows", "decode_route_thresholds"):
+            nodes.append(node)
+    namespace = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace
+
+
+def test_measured_decode_rows_are_scoped_to_qualified_format_and_storage_sides():
+    policy = _native_route_policy()
+    build = policy["decode_rows"]
+    for (bits, n, k), (edge, sides) in policy["DECODE_ROWS_BY_SHAPE"].items():
+        for side in (1, 2):
+            g = dict(bits=bits, output_features=n, input_features=k, sharded_side=side,
+                     codebook="mcg", input_dtype="bf16", groups=1)
+            assert build(g) == (edge if side in sides else 16)
+            for key, value in (("codebook", "mul1"), ("input_dtype", "f16"), ("groups", 4)):
+                assert build(dict(g, **{key: value})) == 16
+    assert build(dict(bits=6, output_features=3072, input_features=7168,
+                      sharded_side=1, codebook="mcg", input_dtype="bf16")) == 16
+
+
+@pytest.mark.parametrize("bits,n,k,groups,expected", [
+    (6, 6144, 7168, 1, (8, 32, 48)),
+    (6, 6144, 7168, 4, (16, 32, 48)),
+    (6, 3072, 7168, 1, (16, 32, 48)),
+    (6, 163840, 7168, 1, (16, 32, 48)),
+    (8, 6144, 7168, 1, (8, 32, 48)),
+    (8, 6144, 7168, 4, (16, 32, 48)),
+    (8, 7168, 3072, 1, (16, 32, 48)),
+    (4, 6144, 7168, 1, ()),
+])
+def test_native_route_metadata_describes_each_actual_program(bits, n, k, groups, expected):
+    policy = _native_route_policy()
+    g = dict(bits=bits, output_features=n, input_features=k, splits=(k + 1023)//1024,
+             sharded_side=1, codebook="mcg", input_dtype="bf16", groups=groups, max_rows=4096)
+    assert policy["decode_route_thresholds"](g) == expected
+    g["max_rows"] = 8
+    assert policy["decode_route_thresholds"](g) == ()
+
+
+def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
+    bench = _native_threshold_bench()
+    source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
+    original = source.read_text()
+    unchanged = bench.threshold_variant(source, tmp_path / "defaults.py", bench.threshold_config(None))
+    assert unchanged.read_text() == original
+    values = bench.threshold_config("narrow=4,decode=8,wide2=24,wide3=32,prefill=64")
+    variant = bench.threshold_variant(source, tmp_path / "variant.py", values).read_text()
+    assert "_K6_NARROW_ROWS = 4" in variant
+    assert "_PREFILL_MIN_ROWS = 64" in variant
+    before, after = ast.parse(original), ast.parse(variant)
+    base = next(n for n in before.body if isinstance(n, ast.ClassDef) and n.name == "NativeTrellisLinear")
+    changed = next(n for n in after.body if isinstance(n, ast.ClassDef) and n.name == "NativeTrellisLinear")
+    methods = {n.name: n for n in changed.body if isinstance(n, ast.FunctionDef)}
+    for method in (n for n in base.body if isinstance(n, ast.FunctionDef)):
+        if method.name not in ("__init__", "_legacy", "_generic_grouped"):
+            assert ast.dump(method) == ast.dump(methods[method.name]), method.name
+    assert source.read_text() == original

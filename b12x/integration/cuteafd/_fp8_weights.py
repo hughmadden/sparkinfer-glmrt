@@ -195,7 +195,7 @@ class Fp8Projection:
         self.kmajor = bool(kmajor) or (self.row_scales and prefill_rows is not None)
         self.prefill_mask = int(prefill_mask)
         self.prefill = prefill_rows is not None
-        self.gemv = self.gemv_wide = self.w8a8 = None
+        self.gemv = self.gemv_wide = self.gemv_m16 = self.gemv_m64 = self.w8a8 = None
         if self.prefill:
             from ._glmf_fp8 import BlockFp8Projection
 
@@ -233,6 +233,18 @@ class Fp8Projection:
                                       cta_tiles=wide_t if wide_groups is None else None,
                                       row_scales=self.row_scales, kmajor=self.kmajor,
                                       out_dtype=out_dtype) if cap > int(gemv_rows) else None
+            # HQA block-scale o projections: only M16 won the direct-widen screen.
+            if (self.n, self.k, warps) in ((4096, 16384, 4), (4096, 8192, 8)) \
+                    and not self.row_scales and out_dtype == cutlass.BFloat16 \
+                    and groups == 1 and int(gemv_rows) == 16 and cap > 16:
+                self.gemv_m16 = MmaFp8Gemv(self.n, self.k, max_rows=int(gemv_rows),
+                    warps=warps, groups=groups, out_dtype=out_dtype, direct_widen=True)
+            # TP2 q_b: two row tiles reduce registers at exactly the measured M64.
+            if (self.n, self.k, warps) == (8192, 1536, 4) and not self.row_scales \
+                    and out_dtype == cutlass.BFloat16 and groups == 1 \
+                    and int(gemv_rows) == 16 and cap >= 64 and wide_groups is None:
+                self.gemv_m64 = MmaFp8Gemv(self.n, self.k, max_rows=64, warps=warps,
+                    groups=2, cta_tiles=2, out_dtype=out_dtype)
             self.gemv_rows = int(gemv_rows)
             self.max_gemv_rows = cap if self.gemv_wide is not None else int(gemv_rows)
             tile_n = decode_tile_n(self.n)
@@ -244,6 +256,8 @@ class Fp8Projection:
         return (self.n, self.k, self.row_scales, self.kmajor, self.prefill_mask, self.max_gemv_rows,
                 None if self.gemv is None else self.gemv.key(),
                 None if self.gemv_wide is None else self.gemv_wide.key(),
+                None if self.gemv_m16 is None else self.gemv_m16.key(),
+                None if self.gemv_m64 is None else self.gemv_m64.key(),
                 None if self.w8a8 is None else self.w8a8.key(), self.w8a16.key())
 
     @property
@@ -273,7 +287,21 @@ class Fp8Projection:
             if limit > Int32(self.max_gemv_rows):
                 limit = Int32(self.max_gemv_rows)
             if rows <= limit:
-                if cutlass.const_expr(self.gemv_wide is None):
+                if cutlass.const_expr(self.gemv_m16 is not None):
+                    if rows == Int32(16):
+                        self.gemv_m16(x, w_fp8, scale, out, rows, stream)
+                    elif rows <= Int32(self.gemv_rows):
+                        self.gemv(x, w_fp8, scale, out, rows, stream)
+                    else:
+                        self.gemv_wide(x, w_fp8, scale, out, rows, stream)
+                elif cutlass.const_expr(self.gemv_m64 is not None):
+                    if rows == Int32(64):
+                        self.gemv_m64(x, w_fp8, scale, out, rows, stream)
+                    elif rows <= Int32(self.gemv_rows):
+                        self.gemv(x, w_fp8, scale, out, rows, stream)
+                    else:
+                        self.gemv_wide(x, w_fp8, scale, out, rows, stream)
+                elif cutlass.const_expr(self.gemv_wide is None):
                     self.gemv(x, w_fp8, scale, out, rows, stream)
                 else:
                     if rows <= Int32(self.gemv_rows):
@@ -382,6 +410,8 @@ FP8_GEMV_CONFIG = {
     (24896, 4096): (8, 1), (4096, 8192): (8, 1), (4096, 16384): (4, 1), (16384, 1536): (2, 1),
     (2048, 4096): (8, 1), (4096, 4096): (8, 1), (4096, 2048): (2, 1), (24576, 4096): (8, 1),
     (4096, 12288): (8, 1), (154880, 4096): (8, 1),
+    # Flash TP2 q_b keeps its original four-way K split, not full q_b's two.
+    (8192, 1536): (4, 1),
     # MiMo V2 Flash, per-row scales: full qkv 13568x4096 43.0/47.1 -> 38.9/43.0, SWA qkv
     # 14848x4096 45.1/50.2 -> 43.0/47.1, dense gate_up 32768x4096 88.1/90.1 -> 88.1/90.1,
     # LM head 152576x4096 386.0/388.1 -> 385.0/387.1.
@@ -427,6 +457,9 @@ FP8_GEMV_GROUPS_DEFAULT = 4
 # warps: ``groups`` and ``cta_tiles`` only partition the launch grid, so the rows 16 -> 17
 # program switch is still one bitwise K order.
 FP8_GEMV_WIDE = {
+    # The thin TP2 q_b tile changes column groups; preserve the shipped wide tile.
+    (8192, 1536): (4, 4, 4),
+    (16384, 1536): (2, 1, 4),
     (34816, 5120): (4, 2, 4), (5120, 17408): (4, 1, 1),
     (4096, 16384): (4, 2, 2), (2048, 4096): (8, 1, 1), (4096, 4096): (8, 2, 4),
     (4096, 2048): (2, 1, 1),
@@ -467,7 +500,11 @@ def fp8_gemv_wide(n: int, k: int, *, warps: int, groups: int) -> tuple[int, int 
 # shipped tile.  The nc path needs few column blocks (n=5120) to pay: on the wide-n shapes
 # it loses badly (34816x5120 0.62/0.51/0.46, 16384x5120 0.59/0.51/0.45), and on every
 # other measured shape the base kernel at least ties it, so everything else stays put.
-FP8_GEMV_WIDE_KERNEL = {(5120, 17408): "nc"}
+FP8_GEMV_WIDE_KERNEL = {
+    (5120, 17408): "nc",
+    (16384, 1536): "nc",
+    (4096, 16384): "nc",
+}
 
 
 def fp8_gemv_wide_kernel(n: int, k: int, *, warps: int, row_scales: bool = False,
@@ -885,7 +922,12 @@ class MmaFp8Gemv:
     def __init__(self, n: int, k: int, *, max_rows: int = 64, warps: int = 4, groups: int = 4,
                  out_dtype=cutlass.BFloat16, row_scales: bool = False, kmajor: bool = False,
                  load_hint: str = "stream", prefetch_blocks: int = 0, prefetch_bytes: int = 1024,
-                 cta_tiles: int | None = None):
+                 cta_tiles: int | None = None, direct_widen: bool = False):
+        self.direct_widen = bool(direct_widen)
+        self.widen = _e4m3x4_scaled_bf16x2x2
+        if self.direct_widen:
+            from ._fp8_gemv_nc import _e4m3x4_scaled_bf16x2x2_fast
+            self.widen = _e4m3x4_scaled_bf16x2x2_fast
         if load_hint not in ("stream", "l2_128b", "l2_256b"):
             raise ValueError("load_hint is stream, l2_128b or l2_256b")
         if prefetch_blocks and (prefetch_bytes % 128 or prefetch_bytes > 4096):
@@ -926,6 +968,8 @@ class MmaFp8Gemv:
                str(self.out_dtype), self.row_scales, self.kmajor)
         if self.load_hint != "stream" or self.prefetch_blocks:
             key += (self.load_hint, self.prefetch_blocks, self.prefetch_bytes)
+        if self.direct_widen:
+            key += ("direct_widen",)
         return key
 
     def _storage(self):
@@ -1066,8 +1110,8 @@ class MmaFp8Gemv:
                 bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
                 for gi in cutlass.range_constexpr(self.groups):
                     for t in cutlass.range_constexpr(4):
-                        b0, b1 = _e4m3x4_scaled_bf16x2x2(cur[(chunk * self.groups + gi) * 4 + t],
-                                                          s_cur[gi if self.row_scales else 0])
+                        b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t],
+                                           s_cur[gi if self.row_scales else 0])
                         bw[8 * gi + 2 * t] = b0
                         bw[8 * gi + 2 * t + 1] = b1
                 for mt in cutlass.range_constexpr(self.m_tiles):

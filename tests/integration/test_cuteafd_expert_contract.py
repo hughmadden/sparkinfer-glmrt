@@ -64,6 +64,53 @@ def test_cpu_geometry_contract(tp, width):
         Fp8MoeGeometry("bad", 4096, 352, 8, 1536, activation="unknown")
 
 
+@pytest.mark.parametrize("tp,width", [(1, 3072), (2, 1536), (3, 1024), (4, 768), (5, 640), (6, 512), (7, 512), (8, 384)])
+def test_cpu_minimax_vendor_expert_geometry(tp, width):
+    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, _resolve, fp8_moe_scratch_bytes
+
+    g = GEOMETRIES["minimax_nvfp4a4"].with_tp(tp)
+    assert (g.hidden, g.experts, g.top_k, g.intermediate, g.slice) == (6144, 128, 4, 3072, width)
+    assert (g.weights, g.activations, g.activation, g.projection) == ("nvfp4", "a4", "swigluoai", "bf16")
+    assert (g.swiglu_alpha, g.swiglu_beta, g.swiglu_limit) == (1.702, 1.0, 7.0)
+    for capacity in (1, 16, 80, 1024, 4096):
+        assert _resolve("auto", capacity, False, g.kind) == "stream"
+        assert fp8_moe_scratch_bytes(g, "auto", capacity, False) > 0
+        with pytest.raises(ValueError, match="original BF16"):
+            fp8_moe_scratch_bytes(g, "auto", capacity, True)
+
+
+def test_cpu_minimax_producer_abis_use_existing_arithmetic(monkeypatch):
+    from b12x.integration.cuteafd import minimax_producer as producer
+    from b12x.integration.cuteafd._mimo_kernels import MimoQkvRope
+    from b12x.integration.cuteafd._qwen4_attention_kernels import Qwen4AttnPost
+
+    def capture(launch, **contract):
+        return launch, contract
+
+    monkeypatch.setattr(producer, "compile_program", capture)
+    norm, contract = producer.compile_minimax_norm_rope_aot(heads=64)
+    assert isinstance(norm.norm, Qwen4AttnPost)
+    assert isinstance(norm.rope, MimoQkvRope)
+    assert norm.norm.eps == 1e-6
+    assert contract["scratch"]["scratch"](7) == 7 * 64 * 128 * 2
+    assert contract["operands"][3].dtype is torch.float32
+    assert [s.name for s in contract["scalars"]] == ["rows"]
+    index, contract = producer.compile_minimax_index_producer_aot()
+    assert (index.query.heads, index.key.heads) == (4, 1)
+    assert contract["scratch"]["scratch"](7) == 7 * 9 * 128 * 2
+    assert contract["operands"][6].dtype is torch.float32
+    assert [o.name for o in contract["operands"]][7:11] == ["q_fp8", "q_scale", "k_fp8", "k_scale"]
+    assert contract["geometry"]["page_rows"] == 64
+    oai, contract = producer.compile_minimax_oai_split_aot(width=3072)
+    assert oai.width == 3072
+    assert contract["geometry"] == dict(width=3072, alpha=1.702, beta=1.0, limit=7.0)
+    for value in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            producer.compile_minimax_norm_rope_aot(heads=value)
+        with pytest.raises(ValueError, match="positive integer"):
+            producer.compile_minimax_oai_split_aot(width=value)
+
+
 def bf16_reference(x, ids, route_weights, w1, w3, w2, limit, contract):
     # Sum in slot order, as MoeCombine does (including duplicate expert ids).
     result = torch.zeros_like(x, dtype=torch.float32)

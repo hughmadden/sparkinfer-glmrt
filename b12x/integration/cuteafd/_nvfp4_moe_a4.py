@@ -57,6 +57,8 @@ from b12x._lib.intrinsics import (
     st_shared_u32,
 )
 
+from b12x._lib.activation import gated_activation_value
+
 from ._fp8_moe_kernels import _post_silu_product, _ceil, _i32_at, _ld_u8, _ld_v2_u32, _round_bf16, _u32_as_f32
 from ._fp8_moe_stream import STREAM_TILE_M, _chunk
 from ._fp8_weights import _e4m3x8_scaled_bf16, _ld_f32
@@ -155,14 +157,17 @@ class ChunkSwiGLUA4:
     threads = 128
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0,
-                 activation: str = "silu_bf16_product"):
+                 activation: str = "silu_bf16_product", alpha: float | None = None, beta: float | None = None):
         self.inter, self.experts, self.limit = int(inter), int(experts), float(limit)
         self.post_silu = activation == "silu_post_clamp_fp32_product"
+        self.oai = activation == "swigluoai"
+        self.alpha, self.beta = alpha, beta
         self.in_offset = nvfp4_input_scale_offset(experts, hidden, inter)
 
     def key(self) -> tuple:
         return ("chunk_swiglu_a4", self.inter, self.experts, self.limit, self.in_offset) + (
-            ("silu_post_clamp_fp32_product",) if self.post_silu else ())
+            ("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (
+                ("swigluoai", self.alpha, self.beta) if self.oai else ())
 
     @cute.jit
     def __call__(self, g: cute.Pointer, u: cute.Pointer, meta: cute.Pointer, scales: cute.Pointer,
@@ -196,7 +201,11 @@ class ChunkSwiGLUA4:
                         for side in cutlass.range_constexpr(2):
                             gate = _bf16_lo(gw[q]) if side == 0 else _bf16_hi(gw[q])
                             up = _bf16_lo(uw[q]) if side == 0 else _bf16_hi(uw[q])
-                            if const_expr(self.post_silu):
+                            if const_expr(self.oai):
+                                values[8 * half + 2 * q + side] = _round_bf16(gated_activation_value(
+                                    gate, up, has_limit=True, limit_value=self.limit,
+                                    is_swigluoai=True, alpha=self.alpha, offset=self.beta))
+                            elif const_expr(self.post_silu):
                                 values[8 * half + 2 * q + side] = _round_bf16(_post_silu_product(gate, up, self.limit))
                             else:
                                 if const_expr(self.limit > 0.0):
@@ -434,13 +443,18 @@ class StreamNvfp4LinearA4:
 
 @cute.jit
 def _swiglu16(gw, uw, values: cute.Tensor, base: cutlass.Constexpr, limit: cutlass.Constexpr,
-              post_silu: cutlass.Constexpr = False):
+              post_silu: cutlass.Constexpr = False, oai: cutlass.Constexpr = False,
+              alpha: cutlass.Constexpr = None, beta: cutlass.Constexpr = None):
     """``values[base + j] = bf16(bf16(silu(g)) * u)`` of eight BF16 gate/up pairs (``ChunkSwiGLUA4``'s math)."""
     for q in cutlass.range_constexpr(4):
         for side in cutlass.range_constexpr(2):
             gate = _bf16_lo(gw[q]) if side == 0 else _bf16_hi(gw[q])
             up = _bf16_lo(uw[q]) if side == 0 else _bf16_hi(uw[q])
-            if const_expr(post_silu):
+            if const_expr(oai):
+                values[base + 2 * q + side] = _round_bf16(gated_activation_value(
+                    gate, up, has_limit=True, limit_value=limit,
+                    is_swigluoai=True, alpha=alpha, offset=beta))
+            elif const_expr(post_silu):
                 values[base + 2 * q + side] = _round_bf16(_post_silu_product(gate, up, limit))
             else:
                 if const_expr(limit > 0.0):
@@ -470,13 +484,15 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, k_block: int | None = None,
                  stages: int = 2, tile_m: int = 128, tile_n: int = 128,
-                 live_min: int = 1, live_max: int = 128, activation: str = "silu_bf16_product"):
+                 live_min: int = 1, live_max: int = 128, activation: str = "silu_bf16_product", alpha: float | None = None, beta: float | None = None):
         super().__init__(n=2 * int(inter), k=hidden, experts=experts, tile_m=tile_m, tile_n=tile_n,
                          live_min=live_min, live_max=live_max)
         self.half_n = self.tile_n // 2
         self.x_stride = 2 * self.tile_n + 16
         self.inter, self.limit = int(inter), float(limit)
         self.post_silu = activation == "silu_post_clamp_fp32_product"
+        self.oai = activation == "swigluoai"
+        self.alpha, self.beta = alpha, beta
         if k_block is None:
             k_block = self.k_block
         if self.k % k_block or k_block % 64:
@@ -508,7 +524,8 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
     def key(self) -> tuple:
         return ("stream_gate_up_nvfp4_a4", 5, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.live_min, self.live_max) + (
-                    ("silu_post_clamp_fp32_product",) if self.post_silu else ())
+                    ("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (
+                ("swigluoai", self.alpha, self.beta) if self.oai else ())
 
     def _storage(self):
         class Storage:
@@ -622,7 +639,8 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                         for half in cutlass.range_constexpr(2):
                             gw = ld_shared_v4_u32(at + Int32(16 * half))
                             uw = ld_shared_v4_u32(at + Int32(self.half_n * 2 + 16 * half))
-                            _swiglu16(gw, uw, values, 8 * half, self.limit, self.post_silu)
+                            _swiglu16(gw, uw, values, 8 * half, self.limit, self.post_silu,
+                                      self.oai, self.alpha, self.beta)
                         i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(row)
                         col16 = Int64(n0 // Int32(16) + grp)
                         _quantize_row16(values, gs, Int64(act.toint()) + i * Int64(self.inter // 2) + col16 * Int64(8),

@@ -50,6 +50,8 @@ import torch
 import triton
 import triton.language as tl
 from cutlass import Int32, Int64, Uint8, Uint32, Uint64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
@@ -1090,6 +1092,22 @@ class DenseGemmKernel:
         self.threads_per_cta = (
             self.num_mma_warps + 1  # 1 warp for DMA
         ) * self.num_threads_per_warp
+        cta_threads = (self.num_mma_warps + 1) * self.num_threads_per_warp
+        mma_threads = self.num_mma_warps * self.num_threads_per_warp
+        self.epi_tidx_mask = (1 << (self.threads_per_cta - 1).bit_length()) - 1
+        if (
+            self.threads_per_cta != cta_threads
+            or self.threads_per_cta <= 0
+            or mma_threads <= 0
+            or (self.epi_tidx_mask & (self.epi_tidx_mask + 1)) != 0
+            or self.threads_per_cta > self.epi_tidx_mask + 1
+            or mma_threads > self.epi_tidx_mask + 1
+        ):
+            raise ValueError(
+                f"Invalid CTA/MMA thread geometry for epilogue tidx mask: "
+                f"threads_per_cta={self.threads_per_cta}, mma_threads={mma_threads}, "
+                f"epi_tidx_mask=0x{self.epi_tidx_mask:x}"
+            )
 
         self.smem_capacity = utils.get_smem_capacity_in_bytes(target_smem_arch())
 
@@ -1109,8 +1127,29 @@ class DenseGemmKernel:
             barrier_id=2,
             num_threads=self.num_mma_warps * self.num_threads_per_warp,
         )
-        self.load_register_requirement = 40
-        self.mma_register_requirement = 232
+        # setmaxnreg budgets: MMA warps increase, the TMA warp decreases, and the
+        # per-CTA pool is rebalanced inside the SM's 64K register file.
+        # Block-FP8 (W8A8) at 8 MMA warps and one CTA per SM uses 240/24: with
+        # CUTLASS DSL 4.8.1 the 232 budget spills (LDL/STL 3/2 -> 37/22 and
+        # 4/2 -> 25/16 per kernel). Measured on RTX PRO 6000 (SM120), MiMo
+        # W8A8 m4096 programs at 2752 rows, 4.6.2 time / 4.8.1 time:
+        # 232 -> 0.72-0.91, 240 -> 0.98-1.00; GLM 5.3 producer and GLM Flash
+        # KDA neutral (0.98-1.00 either way); outputs bitwise identical
+        # (cuteafd #1423, sparkinfer-glmrt PR for this change).
+        if self.block_fp8 and self.num_mma_warps == 8 and self.occupancy == 1:
+            self.load_register_requirement = 24
+            self.mma_register_requirement = 240
+        else:
+            self.load_register_requirement = 40
+            self.mma_register_requirement = 232
+        mma_regs = self.num_mma_warps * self.num_threads_per_warp * self.mma_register_requirement
+        load_regs = self.num_threads_per_warp * self.load_register_requirement
+        if (mma_regs + load_regs) * self.occupancy > 65536:
+            raise ValueError(
+                f"setmaxnreg budgets exceed the SM register file: {self.num_mma_warps} MMA warps x "
+                f"{self.mma_register_requirement} + 1 TMA warp x {self.load_register_requirement} "
+                f"at {self.occupancy} CTA(s)/SM"
+            )
 
     def _setup_attributes(self):
         mma_sf_dtype = cutlass.Float8E8M0FNU if self.block_fp8 else self.sf_dtype
@@ -1626,9 +1665,12 @@ class DenseGemmKernel:
         n0 = tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
         for acc_n in cutlass.range_constexpr(cute.size(scale_cols)):
             n_coord = n0 + coord_mn[0, acc_n][1]
-            scale_cols[acc_n] = cutlass.Float32(0.0)
-            if n_coord < Int32(sfb.shape[0]):
+            if cutlass.const_expr(sfb.shape[0] % self.tile_shape_mnk[1] == 0):
                 scale_cols[acc_n] = cutlass.Float32(sfb[(n_coord, k_tile_global, tile_coord_mnl[2])])
+            else:
+                scale_cols[acc_n] = cutlass.Float32(0.0)
+                if n_coord < Int32(sfb.shape[0]):
+                    scale_cols[acc_n] = cutlass.Float32(sfb[(n_coord, k_tile_global, tile_coord_mnl[2])])
 
     @cute.jit
     def _emit_promoted_k_block(self, accumulators: cute.Tensor, tCrA: cute.Tensor,
@@ -3239,7 +3281,26 @@ class DenseGemmKernel:
                         tiled_copy_C_Atom,
                     )
 
-                    thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+                    if cutlass.const_expr(self.block_fp8):
+                        cta_threads = (self.num_mma_warps + 1) * self.num_threads_per_warp
+                        mma_threads = self.num_mma_warps * self.num_threads_per_warp
+                        assert self.threads_per_cta == cta_threads
+                        assert (self.epi_tidx_mask & (self.epi_tidx_mask + 1)) == 0
+                        assert mma_threads <= self.threads_per_cta <= self.epi_tidx_mask + 1
+                        epi_tidx = Int32(
+                            llvm.inline_asm(
+                                T.i32(),
+                                [Int32(tidx).ir_value()],
+                                "mov.u32 $0, $1;",
+                                "=r,r",
+                                has_side_effects=True,
+                                is_align_stack=False,
+                                asm_dialect=llvm.AsmDialect.AD_ATT,
+                            )
+                        ) & Int32(self.epi_tidx_mask)
+                    else:
+                        epi_tidx = tidx
+                    thr_copy_r2s = tiled_copy_r2s.get_slice(epi_tidx)
                     tRS_sD = thr_copy_r2s.partition_D(sC)
                     tRS_rAcc = tiled_copy_r2s.retile(accumulators)
 
@@ -8161,6 +8222,19 @@ def _select_mxfp8_tile_k(
         and _use_low_sm_dense_tactics(sm_count)
     ):
         return 128
+    # V4.1 main-wide (N=5120, K=15360) prefers BK64: the smaller per-stage
+    # scale tile keeps the K loop on the manual_bk64_sf path. Measured on
+    # SM120 at M=2048/2752/4096, interleaved and sustained against BK128 on
+    # the same tiler: 689.7/912.8/1444.0 vs 700.1/920.1/1458.7 us
+    # (-1.5/-0.8/-1.0%), bit-identical output at every row. The neighbouring
+    # (5120, 17408) shape in the high-SM table is unmeasured and keeps BK128.
+    if (
+        expected_m is not None
+        and expected_m >= 2048
+        and not _use_low_sm_dense_tactics(sm_count)
+        and (n, k) == (5120, 15360)
+    ):
+        return 64
     # BK64 is an explicitly hinted production specialization. Choosing it from
     # live M when expected_m is absent would change both tile K and generated
     # code at M=2048, violating the no-hint frozen-resolution reuse contract.

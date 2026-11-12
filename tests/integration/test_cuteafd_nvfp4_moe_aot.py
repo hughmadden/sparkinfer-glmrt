@@ -144,7 +144,14 @@ def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
             (alpha * inscale if a4 else alpha)).bfloat16().to(dtype)
         gate = project(xr, operand(w1, q1), a1[expert], in1[expert])
         up = project(xr, operand(w3, q3), a3[expert], in1[expert])
-        if g.activation == "silu_post_clamp_fp32_product":
+        if g.activation == "swigluoai":
+            from b12x.moe._shared.kernels.reference import _apply_gated_activation
+
+            act = _apply_gated_activation(
+                gate.float(), up.float(), activation="swigluoai_uninterleave",
+                swiglu_limit=limit, swiglu_alpha=g.swiglu_alpha,
+                swiglu_beta=g.swiglu_beta).bfloat16().to(dtype)
+        elif g.activation == "silu_post_clamp_fp32_product":
             silu = torch.nn.functional.silu(gate.float())
             up32 = up.float()
             if limit > 0:
@@ -276,6 +283,40 @@ A4_CASES = [
 ]
 
 
+@pytest.mark.parametrize("tp,real,capacity,rows", [(6, 512, 16, 1), (5, 624, 80, 17)])
+def test_minimax_vendor_nvfp4_a4(tp, real, capacity, rows):
+    g = _geometry("minimax_nvfp4a4", tp)
+    c, worst = _run(g, real, capacity, rows, hot=4, scale=40.0)
+    print(f"MiniMax W4A4 tp{tp} real={real} stored={g.slice} rows={rows}: cosine={c:.7f} worst={worst:.7f}")
+    assert c >= 0.9999 and worst >= 0.999
+    from b12x.integration.cuteafd.fp8_moe import fp8_moe_scratch_bytes
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    w = _weights(g, real)
+    program = _PROGRAMS[(g, capacity, False, "auto")]
+    x = torch.zeros(rows, g.hidden, device="cuda", dtype=torch.bfloat16)
+    ids = torch.arange(g.top_k, device="cuda", dtype=torch.int32).expand(rows, -1).contiguous()
+    weights = torch.full((rows, g.top_k), 1.0 / g.top_k, device="cuda")
+    out = torch.empty_like(x)
+    scratch = torch.empty(fp8_moe_scratch_bytes(g, "auto", capacity, False), device="cuda", dtype=torch.uint8)
+    tensors = (x, ids, weights, *w, out, scratch)
+    pointers = [t.data_ptr() for t in tensors]
+    program.launch(*tensors, scalars=(rows,))
+    with kernel_resolution_guard("MiniMax native worker graph replay"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            program.launch(*tensors, scalars=(rows,))
+        x.fill_(0.25)
+        program.launch(*tensors, scalars=(rows,))
+        eager = out.clone()
+        graph.replay()
+        assert torch.equal(out, eager)
+        assert torch.isfinite(out).all() and torch.count_nonzero(out) > 0
+        program.launch(*tensors, scalars=(1,))
+        assert torch.equal(out[:1], eager[:1])
+    assert pointers == [t.data_ptr() for t in tensors]
+
+
 @pytest.mark.parametrize("name,tp,real,capacity,rows,wire,hot,scale,route", A4_CASES)
 def test_nvfp4_moe_a4(name, tp, real, capacity, rows, wire, hot, scale, route):
     g = _geometry(name, tp)
@@ -321,14 +362,21 @@ def test_nvfp4_moe_a4_fused_exact(name, tp, real, capacity, rows, wire, hot, sca
     assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
 
 
-def test_nvfp4_sparse_tiles_reuse_and_graph(monkeypatch):
+@pytest.mark.parametrize("activation", ["silu_bf16_product", "swigluoai"])
+def test_nvfp4_sparse_tiles_reuse_and_graph(monkeypatch, activation):
     """One capacity program covers sparse/dense chunks under frozen resolution."""
     from b12x.integration.cuteafd import fp8_moe
 
-    g = fp8_moe.Fp8MoeGeometry("nvfp4_sparse_test", hidden=256, experts=32, top_k=2,
-                              intermediate=256, weights="nvfp4", activations="a4")
+    g = fp8_moe.Fp8MoeGeometry("nvfp4_sparse_test_" + activation, hidden=256, experts=32, top_k=2,
+                              intermediate=256, weights="nvfp4", activations="a4", activation=activation,
+                              **(dict(swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0)
+                                 if activation == "swigluoai" else {}))
     capacity = 256
     w = _weights(g, g.slice)
+    if activation == "swigluoai":
+        # Exercise the trained clamp, not only the unsaturated alpha/beta arms.
+        for scales in (w[1], w[3]):
+            split_scales(scales, g.experts, g.slice, g.hidden)[1].mul_(16.0)
     monkeypatch.setenv("B12X_NVFP4_A4_FUSED", "1")
     program = fp8_moe.compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False)
     monkeypatch.setenv("B12X_NVFP4_A4_FUSED", "0")
@@ -368,6 +416,9 @@ def test_nvfp4_sparse_tiles_reuse_and_graph(monkeypatch):
         with torch.cuda.graph(graph):
             run()
         graph.replay()
+        if activation == "swigluoai":
+            x.neg_()
+            graph.replay()
         torch.cuda.synchronize()
         assert pointers == tuple(t.data_ptr() for t in (x, ids, weights, *w, out, scratch))
         separate_out.fill_(float("nan"))

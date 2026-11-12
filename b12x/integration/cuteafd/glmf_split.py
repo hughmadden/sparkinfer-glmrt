@@ -227,6 +227,17 @@ def compile_glmf_kda_core_aot(g=GLM53_FLASH, *, max_rows=64, decode=True,
         state_dtype=state_dtype, state_rounding=state_rounding)
 
 
+def compile_glmf_kda_core_projected_aot(g=GLM53_FLASH, *, max_rows=64, decode=True,
+                                        state_dtype="float32", state_rounding="window"):
+    """``compile_glmf_kda_core_aot`` over in-projection rows the caller writes into ``scratch``
+    (``[rows, kda_in_width]`` at its base: q, k, v and the original f_a/g_a/b rows), so an engine
+    whose projections are not BF16 GEMMs (KX7 exact packs) runs only the KDA body."""
+    if not isinstance(g, GLMFGeometry):
+        raise ValueError("GLM Flash KDA requires its low-rank GLMFGeometry")
+    return compile_kda_core_aot(g, max_rows=max_rows, decode=decode,
+        state_dtype=state_dtype, state_rounding=state_rounding, projected=True)
+
+
 def compile_glmf_projected_kda_aot(g=GLM53_FLASH, *, max_rows=64, decode=True,
                                    state_dtype="float32", state_rounding="window"):
     """Native-weight caller supplies q/k/v, f_b, g_b and raw beta BF16 rows."""
@@ -247,3 +258,42 @@ def compile_glmf_fp8_stage_aot(g=GLM53_FLASH, *, stage, max_rows=64, mode="decod
         raise ValueError("GLM Flash FP8 mode must be decode or prefill")
     return compile_glm_attention_stage_aot(g, stage=stage, max_rows=max_rows,
         fp8_only=mode, query_row=query_row)
+
+
+class _Fp8Linear:
+    """The fused Flash projection itself, without its surrounding stages."""
+    def __init__(self, n, k, max_rows, decode):
+        from .glmf import _w8
+        self.projection = _w8(n, k, None if decode else max_rows)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, scales: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 fp8_rows: Int32, stream: cuda.CUstream):
+        self.projection(x, weight, scales, out, rows, fp8_rows,
+                        Int64(scratch.toint()), stream)
+
+
+def compile_glmf_fp8_linear_aot(*, input_features, output_features, max_rows=64, decode=True):
+    """Existing Fp8Projection over native row-major E4M3 and F32 128x128 scales.
+
+    fp8_rows has the fused operator's exact semantics: decode GEMV crossover,
+    or the prefill W8A8 flag. No new arithmetic or weight transformation.
+    """
+    max_rows = _check_rows(max_rows)
+    k, n = input_features, output_features
+    if any(type(v) is not int or v <= 0 or v % 128 for v in (k, n)):
+        raise ValueError("Flash block-FP8 projection requires positive H128 geometry")
+    launch = _Fp8Linear(n, k, max_rows, decode)
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("weight", torch.uint8, f"[{n},{k}]"),
+        Operand("scales", torch.float32, f"[{n//128},{k//128}]"),
+        Operand("out", torch.bfloat16, f"[rows,{n}]", "out"),
+        Operand("scratch", torch.uint8, "[projection_scratch]", "scratch"))
+    return compile_program(launch, name="glmf_fp8_linear", operands=operands,
+        scalars=(Scalar("rows"), Scalar("fp8_rows")),
+        key=(k, n, max_rows, decode, launch.projection.key()),
+        scratch={"scratch": lambda rows: max(256, launch.projection.prefill_scratch_bytes(rows))},
+        geometry=dict(input_features=k, output_features=n, max_rows=max_rows, decode=decode,
+                      scale_block=128, storage="row_major_e4m3"))
