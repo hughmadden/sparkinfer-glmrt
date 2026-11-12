@@ -45,6 +45,7 @@ from b12x._lib.utils import current_cuda_stream
 from b12x.gemm.bf16_gemv import _kernel as native
 from b12x.gemm.bf16_gemv import query_from_call
 from b12x.gemm.bf16_gemv._tuning import TUNING
+from benchmarks.kimi_k6_dense import thermal_snapshot
 from benchmarks.common import (
     bench_cuda_graph,
     capture_cuda_graph,
@@ -599,6 +600,7 @@ def _build_routed_program(n: int, k: int, dtype_name: str, spec: str, arm_tag: s
         RowTiledBf16Projection,
         TmaBf16Projection,
         WIDE_PREFILL_MIN_ROWS,
+        wide_prefill_min_rows,
     )
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
 
@@ -607,9 +609,11 @@ def _build_routed_program(n: int, k: int, dtype_name: str, spec: str, arm_tag: s
         cutlass.BFloat16 if dtype_name == "bf16" else cutlass.Float32
     )
 
+    wide_floor = wide_prefill_min_rows(n, k, 2**31 - 1)
     if spec == "routed-wide":
         launch = RoutedBf16Projection(
-            n, k, out_dtype=cutlass_dtype, max_skinny_rows=0, wide=True
+            n, k, out_dtype=cutlass_dtype, max_skinny_rows=0,
+            wide=wide_floor is not None, wide_min_rows=wide_floor
         )
         desc = f"RoutedBf16Projection(wide=True, key={launch.key()})"
         prog_key = ("routed-wide", arm_tag, launch.key())
@@ -634,7 +638,7 @@ def _build_routed_program(n: int, k: int, dtype_name: str, spec: str, arm_tag: s
         if spec == "c324b67f":
             desc = f"c324b67f_pinned({c324_cfg})"
         elif spec == "wide-floor":
-            if n % 2 == 0:
+            if wide_floor is not None and n % 2 == 0:
                 wf_cfg = dict(
                     warp_layout=(2, 2),
                     tile_m=128,
@@ -644,7 +648,7 @@ def _build_routed_program(n: int, k: int, dtype_name: str, spec: str, arm_tag: s
                 )
                 bands.append(
                     (
-                        WIDE_PREFILL_MIN_ROWS,
+                        wide_floor,
                         2**31 - 1,
                         TmaBf16Projection(
                             n, k, out_dtype=cutlass_dtype, tiles_by_rows=(), **wf_cfg
@@ -790,7 +794,8 @@ def run_routed_shape_row(
         "Kimi BF16 routed prefill projection graph capture, dynamic-row invariance, and paired replay"
     ):
         # Row-invariance check under frozen kernel resolution (reuses the same compiled callable!).
-        probe_counts = sorted({max(1, rows - 13), min(rows, 511), min(rows, 512)})
+        probe_counts = sorted({max(1, rows - 13), *(min(rows, m) for m in
+                              (1, 16, 64, 65, 511, 512, 1023, 1024, 1025, 2048, 2752, 4096))})
         row_invariance_checked: list[int] = []
         for probe_m in probe_counts:
             if probe_m <= 0 or probe_m > rows:
@@ -845,21 +850,26 @@ def run_routed_shape_row(
                 )
 
         gpu_before = nvidia_smi_gpu_mode_snapshot()
+        thermal_before = thermal_snapshot()
         for repeat in range(args.repeats):
             order = initial_order if repeat % 2 == 0 else initial_order[::-1]
             block = {"repeat": repeat, "order": list(order), "replay_us": {}}
             for arm in order:
+                before = thermal_snapshot()
                 raw = bench_cuda_graph(
                     graphs[arm], replays=args.replays, l2_flush=flush
                 )["replay_us"]
                 if any(not math.isfinite(value) or value <= 0 for value in raw):
                     raise RuntimeError(f"Invalid CUDA event samples for {arm}: {raw}")
+                block.setdefault("thermal", {})[arm] = {
+                    "before": before, "after": thermal_snapshot()}
                 block["replay_us"][arm] = raw
                 samples[arm].extend(value / args.launches for value in raw)
             block["base_over_cand_ratio"] = statistics.median(
                 block["replay_us"]["base"]
             ) / statistics.median(block["replay_us"]["cand"])
             blocks.append(block)
+        thermal_after = thermal_snapshot()
         gpu_after = nvidia_smi_gpu_mode_snapshot()
 
         graph_after_outputs = {}
@@ -913,6 +923,8 @@ def run_routed_shape_row(
         "bitwise_equal_eager": eager_bits_equal,
         "bitwise_equal_graph": graph_bits_equal,
         "row_invariance_probes": row_invariance_checked,
+        "thermal_before": thermal_before,
+        "thermal_after": thermal_after,
         "correctness": correctness,
         "median_us_per_projection": medians,
         "stats_us": stats,
@@ -950,6 +962,7 @@ def main():
         ROOT / "b12x/gemm/bf16_gemv/_prefill.py",
         ROOT / "b12x/gemm/bf16_gemv/_skinny.py",
         ROOT / "benchmarks/common.py",
+        ROOT / "benchmarks/kimi_k6_dense.py",
         ROOT / "b12x/_lib/compiler.py",
         ROOT / "b12x/_lib/intrinsics.py",
         ROOT / "b12x/_lib/runtime_control.py",

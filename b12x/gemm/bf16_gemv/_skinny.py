@@ -675,7 +675,8 @@ class RoutedBf16Projection:
                 ) if self.wide is not None and self.wide_min_rows != WIDE_PREFILL_MIN_ROWS else ()) \
             + ((("tiles_by_rows", self.tiles_by_rows),) if self.tiles_by_rows else ()) \
             + ((("skinny_tiles_by_rows", self.skinny_tiles_by_rows),) if self.skinny_tiles_by_rows else ()) \
-            + ((("wide", self.wide.key()),) if self.wide is not None else ())
+            + ((("wide", self.wide.key()),) if self.wide is not None
+               and (self.n, self.k) in WIDE_PREFILL_CONFIG_BY_SHAPE else ())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,

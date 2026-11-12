@@ -24,9 +24,6 @@ from b12x._lib.compiler import DimKey, KernelCompileSpec, compile as b12x_compil
 from b12x._lib.utils import current_cuda_stream
 from b12x._lib.intrinsics import pack_f32x2_to_bfloat2, st_global_u32
 
-_TMA_L2_EVICT_FIRST = 0x12F0000000000000
-_TMA_L2_EVICT_LAST = 0x14F0000000000000
-
 def _to_kernel_tensor(tensor, dtype, *, dynamic_layout=False):
     if hasattr(tensor, "fake_mode"):
         from cutlass.cute.runtime import make_fake_tensor
@@ -111,7 +108,7 @@ class Bf16PrefillKernel:
                  compensated: bool = True, warp_layout: tuple[int, int] | None = None,
                  tile_m: int | None = None, tile_k: int | None = None,
                  mbar_last: bool = False, cross_stage_pipe: bool = False,
-                 k_unroll: int = 1, a_l2_hint: str | None = None):
+                 k_unroll: int = 1):
         """Defaults keep the original 64x64x64, two-stage, compensated kernel.
 
         ``compensated=False`` accumulates directly in the tensor-core FP32
@@ -145,9 +142,6 @@ class Bf16PrefillKernel:
         self.mbar_last = bool(mbar_last)
         self.cross_stage_pipe = bool(cross_stage_pipe) and not self.compensated
         self.k_unroll = max(1, int(k_unroll))
-        self.a_l2_hint = a_l2_hint
-        if self.a_l2_hint not in (None, "evict_last", "evict_first"):
-            raise ValueError(f"unsupported a_l2_hint: {self.a_l2_hint!r}")
         self.n, self.k = int(n), int(k)
         if self.n <= 0 or self.k <= 0 or self.k % self.tile_k or self.tile_k % 16:
             raise ValueError("BF16 prefill needs positive N and a K divisible by its K tile")
@@ -291,6 +285,7 @@ class Bf16PrefillKernel:
             grid=(grid_m, self.n_tiles, 1),
             block=[self.num_threads, 1, 1],
             stream=stream,
+            min_blocks_per_mp=1,
         )
 
     @cute.kernel
@@ -375,6 +370,9 @@ class Bf16PrefillKernel:
             acc_shape = thr_mma.partition_shape_C((self.tile_m, self.tile_n))
             acc = cute.make_rmem_tensor(acc_shape, Float32)
             acc.fill(0.0)
+            if const_expr(not self.cross_stage_pipe):
+                correction = cute.make_rmem_tensor(acc_shape, Float32)
+                correction.fill(0.0)
             smem_copy_atom_A = cute.make_copy_atom(
                 warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
                 cutlass.BFloat16,
@@ -461,38 +459,32 @@ class Bf16PrefillKernel:
                         tCrB[None, None, k_block],
                         acc,
                     )
-            elif const_expr(self.compensated):
-                correction = cute.make_rmem_tensor(acc_shape, Float32)
-                correction.fill(0.0)
-                for _k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
-                    load_pipeline.consumer_wait(consumer_state)
-                    _warp_gemm(
-                        thr_mma,
-                        acc,
-                        correction,
-                        tCrA,
-                        tCrB,
-                        tSsA[None, None, None, consumer_state.index],
-                        tSsB[None, None, None, consumer_state.index],
-                        smem_thr_copy_A,
-                        smem_thr_copy_B,
-                    )
-                    cute.arch.fence_view_async_shared()
-                    load_pipeline.consumer_release(consumer_state)
-                    consumer_state.advance()
             else:
                 for _k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
                     load_pipeline.consumer_wait(consumer_state)
-                    _warp_gemm_direct(
-                        thr_mma,
-                        acc,
-                        tCrA,
-                        tCrB,
-                        tSsA[None, None, None, consumer_state.index],
-                        tSsB[None, None, None, consumer_state.index],
-                        smem_thr_copy_A,
-                        smem_thr_copy_B,
-                    )
+                    if const_expr(self.compensated):
+                        _warp_gemm(
+                            thr_mma,
+                            acc,
+                            correction,
+                            tCrA,
+                            tCrB,
+                            tSsA[None, None, None, consumer_state.index],
+                            tSsB[None, None, None, consumer_state.index],
+                            smem_thr_copy_A,
+                            smem_thr_copy_B,
+                        )
+                    else:
+                        _warp_gemm_direct(
+                            thr_mma,
+                            acc,
+                            tCrA,
+                            tCrB,
+                            tSsA[None, None, None, consumer_state.index],
+                            tSsB[None, None, None, consumer_state.index],
+                            smem_thr_copy_A,
+                            smem_thr_copy_B,
+                        )
                     cute.arch.fence_view_async_shared()
                     load_pipeline.consumer_release(consumer_state)
                     consumer_state.advance()
@@ -529,29 +521,12 @@ class Bf16PrefillKernel:
                 prod_unroll = min(self.k_unroll, self.k_tiles)
                 for k_tile in cutlass.range(self.k_tiles, unroll=prod_unroll):
                     load_pipeline.producer_acquire(producer_state)
-                    if const_expr(self.a_l2_hint == "evict_last"):
-                        cute.copy(
-                            tma_atom_A,
-                            tAgA[(None, m_tile, k_tile)],
-                            tAsA[(None, producer_state.index)],
-                            tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
-                            cache_policy=Int64(_TMA_L2_EVICT_LAST),
-                        )
-                    elif const_expr(self.a_l2_hint == "evict_first"):
-                        cute.copy(
-                            tma_atom_A,
-                            tAgA[(None, m_tile, k_tile)],
-                            tAsA[(None, producer_state.index)],
-                            tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
-                            cache_policy=Int64(_TMA_L2_EVICT_FIRST),
-                        )
-                    else:
-                        cute.copy(
-                            tma_atom_A,
-                            tAgA[(None, m_tile, k_tile)],
-                            tAsA[(None, producer_state.index)],
-                            tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
-                        )
+                    cute.copy(
+                        tma_atom_A,
+                        tAgA[(None, m_tile, k_tile)],
+                        tAsA[(None, producer_state.index)],
+                        tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
+                    )
                     cute.copy(
                         tma_atom_B,
                         tBgB[(None, n_tile, k_tile)],
@@ -563,29 +538,12 @@ class Bf16PrefillKernel:
             else:
                 for k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
                     load_pipeline.producer_acquire(producer_state)
-                    if const_expr(self.a_l2_hint == "evict_last"):
-                        cute.copy(
-                            tma_atom_A,
-                            tAgA[(None, m_tile, k_tile)],
-                            tAsA[(None, producer_state.index)],
-                            tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
-                            cache_policy=Int64(_TMA_L2_EVICT_LAST),
-                        )
-                    elif const_expr(self.a_l2_hint == "evict_first"):
-                        cute.copy(
-                            tma_atom_A,
-                            tAgA[(None, m_tile, k_tile)],
-                            tAsA[(None, producer_state.index)],
-                            tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
-                            cache_policy=Int64(_TMA_L2_EVICT_FIRST),
-                        )
-                    else:
-                        cute.copy(
-                            tma_atom_A,
-                            tAgA[(None, m_tile, k_tile)],
-                            tAsA[(None, producer_state.index)],
-                            tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
-                        )
+                    cute.copy(
+                        tma_atom_A,
+                        tAgA[(None, m_tile, k_tile)],
+                        tAsA[(None, producer_state.index)],
+                        tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
+                    )
                     cute.copy(
                         tma_atom_B,
                         tBgB[(None, n_tile, k_tile)],
