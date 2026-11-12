@@ -293,16 +293,18 @@ def test_head_split_shipping_combination_replays_default_bytes(rows, spec):
 
 
 def test_tiles_by_rows_and_decode_tiles_are_checked():
-    from b12x.gemm.bf16_gemv._skinny import RoutedBf16Projection, RowTiledBf16Projection
+    from b12x.gemm.bf16_gemv._skinny import DECODE_TMA_TILES, RoutedBf16Projection, RowTiledBf16Projection
     from b12x.integration.cuteafd import glmf
     from b12x.integration.cuteafd._glm_kernels import glm_projection
 
     n, k = _shape("out")
     tiles = _tiles("out")
     plain, tiled = glm_projection(n, k), glm_projection(n, k, tiles_by_rows=tiles)
-    assert plain.tiles_by_rows == () and plain.key() == RoutedBf16Projection(n, k, max_skinny_rows=0).key()
+    assert plain.tiles_by_rows == DECODE_TMA_TILES[(n, k)]
+    assert plain.key() == RoutedBf16Projection(n, k, max_skinny_rows=0).key()
     assert tiled.max_skinny_rows == plain.max_skinny_rows == 0
-    assert tiled.key()[:len(plain.key())] == plain.key() and tiled.key()[-1] == ("tiles_by_rows", tiles)
+    assert tiled.tiles_by_rows == tiles and tiled.key()[-1] == ("tiles_by_rows", tiles)
+    assert tiled.key()[:-1] == plain.key()[:-1]
     for bad, match in (
             (((32, 1, 32),), "entries"),                               # an entry is four numbers
             (((32, 1, 32, 4), (32, 4, 64, 3)), "ascending"),           # rows must ascend
