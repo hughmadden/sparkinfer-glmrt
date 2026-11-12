@@ -109,8 +109,8 @@ class SharedSupertileGather:
             local = Int32(src_len[row]) - page_begin * Int32(_PAGE)
             if local < Int32(0):
                 local = Int32(0)
-            if local > Int32(self.supertile):
-                local = Int32(self.supertile)
+            if local > output_tokens:
+                local = output_tokens
             if cutlass.const_expr(bounded):
                 if Int64(local) > live_tokens:
                     local = Int32(cute.max(Int64(0), live_tokens))
