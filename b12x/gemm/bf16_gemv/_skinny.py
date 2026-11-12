@@ -309,6 +309,14 @@ class RowTiledSkinnyBf16Gemv:
 WIDE_PREFILL_CONFIG = dict(warp_layout=(2, 2), tile_m=128, tile_n=128, num_stages=2, compensated=False)
 WIDE_PREFILL_MIN_ROWS = 512
 
+# Gemini's three-stage gate/up pipeline; other shapes keep the two-stage tile.
+WIDE_PREFILL_CONFIG_BY_SHAPE = {
+    (6144, 7168): dict(
+        WIDE_PREFILL_CONFIG, num_stages=3, mbar_last=True,
+        cross_stage_pipe=True, k_unroll=3,
+    ),
+}
+
 # Measured SM120 wide-prefill floor by weight shape [N, K]: from this many live
 # rows the wide tile beats prefill_config (interleaved, L2-cold, bitwise
 # identical). Narrow and small outputs need 1024 rows: four 128-row M tiles by
@@ -649,7 +657,7 @@ class RoutedBf16Projection:
         self.wide_min_rows = int(WIDE_PREFILL_MIN_ROWS if wide_min_rows is None else wide_min_rows)
         if self.wide_min_rows < 1:
             raise ValueError("wide_min_rows must be positive")
-        self.wide = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(), **WIDE_PREFILL_CONFIG) \
+        self.wide = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(), **WIDE_PREFILL_CONFIG_BY_SHAPE.get((self.n, self.k), WIDE_PREFILL_CONFIG)) \
             if wide and self.n % 2 == 0 else None
 
     @property
@@ -666,7 +674,9 @@ class RoutedBf16Projection:
             + ((("wide_min_rows", self.wide_min_rows),
                 ) if self.wide is not None and self.wide_min_rows != WIDE_PREFILL_MIN_ROWS else ()) \
             + ((("tiles_by_rows", self.tiles_by_rows),) if self.tiles_by_rows else ()) \
-            + ((("skinny_tiles_by_rows", self.skinny_tiles_by_rows),) if self.skinny_tiles_by_rows else ())
+            + ((("skinny_tiles_by_rows", self.skinny_tiles_by_rows),) if self.skinny_tiles_by_rows else ()) \
+            + ((("wide", self.wide.key()),) if self.wide is not None
+               and (self.n, self.k) in WIDE_PREFILL_CONFIG_BY_SHAPE else ())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,

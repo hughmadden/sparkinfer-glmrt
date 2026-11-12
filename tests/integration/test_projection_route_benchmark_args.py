@@ -16,6 +16,34 @@ _BENCH = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_BENCH)
 
 
+@pytest.mark.parametrize("shape,wide,extended", [
+    ((6144, 7168), True, True),
+    ((6144, 7168), False, False),
+    ((3584, 7168), True, False),
+    ((7168, 6144), True, False),
+])
+def test_wide_override_extends_only_selected_shape_keys(shape, wide, extended):
+    source = _PATH.parents[1] / "b12x/gemm/bf16_gemv/_skinny.py"
+    tree = ast.parse(source.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == "RoutedBf16Projection")
+    key = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "key")
+    namespace = dict(WIDE_PREFILL_MIN_ROWS=512,
+                     WIDE_PREFILL_CONFIG_BY_SHAPE={(6144, 7168): {}})
+    exec(compile(ast.Module(body=[key], type_ignores=[]), str(source), "exec"), namespace)
+    projection = SimpleNamespace(
+        n=shape[0], k=shape[1], out_dtype="bf16", max_skinny_rows=0,
+        skinny=SimpleNamespace(cols=1, rows_per_tile=8, threads=128),
+        large=SimpleNamespace(config={"compensated": False}),
+        wide=SimpleNamespace(key=lambda: ("selected-config",)) if wide else None,
+        wide_min_rows=1024, tiles_by_rows=(), skinny_tiles_by_rows=())
+    original = (*shape, "bf16", 0, 1, 8, 128, (("compensated", False),), wide)
+    if wide:
+        original += (("wide_min_rows", 1024),)
+    expected = original + ((("wide", ("selected-config",)),) if extended else ())
+    assert namespace["key"](projection) == expected
+
+
 def test_compensation_pair_accepts_production_shapes_and_wide_rows():
     args = _BENCH.parse_args(["--recipes", "compensation", "--shapes", "7168x6144,6144x6144",
                               "--rows", "1,16,4096"])
