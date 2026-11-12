@@ -36,37 +36,58 @@ class SharedSupertileGather:
                  lengths: cute.Pointer, k_quant: cute.Pointer, k_scale: cute.Pointer,
                  k_start: cute.Pointer, k_end: cute.Pointer, rows: Int32,
                  table_width: Int32, page_begin: Int32, stream: cuda.CUstream):
-        token_ctas = (self.supertile + _TOKENS_PER_CTA - 1) // _TOKENS_PER_CTA
+        self.bounded(index_k_cache, page_table, lengths, k_quant, k_scale, k_start, k_end,
+                     rows, table_width, page_begin, Int64(1 << 31),
+                     Int64(self.supertile), stream, bounded=False)
+
+    @cute.jit
+    def bounded(self, index_k_cache: cute.Pointer, page_table: cute.Pointer,
+                lengths: cute.Pointer, k_quant: cute.Pointer, k_scale: cute.Pointer,
+                k_start: cute.Pointer, k_end: cute.Pointer, rows: Int32,
+                table_width: Int32, page_begin: Int32, pool_pages: Int64,
+                live_tokens: Int64, stream: cuda.CUstream, bounded: cutlass.Constexpr = True,
+                output_tokens: Int32 = Int32(0)):
+        extent = Int32(self.supertile)
+        if cutlass.const_expr(bounded):
+            extent = output_tokens
+        token_ctas = (extent + Int32(_TOKENS_PER_CTA - 1)) // Int32(_TOKENS_PER_CTA)
         row_ctas = (rows + Int32(_THREADS - 1)) // Int32(_THREADS)
         grid = Int32(token_ctas)
         if row_ctas > grid:
             grid = row_ctas
         self.kernel(index_k_cache, page_table, lengths, k_quant, k_scale, k_start, k_end,
-                    rows, table_width, page_begin).launch(
+                    rows, table_width, page_begin, pool_pages, live_tokens, bounded, extent).launch(
             grid=(grid, 1, 1), block=(_THREADS, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, index_k_cache: cute.Pointer, page_table: cute.Pointer,
                lengths: cute.Pointer, k_quant: cute.Pointer, k_scale: cute.Pointer,
                k_start: cute.Pointer, k_end: cute.Pointer, rows: Int32,
-               table_width: Int32, page_begin: Int32):
+               table_width: Int32, page_begin: Int32, pool_pages: Int64,
+               live_tokens: Int64, bounded: cutlass.Constexpr, output_tokens: Int32):
         bidx = Int32(cute.arch.block_idx()[0])
         tidx = Int32(cute.arch.thread_idx()[0])
         warp = tidx // Int32(32)
         lane = tidx % Int32(32)
         cache_base = Int64(index_k_cache.toint())
         token = bidx * Int32(_TOKENS_PER_CTA) + warp
-        if token < Int32(self.supertile):
+        if token < output_tokens:
             column = page_begin + token // Int32(_PAGE)
             slot = token % Int32(_PAGE)
             page_id = Int32(-1)
-            if column < table_width:
+            valid_column = column < table_width
+            if cutlass.const_expr(bounded):
+                valid_column = valid_column and column >= Int32(0) and Int64(token) < live_tokens
+            if valid_column:
                 table = cute.make_ptr(Int32, Int64(page_table.toint()), cute.AddressSpace.gmem,
                                       assumed_align=4)
                 page_id = Int32(table[column])
             word = Uint32(0)
             scale = Uint32(0)
-            if page_id >= Int32(0):
+            valid_page = page_id >= Int32(0)
+            if cutlass.const_expr(bounded):
+                valid_page = valid_page and Int64(page_id) < pool_pages
+            if valid_page:
                 page_base = cache_base + Int64(page_id) * Int64(_PAGE_BYTES)
                 src = cute.make_ptr(Uint32, page_base + Int64(slot) * Int64(_HEAD_DIM),
                                     cute.AddressSpace.gmem, assumed_align=4)
@@ -90,6 +111,9 @@ class SharedSupertileGather:
                 local = Int32(0)
             if local > Int32(self.supertile):
                 local = Int32(self.supertile)
+            if cutlass.const_expr(bounded):
+                if Int64(local) > live_tokens:
+                    local = Int32(cute.max(Int64(0), live_tokens))
             starts = cute.make_ptr(Int32, Int64(k_start.toint()), cute.AddressSpace.gmem, assumed_align=4)
             ends = cute.make_ptr(Int32, Int64(k_end.toint()), cute.AddressSpace.gmem, assumed_align=4)
             starts[row] = Int32(0)
