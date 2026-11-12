@@ -26,7 +26,7 @@ class _IndexCacheGather:
                  stream: cuda.CUstream):
         self.gather.bounded(cache, pages, lengths, keys, scales, starts, ends,
                             rows, table_width, page_begin, pool_pages, Int64(live_tokens),
-                            stream, output_tokens=output_tokens)
+                            output_tokens, stream)
 
 
 def compile_index_cache_gather_aot():
