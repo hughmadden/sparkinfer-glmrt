@@ -157,6 +157,10 @@ def producer_cases(args):
             operands = (k, v, slots, batch, kd, vd, *caches)
             refs = [(value.float() * (1 / scale[batch.long(), :, None])).to(torch.float8_e4m3fn).view(torch.uint8)
                     for value, scale in zip((k, v), (kd, vd))]
+        full_bits = None
+        if name != "kv_pack":
+            program.launch(*operands, scalars=(max(args.rows),))
+            full_bits = out[:max(args.rows)].view(torch.uint8).clone()
         first = None
         for rows in args.rows:
             if name == "kv_pack":
@@ -178,6 +182,7 @@ def producer_cases(args):
             else:
                 torch.testing.assert_close(out[:rows], ref[:rows], rtol=rtol, atol=atol)
                 assert torch.isnan(out[rows:]).all(), "writes beyond live rows"
+                assert torch.equal(out[:rows].view(torch.uint8), full_bits[:rows]), "row-count dependent prefix"
                 outputs = [out[:rows]]
                 row_bits = [out[0].view(torch.uint8).clone()]
                 byte_count = rows * 6144 * 6 + 6144 * 2 if name == "norm" else 128 * 6144 * 4 + rows * (6144 * 2 + 128 * 4)
