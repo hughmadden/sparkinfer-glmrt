@@ -9,6 +9,7 @@ The baseline producers derive from Hugh Madden's donated implementation.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import itertools
 import statistics
@@ -114,6 +115,27 @@ def check_reference(args, key, outputs, bounded=False):
     return {"baseline_exact": exact, "fp64_bound_exception": not exact}
 
 
+def check_manifest(args, name, program):
+    """Pin every public contract field; compiled code/cache identities are excluded."""
+    record = dict(name=program.name, abi=program.abi,
+                  operands=[asdict(o) for o in program.operands],
+                  scalars=[asdict(s) for s in program.scalars],
+                  geometry=dict(program.geometry),
+                  scratch_bytes={str(rows): program.scratch_bytes(rows) for rows in (1, 4096)})
+    record = json.loads(json.dumps(record, default=str))
+    if args.references is not None:
+        path = args.references / (name + "-manifest.json")
+        if args.write_reference:
+            path.write_text(json.dumps(record, indent=2) + "\n")
+        else:
+            expected = json.loads(path.read_text())
+            if record != expected:
+                fields = sorted(k for k in record.keys() | expected.keys()
+                                if record.get(k) != expected.get(k))
+                raise AssertionError(f"{name}: changed baseline manifest fields: {fields}")
+    return record
+
+
 def producer_cases(args):
     from b12x.integration.cuteafd.minimax import (
         compile_minimax_norm_aot, compile_minimax_router_scores_aot, compile_minimax_kv_pack_aot)
@@ -125,6 +147,10 @@ def producer_cases(args):
         if name not in args.kernels:
             continue
         program = compile_fn()
+        manifest = check_manifest(args, name, program)
+        if args.manifest_only:
+            yield dict(kernel=name, manifest=manifest)
+            continue
         # The same first row is used at every row count, checking row invariance.
         torch.manual_seed(281)
         capacity = max(args.rows) + 1
@@ -193,7 +219,7 @@ def producer_cases(args):
             comparison = check_reference(args, f"{name}-{rows}", outputs, bounded=name != "kv_pack")
             us, raw = measure(fn, args.iterations, args.samples)
             yield dict(kernel=name, rows=rows, median_us=us, samples_us=raw,
-                       nominal_bytes=byte_count, nominal_flops=flops, **comparison)
+                       nominal_bytes=byte_count, nominal_flops=flops, manifest=manifest, **comparison)
 
 
 def gather_cases(args):
@@ -259,6 +285,7 @@ def main():
     p.add_argument("--references", type=Path)
     p.add_argument("--write-reference", action="store_true")
     p.add_argument("--allow-fp64-bound", action="store_true")
+    p.add_argument("--manifest-only", action="store_true", help="compile and check producer contracts without timing")
     p.add_argument("--skip-tests", action="store_true", help="only after the unchanged #281/#282 tests ran separately")
     p.add_argument("--json", required=True, type=Path)
     args = p.parse_args()
@@ -268,6 +295,8 @@ def main():
     if (not args.rows or min(args.rows) < 1 or min(args.gather_contexts) < 1
             or args.iterations < 1 or args.samples < 1 or (args.gather_live is not None and args.gather_live < 0)):
         p.error("rows, contexts, iterations and samples must be positive; live must be nonnegative")
+    if args.manifest_only and "gather" in args.kernels:
+        p.error("--manifest-only supports producers only")
     if args.write_reference and args.references is None:
         p.error("--write-reference requires --references")
     if args.references is not None and args.write_reference:
