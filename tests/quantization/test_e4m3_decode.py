@@ -111,15 +111,22 @@ def test_e4m3_reciprocal_helpers_match_the_exact_decode() -> None:
     nan = torch.isnan(reference)
     zero = reference == 0
     regular = ~nan & ~zero
-    expected = 1.0 / reference[regular]
     assert torch.isnan(out[nan, 1]).all(), out[nan, 1]
-    for column, name in ((1, "fp8_e4m3_to_f32_and_rcp"), (2, "effective_rcp")):
+    # The NVFP4 quantizer's effective reciprocal only ever sees the scale
+    # bytes of non-negative block scales (0x00..0x7E) and ignores the sign.
+    scale_domain = codes < 0x7F
+    for column, name, domain in (
+        (1, "fp8_e4m3_to_f32_and_rcp", torch.ones_like(scale_domain)),
+        (2, "effective_rcp", scale_domain),
+    ):
         got = out[:, column].to(torch.float64)
-        assert (got[zero] == 0).all(), (name, got[zero])
-        rel = ((got[regular] - expected) / expected).abs()
+        assert (got[zero & domain] == 0).all(), (name, got[zero & domain])
+        mask = regular & domain
+        want = 1.0 / reference[mask]
+        rel = ((got[mask] - want) / want).abs()
         # rcp.approx.ftz is within 1 ulp; div.rn is exact to rounding.
         assert rel.max().item() <= 2.0**-22, (name, rel.max().item())
-        assert torch.equal(torch.sign(got[regular]), torch.sign(expected)), name
+        assert torch.equal(torch.sign(got[mask]), torch.sign(want)), name
 
 
 class _QuantizeBlocksKernel:
